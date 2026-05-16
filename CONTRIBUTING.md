@@ -5,8 +5,12 @@ Thanks for your interest. Atelier is pre-implementation: the spec, schemas, and 
 ## Where to read first
 
 1. `README.md` for orientation and the state of the project.
-2. `coding-harness-spec.md` — at minimum the table of contents and §0–§2.5.
-3. `tasks/todo.md` for the phased build plan and the open-questions table.
+2. `coding-harness-spec.md` — at minimum the table of contents and §0 (mission), §1, §2, and §7 (the load-bearing pillars).
+3. `tasks/todo.md` for the phased build plan, the open-questions table, and the two external-action items blocking Phase A code.
+4. `tests/workload/canonical/README.md` — the 11-task calibration workload. The priority subset for the backend milestone is **t01, t02, t05, t06, t10**.
+5. `schemas/README.md` — the data model. Useful before touching any artifact under `examples/`, `prompts/`, or `crates/atelier-core/{skills,catalog,templates,tools}/`.
+6. `CHANGELOG.md` — how the spec arrived at its current shape; useful if you want to know *why* a section is the way it is.
+7. `docs/layout.md` — exhaustive repo tree if the top-level README's high-level listing isn't enough.
 
 ## What can be contributed now
 
@@ -37,6 +41,8 @@ cargo test --workspace
 cargo clippy --workspace -- -D warnings
 cargo fmt --check
 ```
+
+CI runs these same gates on a matrix of **Ubuntu + macOS**. The toolchain is pinned to **Rust 1.85.0** via `rust-toolchain.toml` (see [`docs/toolchain.md`](docs/toolchain.md) for why this exact version is required). The reference machine — used for any timing or baseline procedure — is documented at `tests/perf/reference.md`.
 
 ## Conventions
 

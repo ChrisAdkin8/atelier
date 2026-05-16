@@ -25,6 +25,17 @@ The Atelier rig — schemas, validators, fixtures, and the workload runner. Driv
 - No-op-harness detection on t05 / t07; harness-smoke for every task's `checks.json`.
 - Lints: `fixture/`-path leak, hook-impl `timeout_ms` regression lock, `.claude/` path-leak (BYOM directive), stale `*_file` / `*_dir` tool-name mentions.
 
+## Properties the rig enforces
+
+These are the load-bearing invariants the rig is built to catch — explicit so that anyone touching a schema, fixture, or runner knows what they're not allowed to break:
+
+- **No-op-harness exploits** caught on t05, t07, t11 (a harness that does nothing must fail these tasks' checks).
+- **Cross-schema `$ref`s** (session → envelope; subagent-type → routing; tool manifests → `_implementation.v1.json`) resolve via the shared registry in `_schema_helpers.py`.
+- **Hooks inline their implementation `oneOf`** so a tool-only `timeout_ms` can't leak into the hook contract (spec §15: hooks warn, never block).
+- **Every schema carries a `version: const 1` discriminator.**
+- **Built-in tool manifests** (`read_file`, `write_file`, `edit_file`, `list_dir`, `grep`, `ast_grep`, `shell`, `spawn_subagent`) live under `crates/atelier-core/tools/` and match spec §15 L722.
+- **Vendor-neutral baselines** (`baseline_harness_name` + `baseline_harness_version`). The §8 reference baseline is a spec choice, not a schema commitment — BYOM by construction.
+
 ## What's not here
 
 - **The baseline JSON file.** `tests/baselines/permission_prompts.json` is captured by running `workload/canonical/baseline_procedure.md` against a reference harness; it doesn't yet exist (external action required).
