@@ -1,0 +1,5 @@
+# Fixtures must be reset to clean state between runs. The workload runner does this,
+# but local ad-hoc verification leaves pytest cache behind. Keep it out of source.
+**/.pytest_cache/
+**/__pycache__/
+**/*.pyc

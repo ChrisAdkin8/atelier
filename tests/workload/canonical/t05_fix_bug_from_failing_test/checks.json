@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "checks": [
+    {
+      "name": "pytest passes",
+      "command": "python3 -m pytest  -q",
+      "expect": {
+        "exit_code": 0
+      }
+    },
+    {
+      "name": "test file untouched (agent fixed production code, not the test)",
+      "file_unchanged": "tests/test_duration.py"
+    },
+    {
+      "name": "format_duration(7200) returns '2h'",
+      "command": "python3 -c \"import sys; sys.path.insert(0, '.'); from duration import format_duration; assert format_duration(7200) == '2h'\"",
+      "expect": {
+        "exit_code": 0
+      }
+    },
+    {
+      "name": "format_duration(5400) returns '1h30m'",
+      "command": "python3 -c \"import sys; sys.path.insert(0, '.'); from duration import format_duration; assert format_duration(5400) == '1h30m'\"",
+      "expect": {
+        "exit_code": 0
+      }
+    }
+  ]
+}

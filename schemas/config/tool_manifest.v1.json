@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://atelier.example/schemas/config/tool_manifest.v1.json",
+  "title": "Custom tool manifest",
+  "description": "Registers a tool with Atelier's built-in tool registry (§15). Built-in tools (read_file, write_file, shell, grep, ...) are shipped in atelier-core; custom tools are added by dropping a manifest file in `~/.atelier/tools/` (global) or `<repo>/.atelier/tools/` (per-repo, overrides global by name). The tool is exposed internally through the same MCP-compatible interface as external MCP-routed tools; the rest of the harness (verification gates, hooks, ledger, trust budget) treats built-in, custom, and MCP-routed tools uniformly.",
+  "type": "object",
+  "required": ["version", "name", "side_effect_class", "input_schema", "implementation"],
+  "additionalProperties": false,
+  "properties": {
+    "version": {"const": 1},
+    "name": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*$",
+      "description": "Tool identifier surfaced to the model and in the §1 cost ledger. Must be unique within the session; per-repo manifests override same-name global ones."
+    },
+    "description": {
+      "type": "string",
+      "description": "Surfaced to the model as the tool's natural-language description. Should explain what the tool does, when to use it, and what arguments it takes."
+    },
+    "side_effect_class": {
+      "enum": ["local-safe", "local-risky", "shared-state", "irreversible"],
+      "description": "§8 trust-budget classification. Overridable per-call via the trust-budget UI, but this is the default."
+    },
+    "input_schema": {
+      "type": "object",
+      "description": "JSONSchema for the tool's argument object. The harness validates the model's tool-call arguments against this before dispatch; SchemaViolation (§2.5) on mismatch."
+    },
+    "output_schema": {
+      "type": "object",
+      "description": "Optional JSONSchema for the tool's result object. If present, the harness validates the tool's result before injecting it into the conversation; SchemaViolation (§2.5) on mismatch."
+    },
+    "implementation": {"$ref": "https://atelier.example/schemas/config/_implementation.v1.json"},
+    "allow_net": {
+      "type": "boolean",
+      "default": false,
+      "description": "Shell-only: if true, the subprocess sandbox permits outbound network. HTTP implementation implies network and ignores this flag."
+    }
+  }
+}

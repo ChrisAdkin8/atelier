@@ -1,0 +1,86 @@
+name: check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  rig:
+    name: rig (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node (for t11)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # Single source of truth for rig deps: pyproject.toml [project.optional-dependencies] rig.
+      # Bump versions there, not here.
+      - name: Install rig dependencies
+        run: pip install ".[rig]"
+
+      - name: Schema meta-validation
+        run: python tests/validate_schemas.py
+
+      - name: Artifact validation
+        run: python tests/validate_artifacts.py
+
+      - name: Rig self-tests
+        run: pytest tests/test_schemas.py tests/test_validators.py tests/test_runner.py -q
+
+      - name: Workload dry-run (every task's starting state matches declared expected_starting_returncode)
+        run: python tests/workload/runner/runner.py --task all --dry-run --summary
+
+  rust:
+    name: rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      # Explicitly install the toolchain pinned in rust-toolchain.toml so the
+      # download happens once, before any cargo step, and the components
+      # (rustfmt, clippy) are reliably present. Auto-installing via stale rustup
+      # has bitten us on the macos runner before. Action pinned to @v1 (the
+      # major version tag) rather than @stable — `@stable` follows the action's
+      # default branch and is a moving target; @v1 is the supported semver pin.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: "1.85.0"
+          components: rustfmt, clippy
+
+      # Cache key includes rust-toolchain.toml so a channel bump invalidates the
+      # cache. Without it, an old toolchain's target/ artefacts get reused.
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('rust-toolchain.toml', '**/Cargo.toml') }}
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test atelier-core
+        run: cargo test -p atelier-core

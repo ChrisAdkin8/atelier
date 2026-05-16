@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "task_id": "t04_add_missing_test",
+  "title": "Write tests for an untested function",
+  "priority": false,
+  "expected_starting_returncode": 5,
+  "turn_cap": 20,
+  "exercises": [
+    "read existing code",
+    "test design",
+    "edge cases"
+  ]
+}

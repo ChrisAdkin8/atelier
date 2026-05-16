@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "name": "review",
+  "description": "Review the current diff and call out regressions, missing test coverage, security concerns, and ATELIER.md convention violations.",
+  "prompt_template": "Please review the pending changes in the workspace. Identify:\n\n1. **Regressions or behavior changes** that aren't obviously intentional from the diff.\n2. **Test coverage gaps** for the changed code — both for new functionality and for previously-uncovered paths the change touches.\n3. **Security concerns** — credential handling, input validation at trust boundaries, injection vectors.\n4. **Convention violations** against ATELIER.md (the project's instructions file).\n\nBe specific: cite file paths and line numbers. Group findings by severity (must-fix / should-fix / nit). If nothing significant, say so plainly.",
+  "pinned_context": ["ATELIER.md"],
+  "side_effect_class": "local-safe"
+}

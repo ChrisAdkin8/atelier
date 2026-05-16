@@ -1,0 +1,92 @@
+{
+  "version": 1,
+  "name": "spawn_subagent",
+  "description": "Spawn a sub-agent of a registered `subagent_type` (§10 delegation mode). The harness materialises a fresh §2.5 state machine with the type's `system_prompt_addendum`, `tool_allowlist`, `default_max_turns`, and optional `model_routing`. The sub-agent runs to completion and returns a single tool-result message; the parent never sees the sub-agent's intermediate turns. Cancellation cascades (cancelling the parent cancels its sub-agents). Recursion depth is capped at 3 (PROVISIONAL).\n\n**Two invocation shapes:**\n1. *Spawn:* `{description, prompt, subagent_type?, tool_allowlist?, max_turns?}` — `subagent_type` defaults to `general-purpose` per spec §10.1.\n2. *Cancel:* `{subagent_id, cancel: true}` — terminates a running sub-agent; cascades to its descendants.",
+  "side_effect_class": "local-risky",
+  "input_schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "subagent_type": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9_-]*$",
+        "description": "Name of a registered `schemas/config/subagent_type.v1.json` manifest (bundled, global, or per-repo). Optional; defaults to `general-purpose` per spec §10.1."
+      },
+      "description": {
+        "type": "string",
+        "description": "One-line summary shown in the parent's conversation card and the sub-agent pane title. Required when spawning."
+      },
+      "prompt": {
+        "type": "string",
+        "description": "The user-role message the sub-agent begins with. The sub-agent's `system_prompt_addendum` is automatically prepended; do not duplicate it here. Required when spawning."
+      },
+      "max_turns": {
+        "type": "integer",
+        "minimum": 1,
+        "description": "Override the sub-agent type's `default_max_turns` for this invocation. Subject to the global recursion-depth cap."
+      },
+      "tool_allowlist": {
+        "type": "array",
+        "items": {"type": "string"},
+        "description": "Override the sub-agent type's `tool_allowlist` for this invocation. If neither is set, the sub-agent inherits the parent's full tool set."
+      },
+      "subagent_id": {
+        "type": "string",
+        "description": "Identifier of an already-running sub-agent to cancel. Required iff `cancel: true`."
+      },
+      "cancel": {
+        "type": "boolean",
+        "description": "Set to `true` together with `subagent_id` to terminate a running sub-agent (§10.1, L552). Cancellation cascades to descendants."
+      }
+    },
+    "oneOf": [
+      {
+        "title": "spawn",
+        "required": ["description", "prompt"],
+        "not": {"required": ["cancel"]}
+      },
+      {
+        "title": "cancel",
+        "required": ["subagent_id", "cancel"],
+        "properties": {"cancel": {"const": true}},
+        "not": {"anyOf": [{"required": ["prompt"]}, {"required": ["description"]}]}
+      }
+    ]
+  },
+  "output_schema": {
+    "type": "object",
+    "required": ["subagent_id", "result", "status", "turns_used"],
+    "additionalProperties": false,
+    "properties": {
+      "subagent_id": {
+        "type": "string",
+        "description": "Key into `session.subagents` where the sub-agent's full conversation and cost summary live."
+      },
+      "result": {
+        "type": "string",
+        "description": "The single final assistant message from the sub-agent. This is the only content injected back into the parent's conversation."
+      },
+      "status": {
+        "enum": ["completed", "failed", "timed_out", "cancelled"],
+        "description": "Terminal state of the sub-agent's §2.5 state machine. `running` never appears here — the tool only returns once the sub-agent has finished."
+      },
+      "turns_used": {
+        "type": "integer",
+        "minimum": 0,
+        "description": "Number of turns the sub-agent consumed. ≤ `max_turns` if set, else ≤ `subagent_type.default_max_turns`."
+      },
+      "cost": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Token + cost summary for the sub-agent. Mirrors the per-sub-agent entry in `session.subagents.*.cost_summary`.",
+        "properties": {
+          "prompt_tokens": {"type": "integer", "minimum": 0},
+          "completion_tokens": {"type": "integer", "minimum": 0},
+          "cached_tokens": {"type": "integer", "minimum": 0},
+          "cost_usd": {"type": "number"}
+        }
+      }
+    }
+  },
+  "implementation": {"kind": "builtin"}
+}

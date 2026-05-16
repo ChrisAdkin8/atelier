@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "task_id": "t03_config_migration",
+  "title": "Migrate config schema from legacy key names",
+  "priority": false,
+  "expected_starting_returncode": 1,
+  "turn_cap": 20,
+  "exercises": [
+    "cross-file coordinated edit",
+    "JSON + code",
+    "key renaming"
+  ]
+}

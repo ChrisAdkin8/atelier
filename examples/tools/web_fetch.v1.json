@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "name": "web_fetch",
+  "description": "Fetch the content of a public URL and return it as text. Use sparingly — counts as egress under §12 and consumes the §8 shared-state budget on every call.",
+  "side_effect_class": "shared-state",
+  "input_schema": {
+    "type": "object",
+    "required": ["url"],
+    "additionalProperties": false,
+    "properties": {
+      "url": {"type": "string", "format": "uri"},
+      "max_bytes": {"type": "integer", "minimum": 1, "default": 200000}
+    }
+  },
+  "output_schema": {
+    "type": "object",
+    "required": ["status", "body"],
+    "properties": {
+      "status": {"type": "integer"},
+      "body": {"type": "string"},
+      "truncated": {"type": "boolean"}
+    }
+  },
+  "implementation": {
+    "kind": "http",
+    "url": "https://internal.example/atelier/web-fetch",
+    "headers": {
+      "Authorization": "Bearer ${keychain:atelier_webfetch_token}"
+    },
+    "timeout_ms": 15000
+  }
+}

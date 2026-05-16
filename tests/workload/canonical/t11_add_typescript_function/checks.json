@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "checks": [
+    {
+      "name": "node --test passes",
+      "command": "node --test tests/test_utils.ts",
+      "expect": {"exit_code": 0}
+    },
+    {
+      "name": "test file untouched",
+      "file_unchanged": "tests/test_utils.ts"
+    },
+    {
+      "name": "divisibleBy exported from utils.ts",
+      "command": "node -e \"import('./utils.ts').then(m => { if (typeof m.divisibleBy !== 'function') process.exit(2); }).catch(() => process.exit(3))\"",
+      "expect": {"exit_code": 0}
+    }
+  ]
+}

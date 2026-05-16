@@ -1,0 +1,260 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://atelier.example/schemas/session/v1.json",
+  "title": "Atelier session artifact",
+  "description": "The complete persistent state of an Atelier session. Wraps every component referenced elsewhere in the spec: conversation history (with envelopes), cost ledger, recovery log, checkpoint tree, tool-result fixtures, memory, plan, and constraint pins. Replay, fork, and crash recovery all operate on this artifact.",
+  "type": "object",
+  "required": [
+    "session_uuid",
+    "harness_session_version",
+    "atelier_version",
+    "created_at",
+    "conversation",
+    "cost_ledger",
+    "checkpoints",
+    "tool_fixtures",
+    "memory",
+    "plan",
+    "constraints",
+    "recovery_log"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "session_uuid": {"type": "string", "format": "uuid"},
+    "harness_session_version": {"type": "integer", "minimum": 1, "description": "Session-schema version; bumps require a one-way migration tool."},
+    "atelier_version": {"type": "string"},
+    "created_at": {"type": "string", "format": "date-time"},
+    "conversation": {
+      "type": "array",
+      "description": "Ordered turns. Each turn carries an envelope per schemas/model_protocol/envelope.v1.json.",
+      "items": {"$ref": "#/$defs/turn"}
+    },
+    "cost_ledger": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["timestamp", "kind"],
+        "properties": {
+          "timestamp": {"type": "string", "format": "date-time"},
+          "kind": {"enum": ["model_call", "cache_bust", "tool_call"]},
+          "model_id": {"type": "string"},
+          "prompt_tokens": {"type": "integer", "minimum": 0},
+          "completion_tokens": {"type": "integer", "minimum": 0},
+          "cached_tokens": {"type": "integer", "minimum": 0},
+          "count_source": {"enum": ["exact", "approx", "unavailable"]},
+          "cost_usd": {"type": "number"},
+          "latency_ms": {"type": "number"},
+          "tool_name": {"type": "string", "description": "Name of the tool invoked. Required for kind=tool_call so replay can link the ledger entry to the corresponding tool_fixtures entry programmatically (rather than string-parsing the free-form `note`)."},
+          "note": {"type": "string"}
+        },
+        "allOf": [
+          {
+            "if": {"properties": {"kind": {"const": "model_call"}}, "required": ["kind"]},
+            "then": {"required": ["model_id", "prompt_tokens", "completion_tokens", "count_source"]}
+          },
+          {
+            "if": {"properties": {"kind": {"const": "cache_bust"}}, "required": ["kind"]},
+            "then": {"required": ["note"]}
+          },
+          {
+            "if": {"properties": {"kind": {"const": "tool_call"}}, "required": ["kind"]},
+            "then": {"required": ["latency_ms", "tool_name"]}
+          }
+        ]
+      }
+    },
+    "checkpoints": {
+      "type": "object",
+      "description": "Diff-based per-action checkpoint tree. Forks branch from named checkpoints.",
+      "required": ["root", "nodes"],
+      "additionalProperties": false,
+      "properties": {
+        "root": {"type": "string"},
+        "nodes": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "required": ["parent", "diff_ref", "created_at"],
+            "additionalProperties": false,
+            "properties": {
+              "parent": {"type": ["string", "null"]},
+              "diff_ref": {"type": "string", "description": "Pointer to the stored diff blob"},
+              "created_at": {"type": "string", "format": "date-time"},
+              "fork_label": {"type": "string"},
+              "pruned": {"type": "boolean"}
+            }
+          }
+        }
+      }
+    },
+    "tool_fixtures": {
+      "type": "object",
+      "description": "Recorded input/output per tool call. Replay reads results from here rather than re-executing tools. Each fixture carries either a `result` (successful call) or an `error` (failed call per the §2.5 tool error taxonomy) — never both, never neither.",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["tool_name", "args", "captured_at"],
+        "additionalProperties": false,
+        "properties": {
+          "tool_name": {"type": "string"},
+          "args": {},
+          "result": {},
+          "error": {
+            "type": "object",
+            "description": "Structured tool failure per spec §2.5 \"Tool error model\". `kind` matches the ToolError variant; `message` is the rendered Display.",
+            "required": ["kind", "message"],
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "enum": [
+                  "SandboxViolation",
+                  "Timeout",
+                  "McpServerUnreachable",
+                  "McpServerCrashed",
+                  "ResultMalformed",
+                  "PermissionDenied",
+                  "ExecutionFailed",
+                  "SchemaViolation"
+                ]
+              },
+              "message": {"type": "string"}
+            }
+          },
+          "captured_at": {"type": "string", "format": "date-time"}
+        },
+        "oneOf": [
+          {"required": ["result"]},
+          {"required": ["error"]}
+        ]
+      }
+    },
+    "memory": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "content", "created_at", "last_used"],
+        "additionalProperties": false,
+        "properties": {
+          "id": {"type": "string"},
+          "content": {"type": "string"},
+          "created_at": {"type": "string", "format": "date-time"},
+          "last_used": {"type": "string", "format": "date-time"},
+          "pinned": {"type": "boolean"}
+        }
+      }
+    },
+    "plan": {
+      "type": "object",
+      "required": ["steps"],
+      "additionalProperties": false,
+      "properties": {
+        "steps": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "text", "status"],
+            "additionalProperties": false,
+            "properties": {
+              "id": {"type": "string"},
+              "text": {"type": "string"},
+              "status": {"enum": ["pending", "in_progress", "done", "skipped"]},
+              "constraints": {"type": "array", "items": {"type": "string"}}
+            }
+          }
+        }
+      }
+    },
+    "constraints": {
+      "type": "array",
+      "description": "Active constraint pins added by the user; reinforced on every subsequent prompt.",
+      "items": {
+        "type": "object",
+        "required": ["id", "text", "added_at"],
+        "additionalProperties": false,
+        "properties": {
+          "id": {"type": "string"},
+          "text": {"type": "string"},
+          "added_at": {"type": "string", "format": "date-time"},
+          "active": {"type": "boolean"}
+        }
+      }
+    },
+    "recovery_log": {
+      "type": "array",
+      "description": "Partial output from turns interrupted by crash. NOT part of conversation; surfaced as a UI banner so the next turn's model does not misread partial state as completed work.",
+      "items": {
+        "type": "object",
+        "required": ["turn_id", "partial_content", "captured_at", "reason"],
+        "additionalProperties": false,
+        "properties": {
+          "turn_id": {"type": "string"},
+          "partial_content": {"type": "string"},
+          "captured_at": {"type": "string", "format": "date-time"},
+          "reason": {"enum": ["crash", "user_cancel", "timeout", "concurrent_edit_pause"]}
+        }
+      }
+    },
+    "subagents": {
+      "type": "object",
+      "description": "Sub-agents spawned during this session (§10 delegation mode). Each entry is an isolated §2.5 state-machine run; its conversation rolls up to the parent only via the `spawn_subagent` tool-call result. Keyed by `subagent_id` (matches the `spawn_subagent` tool's output).",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["parent_turn_id", "started_at", "status"],
+        "additionalProperties": false,
+        "properties": {
+          "parent_turn_id": {"type": "string", "description": "Turn in the parent's `conversation` where `spawn_subagent` was invoked."},
+          "subagent_type": {"type": "string", "description": "Name of the registered sub-agent type (matches a `schemas/config/subagent_type.v1.json` manifest)."},
+          "started_at": {"type": "string", "format": "date-time"},
+          "finished_at": {"type": "string", "format": "date-time"},
+          "status": {"enum": ["running", "completed", "failed", "timed_out", "cancelled"]},
+          "max_turns": {"type": "integer", "minimum": 1},
+          "turns_used": {"type": "integer", "minimum": 0},
+          "tool_allowlist": {"type": "array", "items": {"type": "string"}},
+          "conversation": {
+            "type": "array",
+            "description": "The sub-agent's full conversation, same shape as the top-level `conversation` field. Persisted for replay/inspection; never injected into the parent's context.",
+            "items": {"$ref": "#/$defs/turn"}
+          },
+          "result": {"type": "string", "description": "The single message the sub-agent returned to the parent (the `spawn_subagent` tool-result body)."},
+          "cost_summary": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "prompt_tokens": {"type": "integer", "minimum": 0},
+              "completion_tokens": {"type": "integer", "minimum": 0},
+              "cached_tokens": {"type": "integer", "minimum": 0},
+              "cost_usd": {"type": "number"}
+            }
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "turn": {
+      "type": "object",
+      "description": "A single conversation turn. Used by both top-level conversation and subagents.*.conversation.",
+      "required": ["turn_id", "role", "content"],
+      "additionalProperties": false,
+      "properties": {
+        "turn_id": {"type": "string"},
+        "role": {"enum": ["user", "assistant", "system", "tool"]},
+        "content": {"type": "string"},
+        "envelope": {"$ref": "https://atelier.example/schemas/model_protocol/envelope.v1.json"},
+        "tool_calls": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["tool_call_id", "tool_name", "args"],
+            "additionalProperties": false,
+            "properties": {
+              "tool_call_id": {"type": "string"},
+              "tool_name": {"type": "string"},
+              "args": {},
+              "fixture_ref": {"type": "string", "description": "Pointer into tool_fixtures by tool_call_id; replay reads results from here."}
+            }
+          }
+        }
+      }
+    }
+  }
+}

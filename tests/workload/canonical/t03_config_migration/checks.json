@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "checks": [
+    {
+      "name": "pytest passes",
+      "command": "python3 -m pytest  -q",
+      "expect": {
+        "exit_code": 0
+      }
+    },
+    {
+      "name": "legacy_name removed; name present",
+      "command": "python3 -c \"import json; d = json.load(open('config.json')); assert 'legacy_name' not in d and 'name' in d\"",
+      "expect": {
+        "exit_code": 0
+      }
+    },
+    {
+      "name": "legacy_timeout_seconds removed; timeout_seconds present",
+      "command": "python3 -c \"import json; d = json.load(open('config.json')); assert 'legacy_timeout_seconds' not in d and 'timeout_seconds' in d\"",
+      "expect": {
+        "exit_code": 0
+      }
+    }
+  ]
+}

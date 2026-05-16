@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "checks": [
+    {
+      "name": "pytest passes",
+      "command": "python3 -m pytest  -q",
+      "expect": {
+        "exit_code": 0
+      }
+    },
+    {
+      "name": "default greeting preserved (verbose off)",
+      "command": "python3 -c \"import sys; sys.path.insert(0, '.'); from mycli import main; assert main(['World']) == 'Hello, World!'\"",
+      "expect": {
+        "exit_code": 0
+      }
+    },
+    {
+      "name": "verbose flag prefixes output",
+      "command": "python3 -c \"import sys; sys.path.insert(0, '.'); from mycli import main; assert main(['--verbose', 'World']) == '[VERBOSE] Hello, World!'\"",
+      "expect": {
+        "exit_code": 0
+      }
+    },
+    {
+      "name": "--verbose appears in --help text",
+      "command": "python3 -c \"import sys; sys.path.insert(0, '.'); from mycli import build_parser; assert '--verbose' in build_parser().format_help()\"",
+      "expect": {
+        "exit_code": 0
+      }
+    }
+  ]
+}

@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://atelier.example/schemas/model_protocol/envelope.v1.json",
+  "title": "Atelier Model Protocol Envelope",
+  "description": "Structured signals emitted by the model alongside its natural-language output. Consumed by Pillars 3, 4, 5, 7, 8, 9.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "claimed_changes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "kind", "summary"],
+        "properties": {
+          "path": {"type": "string"},
+          "kind": {"enum": ["edit", "create", "delete"]},
+          "summary": {"type": "string", "maxLength": 500}
+        }
+      }
+    },
+    "claimed_done": {"type": "boolean"},
+    "uncertainty": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["about", "kind", "asks"],
+        "properties": {
+          "about": {"type": "string"},
+          "kind": {"enum": ["missing-context", "ambiguous-spec", "untestable-claim"]},
+          "asks": {"type": "string"}
+        }
+      }
+    },
+    "plan_update": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ops"],
+      "properties": {
+        "ops": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["op", "step"],
+            "properties": {
+              "op": {"enum": ["add", "remove", "reorder", "complete"]},
+              "step": {"type": "string"}
+            }
+          }
+        }
+      }
+    },
+    "grounding": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["text_span", "source"],
+        "properties": {
+          "text_span": {"type": "string"},
+          "source": {"enum": ["tool:read", "tool:grep", "context:file", "guess"]}
+        }
+      }
+    },
+    "constraints_acknowledged": {
+      "type": "array",
+      "items": {"type": "string"}
+    }
+  }
+}

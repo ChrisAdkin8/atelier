@@ -1,0 +1,52 @@
+{
+  "version": 1,
+  "checks": [
+    {
+      "name": "pytest passes",
+      "command": "python3 -m pytest  -q",
+      "expect": {
+        "exit_code": 0
+      }
+    },
+    {
+      "name": "at least 5 tests collected (happy-path plus 4 validations)",
+      "command": "python3 -m pytest  --co -q",
+      "expect": {
+        "exit_code": 0,
+        "stdout_pattern": "[5-9]\\s*test|[1-9][0-9]+\\s*test"
+      }
+    },
+    {
+      "name": "negative amount rejected with ValueError",
+      "command": "python3 -c \"import sys; sys.path.insert(0, '.'); from transfer import transfer; transfer(-5, 'alice', 'bob')\"",
+      "expect": {
+        "exit_code_ne": 0,
+        "stderr_contains": "ValueError"
+      }
+    },
+    {
+      "name": "same-account transfer rejected",
+      "command": "python3 -c \"import sys; sys.path.insert(0, '.'); from transfer import transfer; transfer(10, 'alice', 'alice')\"",
+      "expect": {
+        "exit_code_ne": 0,
+        "stderr_contains": "ValueError"
+      }
+    },
+    {
+      "name": "missing account rejected",
+      "command": "python3 -c \"import sys; sys.path.insert(0, '.'); from transfer import transfer; transfer(10, 'alice', 'ghost')\"",
+      "expect": {
+        "exit_code_ne": 0,
+        "stderr_contains": "ValueError"
+      }
+    },
+    {
+      "name": "overdraft rejected",
+      "command": "python3 -c \"import sys; sys.path.insert(0, '.'); from transfer import transfer; transfer(99999, 'alice', 'bob')\"",
+      "expect": {
+        "exit_code_ne": 0,
+        "stderr_contains": "ValueError"
+      }
+    }
+  ]
+}

@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "name": "read_file",
+  "description": "Read a file from the workspace. Returns the file's contents as a UTF-8 string (with replacement on invalid bytes), plus the byte length. Subject to the §11 sandbox: paths outside the workspace are refused.",
+  "side_effect_class": "local-safe",
+  "input_schema": {
+    "type": "object",
+    "required": ["path"],
+    "additionalProperties": false,
+    "properties": {
+      "path": {"type": "string", "description": "Workspace-relative or absolute path. Absolute paths must be inside the §11 sandbox."},
+      "offset": {"type": "integer", "minimum": 0, "description": "Optional byte offset to start reading from. Default 0."},
+      "length": {"type": "integer", "minimum": 1, "description": "Optional max bytes to read. If omitted, the full file is returned subject to a harness-level cap."}
+    }
+  },
+  "output_schema": {
+    "type": "object",
+    "required": ["content", "bytes"],
+    "additionalProperties": false,
+    "properties": {
+      "content": {"type": "string", "description": "UTF-8 decoded contents. Invalid bytes are replaced; the harness logs a tracing event when replacement occurred."},
+      "bytes": {"type": "integer", "minimum": 0, "description": "Total bytes read (post-offset, pre-truncation)."},
+      "truncated": {"type": "boolean", "description": "True iff the harness cap or caller's `length` truncated the read."}
+    }
+  },
+  "implementation": {"kind": "builtin"}
+}

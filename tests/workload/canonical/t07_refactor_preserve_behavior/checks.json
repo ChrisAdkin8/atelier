@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "checks": [
+    {
+      "name": "pytest passes (all 6 tests still pass)",
+      "command": "python3 -m pytest  -q",
+      "expect": {
+        "exit_code": 0
+      }
+    },
+    {
+      "name": "test file untouched (refactor preserved tests verbatim)",
+      "file_unchanged": "tests/test_processor.py"
+    },
+    {
+      "name": "at least 4 callables in processor.py (counts methods; class-based or helper-based refactors both pass)",
+      "command": "python3 -c \"import ast; tree = ast.parse(open('processor.py').read()); n = sum(1 for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))); assert n >= 4, f'only {n} callables, want >= 4'\"",
+      "expect": {
+        "exit_code": 0
+      }
+    },
+    {
+      "name": "process function still callable with original signature",
+      "command": "python3 -c \"import sys; sys.path.insert(0, '.'); from processor import process; r = process([{'id': 1, 'value': 10}, {'id': 2, 'value': 20}]); assert r['stats'] == {'total': 60, 'count': 2, 'average': 30}\"",
+      "expect": {
+        "exit_code": 0
+      }
+    }
+  ]
+}

@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://atelier.example/schemas/workload/task_meta.v1.json",
+  "title": "Canonical workload task metadata",
+  "description": "One per task directory. Declares the invariants the runner asserts.",
+  "type": "object",
+  "required": ["version", "task_id", "expected_starting_returncode", "turn_cap"],
+  "additionalProperties": false,
+  "properties": {
+    "version": {"const": 1, "description": "Schema version. Bumps require a new task_meta.vN.json file."},
+    "task_id": {"type": "string"},
+    "title": {"type": "string"},
+    "priority": {"type": "boolean", "description": "True if this task is in the backend-milestone priority subset"},
+    "expected_starting_returncode": {
+      "type": "integer",
+      "description": "Return code expected when running the test_command against the unmodified fixture. The runner asserts this in --dry-run and fails the task if it diverges."
+    },
+    "turn_cap": {"type": "integer", "minimum": 1},
+    "exercises": {"type": "array", "items": {"type": "string"}},
+    "language": {
+      "type": "string",
+      "description": "Primary language. Drives default test_command and may steer the runner away from a tool the host doesn't have (e.g., skip TypeScript tasks when Node is absent).",
+      "enum": ["python", "typescript", "go", "rust"]
+    },
+    "test_command": {
+      "type": "array",
+      "items": {"type": "string"},
+      "minItems": 1,
+      "description": "Command (argv list) the runner invokes to evaluate fixture state. Defaults to ['python', '-m', 'pytest', '--tb=short', '-q'] when omitted."
+    }
+  }
+}

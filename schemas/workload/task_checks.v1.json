@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://atelier.example/schemas/workload/task_checks.v1.json",
+  "title": "Per-task mechanical checks",
+  "description": "Structured, runnable form of expected.md's 'Mechanical checks' section. The runner executes each check after the harness completes and folds per-check results into the runner_result. expected.md remains the human-readable narrative; this file is what the runner consumes.",
+  "type": "object",
+  "required": ["version", "checks"],
+  "additionalProperties": false,
+  "properties": {
+    "version": {"const": 1},
+    "checks": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name"],
+        "properties": {
+          "name": {"type": "string", "description": "Human-readable label, surfaced in runner output."},
+          "command": {"type": "string", "description": "Shell command run in the fixture tempdir. Mutually exclusive with file_unchanged."},
+          "file_unchanged": {"type": "string", "description": "Relative path under fixture/ that must be byte-equal to its starting state. Mutually exclusive with command."},
+          "expect": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "For command-style checks: assertions on the command's outcome. At least one assertion must be present.",
+            "properties": {
+              "exit_code": {"type": "integer", "description": "Exact exit code required."},
+              "exit_code_ne": {"type": "integer", "description": "Exit code must NOT equal this value."},
+              "stdout_contains": {"type": "string"},
+              "stderr_contains": {"type": "string"},
+              "stdout_pattern": {"type": "string", "description": "Python regex matched against stdout."},
+              "stderr_pattern": {"type": "string", "description": "Python regex matched against stderr."}
+            },
+            "anyOf": [
+              {"required": ["exit_code"]},
+              {"required": ["exit_code_ne"]},
+              {"required": ["stdout_contains"]},
+              {"required": ["stderr_contains"]},
+              {"required": ["stdout_pattern"]},
+              {"required": ["stderr_pattern"]}
+            ]
+          }
+        },
+        "oneOf": [
+          {"required": ["command", "expect"]},
+          {"required": ["file_unchanged"]}
+        ]
+      }
+    }
+  }
+}

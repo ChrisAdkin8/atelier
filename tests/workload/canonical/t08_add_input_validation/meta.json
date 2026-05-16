@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "task_id": "t08_add_input_validation",
+  "title": "Add input validation with new tests",
+  "priority": false,
+  "expected_starting_returncode": 0,
+  "turn_cap": 20,
+  "exercises": [
+    "edge cases",
+    "parametric test design",
+    "error paths"
+  ]
+}

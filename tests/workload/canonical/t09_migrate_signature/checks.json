@@ -1,0 +1,39 @@
+{
+  "version": 1,
+  "checks": [
+    {
+      "name": "pytest passes",
+      "command": "python3 -m pytest  -q",
+      "expect": {
+        "exit_code": 0
+      }
+    },
+    {
+      "name": "test file untouched",
+      "file_unchanged": "tests/test_callers.py"
+    },
+    {
+      "name": "parse signature migrated to keyword-only opts",
+      "command": "sh -c \"grep -E 'def parse\\(input, \\*, opts=None\\):' parse.py\"",
+      "expect": {
+        "exit_code": 0
+      }
+    },
+    {
+      "name": "no caller still passes opts as positional dict literal",
+      "command": "sh -c \"grep -rnE 'parse\\([^,)]+,\\s*\\{' orders/ user.py admin.py batch.py api.py 2>/dev/null; true\"",
+      "expect": {
+        "exit_code": 0,
+        "stdout_pattern": "^$"
+      }
+    },
+    {
+      "name": "at least 3 callers updated to opts kwarg",
+      "command": "sh -c \"grep -rnE 'parse\\([^)]+,\\s*opts='  | wc -l\"",
+      "expect": {
+        "exit_code": 0,
+        "stdout_pattern": "^\\s*([3-9]|[1-9][0-9]+)\\s*$"
+      }
+    }
+  ]
+}

@@ -1,0 +1,81 @@
+{
+  "session_uuid": "22222222-2222-4222-8222-222222222222",
+  "harness_session_version": 1,
+  "atelier_version": "0.0.0",
+  "created_at": "2026-05-15T15:00:00Z",
+  "conversation": [
+    {
+      "turn_id": "turn-1",
+      "role": "user",
+      "content": "Bump the requests dep and fix breakage."
+    },
+    {
+      "turn_id": "turn-2",
+      "role": "assistant",
+      "content": "I attempted to fetch the release notes but the sandbox blocked the request.",
+      "envelope": {
+        "uncertainty": [
+          {
+            "about": "current requests version",
+            "kind": "missing-context",
+            "asks": "May I have network access to fetch release notes, or should I infer from local pyproject.toml?"
+          }
+        ],
+        "grounding": [
+          {"text_span": "shell tool was blocked by sandbox", "source": "tool:read"}
+        ]
+      },
+      "tool_calls": [
+        {"tool_call_id": "tc-1", "tool_name": "shell", "args": {"cmd": "curl https://pypi.org/pypi/requests/json"}, "fixture_ref": "tc-1"}
+      ]
+    }
+  ],
+  "cost_ledger": [
+    {
+      "timestamp": "2026-05-15T15:00:01Z",
+      "kind": "model_call",
+      "model_id": "claude-sonnet-4-6",
+      "prompt_tokens": 950,
+      "completion_tokens": 220,
+      "count_source": "exact",
+      "cost_usd": 0.0034,
+      "latency_ms": 1800
+    },
+    {
+      "timestamp": "2026-05-15T15:00:02Z",
+      "kind": "tool_call",
+      "tool_name": "shell",
+      "latency_ms": 12,
+      "note": "sandbox blocked curl"
+    }
+  ],
+  "checkpoints": {
+    "root": "ck-0",
+    "nodes": {
+      "ck-0": {"parent": null, "diff_ref": "diff/00000000", "created_at": "2026-05-15T15:00:00Z"}
+    }
+  },
+  "tool_fixtures": {
+    "tc-1": {
+      "tool_name": "shell",
+      "args": {"cmd": "curl https://pypi.org/pypi/requests/json"},
+      "error": {
+        "kind": "SandboxViolation",
+        "message": "sandbox blocked shell from outbound network request to pypi.org"
+      },
+      "captured_at": "2026-05-15T15:00:02Z"
+    }
+  },
+  "memory": [],
+  "plan": {
+    "steps": [
+      {"id": "s1", "text": "Identify current requests version", "status": "in_progress"},
+      {"id": "s2", "text": "Determine target version", "status": "pending"},
+      {"id": "s3", "text": "Update pyproject.toml + fix breakage", "status": "pending"}
+    ]
+  },
+  "constraints": [
+    {"id": "c1", "text": "do not enable --allow-net on the shell tool without explicit approval", "added_at": "2026-05-15T15:00:00Z", "active": true}
+  ],
+  "recovery_log": []
+}

@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "checks": [
+    {
+      "name": "pytest passes (all 7 tests)",
+      "command": "python3 -m pytest  -q",
+      "expect": {
+        "exit_code": 0
+      }
+    },
+    {
+      "name": "test file untouched",
+      "file_unchanged": "tests/test_lru.py"
+    },
+    {
+      "name": "eviction at capacity",
+      "command": "python3 -c \"import sys; sys.path.insert(0, '.'); from lru import LRUCache; c = LRUCache(2); c.put('a', 1); c.put('b', 2); c.put('c', 3); assert c.get('a') is None and c.get('b') == 2 and c.get('c') == 3\"",
+      "expect": {
+        "exit_code": 0
+      }
+    }
+  ]
+}

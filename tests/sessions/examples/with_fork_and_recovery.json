@@ -1,0 +1,171 @@
+{
+  "session_uuid": "33333333-3333-4333-8333-333333333333",
+  "harness_session_version": 1,
+  "atelier_version": "0.0.0",
+  "created_at": "2026-05-16T09:00:00Z",
+  "conversation": [
+    {
+      "turn_id": "turn-1",
+      "role": "user",
+      "content": "Refactor process() in processor.py into helpers (t07-shaped)."
+    },
+    {
+      "turn_id": "turn-2",
+      "role": "assistant",
+      "content": "I extracted three helpers: _validate, _transform, _aggregate.",
+      "envelope": {
+        "claimed_changes": [
+          {"path": "processor.py", "kind": "edit", "summary": "Extracted 3 helpers; process() composes them"}
+        ],
+        "grounding": [
+          {"text_span": "no callers outside tests/", "source": "tool:grep"}
+        ]
+      }
+    },
+    {
+      "turn_id": "turn-3",
+      "role": "user",
+      "content": "Actually, fork this and try a class-based shape on the alternative branch."
+    },
+    {
+      "turn_id": "turn-4",
+      "role": "assistant",
+      "content": "Forked at ck-2 → ck-2a; reshaping into Processor class on the fork.",
+      "envelope": {
+        "plan_update": {
+          "ops": [
+            {"op": "add", "step": "Reshape process() as Processor class with validate/transform/aggregate methods"},
+            {"op": "add", "step": "Run pytest; compare to functional refactor on main branch"}
+          ]
+        }
+      }
+    }
+  ],
+  "cost_ledger": [
+    {
+      "timestamp": "2026-05-16T09:00:01Z",
+      "kind": "model_call",
+      "model_id": "anthropic:claude-sonnet-4-6",
+      "prompt_tokens": 1400,
+      "completion_tokens": 420,
+      "cached_tokens": 900,
+      "count_source": "exact",
+      "cost_usd": 0.0061,
+      "latency_ms": 2200
+    },
+    {
+      "timestamp": "2026-05-16T09:00:05Z",
+      "kind": "tool_call",
+      "tool_name": "shell",
+      "latency_ms": 65,
+      "note": "pytest"
+    },
+    {
+      "timestamp": "2026-05-16T09:02:00Z",
+      "kind": "cache_bust",
+      "note": "fork from ck-2 → ck-2a (functional → class-based exploration)"
+    },
+    {
+      "timestamp": "2026-05-16T09:02:30Z",
+      "kind": "model_call",
+      "model_id": "anthropic:claude-sonnet-4-6",
+      "prompt_tokens": 1600,
+      "completion_tokens": 380,
+      "count_source": "exact",
+      "cost_usd": 0.0058,
+      "latency_ms": 2050
+    }
+  ],
+  "checkpoints": {
+    "root": "ck-0",
+    "nodes": {
+      "ck-0": {
+        "parent": null,
+        "diff_ref": "diff/00000000",
+        "created_at": "2026-05-16T09:00:00Z"
+      },
+      "ck-1": {
+        "parent": "ck-0",
+        "diff_ref": "diff/9a3c1f2e",
+        "created_at": "2026-05-16T09:00:03Z"
+      },
+      "ck-2": {
+        "parent": "ck-1",
+        "diff_ref": "diff/b7d4e0a1",
+        "created_at": "2026-05-16T09:00:08Z",
+        "fork_label": "main: functional refactor"
+      },
+      "ck-2a": {
+        "parent": "ck-1",
+        "diff_ref": "diff/4f8d2c33",
+        "created_at": "2026-05-16T09:02:30Z",
+        "fork_label": "alt: class-based reshape"
+      },
+      "ck-3a": {
+        "parent": "ck-2a",
+        "diff_ref": "diff/c1e2b04a",
+        "created_at": "2026-05-16T09:03:15Z"
+      }
+    }
+  },
+  "tool_fixtures": {
+    "tc-1": {
+      "tool_name": "read_file",
+      "args": {"path": "processor.py"},
+      "result": {"content": "...processor.py contents (truncated for the example)..."},
+      "captured_at": "2026-05-16T09:00:01Z"
+    },
+    "tc-2": {
+      "tool_name": "write_file",
+      "args": {"path": "processor.py"},
+      "result": {"bytes_written": 1240},
+      "captured_at": "2026-05-16T09:00:02Z"
+    },
+    "tc-3": {
+      "tool_name": "shell",
+      "args": {"cmd": "pytest"},
+      "result": {"exit_code": 0, "stdout": "6 passed in 0.09s"},
+      "captured_at": "2026-05-16T09:00:05Z"
+    },
+    "tc-4": {
+      "tool_name": "write_file",
+      "args": {"path": "processor.py"},
+      "result": {"bytes_written": 1480},
+      "captured_at": "2026-05-16T09:02:35Z"
+    }
+  },
+  "memory": [
+    {
+      "id": "mem-1",
+      "content": "User prefers small composable helpers over class-based shapes in this repo. (Recorded from turn-2 follow-up; verify on fork merge.)",
+      "created_at": "2026-05-16T09:00:10Z",
+      "last_used": "2026-05-16T09:02:30Z",
+      "pinned": false
+    }
+  ],
+  "plan": {
+    "steps": [
+      {"id": "s1", "text": "Extract validate / transform / aggregate helpers", "status": "done"},
+      {"id": "s2", "text": "Compose process() as helper-call chain", "status": "done"},
+      {"id": "s3", "text": "Run pytest and confirm all 6 tests pass", "status": "done"},
+      {"id": "s4", "text": "Fork: reshape as Processor class on ck-2a", "status": "in_progress"},
+      {"id": "s5", "text": "Compare branches; merge winner", "status": "pending"}
+    ]
+  },
+  "constraints": [
+    {
+      "id": "c1",
+      "text": "do not modify tests/test_processor.py (t07 contract)",
+      "added_at": "2026-05-16T09:00:00Z",
+      "active": true
+    }
+  ],
+  "recovery_log": [
+    {
+      "turn_id": "turn-5",
+      "partial_content": "Started writing the Processor class. Got through __init__ and validate before the process was killed (SIGKILL during a parallel ts-node install in another shell consumed all RAM). Bytes written so far have been discarded; class definition not yet committed.",
+      "captured_at": "2026-05-16T09:03:45Z",
+      "reason": "crash"
+    }
+  ]
+}

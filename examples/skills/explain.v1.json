@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "name": "explain",
+  "description": "Explain a piece of code or a section of the codebase at a chosen level of detail.",
+  "prompt_template": "Explain ${target} at a ${detail_level} level. Include:\n- What it does and why it exists.\n- Where it sits in the broader architecture (cite ATELIER.md and surrounding files).\n- Any non-obvious behaviours, edge cases, or invariants.\n\nUse concrete file paths and line numbers. Don't paraphrase the obvious — focus on the why.",
+  "args": [
+    {
+      "name": "target",
+      "description": "File path, function name, or freeform description of what to explain.",
+      "required": true
+    },
+    {
+      "name": "detail_level",
+      "description": "How deep to go: 'brief', 'normal', or 'deep'.",
+      "default": "normal"
+    }
+  ],
+  "pinned_context": ["ATELIER.md"],
+  "side_effect_class": "local-safe"
+}

@@ -1,0 +1,79 @@
+name: Bug report
+description: Something the harness did wrong, the rig caught wrong, or the spec contradicts itself
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing. Before submitting, please confirm `make check` passes locally — that catches a surprising fraction of "looks like a bug" reports against the rig itself.
+
+  - type: textarea
+    id: what_happened
+    attributes:
+      label: What happened
+      description: One paragraph describing the unexpected behaviour. Include exact error messages where available.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+      description: One paragraph describing the behaviour you expected. If this is a spec contradiction, quote the spec section.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction
+      description: |
+        Minimal steps. For rig bugs, ideally a `make` target or a single command. For harness bugs (once we have one), a canonical workload task ID (t01–t11) plus the harness command line.
+      render: shell
+    validations:
+      required: true
+
+  - type: input
+    id: atelier_version
+    attributes:
+      label: Atelier version / commit
+      description: Spec version (from `CHANGELOG.md` head) or git SHA of the commit you're on.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Where it surfaced
+      options:
+        - "spec (`coding-harness-spec.md`)"
+        - "schema (`schemas/`)"
+        - "rig — validator or runner"
+        - "rig — canonical workload fixture"
+        - "harness (atelier-core / atelier-gui / atelier-tui)"
+        - "docs"
+        - "other"
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: |
+        OS + version, Python + version, Node + version (for t11). If a Rust crate is involved, paste the `cargo --version`.
+      placeholder: |
+        macOS 26.4.1
+        Python 3.14.4
+        Node v25.8.2
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Output
+      description: Relevant terminal output, JSON error payloads, or session-artifact excerpts (with secrets redacted).
+      render: text
+    validations:
+      required: false

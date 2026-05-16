@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://atelier.example/schemas/config/permission_state.v1.json",
+  "title": "Persistent permission-learning state",
+  "description": "Per-repo or global persistent state for §8's 'always allow' / 'always deny' decisions. Lives at `<repo>/.atelier/permissions.json` (per-repo) or `~/.atelier/permissions.json` (global). Loaded at session start; per-repo entries take precedence over same-shape global entries. Schema-validated against this file at load.",
+  "type": "object",
+  "required": ["version", "scope", "always_allow", "always_deny"],
+  "additionalProperties": false,
+  "properties": {
+    "version": {"const": 1},
+    "scope": {
+      "enum": ["repo", "global"],
+      "description": "Where this file lives. The harness validates that the value matches the file location."
+    },
+    "captured_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When this file was last written. Used for diagnostics; not load-bearing."
+    },
+    "always_allow": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/shape_entry"},
+      "description": "Tool-call shapes that auto-approve. Matches against `schemas/config/permission_shapes.v1.json` groupings."
+    },
+    "always_deny": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/shape_entry"},
+      "description": "Tool-call shapes the harness refuses without prompting. Takes precedence over `always_allow` on conflict."
+    }
+  },
+  "$defs": {
+    "shape_entry": {
+      "type": "object",
+      "required": ["tool", "shape", "captured_at"],
+      "additionalProperties": false,
+      "properties": {
+        "tool": {"type": "string", "description": "Tool name this entry applies to."},
+        "captured_at": {"type": "string", "format": "date-time"},
+        "note": {"type": "string", "description": "Optional human note explaining the decision."},
+        "shape": {
+          "description": "Shape descriptor matching one of the grouping kinds defined in permission_shapes.v1.json.",
+          "oneOf": [
+            {
+              "title": "argv0-and-flagset",
+              "type": "object",
+              "required": ["kind", "argv0", "flag_names"],
+              "additionalProperties": false,
+              "properties": {
+                "kind": {"const": "argv0-and-flagset"},
+                "argv0": {"type": "string"},
+                "flag_names": {"type": "array", "items": {"type": "string"}}
+              }
+            },
+            {
+              "title": "path-glob",
+              "type": "object",
+              "required": ["kind", "glob"],
+              "additionalProperties": false,
+              "properties": {
+                "kind": {"const": "path-glob"},
+                "glob": {"type": "string"}
+              }
+            },
+            {
+              "title": "exact-match",
+              "type": "object",
+              "required": ["kind", "args"],
+              "additionalProperties": false,
+              "properties": {
+                "kind": {"const": "exact-match"},
+                "args": {"type": "object", "description": "Tool call args, byte-equal."}
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://atelier.example/schemas/baselines/permission_prompts.v1.json",
+  "title": "Permission-prompts baseline",
+  "description": "Per-task permission-prompt counts captured against a *baseline harness* (the harness Atelier compares itself to in §8). The same schema records Atelier's own counts for comparison via tests/workload/runner/compare_baselines.py. The reference baseline harness for v0.1 is documented in spec §8 but the schema itself is vendor-neutral — any harness with a measurable prompt-count behaviour can use these slots.",
+  "type": "object",
+  "required": ["version", "captured_at", "baseline_harness_name", "baseline_harness_version", "model_id", "reference_machine", "tasks"],
+  "additionalProperties": false,
+  "properties": {
+    "version": {"const": 1, "description": "Schema version."},
+    "captured_at": {"type": "string", "format": "date-time"},
+    "baseline_harness_name": {
+      "type": "string",
+      "description": "Identifier of the harness measured. Vendor-neutral by design. For the §8 calibration this is the name of whatever current harness is being treated as the reference baseline (Atelier's spec picks one — see spec §8). When recording Atelier's own numbers, use `\"atelier\"`."
+    },
+    "baseline_harness_version": {
+      "type": "string",
+      "description": "Version string for `baseline_harness_name`. Format is harness-specific."
+    },
+    "model_id": {
+      "type": "string",
+      "description": "Provider-qualified model identifier used during the run (e.g., `anthropic:claude-sonnet-4-6`, `openai:gpt-4.1`, `ollama:qwen2.5-coder:7b`). BYOM by design: the model is not constrained, only recorded."
+    },
+    "reference_machine": {"type": "string", "description": "Pointer to the spec at tests/perf/reference.md (e.g., 'reference.md@<git-sha>')"},
+    "tasks": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["task_id", "median_prompt_count", "runs"],
+        "additionalProperties": false,
+        "properties": {
+          "task_id": {"type": "string", "description": "Matches a task ID in tests/workload/canonical/"},
+          "median_prompt_count": {"type": "integer", "minimum": 0},
+          "runs": {
+            "type": "array",
+            "minItems": 3,
+            "items": {"type": "integer", "minimum": 0},
+            "description": "Per-run prompt counts; minimum 3 runs to compute median"
+          }
+        }
+      }
+    }
+  }
+}

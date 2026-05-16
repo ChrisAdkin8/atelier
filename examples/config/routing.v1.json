@@ -1,0 +1,6 @@
+{
+  "version": 1,
+  "executor": "anthropic:claude-sonnet-4-6",
+  "planner": "anthropic:claude-opus-4-7",
+  "critic": null
+}

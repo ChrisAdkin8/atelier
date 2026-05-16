@@ -1,0 +1,39 @@
+{
+  "version": 1,
+  "name": "grep",
+  "description": "Search workspace contents by extended regex. Returns matched lines with path + line number. Always excludes .git/, target/, node_modules/, __pycache__/, and any path listed in .atelierignore (or .gitignore as a fallback). Subject to the §11 sandbox.",
+  "side_effect_class": "local-safe",
+  "input_schema": {
+    "type": "object",
+    "required": ["pattern"],
+    "additionalProperties": false,
+    "properties": {
+      "pattern": {"type": "string", "description": "Extended regex pattern (POSIX ERE). The harness compiles once and reuses across files."},
+      "path": {"type": "string", "default": ".", "description": "Workspace-relative or absolute root for the search. Default: repo root."},
+      "max_results": {"type": "integer", "minimum": 1, "default": 200, "description": "Cap on returned matches; the rest are dropped and `truncated: true` set."},
+      "case_insensitive": {"type": "boolean", "default": false}
+    }
+  },
+  "output_schema": {
+    "type": "object",
+    "required": ["matches", "truncated"],
+    "additionalProperties": false,
+    "properties": {
+      "matches": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "required": ["path", "line_number", "line"],
+          "additionalProperties": false,
+          "properties": {
+            "path": {"type": "string"},
+            "line_number": {"type": "integer", "minimum": 1},
+            "line": {"type": "string"}
+          }
+        }
+      },
+      "truncated": {"type": "boolean"}
+    }
+  },
+  "implementation": {"kind": "builtin"}
+}

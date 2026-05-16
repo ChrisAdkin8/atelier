@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "task_id": "t07_refactor_preserve_behavior",
+  "title": "Refactor without changing behavior",
+  "priority": false,
+  "expected_starting_returncode": 0,
+  "turn_cap": 20,
+  "exercises": [
+    "behavior preservation",
+    "decomposition",
+    "self-restraint"
+  ]
+}

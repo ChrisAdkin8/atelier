@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "checks": [
+    {
+      "name": "no occurrence of compute_total remains",
+      "command": "grep -r compute_total ",
+      "expect": {
+        "exit_code_ne": 0
+      }
+    },
+    {
+      "name": "pytest passes",
+      "command": "python3 -m pytest  -q",
+      "expect": {
+        "exit_code": 0
+      }
+    },
+    {
+      "name": "compute_grand_total works in cart.py",
+      "command": "python3 -c \"import sys; sys.path.insert(0, '.'); from orders.cart import compute_grand_total; assert compute_grand_total([{'price': 3, 'qty': 2}]) == 6\"",
+      "expect": {
+        "exit_code": 0
+      }
+    }
+  ]
+}

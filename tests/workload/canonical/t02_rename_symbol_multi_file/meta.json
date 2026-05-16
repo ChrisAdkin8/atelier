@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "task_id": "t02_rename_symbol_multi_file",
+  "title": "Rename a symbol across 8+ files",
+  "priority": true,
+  "expected_starting_returncode": 0,
+  "turn_cap": 20,
+  "exercises": [
+    "multi-file edits",
+    "cross-file refs",
+    "refactor safety"
+  ]
+}

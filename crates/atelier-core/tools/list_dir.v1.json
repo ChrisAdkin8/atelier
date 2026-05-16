@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "name": "list_dir",
+  "description": "List the entries of a workspace directory. Non-recursive; for recursive walks, the agent should call list_dir per level (cheaper than a hidden recursion budget). Subject to the §11 sandbox.",
+  "side_effect_class": "local-safe",
+  "input_schema": {
+    "type": "object",
+    "required": ["path"],
+    "additionalProperties": false,
+    "properties": {
+      "path": {"type": "string", "description": "Workspace-relative or absolute path. Absolute paths must be inside the §11 sandbox."},
+      "include_hidden": {"type": "boolean", "default": false, "description": "If true, include dotfiles (e.g., .gitignore). Default false."}
+    }
+  },
+  "output_schema": {
+    "type": "object",
+    "required": ["entries"],
+    "additionalProperties": false,
+    "properties": {
+      "entries": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "required": ["name", "kind"],
+          "additionalProperties": false,
+          "properties": {
+            "name": {"type": "string"},
+            "kind": {"enum": ["file", "dir", "symlink", "other"]},
+            "bytes": {"type": "integer", "minimum": 0, "description": "File size in bytes. Absent for non-files."}
+          }
+        }
+      }
+    }
+  },
+  "implementation": {"kind": "builtin"}
+}

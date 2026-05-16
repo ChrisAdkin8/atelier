@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "name": "log_pre_tool",
+  "description": "Append every tool invocation to a local JSONL log before dispatch. Useful for auditing during Phase A development.",
+  "event": "pre-tool",
+  "implementation": {
+    "kind": "shell",
+    "command": "atelier-hook-log-pre-tool"
+  },
+  "time_budget_ms": 50
+}

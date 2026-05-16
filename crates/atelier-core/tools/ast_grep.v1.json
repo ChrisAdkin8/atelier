@@ -1,0 +1,47 @@
+{
+  "version": 1,
+  "name": "ast_grep",
+  "description": "Structural search across the workspace using AST patterns (powered by ast-grep, see https://ast-grep.github.io). Use for queries that grep can't safely express (e.g., 'all call sites of foo() where the first arg is a literal'). Falls back to no results if the language's parser isn't installed; never errors.",
+  "side_effect_class": "local-safe",
+  "input_schema": {
+    "type": "object",
+    "required": ["pattern", "language"],
+    "additionalProperties": false,
+    "properties": {
+      "pattern": {"type": "string", "description": "ast-grep pattern. Metavariables use `$NAME`; see ast-grep docs for the full pattern grammar."},
+      "language": {
+        "enum": ["python", "typescript", "tsx", "javascript", "rust", "go"],
+        "description": "Source language. Drives parser selection. Must be one of the bundled tree-sitter grammars."
+      },
+      "path": {"type": "string", "default": ".", "description": "Workspace-relative or absolute root for the search."},
+      "max_results": {"type": "integer", "minimum": 1, "default": 100}
+    }
+  },
+  "output_schema": {
+    "type": "object",
+    "required": ["matches", "truncated"],
+    "additionalProperties": false,
+    "properties": {
+      "matches": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "required": ["path", "line_number", "text"],
+          "additionalProperties": false,
+          "properties": {
+            "path": {"type": "string"},
+            "line_number": {"type": "integer", "minimum": 1},
+            "text": {"type": "string", "description": "Matched span as source text."},
+            "metavars": {
+              "type": "object",
+              "additionalProperties": {"type": "string"},
+              "description": "Captured `$NAME` metavariables and their matched text."
+            }
+          }
+        }
+      },
+      "truncated": {"type": "boolean"}
+    }
+  },
+  "implementation": {"kind": "builtin"}
+}

@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "scope": "repo",
+  "captured_at": "2026-05-16T12:00:00Z",
+  "always_allow": [
+    {
+      "tool": "bash",
+      "shape": {"kind": "argv0-and-flagset", "argv0": "git", "flag_names": ["--short"]},
+      "captured_at": "2026-05-16T12:00:00Z",
+      "note": "git status --short auto-approved after 3 same-shape invocations (§8 K=3)"
+    },
+    {
+      "tool": "write_file",
+      "shape": {"kind": "path-glob", "glob": "src/**"},
+      "captured_at": "2026-05-16T12:00:00Z"
+    },
+    {
+      "tool": "write_file",
+      "shape": {"kind": "path-glob", "glob": "tests/**"},
+      "captured_at": "2026-05-16T12:00:00Z"
+    }
+  ],
+  "always_deny": [
+    {
+      "tool": "write_file",
+      "shape": {"kind": "exact-match", "args": {"path": ".env"}},
+      "captured_at": "2026-05-16T12:00:00Z",
+      "note": "User-pinned: never overwrite .env"
+    }
+  ]
+}

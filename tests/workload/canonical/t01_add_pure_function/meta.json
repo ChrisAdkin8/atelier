@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "task_id": "t01_add_pure_function",
+  "title": "Add a pure function with a passing pytest",
+  "priority": true,
+  "expected_starting_returncode": 5,
+  "turn_cap": 20,
+  "exercises": [
+    "single-file edit",
+    "test creation",
+    "test execution"
+  ]
+}

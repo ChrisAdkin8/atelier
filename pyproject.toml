@@ -1,0 +1,32 @@
+[build-system]
+# Required by PEP 517 / pip ".[rig]" install. setuptools is fine for a config-only
+# package; the rig has no Python modules to package, just an optional-deps group.
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "atelier"
+version = "0.0.0"
+description = "Atelier coding harness — pre-implementation; this manifest covers the test rig only."
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+rig = [
+  "jsonschema>=4.0",
+  "referencing>=0.35",
+  "pytest>=7.0",
+]
+
+[tool.setuptools]
+# This is a config-only distribution: the rig is a set of scripts under tests/
+# run directly via `python3 tests/...`, not an importable package. Without this,
+# setuptools auto-discovery picks up sibling dirs (crates/, schemas/, target/)
+# as top-level packages and fails the build.
+packages = []
+
+[tool.pytest.ini_options]
+# Do not collect fixture directories under tests/workload/canonical/ — those are
+# per-task fixtures the runner copies to tempdirs. They have their own pyproject.tomls.
+testpaths = ["tests"]
+norecursedirs = ["tests/workload/canonical"]

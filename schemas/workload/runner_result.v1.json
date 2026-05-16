@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://atelier.example/schemas/workload/runner_result.v1.json",
+  "title": "Workload runner result",
+  "type": "object",
+  "required": ["runner_version", "results"],
+  "additionalProperties": false,
+  "properties": {
+    "runner_version": {"type": "integer"},
+    "results": {
+      "type": "array",
+      "items": {
+        "oneOf": [
+          {
+            "title": "dry-run result",
+            "type": "object",
+            "required": ["mode", "task_id", "ok", "expected_starting_returncode", "starting_state"],
+            "additionalProperties": false,
+            "properties": {
+              "mode": {"const": "dry-run"},
+              "task_id": {"type": "string"},
+              "ok": {"type": "boolean"},
+              "expected_starting_returncode": {"type": "integer"},
+              "divergence": {"type": ["string", "null"]},
+              "starting_state": {"$ref": "#/$defs/pytest_result"}
+            }
+          },
+          {
+            "title": "harness result",
+            "type": "object",
+            "required": ["mode", "task_id", "ok", "harness", "post_state"],
+            "additionalProperties": false,
+            "properties": {
+              "mode": {"const": "harness"},
+              "task_id": {"type": "string"},
+              "ok": {"type": "boolean"},
+              "harness": {
+                "type": "object",
+                "required": ["elapsed_s", "timed_out"],
+                "properties": {
+                  "returncode": {"type": ["integer", "null"]},
+                  "elapsed_s": {"type": "number"},
+                  "timed_out": {"type": "boolean"},
+                  "stdout_tail": {"type": "string"},
+                  "meta": {"type": ["object", "null"]},
+                  "meta_schema_violation": {"type": ["string", "null"], "description": "If the harness emitted a <<<atelier-meta>>> block that did not validate against schemas/workload/atelier_meta_sentinel.v1.json, the error message lands here."}
+                }
+              },
+              "post_state": {"$ref": "#/$defs/pytest_result"},
+              "checks": {
+                "type": "array",
+                "description": "Per-mechanical-check outcomes from the task's checks.json. Empty if no checks.json present.",
+                "items": {
+                  "type": "object",
+                  "required": ["name", "ok"],
+                  "additionalProperties": false,
+                  "properties": {
+                    "name": {"type": "string"},
+                    "ok": {"type": "boolean"},
+                    "kind": {"enum": ["command", "file_unchanged"]},
+                    "exit_code": {"type": ["integer", "null"]},
+                    "reason": {"type": ["string", "null"], "description": "Failure reason when ok=false."}
+                  }
+                }
+              }
+            }
+          }
+        ]
+      }
+    }
+  },
+  "$defs": {
+    "pytest_result": {
+      "type": "object",
+      "required": ["returncode", "elapsed_s"],
+      "additionalProperties": false,
+      "properties": {
+        "returncode": {"type": "integer"},
+        "elapsed_s": {"type": "number"},
+        "timed_out": {"type": "boolean", "description": "True if the test_command exceeded its timeout; returncode is set to -1 in that case."},
+        "tail": {"type": "string"},
+        "stderr_tail": {"type": "string"}
+      }
+    }
+  }
+}

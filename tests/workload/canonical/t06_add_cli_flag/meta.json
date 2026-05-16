@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "task_id": "t06_add_cli_flag",
+  "title": "Add a CLI flag with help text and test coverage",
+  "priority": true,
+  "expected_starting_returncode": 0,
+  "turn_cap": 20,
+  "exercises": [
+    "argparse touch",
+    "help text",
+    "behavior + test"
+  ]
+}

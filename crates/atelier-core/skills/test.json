@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "name": "test",
+  "description": "Run the project's test command(s) — from ATELIER.md's 'Useful commands' section — and summarise the result.",
+  "prompt_template": "Run the project's test command. Check `ATELIER.md` for a 'Useful commands' section and use whatever it specifies for running tests. If multiple test commands are listed (e.g., unit tests and integration tests), run them in the order given.\n\nReport:\n\n- Pass / fail counts.\n- For each failing test: full traceback or assertion message, file:line of the failing assertion.\n- Wall-clock time.\n- Any skipped tests with their reasons.\n\nIf ATELIER.md doesn't specify a test command, try `pytest`, `cargo test --workspace`, `npm test`, or `make test` in that order based on the project's primary language (inferred from the file extensions in the repo).",
+  "pinned_context": ["ATELIER.md"],
+  "side_effect_class": "local-risky"
+}

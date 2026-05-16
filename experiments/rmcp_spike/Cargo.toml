@@ -1,0 +1,19 @@
+[package]
+name = "rmcp-spike"
+version = "0.0.0"
+edition = "2021"
+description = "Phase A prerequisite: maturity assessment for the rmcp crate as atelier-core's MCP client. See README.md."
+publish = false
+
+[dependencies]
+# Pin a recent rmcp at spike time; update the README's matrix with the actual version tested.
+rmcp = "0.1"
+
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+
+[[bin]]
+name = "rmcp-spike"
+path = "src/main.rs"

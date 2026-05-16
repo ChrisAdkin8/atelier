@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "task_id": "t09_migrate_signature",
+  "title": "Migrate function signature and all callers",
+  "priority": false,
+  "expected_starting_returncode": 0,
+  "turn_cap": 20,
+  "exercises": [
+    "API change",
+    "caller migration",
+    "kwarg discipline"
+  ]
+}

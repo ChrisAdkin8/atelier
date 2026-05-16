@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "name": "security-review",
+  "description": "Audit pending changes for security issues: credential handling, input validation, authn/authz, injection vectors.",
+  "prompt_template": "Audit the pending changes for security issues. Check specifically for:\n\n- **Secrets in code** — API keys, tokens, passwords. All secrets must reference `${env:NAME}` or `${keychain:NAME}` per spec §11; plaintext is forbidden.\n- **Input validation at trust boundaries** — user input, network payloads, deserialised data. Missing validation = a potential injection or DoS vector.\n- **Authn / authz changes** — anything that affects who can do what. Privilege escalations, default-allow paths, missing checks.\n- **Injection vectors** — SQL, shell, path traversal, template injection, XSS.\n- **Hardcoded external URLs** — surveillance, vendor lock-in, supply-chain risk.\n- **§11 sandbox bypasses** — anything that requests `allow_net: true` or asks for out-of-repo paths.\n\nReport each finding with: severity (critical / high / medium / low), file:line, the issue, and a concrete fix. If no issues, say so plainly and explain what you looked at to be confident.",
+  "pinned_context": ["ATELIER.md", "SECURITY.md"],
+  "proactive_trigger": "Suggest when the user is editing authentication, authorization, credential handling, secret management, or files under common security-sensitive paths (**/auth/**, **/secrets/**, **/login/**, **/permissions/**); when ATELIER.md flags the changed files as security-sensitive; or when the diff touches input parsing at a trust boundary.",
+  "side_effect_class": "local-safe"
+}

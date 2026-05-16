@@ -1,0 +1,29 @@
+[package]
+name = "atelier-gui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Atelier Tauri 2.x shell. Consumes atelier-core over a broadcast channel. See spec §3."
+
+[[bin]]
+name = "atelier-gui"
+path = "src/main.rs"
+
+[dependencies]
+atelier-core = { workspace = true }
+
+# === IMPLEMENTOR: DO NOT UNCOMMENT THESE LINES YET ===
+#
+# Uncommenting `tauri` without first running `cargo tauri init` (which generates
+# tauri.conf.json, build.rs, icons/, capabilities/, and a frontend skeleton)
+# produces a confusing build failure. See crates/atelier-gui/README.md →
+# "Bootstrap" for the numbered checklist; choices made there (frontend stack,
+# bundle identifier, capability set) shouldn't be made in a hurry.
+#
+# tauri = { workspace = true }
+# tokio = { workspace = true }
+# tracing-subscriber = { workspace = true }
+
+# [build-dependencies]
+# tauri-build = { workspace = true }   # uncomment after tauri init produces build.rs

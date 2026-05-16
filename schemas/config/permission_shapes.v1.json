@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://atelier.example/schemas/config/permission_shapes.v1.json",
+  "title": "Per-tool permission-shape grouping config",
+  "description": "Defines how the permission-learning system groups tool calls into 'same shape' classes.",
+  "type": "object",
+  "required": ["version", "tools"],
+  "additionalProperties": false,
+  "properties": {
+    "version": {"const": 1},
+    "tools": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["grouping"],
+        "additionalProperties": false,
+        "properties": {
+          "grouping": {
+            "oneOf": [
+              {
+                "title": "argv0-and-flagset",
+                "description": "For shell-style tools: two calls share shape iff argv[0] matches AND the set of --flag *names* matches. Flag values may differ.",
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["kind"],
+                "properties": {"kind": {"const": "argv0-and-flagset"}}
+              },
+              {
+                "title": "path-glob",
+                "description": "For file-write tools: two calls share shape iff the path matches the same configured glob.",
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["kind", "globs"],
+                "properties": {
+                  "kind": {"const": "path-glob"},
+                  "globs": {"type": "array", "minItems": 1, "items": {"type": "string"}}
+                }
+              },
+              {
+                "title": "exact-match",
+                "description": "For tools where every distinct call is its own shape.",
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["kind"],
+                "properties": {"kind": {"const": "exact-match"}}
+              }
+            ]
+          }
+        }
+      }
+    }
+  },
+  "examples": [
+    {
+      "version": 1,
+      "tools": {
+        "shell": {"grouping": {"kind": "argv0-and-flagset"}},
+        "write_file": {"grouping": {"kind": "path-glob", "globs": ["src/**", "tests/**", "**/*"]}},
+        "edit_file": {"grouping": {"kind": "exact-match"}}
+      }
+    }
+  ]
+}

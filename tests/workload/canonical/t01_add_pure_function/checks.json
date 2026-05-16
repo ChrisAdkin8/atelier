@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "checks": [
+    {
+      "name": "pytest passes",
+      "command": "python3 -m pytest  -q",
+      "expect": {
+        "exit_code": 0
+      }
+    },
+    {
+      "name": "divisible_by(6,2) is True",
+      "command": "python3 -c \"import sys; sys.path.insert(0, '.'); from utils import divisible_by; assert divisible_by(6, 2) is True\"",
+      "expect": {
+        "exit_code": 0
+      }
+    },
+    {
+      "name": "divisible_by(7,2) is False",
+      "command": "python3 -c \"import sys; sys.path.insert(0, '.'); from utils import divisible_by; assert divisible_by(7, 2) is False\"",
+      "expect": {
+        "exit_code": 0
+      }
+    },
+    {
+      "name": "divisible_by(0,5) is True",
+      "command": "python3 -c \"import sys; sys.path.insert(0, '.'); from utils import divisible_by; assert divisible_by(0, 5) is True\"",
+      "expect": {
+        "exit_code": 0
+      }
+    },
+    {
+      "name": "divisible_by(5,0) raises ValueError",
+      "command": "python3 -c \"import sys; sys.path.insert(0, '.'); from utils import divisible_by; divisible_by(5, 0)\"",
+      "expect": {
+        "exit_code_ne": 0,
+        "stderr_contains": "ValueError"
+      }
+    }
+  ]
+}

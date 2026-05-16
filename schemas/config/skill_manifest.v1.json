@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://atelier.example/schemas/config/skill_manifest.v1.json",
+  "title": "Skill manifest",
+  "description": "Registers a user- or agent-invocable skill with the harness. Skills are named procedures invoked via /<name> from the conversation pane (GUI/TUI) or — when `proactive_trigger` is set — suggested by the model itself. The harness expands the manifest's `prompt_template` (with `${arg}` substitution) into a regular user turn; the §2.5 agent loop runs unchanged. Skill invocations are recorded as a `note` on the next turn's ledger entry.\n\nStored at `~/.atelier/skills/<name>.json` (global), `<repo>/.atelier/skills/<name>.json` (per-repo, overrides global), or bundled with `atelier-core` (overridable by either). Built-in v1 bundled skills: `/review`, `/security-review`, `/test`. `/help` and `/init` are harness-intercepted CLI verbs, not skill manifests.",
+  "type": "object",
+  "required": ["version", "name", "description", "prompt_template"],
+  "additionalProperties": false,
+  "properties": {
+    "version": {"const": 1},
+    "name": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_-]*$",
+      "description": "Skill identifier. Invoked as `/<name>` from the conversation pane. Per-repo manifests override same-name global ones; both override bundled defaults of the same name."
+    },
+    "description": {
+      "type": "string",
+      "description": "One-line description. Shown in `/help` and the GUI skill list. Used to guide proactive suggestion when `proactive_trigger` is set."
+    },
+    "prompt_template": {
+      "type": "string",
+      "description": "Prompt expansion template that becomes the next user turn. May reference declared args via `${arg_name}` substitution. May reference `${repo_root}` and `${atelier_md}` as harness-provided context variables."
+    },
+    "args": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name"],
+        "additionalProperties": false,
+        "properties": {
+          "name": {"type": "string", "pattern": "^[a-z][a-z0-9_]*$"},
+          "description": {"type": "string"},
+          "required": {"type": "boolean", "default": false},
+          "default": {"type": "string", "description": "String default used when the arg is omitted. Only valid if `required` is false."}
+        }
+      }
+    },
+    "pinned_context": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "File paths (relative to repo root, glob-supported) to pin into the §5 context panel before the prompt fires. Useful for skills that should always see ATELIER.md, a specific test file, etc."
+    },
+    "tools_required": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Tool names this skill expects to be available. If any are missing at invocation time, the UI surfaces a warning and the user can skip / install the tool / cancel."
+    },
+    "proactive_trigger": {
+      "type": "string",
+      "description": "Natural-language description of when the model should auto-suggest this skill. When present, the skill's name + this text are summarised in the system prompt so the model is aware of it. When absent, the skill is manual-only and not advertised to the model."
+    },
+    "side_effect_class": {
+      "enum": ["local-safe", "local-risky", "shared-state", "irreversible"],
+      "description": "Optional §8 trust-budget hint. If absent, the skill inherits the maximum side-effect class of its constituent tool calls; if no tools fire, defaults to local-safe."
+    }
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "name": "write_file",
+  "description": "Atomically write contents to a workspace file. Uses tempfile + rename so partial writes are not observable. Subject to the §11 sandbox; per-call subject to §8 trust budget. Counts as a §3 staged edit until the turn's atomic-diff application commits.",
+  "side_effect_class": "local-risky",
+  "input_schema": {
+    "type": "object",
+    "required": ["path", "content"],
+    "additionalProperties": false,
+    "properties": {
+      "path": {"type": "string", "description": "Workspace-relative or absolute path. Absolute paths must be inside the §11 sandbox."},
+      "content": {"type": "string", "description": "Full new file content. The harness writes the file atomically; partial-update semantics are not supported (use read_file → edit → write_file)."},
+      "create_dirs": {"type": "boolean", "default": false, "description": "If true, create missing parent directories. Default false — the harness errors on missing parent rather than silently create."}
+    }
+  },
+  "output_schema": {
+    "type": "object",
+    "required": ["bytes_written"],
+    "additionalProperties": false,
+    "properties": {
+      "bytes_written": {"type": "integer", "minimum": 0},
+      "created": {"type": "boolean", "description": "True iff the file did not exist before this call."}
+    }
+  },
+  "implementation": {"kind": "builtin"}
+}

@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://atelier.example/schemas/config/subagent_type.v1.json",
+  "title": "Sub-agent type manifest",
+  "description": "Registers a named sub-agent type with the harness. When the parent agent invokes the built-in `spawn_subagent` tool with `subagent_type: '<name>'`, the harness materialises a fresh §2.5 state machine with this manifest's `system_prompt_addendum`, `tool_allowlist`, `default_max_turns`, and optional `model_routing` override. The sub-agent runs to completion and returns a single tool-result message to the parent; the parent never sees the sub-agent's intermediate turns.\n\nStored at `~/.atelier/subagents/<name>.json` (global), `<repo>/.atelier/subagents/<name>.json` (per-repo, overrides global), or bundled in `crates/atelier-core/subagents/` (overridable by either). Bundled v1: `researcher`, `test-runner`, `general-purpose`.",
+  "type": "object",
+  "required": ["version", "name", "description", "system_prompt_addendum"],
+  "additionalProperties": false,
+  "properties": {
+    "version": {"const": 1},
+    "name": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_-]*$",
+      "description": "Subagent-type identifier. Referenced by the parent's `spawn_subagent` tool call via `subagent_type: '<name>'`. Per-repo manifests override same-name global; both override bundled."
+    },
+    "description": {
+      "type": "string",
+      "description": "One-line description shown in the GUI subagent-type picker and used to help the parent model decide when to delegate."
+    },
+    "system_prompt_addendum": {
+      "type": "string",
+      "description": "Appended to the harness's base system prompt for sub-agent turns. Use to establish the sub-agent's persona, restrictions, and output expectations (e.g., 'You are a research sub-agent. Investigate, do not edit. Report findings in under 300 words.')."
+    },
+    "tool_allowlist": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "If present, restricts the sub-agent to only these tool names. Names match the registered tool set (built-in + MCP-routed). If absent, the sub-agent inherits the parent's full tool set."
+    },
+    "default_max_turns": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Cap on the sub-agent's §2.5 state-machine turn count. The parent can override on a per-invocation basis via the `spawn_subagent` tool's `max_turns` argument. PROVISIONAL default 25 if not set here and not overridden by the caller."
+    },
+    "model_routing": {
+      "description": "Optional per-subagent routing override. When absent, the sub-agent inherits the session's routing (`schemas/config/routing.v1.json`). When present, fully replaces the routing for this sub-agent only.",
+      "$ref": "https://atelier.example/schemas/config/routing.v1.json"
+    },
+    "side_effect_class_cap": {
+      "enum": ["local-safe", "local-risky", "shared-state", "irreversible"],
+      "description": "Caps the maximum tool-call side-effect class this sub-agent may invoke. Calls above the cap are refused. Useful for restricting a `researcher` sub-agent to read-only operations. Default: no cap (inherits parent's §8 trust budget)."
+    }
+  }
+}

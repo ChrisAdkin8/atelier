@@ -1,0 +1,156 @@
+{
+  "version": 1,
+  "captured_at": "2026-05-16T00:00:00Z",
+  "servers": [
+    {
+      "name": "filesystem",
+      "display_name": "Filesystem",
+      "description": "Read, write, and list files under a configured root. The reference MCP server for local file access; the same server Phase A's gate exercises in `experiments/rmcp_spike/`.",
+      "transport": "stdio",
+      "tags": ["filesystem", "core", "first-party"],
+      "install": {
+        "kind": "npm",
+        "npm_package": "@modelcontextprotocol/server-filesystem",
+        "command_template": {
+          "command": "npx",
+          "args": ["-y", "@modelcontextprotocol/server-filesystem", "${repo_root}"]
+        }
+      },
+      "homepage": "https://github.com/modelcontextprotocol/servers/tree/main/src/filesystem",
+      "side_effect_class": "local-risky"
+    },
+    {
+      "name": "git",
+      "display_name": "Git",
+      "description": "Inspect and manipulate the current repository — log, diff, status, blame, branch operations. Read-only by default; write operations require explicit per-tool approval.",
+      "transport": "stdio",
+      "tags": ["vcs", "core", "first-party"],
+      "install": {
+        "kind": "npm",
+        "npm_package": "@modelcontextprotocol/server-git",
+        "command_template": {
+          "command": "npx",
+          "args": ["-y", "@modelcontextprotocol/server-git", "--repository", "${repo_root}"]
+        }
+      },
+      "homepage": "https://github.com/modelcontextprotocol/servers/tree/main/src/git",
+      "side_effect_class": "local-risky"
+    },
+    {
+      "name": "sqlite",
+      "display_name": "SQLite",
+      "description": "Query and update a local SQLite database. Useful when ATELIER.md points at an in-repo DB the agent should be able to inspect.",
+      "transport": "stdio",
+      "tags": ["database", "first-party"],
+      "install": {
+        "kind": "npm",
+        "npm_package": "@modelcontextprotocol/server-sqlite",
+        "command_template": {
+          "command": "npx",
+          "args": ["-y", "@modelcontextprotocol/server-sqlite", "--db-path", "${db_path}"]
+        }
+      },
+      "homepage": "https://github.com/modelcontextprotocol/servers/tree/main/src/sqlite",
+      "side_effect_class": "local-risky"
+    },
+    {
+      "name": "fetch",
+      "display_name": "Web fetch",
+      "description": "Fetch the contents of a URL. Counts as egress under §12 and consumes the §8 shared-state budget on every call. Use sparingly; prefer pinning specific docs via ATELIER.md.",
+      "transport": "stdio",
+      "tags": ["web", "shared-state", "first-party"],
+      "install": {
+        "kind": "npm",
+        "npm_package": "@modelcontextprotocol/server-fetch",
+        "command_template": {
+          "command": "npx",
+          "args": ["-y", "@modelcontextprotocol/server-fetch"]
+        }
+      },
+      "homepage": "https://github.com/modelcontextprotocol/servers/tree/main/src/fetch",
+      "side_effect_class": "shared-state"
+    },
+    {
+      "name": "memory",
+      "display_name": "Memory (knowledge graph)",
+      "description": "Persistent knowledge-graph storage across sessions. Useful when ATELIER.md alone isn't enough — long-running facts the agent should remember between sessions live here.",
+      "transport": "stdio",
+      "tags": ["memory", "persistence", "first-party"],
+      "install": {
+        "kind": "npm",
+        "npm_package": "@modelcontextprotocol/server-memory",
+        "command_template": {
+          "command": "npx",
+          "args": ["-y", "@modelcontextprotocol/server-memory"]
+        }
+      },
+      "homepage": "https://github.com/modelcontextprotocol/servers/tree/main/src/memory",
+      "side_effect_class": "local-risky"
+    },
+    {
+      "name": "github",
+      "display_name": "GitHub",
+      "description": "Read and write GitHub issues, pull requests, and repository contents. Egress per §12; counts as shared-state in §8.",
+      "transport": "stdio",
+      "tags": ["vcs", "remote", "shared-state", "first-party"],
+      "install": {
+        "kind": "npm",
+        "npm_package": "@modelcontextprotocol/server-github",
+        "command_template": {
+          "command": "npx",
+          "args": ["-y", "@modelcontextprotocol/server-github"]
+        }
+      },
+      "requires_secrets": [
+        {
+          "name": "github_personal_access_token",
+          "description": "Personal access token with the repo scopes you intend the agent to operate against. Stored via §11 keychain.",
+          "where": "env"
+        }
+      ],
+      "homepage": "https://github.com/modelcontextprotocol/servers/tree/main/src/github",
+      "side_effect_class": "shared-state"
+    },
+    {
+      "name": "postgres",
+      "display_name": "PostgreSQL",
+      "description": "Query (and conditionally update) a PostgreSQL database. The Atelier-recommended deployment uses a read-only connection string by default; write privileges should be granted via a separate registration with a separate keychain entry.",
+      "transport": "stdio",
+      "tags": ["database", "shared-state", "first-party"],
+      "install": {
+        "kind": "npm",
+        "npm_package": "@modelcontextprotocol/server-postgres",
+        "command_template": {
+          "command": "npx",
+          "args": ["-y", "@modelcontextprotocol/server-postgres"]
+        }
+      },
+      "requires_secrets": [
+        {
+          "name": "postgres_connection_string",
+          "description": "Standard libpq connection string. Use a role with the minimum privilege the agent needs.",
+          "where": "env"
+        }
+      ],
+      "homepage": "https://github.com/modelcontextprotocol/servers/tree/main/src/postgres",
+      "side_effect_class": "shared-state"
+    },
+    {
+      "name": "puppeteer",
+      "display_name": "Puppeteer (browser automation)",
+      "description": "Launch a headless browser to fetch rendered pages, take screenshots, or interact with web UIs. Heavier than `fetch`; use when JavaScript-rendered content is unavoidable.",
+      "transport": "stdio",
+      "tags": ["browser", "automation", "shared-state", "first-party"],
+      "install": {
+        "kind": "npm",
+        "npm_package": "@modelcontextprotocol/server-puppeteer",
+        "command_template": {
+          "command": "npx",
+          "args": ["-y", "@modelcontextprotocol/server-puppeteer"]
+        }
+      },
+      "homepage": "https://github.com/modelcontextprotocol/servers/tree/main/src/puppeteer",
+      "side_effect_class": "shared-state"
+    }
+  ]
+}

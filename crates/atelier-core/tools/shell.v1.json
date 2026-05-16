@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "name": "shell",
+  "description": "Run a shell command in the workspace. Stdout + stderr + exit code are returned. Subject to the §11 sandbox: by default no network, no writes outside the workspace, no setuid. Counts against the §8 trust budget; long-lived processes hit the per-call timeout. NOT for editing files — use write_file or edit_file so edits flow through §3 atomic application.",
+  "side_effect_class": "local-risky",
+  "input_schema": {
+    "type": "object",
+    "required": ["command"],
+    "additionalProperties": false,
+    "properties": {
+      "command": {"type": "string", "description": "Single shell command. Argv-style array is not supported here; if you need it, register a dedicated tool with `implementation.kind: shell`."},
+      "cwd": {"type": "string", "description": "Working directory, workspace-relative or absolute. Default: workspace root."},
+      "timeout_ms": {"type": "integer", "minimum": 1, "default": 30000, "description": "Per-call timeout. Over-budget → Timeout (§2.5)."},
+      "allow_net": {"type": "boolean", "default": false, "description": "Permit outbound network for this call only. Subject to first-use approval via the §8 trust-budget UI."}
+    }
+  },
+  "output_schema": {
+    "type": "object",
+    "required": ["exit_code", "stdout", "stderr"],
+    "additionalProperties": false,
+    "properties": {
+      "exit_code": {"type": "integer"},
+      "stdout": {"type": "string", "description": "Truncated at a harness-level cap; see `truncated`."},
+      "stderr": {"type": "string"},
+      "truncated": {"type": "boolean", "description": "True iff stdout or stderr exceeded the cap."}
+    }
+  },
+  "implementation": {"kind": "builtin"}
+}

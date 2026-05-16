@@ -1,0 +1,20 @@
+[package]
+name = "atelier-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Atelier terminal UI (ratatui + crossterm). Consumes atelier-core over a broadcast channel. See spec §3 (TUI subset)."
+
+[[bin]]
+name = "atelier-tui"
+path = "src/main.rs"
+
+[dependencies]
+atelier-core = { workspace = true }
+
+# Deps to add when implementation lands:
+# ratatui = { workspace = true }
+# crossterm = { workspace = true }
+# tokio = { workspace = true }
+# tracing-subscriber = { workspace = true }

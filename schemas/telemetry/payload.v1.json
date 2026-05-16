@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://atelier.example/schemas/telemetry/payload.v1.json",
+  "title": "Atelier telemetry payload",
+  "description": "All telemetry payloads carry these top-level fields. Channel-specific data lives in `body` per `channel`.",
+  "type": "object",
+  "required": ["version", "channel", "atelier_version", "session_uuid", "sent_at", "body"],
+  "additionalProperties": false,
+  "properties": {
+    "version": {"const": 1, "description": "Schema version."},
+    "channel": {"enum": ["crash", "perf", "usage"]},
+    "atelier_version": {"type": "string"},
+    "session_uuid": {"type": "string", "format": "uuid"},
+    "sent_at": {"type": "string", "format": "date-time"},
+    "os": {"type": "string"},
+    "body": {
+      "oneOf": [
+        {
+          "title": "crash",
+          "type": "object",
+          "required": ["stack", "exit_code"],
+          "additionalProperties": false,
+          "properties": {
+            "stack": {"type": "string"},
+            "exit_code": {"type": "integer"},
+            "last_tool": {"type": "string"}
+          }
+        },
+        {
+          "title": "perf",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "tool_latency_histogram": {
+              "type": "object",
+              "additionalProperties": {"type": "array", "items": {"type": "number"}}
+            },
+            "ledger_summary": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "total_prompt_tokens": {"type": "integer"},
+                "total_completion_tokens": {"type": "integer"},
+                "cached_tokens": {"type": "integer"},
+                "total_cost_usd": {"type": "number"}
+              }
+            }
+          }
+        },
+        {
+          "title": "usage",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "feature": {"type": "string"},
+            "count": {"type": "integer", "minimum": 1}
+          },
+          "required": ["feature", "count"]
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "task_id": "t11_add_typescript_function",
+  "title": "TypeScript equivalent of t01 \u2014 exercises \u00a77 Tier-1 hallucination detector",
+  "priority": false,
+  "expected_starting_returncode": 1,
+  "turn_cap": 20,
+  "language": "typescript",
+  "test_command": [
+    "node",
+    "--test",
+    "tests/test_utils.ts"
+  ],
+  "exercises": [
+    "TypeScript edit",
+    "test contract",
+    "Tier-1 LSP detector target"
+  ]
+}

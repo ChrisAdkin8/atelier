@@ -1,0 +1,115 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://atelier.example/schemas/config/mcp_catalog.v1.json",
+  "title": "MCP server catalog",
+  "description": "A curated list of well-known MCP servers presented in the GUI's 'Browse catalog' (spec §15). Distinct from `mcp_servers.v1.json` (which registers a server in a session): this is *metadata about available servers* — installation hints, requires-secrets list, tags. When the user picks an entry from the catalog, the harness materialises a properly-shaped `mcp_servers.json` entry pre-filled from the install hint, prompting for any required secrets via the §11 keychain.\n\nThe v1 bundled catalog ships at `crates/atelier-core/catalog/mcp_servers.json`. Users override with `~/.atelier/catalog.json` if they want a private list. Remote auto-refresh is deferred to v0.2.",
+  "type": "object",
+  "required": ["version", "servers"],
+  "additionalProperties": false,
+  "properties": {
+    "version": {"const": 1},
+    "captured_at": {"type": "string", "format": "date-time"},
+    "servers": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "display_name", "description", "transport", "install"],
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_-]*$",
+            "description": "Internal identifier. Pre-fills the `name` field in the generated `mcp_servers.json` entry."
+          },
+          "display_name": {
+            "type": "string",
+            "description": "Human-readable label shown in the GUI catalog browser."
+          },
+          "description": {
+            "type": "string",
+            "description": "One-paragraph description of what the server does."
+          },
+          "transport": {"enum": ["stdio", "http", "sse"]},
+          "tags": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Free-form tags for filtering: 'filesystem', 'vcs', 'database', 'search', 'communication', etc."
+          },
+          "install": {
+            "oneOf": [
+              {
+                "title": "stdio (npm)",
+                "type": "object",
+                "required": ["kind", "npm_package"],
+                "additionalProperties": false,
+                "properties": {
+                  "kind": {"const": "npm"},
+                  "npm_package": {"type": "string"},
+                  "command_template": {
+                    "type": "object",
+                    "description": "Pre-fill for the user's mcp_servers.json entry. Variables like ${repo_root} are documented but not part of the schema.",
+                    "required": ["command", "args"],
+                    "properties": {
+                      "command": {"type": "string"},
+                      "args": {"type": "array", "items": {"type": "string"}}
+                    }
+                  }
+                }
+              },
+              {
+                "title": "stdio (binary)",
+                "type": "object",
+                "required": ["kind", "command_template"],
+                "additionalProperties": false,
+                "properties": {
+                  "kind": {"const": "binary"},
+                  "homepage": {"type": "string", "format": "uri"},
+                  "command_template": {
+                    "type": "object",
+                    "required": ["command"],
+                    "properties": {
+                      "command": {"type": "string"},
+                      "args": {"type": "array", "items": {"type": "string"}}
+                    }
+                  }
+                }
+              },
+              {
+                "title": "http / sse",
+                "type": "object",
+                "required": ["kind", "url"],
+                "additionalProperties": false,
+                "properties": {
+                  "kind": {"const": "http"},
+                  "url": {"type": "string", "format": "uri"},
+                  "documentation_url": {"type": "string", "format": "uri"}
+                }
+              }
+            ]
+          },
+          "requires_secrets": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["name", "description"],
+              "additionalProperties": false,
+              "properties": {
+                "name": {"type": "string", "description": "Keychain entry name; the GUI prompts for this via the §11 credential UI."},
+                "description": {"type": "string"},
+                "where": {
+                  "enum": ["header", "env"],
+                  "description": "Where the secret is injected when the server is run."
+                }
+              }
+            }
+          },
+          "homepage": {"type": "string", "format": "uri"},
+          "side_effect_class": {
+            "enum": ["local-safe", "local-risky", "shared-state", "irreversible"],
+            "description": "Default §8 classification applied to tools advertised by this server when registered from the catalog."
+          }
+        }
+      }
+    }
+  }
+}

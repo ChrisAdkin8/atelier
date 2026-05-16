@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://atelier.example/schemas/audit/egress.v1.json",
+  "title": "Atelier egress audit log",
+  "description": "One record per remote-model call. Exportable for privacy review.",
+  "type": "object",
+  "required": ["version", "timestamp", "provider", "model_id", "content_hash", "redaction_policy_id", "tokens"],
+  "additionalProperties": false,
+  "properties": {
+    "version": {"const": 1, "description": "Schema version."},
+    "timestamp": {"type": "string", "format": "date-time"},
+    "provider": {"type": "string"},
+    "model_id": {"type": "string"},
+    "content_hash": {"type": "string", "description": "SHA-256 of the post-redaction payload sent"},
+    "redaction_policy_id": {"type": "string", "description": "Pointer to the redaction config in effect at call time"},
+    "redactions_applied": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["pattern", "count"],
+        "additionalProperties": false,
+        "properties": {
+          "pattern": {"type": "string"},
+          "count": {"type": "integer", "minimum": 1}
+        }
+      }
+    },
+    "tokens": {
+      "type": "object",
+      "required": ["prompt", "completion"],
+      "additionalProperties": false,
+      "properties": {
+        "prompt": {"type": "integer", "minimum": 0},
+        "completion": {"type": "integer", "minimum": 0},
+        "cached": {"type": "integer", "minimum": 0}
+      }
+    }
+  }
+}

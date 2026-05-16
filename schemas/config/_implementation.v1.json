@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://atelier.example/schemas/config/_implementation.v1.json",
+  "title": "Shared tool implementation oneOf (shell | http | builtin)",
+  "description": "Referenced by tool_manifest.v1.json. NOT referenced by hook_manifest.v1.json — hooks define their implementations inline so that the tool-only `timeout_ms` field cannot leak in (hooks have warn-only `time_budget_ms` per §15).\n\nThree kinds:\n- `shell`: spawn a subprocess.\n- `http`: POST to a URL.\n- `builtin`: implemented inside `atelier-core`. The harness routes by tool name to an internal handler; no transport configuration is needed. Used by the built-in tool manifests under `crates/atelier-core/tools/`.",
+  "oneOf": [
+    {
+      "title": "shell",
+      "type": "object",
+      "description": "Spawn a subprocess. JSON-encoded payload arrives on stdin; impl writes JSON to stdout. Subject to §11 sandbox.",
+      "required": ["kind", "command"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {"const": "shell"},
+        "command": {"type": "string", "description": "Executable path or name on PATH."},
+        "env": {
+          "type": "object",
+          "additionalProperties": {"type": "string"},
+          "description": "Environment overrides. Values support ${env:NAME} / ${keychain:NAME} interpolation per §11 credential storage."
+        },
+        "timeout_ms": {"type": "integer", "minimum": 1, "description": "Optional per-call timeout; over-budget → Timeout (§2.5)."}
+      }
+    },
+    {
+      "title": "http",
+      "type": "object",
+      "description": "POST JSON-encoded payload; receive JSON-encoded response. Counts as §12 egress; subject to local-only mode.",
+      "required": ["kind", "url"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {"const": "http"},
+        "url": {"type": "string", "format": "uri"},
+        "headers": {
+          "type": "object",
+          "additionalProperties": {"type": "string"},
+          "description": "HTTP headers. Values support ${env:NAME} / ${keychain:NAME} per §11. Authorization headers are redacted in the §12 audit log."
+        },
+        "timeout_ms": {"type": "integer", "minimum": 1}
+      }
+    },
+    {
+      "title": "builtin",
+      "type": "object",
+      "description": "Implemented inside `atelier-core`. The harness routes by tool name to an internal handler. No transport, no subprocess. Used by the manifests under `crates/atelier-core/tools/` — see spec §15 L722 for the canonical built-in list.",
+      "required": ["kind"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {"const": "builtin"}
+      }
+    }
+  ]
+}

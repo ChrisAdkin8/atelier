@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "name": "edit_file",
+  "description": "Apply a single targeted edit to a workspace file by replacing an exact occurrence of `old_text` with `new_text`. Fails if `old_text` does not occur exactly once (use `read_file` first to disambiguate, or pass `expected_count` to permit multi-match replace). Atomic via tempfile + rename. Subject to the §11 sandbox; counts as a §3 staged edit until the turn's atomic-diff application commits.\n\nPrefer this over read+write_file for surgical edits — it avoids re-sending the whole file and makes the §7 'did-it-do-what-it-said' diff readable.",
+  "side_effect_class": "local-risky",
+  "input_schema": {
+    "type": "object",
+    "required": ["path", "old_text", "new_text"],
+    "additionalProperties": false,
+    "properties": {
+      "path": {"type": "string", "description": "Workspace-relative or absolute path. Absolute paths must be inside the §11 sandbox."},
+      "old_text": {"type": "string", "description": "The exact text to replace. Whitespace-sensitive. Must occur exactly `expected_count` times (default 1) or the call fails with `ToolError::ExecutionFailed`."},
+      "new_text": {"type": "string", "description": "Replacement text. May be empty (to delete the matched range)."},
+      "expected_count": {"type": "integer", "minimum": 1, "default": 1, "description": "Number of occurrences expected. Use >1 only when you've explicitly verified all occurrences should change identically."}
+    }
+  },
+  "output_schema": {
+    "type": "object",
+    "required": ["replacements", "bytes_written"],
+    "additionalProperties": false,
+    "properties": {
+      "replacements": {"type": "integer", "minimum": 1, "description": "Number of occurrences replaced. Equals `expected_count`."},
+      "bytes_written": {"type": "integer", "minimum": 0, "description": "Post-edit file size in bytes."}
+    }
+  },
+  "implementation": {"kind": "builtin"}
+}

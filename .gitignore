@@ -1,0 +1,45 @@
+# Rust
+target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# Python (rig)
+**/__pycache__/
+**/*.pyc
+**/.pytest_cache/
+.venv/
+# `pip install -e .` byproducts from the rig (see pyproject.toml).
+*.egg-info/
+/build/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Per-user agent harness configs (Atelier is a BYOM harness; these are *other*
+# harnesses' local config that contributors may have running alongside their
+# checkout — they should not ship in the repo).
+.claude/
+.cursor/
+.aider/
+.copilot/
+# Harness-required project-level instruction shim (symlink → ATELIER.md).
+# The real file is ATELIER.md; CLAUDE.md exists only when running under a
+# host harness that hard-codes that filename.
+CLAUDE.md
+
+# Per-user permission allowlist for whichever host harness Atelier runs under.
+# Each contributor regenerates locally. Shared config (no personal paths) lives
+# in .atelier/settings.json which is tracked.
+.atelier/settings.local.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Tauri
+src-tauri/target/
+crates/atelier-gui/gen/
+crates/atelier-gui/dist/

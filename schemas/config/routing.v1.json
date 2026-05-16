@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://atelier.example/schemas/config/routing.v1.json",
+  "title": "Per-task model routing",
+  "description": "Maps the three §1 roles (planner / executor / critic) to provider+model strings. Lives at `<repo>/.atelier/routing.json` (per-repo, takes precedence) or `~/.atelier/routing.json` (global fallback). When absent, all roles default to the user's configured default executor; the critic is `null` (matches §10's 'off by default').",
+  "type": "object",
+  "required": ["version", "executor"],
+  "additionalProperties": false,
+  "properties": {
+    "version": {"const": 1},
+    "executor": {
+      "$ref": "#/$defs/model_ref",
+      "description": "Required. Runs the §2.5 agent loop turn-by-turn; emits the §2 envelope."
+    },
+    "planner": {
+      "oneOf": [{"$ref": "#/$defs/model_ref"}, {"type": "null"}],
+      "description": "If null (default), the executor doubles as the planner. When set, the planner runs once at task start to emit a `plan_update` envelope; the executor takes over for the actual edits."
+    },
+    "critic": {
+      "oneOf": [{"$ref": "#/$defs/model_ref"}, {"type": "null"}],
+      "description": "If null (default), no critic runs — matches §10's 'background critic off by default'. When set, runs against each turn's output and emits an advisory envelope into a side pane; does not gate the §2.5 state machine."
+    }
+  },
+  "$defs": {
+    "model_ref": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_-]*:[a-zA-Z0-9._/:-]+$",
+      "description": "Format: '<provider>:<model_id>'. Provider names must match a registered §1 adapter (e.g., `anthropic`, `openai`, `litellm`, `ollama`, `mlx`, `llamacpp`). Model IDs are provider-specific (e.g., `anthropic:claude-sonnet-4-6`, `ollama:qwen2.5-coder:7b`)."
+    }
+  }
+}

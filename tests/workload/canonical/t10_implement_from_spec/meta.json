@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "task_id": "t10_implement_from_spec",
+  "title": "Implement an LRUCache class from a spec snippet",
+  "priority": true,
+  "expected_starting_returncode": 2,
+  "turn_cap": 20,
+  "exercises": [
+    "spec to code",
+    "tests as contract"
+  ]
+}

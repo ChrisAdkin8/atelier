@@ -1,0 +1,123 @@
+{
+  "session_uuid": "44444444-4444-4444-8444-444444444444",
+  "harness_session_version": 1,
+  "atelier_version": "0.0.0",
+  "created_at": "2026-05-16T11:00:00Z",
+  "conversation": [
+    {
+      "turn_id": "turn-1",
+      "role": "user",
+      "content": "Rename `compute_total` to `compute_grand_total` everywhere. Before you start, have a researcher sub-agent confirm there are no callers outside this repo (e.g., via a published package)."
+    },
+    {
+      "turn_id": "turn-2",
+      "role": "assistant",
+      "content": "Delegating the cross-package check to a researcher first.",
+      "tool_calls": [
+        {
+          "tool_call_id": "tc-1",
+          "tool_name": "spawn_subagent",
+          "args": {
+            "description": "Confirm no published-package callers of compute_total",
+            "prompt": "Search the repo for any reference suggesting this code is published as a package: pyproject.toml, setup.py, README mentioning PyPI/npm. If it is published, search recent commits and CHANGELOG for callers outside this repo. Return a concise yes/no with citations.",
+            "subagent_type": "researcher",
+            "max_turns": 10
+          },
+          "fixture_ref": "tc-1"
+        }
+      ]
+    }
+  ],
+  "cost_ledger": [
+    {
+      "timestamp": "2026-05-16T11:00:01Z",
+      "kind": "model_call",
+      "model_id": "anthropic:claude-sonnet-4-6",
+      "prompt_tokens": 900,
+      "completion_tokens": 180,
+      "count_source": "exact",
+      "cost_usd": 0.0029,
+      "latency_ms": 1500
+    },
+    {
+      "timestamp": "2026-05-16T11:00:30Z",
+      "kind": "tool_call",
+      "tool_name": "spawn_subagent",
+      "latency_ms": 28000,
+      "note": "researcher (4 turns, completed)"
+    }
+  ],
+  "checkpoints": {
+    "root": "ck-0",
+    "nodes": {
+      "ck-0": {"parent": null, "diff_ref": "diff/00000000", "created_at": "2026-05-16T11:00:00Z"}
+    }
+  },
+  "tool_fixtures": {
+    "tc-1": {
+      "tool_name": "spawn_subagent",
+      "args": {
+        "description": "Confirm no published-package callers of compute_total",
+        "prompt": "Search the repo for any reference suggesting this code is published as a package: pyproject.toml, setup.py, README mentioning PyPI/npm. If it is published, search recent commits and CHANGELOG for callers outside this repo. Return a concise yes/no with citations.",
+        "subagent_type": "researcher",
+        "max_turns": 10
+      },
+      "result": {
+        "subagent_id": "sa-1",
+        "result": "Not a published package. `pyproject.toml` exists but has `name = 't02-orders-fixture'` and is not on PyPI; no `setup.py` or `package.json` for publishing; no CHANGELOG mentions external callers. Safe to rename across the repo without external coordination.",
+        "status": "completed",
+        "turns_used": 4,
+        "cost": {"prompt_tokens": 1400, "completion_tokens": 220, "cost_usd": 0.0042}
+      },
+      "captured_at": "2026-05-16T11:00:30Z"
+    }
+  },
+  "memory": [],
+  "plan": {
+    "steps": [
+      {"id": "s1", "text": "Confirm no external callers (delegated to researcher)", "status": "done"},
+      {"id": "s2", "text": "Rename across this repo", "status": "pending"},
+      {"id": "s3", "text": "Run tests", "status": "pending"}
+    ]
+  },
+  "constraints": [],
+  "recovery_log": [],
+  "subagents": {
+    "sa-1": {
+      "parent_turn_id": "turn-2",
+      "subagent_type": "researcher",
+      "started_at": "2026-05-16T11:00:02Z",
+      "finished_at": "2026-05-16T11:00:30Z",
+      "status": "completed",
+      "max_turns": 10,
+      "turns_used": 4,
+      "tool_allowlist": ["read_file", "list_dir", "grep", "ast_grep"],
+      "conversation": [
+        {
+          "turn_id": "sa-1.turn-1",
+          "role": "user",
+          "content": "Search the repo for any reference suggesting this code is published as a package: pyproject.toml, setup.py, README mentioning PyPI/npm. If it is published, search recent commits and CHANGELOG for callers outside this repo. Return a concise yes/no with citations."
+        },
+        {
+          "turn_id": "sa-1.turn-2",
+          "role": "assistant",
+          "content": "Checked pyproject.toml — name is `t02-orders-fixture`, no publish targets configured. No setup.py, no package.json, no PyPI references in README. CHANGELOG has no external-caller mentions. Safe to rename across the repo.",
+          "envelope": {
+            "claimed_done": true,
+            "grounding": [
+              {"text_span": "pyproject.toml name field", "source": "tool:read"},
+              {"text_span": "no setup.py / package.json", "source": "tool:grep"},
+              {"text_span": "CHANGELOG has no external-caller mentions", "source": "tool:grep"}
+            ]
+          }
+        }
+      ],
+      "result": "Not a published package. `pyproject.toml` exists but has `name = 't02-orders-fixture'` and is not on PyPI; no `setup.py` or `package.json` for publishing; no CHANGELOG mentions external callers. Safe to rename across the repo without external coordination.",
+      "cost_summary": {
+        "prompt_tokens": 1400,
+        "completion_tokens": 220,
+        "cost_usd": 0.0042
+      }
+    }
+  }
+}

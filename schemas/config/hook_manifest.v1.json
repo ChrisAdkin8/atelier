@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://atelier.example/schemas/config/hook_manifest.v1.json",
+  "title": "Hook manifest",
+  "description": "Registers a hook with Atelier's hook system (§15). Hooks fire at named lifecycle events around tool dispatch and verification. Manifest files live in `~/.atelier/hooks/` (global) or `<repo>/.atelier/hooks/` (per-repo, overrides global by name). First-use approval flows through §8 trust budget. Over-budget hooks emit a warning and continue — never block the turn.",
+  "type": "object",
+  "required": ["version", "name", "event", "implementation", "time_budget_ms"],
+  "additionalProperties": false,
+  "properties": {
+    "version": {"const": 1},
+    "name": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_-]*$",
+      "description": "Hook identifier surfaced in the §8 trust budget UI and in any over-budget warnings."
+    },
+    "description": {"type": "string"},
+    "event": {
+      "enum": ["pre-tool", "post-tool", "on-verify-pass", "on-verify-fail"],
+      "description": "Lifecycle event this hook responds to. See §15 for semantics."
+    },
+    "tool_filter": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "If present, hook fires only for tool calls whose tool name matches one of these glob patterns. Default: fires for all tools. Ignored for on-verify-* events."
+    },
+    "implementation": {
+      "description": "Hook impls deliberately do NOT support implementation-level `timeout_ms` — hooks have manifest-level `time_budget_ms` with warn-but-never-block semantics (§15). Kept inline (rather than $ref'ing config/_implementation.v1.json) so tool-level `timeout_ms` cannot leak in via the shared schema.",
+      "oneOf": [
+        {
+          "title": "shell",
+          "type": "object",
+          "description": "Spawn a subprocess. Event payload (tool name + args + result + envelope) arrives as JSON on stdin. Hook may write nothing, or write JSON describing follow-up actions (out of scope for v1; reserved).",
+          "required": ["kind", "command"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": {"const": "shell"},
+            "command": {"type": "string"},
+            "env": {
+              "type": "object",
+              "additionalProperties": {"type": "string"},
+              "description": "Environment overrides. Values support ${env:NAME} / ${keychain:NAME} interpolation per §11 credential storage."
+            }
+          }
+        },
+        {
+          "title": "http",
+          "type": "object",
+          "description": "POST event payload as JSON. Counts as §12 egress.",
+          "required": ["kind", "url"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": {"const": "http"},
+            "url": {"type": "string", "format": "uri"},
+            "headers": {
+              "type": "object",
+              "additionalProperties": {"type": "string"}
+            }
+          }
+        }
+      ]
+    },
+    "time_budget_ms": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Median budget for this hook's execution. Over-budget hooks emit a warning panel in the UI and the turn proceeds — they never block (§15)."
+    },
+    "allow_net": {
+      "type": "boolean",
+      "default": false,
+      "description": "Shell-only: permit outbound network from the subprocess sandbox."
+    }
+  }
+}

@@ -1,0 +1,62 @@
+name: Feature request
+description: A new capability, schema field, fixture, or spec change
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For broad "should Atelier do X?" discussion, please open a Discussion instead. This template is for concrete, actionable proposals.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What workflow or limitation prompted this request?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: |
+        What specifically would change? Reference spec sections, schemas, or files where applicable.
+        If this touches the spec, note which pillar(s) (§1–§15).
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other approaches and why they're worse.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Likely scope
+      options:
+        - "Spec edit only"
+        - "New schema or schema change"
+        - "Workload fixture addition"
+        - "Rig change (validator / runner / self-tests)"
+        - "Harness implementation (Phase A–F item)"
+        - "Documentation only"
+        - "Don't know"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: priority_hint
+    attributes:
+      label: Priority hint
+      description: Your honest sense, not a binding ask. Maintainers re-prioritise.
+      options:
+        - "Blocks me from using the harness as designed"
+        - "Workaround exists but it's friction"
+        - "Quality-of-life improvement"
+        - "Speculative / future-proofing"
+    validations:
+      required: true

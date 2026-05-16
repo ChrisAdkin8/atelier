@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://atelier.example/schemas/config/mcp_servers.v1.json",
+  "title": "MCP server registration manifest",
+  "description": "Declares the Model Context Protocol servers Atelier should launch / connect to at session start. Atelier ships with an MCP client in atelier-core (via the rmcp crate); this manifest is how users plug in any MCP-compliant server.",
+  "type": "object",
+  "required": ["version", "servers"],
+  "additionalProperties": false,
+  "properties": {
+    "version": {"const": 1},
+    "servers": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "transport"],
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_-]*$",
+            "description": "Unique identifier for this server within the session. Surfaces in the trust-budget UI and the egress audit log."
+          },
+          "transport": {
+            "enum": ["stdio", "http", "sse"],
+            "description": "Transport. stdio launches the server as a subprocess; http/sse connect to a remote endpoint and count as egress (§12)."
+          },
+          "command": {
+            "type": "string",
+            "description": "Shell command for stdio transport (e.g., 'npx @modelcontextprotocol/server-filesystem')."
+          },
+          "args": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Arguments to command (stdio only)."
+          },
+          "env": {
+            "type": "object",
+            "additionalProperties": {"type": "string"},
+            "description": "Environment variables for the subprocess (stdio only). Values support interpolation tokens `${env:NAME}` and `${keychain:NAME}` per §11 credential storage. Subject to §12 redaction policy on values."
+          },
+          "url": {
+            "type": "string",
+            "format": "uri",
+            "description": "Endpoint URL for http/sse transport."
+          },
+          "headers": {
+            "type": "object",
+            "additionalProperties": {"type": "string"},
+            "description": "HTTP headers for http/sse transport. Values support interpolation tokens `${env:NAME}` (read from environment) and `${keychain:NAME}` (read from OS keychain via §11 credential storage). Plaintext literals are accepted but discouraged for anything resembling a secret. `Authorization` headers are redacted in the §12 egress audit log; interpolation is resolved at request time and never persisted."
+          },
+          "side_effect_class": {
+            "enum": ["local-safe", "local-risky", "shared-state", "irreversible"],
+            "description": "Default §8 trust-budget classification applied to all tools advertised by this server. Per-tool overrides allowed in the tool manifest."
+          },
+          "allow_net": {
+            "type": "boolean",
+            "default": false,
+            "description": "stdio transport only: if true, the subprocess sandbox permits outbound network. http/sse transports imply network; this flag is ignored."
+          },
+          "enabled": {
+            "type": "boolean",
+            "default": true,
+            "description": "Set to false to keep the registration in the file but skip launching the server."
+          }
+        },
+        "allOf": [
+          {
+            "if": {"properties": {"transport": {"const": "stdio"}}},
+            "then": {"required": ["command"]}
+          },
+          {
+            "if": {"properties": {"transport": {"enum": ["http", "sse"]}}},
+            "then": {"required": ["url"]}
+          }
+        ]
+      }
+    }
+  },
+  "examples": [
+    {
+      "version": 1,
+      "servers": [
+        {
+          "name": "filesystem",
+          "transport": "stdio",
+          "command": "npx",
+          "args": ["-y", "@modelcontextprotocol/server-filesystem", "/Users/me/projects/myrepo"],
+          "side_effect_class": "local-risky"
+        },
+        {
+          "name": "websearch",
+          "transport": "http",
+          "url": "https://search.example/mcp",
+          "headers": {"Authorization": "Bearer ${WEBSEARCH_TOKEN}"},
+          "side_effect_class": "shared-state"
+        }
+      ]
+    }
+  ]
+}
