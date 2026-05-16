@@ -9,5 +9,7 @@
 //!   §15  Extensibility — MCP-first tool transport
 
 pub mod error;
+pub mod init;
 
 pub use error::{Recovery, ToolError};
+pub use init::{init, InitSummary, ATELIER_MD_TEMPLATE};

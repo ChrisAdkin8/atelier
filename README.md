@@ -74,6 +74,7 @@ Built-in tools (file ops, shell, search) are exposed through the same interface,
 │   │   ├── subagents/                 bundled sub-agent types (researcher, test-runner, general-purpose)
 │   │   ├── tools/                     bundled built-in tool manifests (read_file, write_file, edit_file, list_dir, grep, ast_grep, shell, spawn_subagent) — matches spec §15
 │   │   └── templates/                 ATELIER.md seed template
+│   ├── atelier-cli/                   headless `atelier` binary (entry point for `atelier init`; spec §11)
 │   ├── atelier-gui/                   Tauri 2.x shell (scaffold)
 │   └── atelier-tui/                   ratatui + crossterm frontend (scaffold)
 ├── pyproject.toml                     rig manifest (jsonschema, pytest)
@@ -217,9 +218,29 @@ make summary          # one-line OK/FAIL per task
 make clean            # remove __pycache__ and .pytest_cache trees
 ```
 
-## Project bootstrap (when the harness ships)
+## Building the `atelier` binary
 
-Once `atelier-core` is built, run from the root of any repo:
+The headless CLI lives in `crates/atelier-cli` and depends only on `atelier-core` — no TUI/GUI dependencies are pulled in.
+
+### Build
+
+```sh
+cargo build -p atelier-cli              # debug   -> target/debug/atelier
+cargo build -p atelier-cli --release    # release -> target/release/atelier
+```
+
+### Install on `$PATH`
+
+```sh
+cargo install --path crates/atelier-cli   # installs `atelier` to ~/.cargo/bin
+atelier --version
+```
+
+`~/.cargo/bin` is added to your `$PATH` by `rustup`'s installer; if not, add it manually.
+
+### Run
+
+From the root of any repo:
 
 ```sh
 atelier init
@@ -232,6 +253,12 @@ This creates `<repo>/.atelier/` with:
 - a `.atelier/` entry appended to an existing `.gitignore`.
 
 `atelier init` is **idempotent** and **never overwrites an existing `ATELIER.md`**. `ATELIER.md` is the project-level user-config file — Atelier reads it at session start and injects it into the system prompt. Equivalent to Cursor's `.cursorrules` / Claude Code's `CLAUDE.md`.
+
+### Without installing
+
+```sh
+cargo run -p atelier-cli -- init /path/to/some/repo
+```
 
 ## Where to read next
 
