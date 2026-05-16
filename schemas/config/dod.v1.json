@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://atelier.example/schemas/config/dod.v1.json",
+  "title": "Per-repo definition-of-done",
+  "description": "Spec §7: a list of machine-checkable assertions the harness runs in the Verifying state after the model emits claimed_done: true. Loaded at session start from <repo>/.atelier/dod.json (per-repo) with optional global fallback at ~/.atelier/dod.json. Each check is a shell command with an expected outcome; the Verifying state shells out via §11 sandbox. Distinct from tests/workload/task_checks.v1.json (which is the rig's per-fixture metadata, not loaded at runtime by the harness).",
+  "type": "object",
+  "required": ["version", "checks"],
+  "additionalProperties": false,
+  "properties": {
+    "version": {"const": 1},
+    "checks": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["name", "tier", "command", "expect"],
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_-]*$",
+            "description": "Stable identifier surfaced in UI / ledger. Matches the hook-manifest name regex so the trust-budget plumbing can treat all named harness primitives the same way."
+          },
+          "tier": {
+            "enum": ["test", "typecheck", "lint", "build", "custom"],
+            "description": "Spec §7 lists test / type-check / lint / build as the canonical DoD tiers. `custom` is the escape hatch for log-line assertions and similar one-offs. UI groups checks by tier."
+          },
+          "command": {
+            "type": "string",
+            "description": "Shell command executed inside the §11 sandbox profile. Relative paths resolve against `working_dir` (defaults to repo root)."
+          },
+          "working_dir": {
+            "type": "string",
+            "description": "Optional repo-relative directory the command runs in. Defaults to repo root. Absolute paths and `..` escapes are rejected by the loader."
+          },
+          "timeout_ms": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Hard per-check timeout. Over-budget = check fails with reason=timeout."
+          },
+          "expect": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "At least one assertion must be present; multiple assertions combine with AND.",
+            "properties": {
+              "exit_code": {"type": "integer"},
+              "exit_code_ne": {"type": "integer"},
+              "stdout_contains": {"type": "string"},
+              "stderr_contains": {"type": "string"},
+              "stdout_pattern": {"type": "string", "description": "Regex (Rust `regex` syntax) matched against stdout."},
+              "stderr_pattern": {"type": "string", "description": "Regex (Rust `regex` syntax) matched against stderr."}
+            },
+            "anyOf": [
+              {"required": ["exit_code"]},
+              {"required": ["exit_code_ne"]},
+              {"required": ["stdout_contains"]},
+              {"required": ["stderr_contains"]},
+              {"required": ["stdout_pattern"]},
+              {"required": ["stderr_pattern"]}
+            ]
+          },
+          "tags": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Free-form labels for ad-hoc grouping in the UI (e.g. \"slow\", \"flaky\", \"pre-merge-only\"). Not interpreted by the harness."
+          }
+        }
+      }
+    }
+  }
+}

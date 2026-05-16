@@ -43,3 +43,9 @@ Thumbs.db
 src-tauri/target/
 crates/atelier-gui/gen/
 crates/atelier-gui/dist/
+# Frontend (Vite + Svelte + TS) — node_modules/ is the install artifact,
+# dist/ the build artifact, .svelte-kit/ a tooling cache.
+crates/atelier-gui/ui/node_modules/
+crates/atelier-gui/ui/dist/
+crates/atelier-gui/ui/.svelte-kit/
+.atelier/

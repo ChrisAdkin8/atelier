@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- atelier banner — studio aesthetic. Edit and re-render with:
+       rsvg-convert -w 3200 -h 800 -f png assets/banner.svg -o assets/banner.png -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 400" width="1600" height="400" role="img" aria-label="atelier — a coding harness for BYOM agents">
+  <title>atelier</title>
+  <desc>atelier — a coding harness for bring-your-own-model agents. Workspace-first, verification-gated.</desc>
+
+  <!-- Background: warm dark cocoa -->
+  <rect width="1600" height="400" fill="#1c1612"/>
+
+  <!-- Subtle vertical paper-grain hint: very faint vertical lines on the right third -->
+  <g opacity="0.04" fill="#f0ead6">
+    <rect x="1200" y="0"   width="1" height="400"/>
+    <rect x="1240" y="0"   width="1" height="400"/>
+    <rect x="1280" y="0"   width="1" height="400"/>
+    <rect x="1320" y="0"   width="1" height="400"/>
+    <rect x="1360" y="0"   width="1" height="400"/>
+    <rect x="1400" y="0"   width="1" height="400"/>
+    <rect x="1440" y="0"   width="1" height="400"/>
+    <rect x="1480" y="0"   width="1" height="400"/>
+    <rect x="1520" y="0"   width="1" height="400"/>
+    <rect x="1560" y="0"   width="1" height="400"/>
+  </g>
+
+  <!-- Wordmark -->
+  <text x="120" y="240"
+        font-family="'Iowan Old Style', Georgia, 'Times New Roman', serif"
+        font-size="200"
+        font-weight="400"
+        letter-spacing="-4"
+        fill="#f0ead6">atelier</text>
+
+  <!-- Umber rule -->
+  <line x1="120" y1="275" x2="1020" y2="275"
+        stroke="#c89968" stroke-width="3"/>
+
+  <!-- Tagline (serif italic) -->
+  <text x="120" y="322"
+        font-family="'Iowan Old Style', Georgia, 'Times New Roman', serif"
+        font-size="32"
+        font-style="italic"
+        fill="#f0ead6">a coding harness for BYOM agents</text>
+
+  <!-- Subline (caps, tracked mono, muted) -->
+  <text x="120" y="362"
+        font-family="Menlo, 'SF Mono', 'Courier New', monospace"
+        font-size="18"
+        letter-spacing="3"
+        fill="#a89c7e">RUST  ·  MCP  ·  WORKSPACE-FIRST  ·  VERIFICATION-GATED</text>
+</svg>

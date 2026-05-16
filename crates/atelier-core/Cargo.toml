@@ -16,3 +16,23 @@ thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 rmcp = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+tempfile = { workspace = true }
+sha2 = { workspace = true }
+tree-sitter = { workspace = true }
+tree-sitter-json = { workspace = true }
+similar = { workspace = true }
+async-trait = { workspace = true }
+regex = { workspace = true }
+walkdir = { workspace = true }
+parking_lot = { workspace = true }
+reqwest = { workspace = true }
+bytes = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util", "time"] }
+wiremock = { workspace = true }

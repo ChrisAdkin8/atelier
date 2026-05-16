@@ -1,5 +1,293 @@
 # Atelier Spec — Changelog
 
+## v40 — 2026-05-16
+**Phase C unblock (4) — TUI bootstrap lands.** `crates/atelier-tui` is no longer a scaffold. `cargo run -p atelier-tui` opens a ratatui + crossterm shell that subscribes to the same `atelier-core` broadcast bus the GUI does, renders an event log + an `EditStaged` counter live, and quits cleanly on `q` / `Esc` / `Ctrl-C`. Closes the §3 TUI subset snapshot gate at the wiring level; the richer widgets (conversation, diff, file tree, plan canvas, cost + context meters, timeline scrubber) sit on top.
+
+- **`crates/atelier-tui/Cargo.toml`** — uncommented `ratatui`, `crossterm`, `tokio`, `tracing(-subscriber)` deps; added `tokio-stream`; added `[lib]` so tests can call `render` / `apply` / `handle_key` / `project_event` without booting a terminal.
+- **`crates/atelier-tui/src/lib.rs`** — new. Three-zone layout (header / event log / help footer) drawn from an `AppState` that an `apply(&Event)` mutator updates as events arrive on the broadcast bus. Newest events first (no scroll), bounded `MAX_EVENT_LOG = 1_000` so a long-running session can't OOM. Header shows the most recent transition's `to` state + cumulative `EditStaged` count. `handle_key` dispatches `q` / `Esc` / `Ctrl-C` → `InputOutcome::Quit`. `run()` boots a `tokio` multi-thread runtime, enables raw mode + alternate screen, installs a `TerminalGuard` RAII restorer (panic-safe), and runs a `tokio::select!` over the broadcast and a `spawn_blocking` `crossterm::event::poll(50ms)`. Lag-handling: `RecvError::Lagged(_)` synthesises a visible `Lagged` line in the log so a slow-to-redraw TUI doesn't silently lose events.
+- **`crates/atelier-tui/src/main.rs`** — three lines. Returns `ExitCode::from(1)` on `io::Error` so terminal-setup failures surface in `$?`.
+- **10 unit tests** cover the pure surface: `apply` increments / state-tracking / log-bound, `project_event` for all five `Event` variants, `render` for header content (state + counter), the empty-state placeholder, newest-first ordering in the log, the help footer mentioning `quit`, and `handle_key` quitting on q / Esc / Ctrl-C while continuing on other keys. Tests render onto a `Buffer::empty(Rect)` directly — no PTY needed.
+- **`crates/atelier-tui/README.md`** — rewritten. Current state, quick start (`cargo run -p atelier-tui`, `cargo test -p atelier-tui`), ASCII architecture diagram of the pure-vs-impure split, anti-bootstrap retained + extended (don't read off the broadcast inside the render path; don't add Cancel until the typed-command direction is wired the same way `atelier-gui` will need).
+
+Lockfile pins required to stay on rustc 1.85 (ratatui's `instability` proc-macro and its `darling` dep moved their MSRV recently): `instability` 0.3.7. (`darling` was already pinned 0.20.11 in v39 for the GUI; the same pin covers the TUI.)
+
+Verified: `cargo test --workspace` → **atelier-core 379 + atelier-cli 10 + atelier-gui 6 + atelier-tui 10**; `cargo fmt --check` clean; `cargo clippy --workspace --all-targets -- -D warnings` clean; `make check` end-to-end green. Did **not** drive `cargo run -p atelier-tui` interactively — the terminal loop is best verified by a human (alt-screen + raw mode are visual).
+
+Phase C unblockers complete:
+- [x] (1) `atelier run` CLI subcommand (v37)
+- [x] (2) §1 Anthropic adapter (v38)
+- [x] (3) Tauri GUI bootstrap (v39)
+- [x] (4) TUI widgets (this entry)
+
+### Rig counts
+- **21 schemas / 52 artifacts / 112 tests / 11 dry-runs / 379 atelier-core unit tests + 10 atelier-cli integration tests + 6 atelier-gui unit tests + 10 atelier-tui unit tests** (was 21 / 52 / 112 / 11 / 379 / 10 / 6 / 0).
+
+## v39 — 2026-05-16
+**Phase C unblock (3) — Tauri GUI bootstrap lands.** `crates/atelier-gui` is no longer a scaffold. The Rust shell + Svelte panel + IPC bridge are wired; `cargo build -p atelier-gui`, `cargo tauri info`, `npm run check`, and `npm run build` all pass. The first panel subscribes to the atelier-core broadcast bus and counts `EditStaged` events — the smallest end-to-end demonstration that the spec §3 wiring round-trips.
+
+D1–D4 decisions captured: `dev.atelier.app` (placeholder bundle id), `Atelier` (product/window title), TypeScript + Vite + Svelte 5, `http://localhost:1420` (Vite pinned with `strictPort: true`).
+
+- **`crates/atelier-gui/Cargo.toml`** — uncommented `tauri`, `tokio`, `tracing(-subscriber)`, `serde(_json)`, `tokio-stream`, `tauri-build`. Added `[lib]` so integration tests can pull in `bridge_event` without going through the binary.
+- **`crates/atelier-gui/src/lib.rs`** — new. `run()` boots Tauri, spawns `atelier_core::session::Handle` with `NoopHook`s, and starts a tokio task that pumps the broadcast `Event` stream onto Tauri's event bus as `atelier://event`. Manual `bridge_event` function projects each `Event` variant onto a `{kind, payload}` JSON shape — pure function, 6 unit tests cover the five variants + serialization round-trip. Chose to hand-roll the projection rather than add `Serialize` to `atelier_core::session::Event` so the core enum's serialization surface stays intentional. Single `ping` IPC command lets the eventual integration test confirm round-trip without booting a full session.
+- **`crates/atelier-gui/src/main.rs`** — three lines. Calls `atelier_gui::run()` from the `[lib]` crate. `#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]` to suppress the stray console on Windows release builds.
+- **`crates/atelier-gui/build.rs`** — three lines. `tauri_build::build()`.
+- **`crates/atelier-gui/tauri.conf.json`** — schema-pinned config; single `main` window 1200×800, narrow CSP (`default-src 'self'`), `frontendDist: "../ui/dist"`, `devUrl: "http://localhost:1420"`. Bundle targets `all` with one placeholder PNG icon.
+- **`crates/atelier-gui/capabilities/default.json`** — deliberately narrow: only `core:default` + `core:event:default`. No fs/shell/http — webview must go through the Rust shell, which goes through the §15 dispatcher.
+- **`crates/atelier-gui/icons/icon.png`** — 32×32 transparent placeholder, generated via a Python one-liner (zlib + struct, ~80 bytes). Replace with `cargo tauri icon` before the first signed release.
+- **`crates/atelier-gui/ui/`** — Vite + Svelte 5 + TypeScript scaffold from `npm create vite@latest`. `App.svelte` subscribes via `@tauri-apps/api/event#listen` and renders an event log + `EditStaged` counter. `vite.config.ts` pinned to `port: 1420, strictPort: true` so Vite can't silently roll to 1421 and 404 the webview. Demo Counter / hero / Svelte+Vite logo assets deleted; `src/app.css` reduced to a comment so component-scoped styles in `App.svelte` own the cascade.
+- **`crates/atelier-gui/README.md`** — rewritten from a planning doc to a state-of-the-bootstrap doc. Captures the D1–D4 decisions and where they live in the generated files, the quick-start commands, and an ASCII architecture diagram of the broadcast bridge. Anti-bootstrap retained + extended.
+- **`.gitignore`** — added `crates/atelier-gui/ui/{node_modules,dist,.svelte-kit}/`.
+
+Lockfile pins required to stay on rustc 1.85 (Tauri's transitive deps moved their MSRV to 1.86/1.88 in recent releases): `darling` 0.20.11, `serde_with`/`serde_with_macros` 3.14.0, `time` 0.3.41 (pulls `time-core` 0.1.4 + `time-macros` 0.2.22 + `deranged` 0.4.0 + `num-conv` 0.1.0), `plist` 1.8.0, `quick-xml` 0.38.4. `tauri-cli` installed via `cargo install tauri-cli --version "^2.0" --locked`.
+
+Verified: `cargo test --workspace` → **atelier-core 379 + atelier-cli 10 + atelier-gui 6**; `cargo fmt --check` clean; `cargo clippy --workspace --all-targets -- -D warnings` clean; `make check` end-to-end green; `npm --prefix crates/atelier-gui/ui run check` clean; `npm --prefix crates/atelier-gui/ui run build` produces `dist/`. Did **not** drive `cargo tauri dev` (opens an interactive webview window — best verified by a human).
+
+Phase C unblockers status:
+- [x] (1) `atelier run` CLI subcommand (v37)
+- [x] (2) §1 Anthropic adapter (v38)
+- [x] (3) Tauri GUI bootstrap (this entry)
+- [ ] (4) TUI widgets — last one
+
+### Rig counts
+- **21 schemas / 52 artifacts / 112 tests / 11 dry-runs / 379 atelier-core unit tests + 10 atelier-cli integration tests + 6 atelier-gui unit tests** (was 21 / 52 / 112 / 11 / 379 / 10 / 0).
+
+## v38 — 2026-05-16
+**Phase C unblock (2) — §1 Anthropic adapter lands.** First real BYOM provider plugged into the `atelier run` loop. Concrete `Adapter` impl talks to `POST https://api.anthropic.com/v1/messages` (`anthropic-version: 2023-06-01`) for both non-streaming `chat()` and streaming `stream()`. Native tool use translates Anthropic's `tool_use` content blocks into `ToolCallRequest`s so the §2 envelope can ride as the `harness_meta` tool's arguments — exactly as Phase B's `Strategy::NativeTool` requires.
+
+- **`crates/atelier-core/src/adapter/anthropic.rs`** — new `AnthropicAdapter`. `new(api_key, model_id)` for explicit credentials; `with_base_url(url)` for tests; `from_env(model_id)` reads `ANTHROPIC_API_KEY`. `Debug` redacts the key.
+  - `chat()` — non-streaming POST; parses `content` blocks (`text` + `tool_use`); returns `ChatResponse` with `strategy = NativeTool` iff any tool_use was emitted.
+  - `stream()` — POST with `stream: true`; the new `AnthropicSseSource` (private `ChunkSource` impl) parses SSE events (`message_start`, `content_block_*`, `message_delta`, `message_stop`, `error`) into `StreamChunk` values incrementally. Tool-call arguments accumulate across `input_json_delta` events; `content_block_stop` flushes a fully-parsed `ToolCallCompleted`.
+  - HTTP error mapping: `401/403` → `Auth`, `429` → `RateLimited`, `5xx` → `Provider`, `400` containing `too_long` → `ContextOverflow`, malformed body → `Malformed`. Truncated streams emit a final `Error` chunk so the loop terminates rather than hanging.
+  - `count_tokens()` returns the spec §1 `char/4` fallback with `TokenSource::Approx`; wiring the real `/v1/messages/count_tokens` endpoint is deferred (separate session — needs its own error shape and rate-limit handling). `prompt_cache` and `vision` declared `Unsupported` until those land.
+  - **18 unit tests against `wiremock`** covering happy-path chat + tool-use, all error mappings, SSE text-only response, SSE native tool use across multiple `input_json_delta` chunks, SSE truncation, SSE provider `error` event, request shaping (system message split, tool spec forwarding, tool-result block mapping), `from_env`, model-id round-trip, capability defaults. **No live API calls in CI.**
+- **`crates/atelier-core/src/adapter/`** — `adapter.rs` restructured to `adapter/mod.rs` so concrete adapters can live as siblings (`adapter/anthropic.rs` first; `openai_compat`, `ollama`, `bedrock`, `vertex` later). `ChunkSource` made `pub(crate)` + `ChunkStream::from_inner` constructor added for sibling-module use. Public API surface unchanged for existing consumers.
+- **`crates/atelier-cli/src/runner.rs`** — `ProviderChoice::Anthropic { model_id }` variant added. `Runner::new` becomes fallible (`Result<Self, RunError>`) because Anthropic needs credentials at construction time; `Config` for missing env vars, `Adapter` for everything else.
+- **`crates/atelier-cli/src/main.rs`** — `--provider anthropic` accepted. New `--model <id>` flag (defaults to `anthropic:claude-opus-4-7` for the anthropic provider, rejects ids that aren't prefixed `anthropic:`). Unknown providers now error with the supported set listed.
+- **`crates/atelier-cli/tests/run_integration.rs`** — 2 new binary tests: `--provider anthropic` without `ANTHROPIC_API_KEY` errors with the env-var name; `--provider anthropic --model claude-opus-4-7` (missing prefix) errors usefully.
+
+Workspace deps added: `wiremock = "0.6"` (dev), `bytes = "1"`. atelier-core gains `reqwest` + `bytes` deps and `wiremock` dev-dep. Lockfile pins: `idna_adapter` 1.2.1, `icu_locale_core/properties/properties_data/normalizer/normalizer_data/provider/collections` ≤ 2.1.1 (the latest 2.2.0 line requires rustc 1.86; we stay on 1.85).
+
+Verified: `cargo test --workspace` → **atelier-core 379 + atelier-cli 10 integration**; `cargo fmt --check` clean; `cargo clippy --workspace --all-targets -- -D warnings` clean; `make check` end-to-end green.
+
+Phase C unblockers status:
+- [x] (1) `atelier run` CLI subcommand (v37)
+- [x] (2) §1 Anthropic adapter (this entry)
+- [ ] (3) Tauri GUI bootstrap — needs interactive D1–D4
+- [ ] (4) TUI widgets — parallel to (3)
+
+`atelier run --provider anthropic --model anthropic:claude-opus-4-7 "..."` is now meaningful end-to-end against a live API; the integration tests stay on the mock so CI never touches the network.
+
+### Rig counts
+- **21 schemas / 52 artifacts / 112 tests / 11 dry-runs / 379 atelier-core unit tests + 10 atelier-cli integration tests** (was 21 / 52 / 112 / 11 / 361 / 8).
+
+## v37 — 2026-05-16
+**Phase C unblock (1) — `atelier run` CLI subcommand lands.** First end-to-end driver of the agent loop. Wires the §2.5 actor + §15 dispatcher + 7 built-in tools + §15 hooks + §7 DoD + §11 sandbox + §1 typed ledger against the in-tree `MockAdapter`. The §3 mechanical gate (scripted multi-file rename, byte-equal final diff) is now runnable in CI against the mock; the same code runs against any future adapter (Anthropic next) without changes.
+
+- **`crates/atelier-cli/src/runner.rs`** — new `Runner` API with `Runner::new(workspace, provider, sink)` + `with_max_turns(n)` + `run(prompt)`. Loop: load `HookSet` + `DodConfig` → build `Dispatcher` with all 7 built-in tools + `ShellHookExecutor` → spawn `Session` actor → loop turns (`adapter.chat` → parse envelope via `protocol_strategy` → dispatch tool calls via `SessionDispatcher` → feed results back into messages) until `claimed_done: true` or `max_turns`. Transition to `Verifying` for DoD checks, persist via `OnDiskSession::save_to` to `<repo>/.atelier/sessions/<uuid>/session.json`. `EventSink::{Stdout, Capture, Null}` for binary vs. tests vs. silence.
+- **`crates/atelier-cli/src/main.rs`** — `atelier run [OPTIONS] [PROMPT]` subcommand. Flags: `--provider mock` (only `mock` for v0; `anthropic` lands with unblock 2), `--workspace PATH`, `--max-turns N`, `--prompt-file PATH` (or `-` for stdin). Prints session id + final state + DoD outcome on success; surface a useful error pointing at Phase C unblock (2) when an unsupported provider is named.
+- **`crates/atelier-cli/tests/run_integration.rs`** — 8 integration tests:
+  - loops until `claimed_done` and reaches `State::Done`
+  - dispatches real `write_file` tool calls and loops back into the next turn
+  - bails after `max_turns` without `claimed_done` (no infinite loop)
+  - **scripted multi-file rename — the §3 mechanical gate against MockAdapter** (3 files; the spec's gate scales to 10 with the same shape)
+  - persists session.json under `.atelier/sessions/<uuid>/`
+  - `assert_cmd`-driven binary tests: `--help` lists `run` + `--provider`, unknown provider errors helpfully, empty prompt rejected
+- **Drop-order fix uncovered by the integration tests:** `SessionDispatcher` holds a `broadcast::Sender` clone; without dropping it before awaiting the event-drain task, the runner hung waiting for a channel that couldn't close. The runner now drops `session_dispatcher` then `session_handle` before awaiting, with a safety `tokio::time::timeout` wrapping the await so a future regression can't hang the process.
+
+Workspace deps added: `assert_cmd = "2"`, `predicates = "3"`. atelier-cli gains `tokio` (full), `serde_json`, `parking_lot`, `tracing`, `thiserror`.
+
+Verified: `cargo test --workspace` → **atelier-core 361 + atelier-cli 8 integration**; `cargo fmt --check` clean; `cargo clippy --workspace --all-targets -- -D warnings` clean; `make check` end-to-end green.
+
+Phase C unblockers status:
+- [x] (1) `atelier run` CLI subcommand
+- [ ] (2) §1 Anthropic adapter — next session
+- [ ] (3) Tauri GUI bootstrap — needs interactive D1–D4
+- [ ] (4) TUI widgets — parallel to (3)
+
+### Rig counts
+- **21 schemas / 52 artifacts / 112 tests / 11 dry-runs / 361 atelier-core unit tests + 8 atelier-cli integration tests** (was 21 / 52 / 112 / 11 / 361 / 0).
+
+## v36 — 2026-05-16
+**Spec edits to clear the path for multi-provider / multi-model routing.** No new code — three small structural changes so the user's eventual Bedrock + Vertex + Ollama / llama.cpp / MLX-LM adapters land cleanly into the existing phase plan instead of forcing schema bumps or auth-layer surgery later.
+
+- **Free-form roles in `schemas/config/routing.v1.json`.** `executor` stays required (catch-all loop runner and fallback for any role-less plan step). `planner` and `critic` stay as well-known optional roles with their specific UI semantics. **Any additional key is now a free-form custom role** — `documenter`, `web_trawler`, `architect`, `reviewer`, anything the user wants — mapped to a `<provider>:<model>` ref or null. The dispatcher (Phase E work) will route a turn to a custom role when a `PlanStep` carries a matching role tag. `additionalProperties` swapped from `false` to a `model_ref`-or-null shape; description updated; spec §1 "Per-task routing" rewritten to spell out the loose-vs-strict-roles choice (now loose).
+- **`examples/config/routing_multimodel.v1.json`** — new bundled example that demonstrates the user's scenario verbatim: cloud frontier for `architect` / `reviewer`, local Ollama for `documenter` / `web_trawler`. Validated by the rig (21/21 schemas, 52/52 artifacts).
+- **Spec §11 "Credentials abstraction"** — new subsection introducing the `CredentialsProvider` trait + `CredentialShape::{ApiKey, AwsSigV4, GcpAdc, Local}`. The existing keychain/env flow is the `ApiKey` impl; SigV4 (Bedrock) and ADC (Vertex) gain dedicated shapes so adapters declare *how* they authenticate without each adapter reimplementing the resolution chain. CLI surface extends with `atelier login bedrock` / `atelier login vertex` / `atelier login ollama`. Audit (§12) records the resolved shape, never the secret.
+- **Spec §"Phased build plan"** — Phase E gains native Bedrock + Vertex adapters + per-task routing UI as named items (calibrated against Phase B–D ledger data; LiteLLM proxy from Phase A covers them day-one). Phase F's "OpenAI and local adapters; per-task routing" line replaced with per-adapter named items (Ollama / llama.cpp / MLX-LM) plus the explicit note that the LiteLLM proxy already handles them transparently.
+- **`tasks/todo.md`** — Phase E gets a new "Native cloud adapters + per-task routing UI" subsection (4 items + 2 prereqs: `CredentialsProvider` trait + CLI extension). Phase F's adapter list breaks out into per-provider items.
+
+Why this is structural-only: the user asked where to land Bedrock / Vertex / local LLMs / multi-model routing. Today the spec's `routing.v1.json` fixes 3 roles, which doesn't map to the user's task-affinity model. Today §11 covers API-key auth only. Fixing both now (small spec + schema edits) lets the eventual adapter work in Phase E / Phase F slot in without forcing a routing v2 or §11 rewrite mid-build.
+
+Verified: `make check` green — 21/21 schemas, **52/52 artifacts** (was 51; +1 for `routing_multimodel.v1.json`), 112 rig tests, 11/11 canonical dry-runs. **Rust unchanged** (no atelier-core code touched this rev).
+
+### Rig counts
+- **21 schemas / 52 artifacts / 112 tests / 11 dry-runs / 361 Rust unit tests** (was 21 / 51 / 112 / 11 / 361).
+
+## v35 — 2026-05-16
+**All remaining v34-analysis items closed.** Four medium-severity fixes (one regression of a v34 partial fix + three new) and seven low-severity cleanups. The deep analysis run after v34 surfaced these; this rev clears the list.
+
+- **M1-incomplete — `diff::hunks_for_created` / `hunks_for_deleted` non-UTF-8.** v34 only patched `hunks_for`. The two sibling functions still silently coerced non-UTF-8 bytes to `""` via `unwrap_or`, producing `Created{new_line_count: 0}` for a real-world latin-1 file. Same fix applied: non-UTF-8 → `Hunks::Binary`. Two new tests (`created_for_non_utf8_text_returns_binary`, `deleted_for_non_utf8_text_returns_binary`).
+- **M3 — `subprocess::run` post-kill timeout now observable.** The 5 s `POST_KILL_REAP_TIMEOUT` block previously silently swallowed both successful and timed-out reaps. Both still surface to the caller as `(None, true)` (correct — same observable shape) but a `tracing::warn!` with the program name, child PID, and reap-timeout-ms fires when the post-kill wait itself times out, so operators can distinguish "killed and reaped clean" from "killed but the kernel hasn't released it → possible zombie".
+- **M4 — dispatcher hooks run in parallel.** `Dispatcher::dispatch`'s pre/post hook loops swapped from sequential `for manifest in …` to `futures::future::join_all(...)`. N pre-tool hooks now share one round of fork/exec overhead instead of serialising it. Spec §15 warn-but-never-block is preserved (failure isolation lives inside the executor). `futures` was already a workspace dep; no new dep.
+- **M5 — `OnDiskSession::save_to` + `Registry::save` fsync the parent dir.** Atomic rename guarantees content visibility but not durability of the directory entry — a power loss right after `persist` returns can roll the rename back. Both call sites now invoke a new `cfg(unix)` `fsync_dir(parent)` helper after `tmp.persist`. Windows fallback is a deliberate no-op (spec §11 doesn't target it).
+- **L4 — `MockAdapter` swapped to `parking_lot::Mutex`.** Same poison-tolerance treatment as v34 gave `Ledger`. Removes the last 3 `.lock().unwrap()` patterns in the crate.
+- **L5 — schema `cost_ledger.items` gains `additionalProperties: false`.** Matches the tight-contract default the rest of `schemas/session/v1.json` uses; closes the v32 S6 smell. Rust serde already rejected extras (`LedgerEntry` is a tagged enum), so this affects only non-Rust validators of the schema.
+- **L6 — `spawn_blocking` panic payload preserved.** New shared helper `tools::join_error_to_tool_error(NAME, join_err)` branches on `is_panic`, downcasts the `Box<dyn Any>` payload to `&str` / `String`, and surfaces it via `stderr: "blocking pool panic: <message>"`. All 6 file tools' `.await.map_err(...)` lines consolidate into one call to the helper.
+- **L7 — `Send + Sync` posture documented.** `ContextManager`, `MemoryStore`, `PlanCanvas` all gained a doc-comment note that they're not internally `Send + Sync` (no interior mutability) and need external `Arc<Mutex<_>>` for shared access.
+- **L8 — `HookSet::merge_dir` emits a shadow warning.** A per-repo hook silently replacing a same-named global is now `tracing::info!`-ed with the hook name + path of the shadowing manifest. UX paper cut closed; future "why isn't my global hook firing?" debugging gets a log line to grep for.
+- **L9 — `shell` tool clones the session sandbox.** Previously rebuilt the policy from scratch via `SandboxPolicy::restrictive(ctx.sandbox.repo_root())`, silently dropping `extra_read_paths` / `extra_write_paths`. Now `ctx.sandbox.clone()` preserves session extras across shell calls.
+- **L10 — `HookExecutor` privacy expectation documented.** Trait doc-comment calls out that the `payload` carries tool arguments verbatim (shell command strings, paths, write contents) and that hook implementations persisting payloads must treat them as sensitive — the §12 redaction layer (when it lands) will route hook payloads through the same filter.
+- **L11 — `Staging::ensure_target_inside_workspace` TOCTOU caveat documented.** The single-threaded-per-turn assumption that closes the race is now spelled out in the helper's doc, with a note that parallelising the apply step would reopen it and should switch to `openat`-style relative-fd I/O.
+
+Verified: `cargo test -p atelier-core --lib` → **361 passed** (was 359; +2 for the two new diff tests); `cargo fmt --check` clean; `cargo clippy -p atelier-core --all-targets -- -D warnings` clean; `make check` end-to-end green.
+
+### Rig counts
+- **21 schemas / 51 artifacts / 112 tests / 11 dry-runs / 361 Rust unit tests** (was 21 / 51 / 112 / 11 / 359).
+
+## v34 — 2026-05-16
+**All remaining v32 / v33 analysis items addressed.** Closes the HIGH-severity runtime issues (blocking I/O stalling tokio, poisonable ledger lock), the MEDIUM correctness issues (non-UTF-8 diff corruption, unbounded post-kill wait), and the LOW documentation + test-hygiene drift.
+
+- **H1 — blocking I/O moved to the blocking pool.** Every file-touching `Tool::execute` (`read_file`, `list_dir`, `grep`, `write_file`, `edit_file`, `ast_grep`) now wraps its `std::fs::*` + `walkdir` + `Staging::commit` work in `tokio::task::spawn_blocking`. The args parse + sandbox-policy clone happen on the async side (cheap); the I/O happens on the blocking pool. A `JoinError` from the blocking pool maps to `ToolError::ExecutionFailed`. Net effect: a multi-MB read or deep walk no longer pins a tokio worker thread, so the §2.5 actor inbox + broadcast bus stay responsive even under load. `shell` was already async via `subprocess::run`.
+- **H2 — `Ledger` swapped from `std::sync::RwLock` to `parking_lot::RwLock`.** Removes all 8 `.expect("ledger lock poisoned")` sites. `parking_lot` doesn't poison on a panic-with-write-guard, so a single panicking tool can no longer brick every subsequent ledger read. External API unchanged. `parking_lot` added as a direct dep (already transitive via tokio).
+- **M1 — `diff::hunks_for` non-UTF-8 inputs now return `Hunks::Binary`.** The prior `unwrap_or("")` silently coerced non-UTF-8 buffers into identical empty strings, returning a bogus "no diff" when two different latin-1 / shift-jis buffers were compared. New test `non_utf8_text_bytes_yield_binary_not_silent_corruption` proves the fix.
+- **M2 — `subprocess::run` post-kill wait bounded.** After `start_kill`, `child.wait()` is now wrapped in `tokio::time::timeout(POST_KILL_REAP_TIMEOUT)` (5 s). A child stuck in D-state (pending uninterruptible I/O — e.g., a hung NFS mount) can ignore SIGKILL until the kernel releases it; the prior code would block the worker thread forever. Constant declared at module top with the rationale.
+- **L1 — misleading `Ledger::clone` docstring removed.** Replaced with explicit "share via `Arc<Ledger>`, not by cloning" + a note that the underlying `parking_lot::RwLock` makes the ledger panic-tolerant.
+- **L2 — `Discrepancy::DuplicateClaim` orthogonality documented.** The duplicate flag + per-path `Claimed`/`KindMismatch` discrepancies are intentionally both surfaced — the duplicate is a model-quality signal, the per-path comparison is a verification signal. Doc-comment makes the design explicit and points UIs at `Discrepancy::path` for grouping.
+- **L3 — tool tests use the actual tempdir as `SandboxPolicy::restrictive` root.** 33 `SandboxPolicy::restrictive("/tmp/x")` sites swapped to `SandboxPolicy::restrictive(dir.path())` (or `ws.path()` for the symlink tests). Tests are now consistent with the realistic case where the workspace and sandbox root match — important because the sandbox is per-session, and tests previously got away with the mismatch only because file tools don't enforce sandbox.
+
+Verified: `cargo test -p atelier-core --lib` → **359 passed** (was 358; +1 for the M1 non-UTF-8 test); `cargo fmt --check` clean; `cargo clippy -p atelier-core --all-targets -- -D warnings` clean; `make check` end-to-end green.
+
+Workspace dep added: `parking_lot = "0.12"`.
+
+### Rig counts
+- **21 schemas / 51 artifacts / 112 tests / 11 dry-runs / 359 Rust unit tests** (was 21 / 51 / 112 / 11 / 358).
+
+## v33 — 2026-05-16
+**Three critical issues from the v32 deep analysis fixed.** Closes the symlink-escape bypass, wires hook execution into the dispatch lifecycle, and adds the `validate_args` trait seam.
+
+- **C1 — symlink containment in file tools + `Staging`.** New module `crates/atelier-core/src/path_safety.rs` with `resolve_repo_path` (syntax-level; rejects absolute paths + `..`), `ensure_inside_workspace_existing` (canonicalize-and-prefix-check; catches the symlink-to-outside attack), and `ensure_inside_workspace_creatable` (same, for not-yet-existing targets). Every file-touching tool now calls the appropriate helper after `resolve_repo_path`: `read_file`, `list_dir`, `edit_file`, `write_file`, `grep`, `ast_grep`. `grep` and `ast_grep` additionally skip symlinks at the leaf — `WalkDir::follow_links(false)` only controls traversal, not whether a reported leaf is itself a symlink to outside. `Staging::commit` does its own containment check via `ensure_target_inside_workspace` (walks up to the deepest existing ancestor, canonicalizes it, asserts prefix) so direct `Staging` callers also get the guarantee. 10 new unit tests covering symlink-to-outside in both file and directory positions, repo-internal symlinks still accepted, missing files / missing parents.
+- **C2 — `HookExecutor` actually fires from `Dispatcher::dispatch`.** Dispatcher gains `executor: Arc<dyn HookExecutor>` (default `NoopHookExecutor`) + `Dispatcher::with_executor` builder. `dispatch` now: lookup → validate_args → **pre-tool hooks** → execute → build outcome → **post-tool hooks** → return. Per spec §15 "warn-but-never-block", the executor's own time-budget + error logging stays inside the executor; the dispatcher just `.await`s. Pre-tool payload = `{event, tool_name, tool_call_id, arguments}`; post-tool payload adds `{ok, error_kind?}` so a hook can act on outcomes. 3 new unit tests with a recording mock executor verify both phases fire in order, payload shape is correct, and unknown-tool short-circuits before any hook runs.
+- **C3 — `Tool::validate_args` trait seam.** New trait method `validate_args(&self, args: &serde_json::Value) -> Result<(), String>`; default `Ok(())`. Dispatcher calls it between lookup and pre-tool hooks; `Err(msg)` short-circuits with `ToolError::SchemaViolation` (ledger entry recorded, no hooks fire, no execute attempted). **Built-in tools rely on the default** because their `execute` impls deserialise via `#[serde(deny_unknown_fields)]` typed structs that produce `SchemaViolation` on shape errors — equivalent to running the bundled manifest's `input_schema` for the constraints those manifests express (types, required, enums, unknown fields). The seam is built so MCP-routed tools and any future built-in with constraints serde can't express (regex, length bounds, `oneOf`/`anyOf` semantics) plug in a real JSONSchema validator without dispatcher churn. 1 new dispatcher test proves the gate fires before execute and hooks.
+
+**Why no `jsonschema` dep was added.** The workspace's `jsonschema = "0.26"` pin transitively requires `icu_*` 2.x which requires rustc 1.86+; we're pinned 1.85.0. The honest fix is the trait-seam-with-serde-fallback above; bumping toolchain or downgrading `jsonschema` to a non-icu version would be its own commit with its own scope.
+
+**Drive-by:** `tools/grep.rs` and `tools/ast_grep.rs` use the canonical walk root (`&root`) for `strip_prefix` of reported paths, not `ctx.workspace_root` — the canonical and uncanonical forms differ on macOS (`/var/folders/...` vs `/private/var/folders/...`) and the prior code accidentally returned absolute paths when they mismatched.
+
+Verified: `cargo test -p atelier-core --lib` → **358 passed** (was 344; +14 across path_safety + symlink tests in read_file/grep + Staging containment test + dispatcher's three new hook-execution tests + validate_args gate test); `cargo fmt --check` clean; `cargo clippy -p atelier-core --all-targets -- -D warnings` clean; `make check` end-to-end green.
+
+### Rig counts
+- **21 schemas / 51 artifacts / 112 tests / 11 dry-runs / 358 Rust unit tests** (was 21 / 51 / 112 / 11 / 344).
+
+## v32 — 2026-05-16
+**Phase C UI unblockers — four follow-ons + the seven built-in tools land.** Closes the loop on the three honest call-outs from v31 (subprocess+sandbox plumbing extracted, dispatcher's pure/wrapped split made explicit, gui bootstrap docs split into decisions vs. mechanical) and ships the §15 built-in tool implementations.
+
+- **`crates/atelier-gui/README.md`** rewritten as a D1–D4 decisions table (each row: choice / why it matters / safe default) plus an M1–M6 mechanical-steps table. D1 (bundle id) flagged irreversible-for-codesign; D3 (frontend stack) flagged load-bearing-once-chosen. New anti-bootstrap entry: don't build a `SessionViewModel` aggregator in `atelier-core` before the frontend exists.
+- **Shared subprocess+sandbox+timeout helper** (`crates/atelier-core/src/subprocess.rs`). `run(program, args, &SubprocessSpec) -> SubprocessOutcome { exit_code, stdout, stderr, duration_ms, timed_out }` spawns under `tokio::process::Command`, drains stdout + stderr in concurrent reader tasks (no pipe-deadlock), times out via `tokio::time::timeout` → SIGKILL → reap. `sandboxed_argv(argv, &SandboxPolicy)` returns the platform-specific `(program, wrapped_args)` pair: macOS = `("sandbox-exec", ["-p", profile, "--", argv...])`, Linux = `("bwrap", linux_bwrap_argv(policy, argv))`, other = `SubprocessError::UnsupportedPlatform`. CI doesn't install `bubblewrap`, so the test suite uses bare `run` against `echo`/`sh -c` (no sandbox dep); cfg-gated tests exercise the wrapped path on macOS where `sandbox-exec` is always present.
+- **`SessionDispatcher`** (`crates/atelier-core/src/dispatcher.rs`). Thin wrapper around the pure `Dispatcher`; owns `Arc<Ledger>` + `broadcast::Sender<Event>` and performs the two side effects after each dispatch (`ledger.append` + `for ev in events { sender.send(ev) }`). Pure `Dispatcher` stays the unit-test surface. `Sender::send` returning Err for "no subscribers" is silently swallowed — headless runs don't surface dispatcher errors when no UI is attached. `Handle::events_sender()` newly exposed so the wiring code can plumb the cloned `Sender` in at session start.
+- **`crates/atelier-core/src/tools/`** — seven `Tool` impls + a shared `resolve_repo_path` helper enforcing "repo-relative, no `..`, no absolute" uniformly:
+  - `read_file` — offset/length window with truncation flag.
+  - `list_dir` — sorted entries, dot-files hidden by default.
+  - `grep` — regex via `regex` crate; walks via `walkdir`; skips dot-dirs / binary (NUL-in-8KB) / files >1 MB; tempdir-prefix workaround for `filter_entry` rejecting roots starting with `.tmp`.
+  - `write_file` — routes through `Staging::commit`; staged-writes report flows into `Event::EditStaged`.
+  - `edit_file` — anchor-based patch; rejects ambiguous anchors; routes through `Staging` with `expected_pre_hash` for §14 concurrent-edit detection.
+  - `ast_grep` — `kind:<node-kind>` patterns over bundled `tree-sitter-json`; richer pattern syntax + other Tier-1 grammars land alongside §7 hallucination detector.
+  - `shell` — `sh -c` via `subprocess::sandboxed_argv` + `subprocess::run`; cwd is repo-relative; `allow_net` derives a fresh `with_net` policy.
+- **`ShellHookExecutor`** (dispatcher.rs) — concrete `HookExecutor` impl spawning the hook's `command` via `sh -c` inside the session sandbox, forwarding the hook payload as `ATELIER_HOOK_PAYLOAD` env-var. Warns past `time_budget_ms` via `tracing` but **never blocks** (spec §15). Non-shell impls log + skip.
+
+**Drive-by fix in `sandbox::macos_profile`** — now `(import "system.sb")`s Apple's baseline profile so subprocess loading actually works inside the sandbox. Without this, the hand-rolled enumeration of allowed paths was incomplete and `sandbox-exec` killed children with SIGABRT during dyld setup. Test asserts the import precedes `(deny default)` so the explicit restrictions still override the baseline's allows.
+
+Workspace deps added: `regex = "1.11"`, `walkdir = "2.5"`.
+
+Verified: `cargo test -p atelier-core --lib` → **344 passed** (was 289; +55 across subprocess + SessionDispatcher + tools/ + ShellHookExecutor); `cargo fmt --check` clean; `cargo clippy -p atelier-core --all-targets -- -D warnings` clean; `make check` end-to-end green (21/21 schemas, 51/51 artifacts, 112 rig tests, 11/11 canonical dry-runs).
+
+Explicitly **not done this round** — tracked as the remaining Phase C UI unblocker:
+- §1 Anthropic adapter against the real Messages API. Trait + `MockAdapter` (v31) and dispatcher + built-in tools (this rev) leave it as a self-contained piece: SSE streaming + native tool-use channel + `wiremock`/recorded-fixture-based tests (no live API in CI).
+
+### Rig counts
+- **21 schemas / 51 artifacts / 112 tests / 11 dry-runs / 344 Rust unit tests** (was 21 / 51 / 112 / 11 / 289).
+
+## v31 — 2026-05-16
+**Phase C UI unblockers — first three of five.** Spec §"Phased build plan" Phase C section was extended in v30 to spell out the five unblockers; this rev lands items 1–3 (the trait + ledger + dispatcher skeleton). Items 4 (seven built-in tool impls) and 5 (Anthropic adapter against the real Messages API) follow in their own commits — bundling them here would produce shallow stubs against my prior pattern of one substantial module per round.
+
+- **§1 BYOM adapter trait** (`crates/atelier-core/src/adapter.rs`). Async `Adapter` trait: `model_id / capabilities / conformance / count_tokens / chat / stream`. `chat` has a default impl in terms of `stream` so streaming-only providers cost nothing extra. `Capabilities { native_tool_use, streaming, vision, prompt_cache, structured_output, long_context, context_window_tokens }`; `CapabilityClaim::{Supported, ClaimedButBroken, Unsupported}` flags the "claimed-but-broken" trap state from spec §1's matrix. `AdapterError` covers `ContextOverflow / Auth / Unreachable / Malformed / RateLimited / Provider / NotConfigured`; `requires_user_decision()` maps each to the §2.5 `Recovery` routing. `Message / Role / ToolSpec / ToolCallRequest / ChatResponse / Usage / StreamChunk::{Text, ToolCallStarted, ToolCallDelta, ToolCallCompleted, Complete, Error}` all round-trip through serde. `MockAdapter` queues a FIFO of `ChunkStream`s + has a `with_context_window` knob that fires `ContextOverflow` deterministically; `record_conformance` lets tests assert the matrix-vs-ring-buffer interaction. Workspace dep added: `async-trait`.
+- **§1 typed cost ledger** (`crates/atelier-core/src/ledger.rs` + retypes `OnDiskSession.cost_ledger`). `LedgerEntry::{ModelCall, ToolCall, CacheBust}` enforces the schema's per-kind required fields at compile time (cannot construct a `ToolCall` without `tool_name`/`latency_ms`, a `ModelCall` without `model_id`/`prompt_tokens`/etc.). `Ledger` is append-only, `RwLock`-backed; `append / to_vec / from_vec / by_kind / total_cost_usd / total_tokens / entries_without_cost` (latter so the §3 cost meter renders "$1.23 + N unknown" rather than understating). Helpers: `LedgerEntry::tool_call(...)`, `LedgerEntry::cache_bust_from(&CacheBustEvent)` bridges the §5 context manager's eviction event into a ledger entry without `context.rs` importing the ledger. `local_cost_usd(latency_ms, rate)` + `DEFAULT_LOCAL_RATE_USD_PER_SEC = $0.00028/sec` (spec §1 PROVISIONAL). `OnDiskSession.cost_ledger: Vec<serde_json::Value>` → `Vec<LedgerEntry>`; all 4 bundled session examples still round-trip.
+- **§15 tool dispatcher skeleton** (`crates/atelier-core/src/dispatcher.rs`). Async `Tool` trait (`name`, `side_effect_class`, `execute(args, &ToolContext)`); `ToolRegistry` keyed by name with sorted iteration + duplicate-name rejection. `Dispatcher::dispatch` walks the per-tool-call lifecycle: lookup tool → identify pre-tool / post-tool hooks via `HookSet::for_tool_event` → execute → translate any `staged_writes: CommitReport` into per-file `Event::EditStaged` via the `edit_staged_events` helper (already built in v30) → build a `LedgerEntry::ToolCall` with measured latency + local cost. Returns a `DispatchOutcome` — pure (no side effects); the caller appends to the ledger + broadcasts events. Failed dispatches still produce a ledger entry; unknown tool names fail closed with `ToolError::ExecutionFailed` so the harness can never silently no-op a model-emitted call. `SideEffectClass::{LocalSafe, LocalRisky, SharedState, Irreversible}` with `budget_cost()` matching spec §8 PROVISIONAL (0/1/20/20). `HookExecutor` trait + `NoopHookExecutor` sketched; real subprocess execution lands with item 4's tool-impls follow-on (it shares the §11 sandbox launcher those tools need).
+
+Verified: `cargo test -p atelier-core --lib` → **289 passed** (was 242; +47 across the three new modules); `cargo fmt --check` clean; `cargo clippy -p atelier-core --all-targets -- -D warnings` clean; `make check` end-to-end green (21/21 schemas, 51/51 artifacts including session round-trips of the now-typed `cost_ledger`, 112 rig tests, 11/11 canonical dry-runs).
+
+Explicitly **not done this round** — each is tracked in `tasks/todo.md` as the remaining Phase C UI unblockers:
+- §15 built-in tool implementations (`read_file`, `write_file`, `edit_file`, `list_dir`, `grep`, `ast_grep`, `shell`). Each gets its own module; the dispatcher already accepts them via the `Tool` trait. Lands across multiple commits.
+- §1 Anthropic adapter against the real Messages API. Needs SSE streaming + tool-use channel + `wiremock`/recorded-fixture-based tests (no live API in CI). The trait + `MockAdapter` this rev landed make this self-contained.
+- Real **hook subprocess execution** (the `HookExecutor` concrete impl) — pairs naturally with the `shell` tool impl since both wrap `tokio::process` inside the §11 sandbox.
+
+### Rig counts
+- **21 schemas / 51 artifacts / 112 tests / 11 dry-runs / 289 Rust unit tests** (was 21 / 51 / 112 / 11 / 242).
+
+## v30 — 2026-05-16
+**Phase C data-layer prerequisites — four typed APIs the UI will consume.** Lays the data underneath the Phase C UI work without touching the GUI/TUI bootstrap. Spec §"Phased build plan" Phase C section was extended to spell out these prerequisites explicitly.
+
+- **§5 context manager** (`crates/atelier-core/src/context.rs`). `ContextItem { id, payload, tokens: TokenCount{count,source}, provenance, pinned, added_at, last_used }`. `Payload::{FileRef, InlineText, BlobRef}` covers the three concrete shapes the workspace renders; `Provenance::{Initial, UserAttached, ToolResult, MemoryPromoted, PinnedByUser}` carries the why-here trace. `ContextManager` insertion-ordered with `add / pin / unpin / evict / touch / iter / token_snapshot`. `evict` refuses pinned items and returns a `CacheBustEvent` the caller forwards to the §1 cost ledger as `kind: cache_bust` — keeps the module pure of I/O. `TokenSnapshot` separates known from `Unavailable` so the §5 token meter never silently underreports.
+- **§5 typed memory** (`crates/atelier-core/src/memory.rs` + retypes `OnDiskSession.memory`). `MemoryCard` matching the schema exactly (`id, content, created_at, last_used, pinned?`); `MemoryStore` with `add / touch / pin / unpin / evict / promote_to_global`. `promote_to_global` returns `PromoteOutput { relative_path, bytes }` for the caller to write (same purity discipline as `context.rs`). `OnDiskSession.memory: Vec<serde_json::Value>` → `Vec<MemoryCard>`; all 4 bundled session examples still round-trip and `make artifacts` validates them.
+- **§5 typed plan** (`crates/atelier-core/src/plan.rs` + retypes `OnDiskSession.plan.steps`). `PlanStep { id, text, status, constraints? }` + `PlanStatus::{Pending, InProgress, Done, Skipped}`. `PlanCanvas` with auto-id `add`, `insert` (rejects duplicates, advances next-serial past imported `step-N` ids), `remove`, `mark_status / mark_done / mark_skipped`, idempotent `add_constraint`, and `reorder` that validates membership before mutating. `apply_envelope(&PlanUpdate) -> ApplyReport` consumes the §2 envelope's `plan_update` field (best-effort text-match for `complete`/`remove`; `reorder` from an envelope is intentionally dropped with a UI-visible reason). `OnDiskSession.plan.steps: Vec<serde_json::Value>` → `Vec<PlanStep>`.
+- **Incremental diff stream** (`crates/atelier-core/src/diff.rs` + `staging::FileOutcome.hunks` + `session::Event::EditStaged`). `Hunks::{Same, Lines{hunks}, Binary, Created, Deleted}` via the `similar` crate. Binary detection uses §14's "NUL in first 8 KB" rule so the diff layer and the §14 diff-blob store agree. `staging::Staging::commit` now reads the pre-image once per file (for both conflict check and hunk extraction; race-free) and stamps the `Hunks` onto every `FileOutcome`. `session::Event::EditStaged { path, hunks }` is the §3 "live diff updates as the agent edits" carrier; `session::edit_staged_events(&CommitReport)` is the pure translator the tool dispatcher will call to forward each commit's per-file events onto the bus.
+
+Workspace deps added: `similar = "2.7"`.
+
+Verified: `cargo test -p atelier-core --lib` → **242 passed** (was 172; +70 across the four new modules); `cargo fmt --check` clean; `cargo clippy -p atelier-core --all-targets -- -D warnings` clean; `make check` end-to-end green (21/21 schemas, 51/51 artifacts including round-trips of the retyped session memory + plan fields, 112 rig tests, 11/11 canonical dry-runs).
+
+Explicitly **not done this round** — each is tracked in `tasks/todo.md`:
+- Phase C UI itself — `cargo tauri init` and TUI widgets still need the interactive bootstrap and an adapter producing real envelopes. The data layer this rev landed is what those UIs will consume.
+- §5 non-destructive compaction with cost disclosure + mental-model panel — defers until the GUI work begins.
+- §5 mechanical gate (context-panel API assertions; cache-bust ledger entry on eviction) — needs the eventual UI to assert against; the underlying ops + `CacheBustEvent` data are in place and unit-tested.
+
+### Rig counts
+- **21 schemas / 51 artifacts / 112 tests / 11 dry-runs / 242 Rust unit tests** (was 21 / 51 / 112 / 11 / 172).
+
+## v29 — 2026-05-16
+**Phase B foundation — §2 protocol + §7 verification (subset, code-first).** Five modules land. Phase B's real-model conformance gate (≥95% on canonical workload across Anthropic + OpenAI) still needs §1 adapters; everything that can be built as a pure data layer is now built and tested.
+
+- **§2 envelope types** (`crates/atelier-core/src/protocol.rs`). Typed `Envelope` mirroring `schemas/model_protocol/envelope.v1.json` with `serde(deny_unknown_fields)`. Round-trips all three bundled `prompts/protocol_fewshot/` examples. Runtime validates the schema's `maxLength: 500` summary cap (JSON Schema's runtime cost in the rig is paid here too). Every optional field is `Option<_>` so absent vs. default is type-distinct — enforces spec §2 "never silently substitute 'everything OK.'"
+- **§2 three emission strategies** (`crates/atelier-core/src/protocol_strategy.rs`). `Strategy::{NativeTool, JsonSentinel, RegexProse}` with `downshift()` chain. Each strategy has an `encode`/`parse` pair. `parse_json_sentinel` returns `(envelope, prose)` so UI renders the two streams separately. The regex-prose fallback is deliberately lossy per spec (drops `plan_update` and `constraints_acknowledged`); both round-trip absent on re-parse, surfacing as gray badges in the UI.
+- **§2 conformance tracker** (`crates/atelier-core/src/protocol_conformance.rs`). `TurnConformance` issues `TurnDecision::{Reprompt, Downshift, EscalateToUser}` — `Reprompt` 3× per strategy, then downshift, then escalate at the bottom of the stack. Cross-call `ConformanceRingBuffer` (capacity 100, PROVISIONAL) for the §1 `Adapter::conformance()` window with `snapshot()` returning per-strategy success counts.
+- **§7 did-it-do-what-it-said** (`crates/atelier-core/src/verify.rs`). Pure function `compare(envelope, &[ObservedChange]) -> Vec<Discrepancy>`. Detects: claimed-but-not-observed, observed-but-not-claimed, kind-mismatch (e.g. claimed delete + observed modify), duplicate claims. Lying-agent gate's primary signal.
+- **§7 DoD config** (`crates/atelier-core/src/dod.rs` + `schemas/config/dod.v1.json` + `examples/config/dod.v1.json`). `DodConfig` loader with `(name, tier, command, working_dir, timeout_ms, expect, tags)` checks. Tier enum matches spec §7 (`test / typecheck / lint / build / custom`). Discovery: per-repo `<repo>/.atelier/dod.json` overrides global `~/.atelier/dod.json`; missing both is a soft no-config state. Validates name regex (shared with hook names), absolute / `..`-escaping `working_dir`, zero timeouts, and unknown fields. Schema-validated end-to-end by the rig.
+
+Verified: `cargo test -p atelier-core --lib` → **172 passed** (was 97; +75 across the five new modules); `cargo fmt --check` clean; `cargo clippy -p atelier-core --all-targets -- -D warnings` clean; `make check` end-to-end green (**51/51 artifacts** including the new DoD example, **112 rig tests**, **11/11 canonical dry-runs**).
+
+Explicitly **not done this round** — each is tracked in `tasks/todo.md`:
+- §2 nightly protocol-overhead measurement harness + `ci/nightly/protocol_overhead.yml` — gated on adapter to drive real model calls.
+- §2 per-adapter few-shot override hook — defers to the BYOM adapter trait (§1).
+- §2 real-model conformance gate (Anthropic + OpenAI canonical workload ≥95%) — needs Phase A adapters.
+- §7 Tier-1 hallucination detector (TypeScript LSP) — gated on Q3 (LSP auto-install UX) + `tower-lsp` integration.
+- §7 lying-agent and hallucinating-agent mechanical gates — same; pure-function detector code is in place and unit-tested.
+
+### Rig counts
+- **21 schemas / 51 artifacts / 112 tests / 11 dry-runs / 172 Rust unit tests** (was 20 / 50 / 112 / 11 / 97).
+
+## v28 — 2026-05-16
+**Phase A foundation — five unblocked modules land in `atelier-core`.** Wires up the runtime mechanics that Phase A's mechanical gate hangs off, without taking on the items blocked by external actions (rmcp spike Q7, baseline capture Q5).
+
+- **§2.5 session actor** (`crates/atelier-core/src/session.rs`). Per-session tokio task with `mpsc` inbox, `broadcast` event channel, bounded `Semaphore` (cap 4, PROVISIONAL) for in-turn tool parallelism, and `tokio_util::CancellationToken` for drop-on-cancel. Every transition goes through `Transition::new` (validates against `LEGAL_TRANSITIONS`) and fires `CheckpointHook` + `LedgerHook` before broadcast. Illegal transitions surface as `Event::IllegalTransitionAttempted` rather than panic. Terminal states (`Done`, `Failed`) end the actor.
+- **§3 atomic diff staging** (`crates/atelier-core/src/staging.rs`). `Staging::commit` stages every write into a same-filesystem `TempDir`, runs the syntax check + SHA-256 pre-hash conflict check, then lexicographically renames. Any validation failure leaves the workspace untouched. `TreeSitterSyntaxCheck` bundles `tree-sitter-json` and reports `Pass / Fail / NotApplicable / GrammarMissing` per spec §3 (other Tier-1 extensions return `GrammarMissing` until their grammars are bundled). Absolute paths and `..` escapes are rejected at `add` time.
+- **§11 sandbox profile generators** (`crates/atelier-core/src/sandbox.rs`). `macos_profile(&SandboxPolicy)` emits a `(deny default)` `sandbox-exec` `.sb` profile; `linux_bwrap_argv` emits the bubblewrap argv with `--unshare-net/-pid/-uts/-ipc/-user-try`, tmpfs `/tmp`, RO bind for `/usr`, `/lib`, `/bin`, `/sbin`, `/etc`, and `--die-with-parent`. Network is denied by default; `with_net()` flips both platforms. Writes to `/etc` and `/usr/local` are rejected at policy-build time per spec §11.
+- **§14 crash-recovery scaffold** (`crates/atelier-core/src/persistence.rs`). Typed `OnDiskSession` matching `schemas/session/v1.json`; atomic `save_to` via `tempfile::NamedTempFile::persist`; `load_from` rejects mismatched `harness_session_version` with a typed error. `RecoveryEntry` + `RecoveryReason::{Crash, UserCancel, Timeout, ConcurrentEditPause}` + `append_recovery`. Global `Registry` at `~/.atelier/registry.json` with `touch / forget / save / load` (missing file = empty per spec).
+- **§15 hook manifest loader** (`crates/atelier-core/src/hooks.rs`). `HookManifest::from_json` round-trips `schemas/config/hook_manifest.v1.json` and enforces the runtime invariants serde can't (`version == 1`, `name` regex, `time_budget_ms >= 1`, `tool_filter` not set for `on-verify-*`, non-empty command/url). `HookSet::load_dir` + `merge_dir` give per-repo-overrides-global discovery. `HookApprovals` is the first-use approval store with atomic save under `_approvals.json` (`_` prefix keeps it out of the name regex space) and a `partition` helper for the UI prompt.
+
+Workspace deps added: `sha2`, `tree-sitter`, `tree-sitter-json`, `uuid`. `atelier-core` now depends on `tokio`, `tokio-util`, `futures`, `tracing`, `uuid`, `tempfile`, `sha2`, `tree-sitter`, `tree-sitter-json`.
+
+Verified: `cargo test -p atelier-core --lib` → **97 passed** (was 21; +76 across the five new modules); `cargo fmt --check` clean; `cargo clippy -p atelier-core --all-targets -- -D warnings` clean; `make check` end-to-end green (`50/50 artifacts`, `112 passed`, `11/11 dry-runs OK`).
+
+Explicitly **not done this round** — each is tracked in `tasks/todo.md`:
+- File-watcher integration (§14) — needs the tool dispatcher's read-set tracking.
+- Concurrent-edit modal flow (§14) — UX surface; queues at tool-call boundary.
+- Hook execution (§15) — subprocess wrapper lands with the §15 tool dispatcher.
+- Diff-blob storage (§4) — bundled with checkpoint store.
+- Anthropic / LiteLLM adapters (§1) — Q2 is resolved but the adapters are a multi-session block of their own.
+- MCP client (§15) — gated on Q7 rmcp spike.
+
+### Rig counts
+- **20 schemas / 50 artifacts / 112 tests / 11 dry-runs / 97 Rust unit tests** (was 21).
+
 ## v27 — 2026-05-16
 **Onboarding fixes: README CI badge URL + `make install-rig` on Homebrew Python.** Two unrelated friction points hit on a fresh checkout, plus one latent packaging bug surfaced by the second fix.
 

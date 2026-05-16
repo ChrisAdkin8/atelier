@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "checks": [
+    {
+      "name": "pytest",
+      "tier": "test",
+      "command": "pytest -q",
+      "timeout_ms": 120000,
+      "expect": {"exit_code": 0}
+    },
+    {
+      "name": "ruff",
+      "tier": "lint",
+      "command": "ruff check .",
+      "expect": {"exit_code": 0}
+    },
+    {
+      "name": "mypy",
+      "tier": "typecheck",
+      "command": "mypy src",
+      "timeout_ms": 60000,
+      "expect": {"exit_code": 0, "stdout_pattern": "^Success:"}
+    }
+  ]
+}

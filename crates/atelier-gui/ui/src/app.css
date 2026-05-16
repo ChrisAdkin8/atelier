@@ -1,0 +1,3 @@
+/* App.svelte owns its own styles via a scoped <style> block. This file is
+   kept intentionally minimal so the cascade is predictable when the
+   multi-pane workspace lands. */

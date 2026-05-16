@@ -34,6 +34,7 @@
       "items": {
         "type": "object",
         "required": ["timestamp", "kind"],
+        "additionalProperties": false,
         "properties": {
           "timestamp": {"type": "string", "format": "date-time"},
           "kind": {"enum": ["model_call", "cache_bust", "tool_call"]},

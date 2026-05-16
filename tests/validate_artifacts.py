@@ -40,6 +40,7 @@ JSON_RULES = [
     ("examples/hooks/*.json", "schemas/config/hook_manifest.v1.json", "hook manifest"),
     ("examples/config/routing*.json", "schemas/config/routing.v1.json", "routing config"),
     ("examples/config/permissions*.json", "schemas/config/permission_state.v1.json", "permission state"),
+    ("examples/config/dod*.json", "schemas/config/dod.v1.json", "DoD config"),
     ("examples/skills/*.json", "schemas/config/skill_manifest.v1.json", "skill manifest"),
     ("crates/atelier-core/skills/*.json", "schemas/config/skill_manifest.v1.json", "bundled skill"),
     ("examples/subagents/*.json", "schemas/config/subagent_type.v1.json", "subagent type"),

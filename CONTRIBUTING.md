@@ -18,7 +18,7 @@ Thanks for your interest. Atelier is pre-implementation: the spec, schemas, and 
 - **Schema improvements.** Tighten existing schemas, add regression tests, or close a gap in coverage.
 - **Workload fixtures.** Add new canonical tasks (t12+) to broaden language and shape coverage. Each task needs `prompt.md`, `expected.md`, `fixture/`, `meta.json`, and `checks.json` per the existing pattern.
 - **Rig hardening.** New cases in `tests/test_schemas.py` / `tests/test_validators.py` / `tests/test_runner.py`.
-- **Phase A implementation.** The cargo workspace is scaffolded. Start at `crates/atelier-core/` and the §2.5 state machine.
+- **Phase A implementation.** The Phase A foundation (§2.5 actor, §3 atomic staging, §11 sandbox profile generators, §14 on-disk session + recovery log + registry, §15 hook loader) has landed in `crates/atelier-core/`. Highest-leverage outstanding work: the §1 BYOM adapter trait + Anthropic adapter, the §15 MCP client (gated on the `rmcp` spike), and the tool dispatcher that wires `staging` + `sandbox` + `hooks` around each tool call. See `tasks/todo.md` for the full ordered list and which items are blocked on external action.
 - **MCP catalog entries.** Curated, well-known MCP servers worth bundling.
 - **rmcp spike execution.** Run `experiments/rmcp_spike/` on a real machine and fill in the decision matrix.
 

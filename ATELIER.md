@@ -1,6 +1,6 @@
 # Atelier — project context
 
-Atelier is a **pre-implementation coding harness**: agent loop, BYOM adapters, MCP transport, verification gates, hooks, cost ledger. Nothing is built yet beyond a full spec, schemas, and a self-testing calibration rig. The harness is the product; this repo is the rig that will verify it.
+Atelier is a **coding harness mid-build**: agent loop, BYOM adapters, MCP transport, verification gates, hooks, cost ledger. Phase A foundation, Phase B protocol/verification subset, and Phase C data-layer prerequisites have all landed in `atelier-core` (§2.5 actor, §3 atomic staging + incremental diff stream, §11 sandbox profiles, §14 on-disk session + recovery log + registry, §15 hook loader + first-use approval, §2 typed envelope + 3 emission strategies + conformance tracker, §7 did-it-do-what-it-said + DoD loader, §5 typed context/memory/plan) on top of the existing state machine, error taxonomy, and `atelier init`. The agent loop is **not yet end-to-end runnable** — no BYOM adapter or MCP client yet — but the runtime mechanics and the data layer that everything else hangs off are in place. The Phase C UIs (Tauri + ratatui) are still scaffold-only and need the adapter to drive real envelopes. The harness is the product; the supporting rig (schemas + canonical workload + self-tests) is what verifies it as the remaining modules land. See `tasks/todo.md` for what's done vs. in flight.
 
 ## Stack
 
@@ -18,7 +18,7 @@ Atelier is a **pre-implementation coding harness**: agent loop, BYOM adapters, M
 ## Layout pointers (read these, not the README, when you need orientation)
 
 - `coding-harness-spec.md` — the spec. Cite section numbers (e.g., §2.5, §15) when relevant.
-- `schemas/` — 20 JSON Schemas. Cross-schema `$ref`s resolve via `tests/_schema_helpers.py`.
+- `schemas/` — 21 JSON Schemas. Cross-schema `$ref`s resolve via `tests/_schema_helpers.py`.
 - `tests/workload/canonical/` — 11 task fixtures. Don't run pytest *inside* canonical/; the runner copies each to a tempdir (`pyproject.toml` excludes it).
 - `tasks/todo.md` — current phased build plan. Active state lives here, not in this file.
 - `CHANGELOG.md` — spec + rig revisions.

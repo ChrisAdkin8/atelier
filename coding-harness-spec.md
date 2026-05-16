@@ -78,7 +78,9 @@ Atelier is a coding harness where the user can always see what the agent is doin
 | ≥128k context | Large refactors | Compact (§5), reroute, or `ContextOverflowError`. Never silent truncation. | n/a |
 
 ### Per-task routing
-Planner / executor / critic routing is config-driven per `schemas/config/routing.v1.json`. Per-repo `<repo>/.atelier/routing.json` overrides global `~/.atelier/routing.json`. When absent, all roles default to the executor; the critic is `null` (matches §10's off-by-default). Handoff between roles is via conversation transcript + Model Protocol envelope (§2), not raw token streams.
+Role-based routing is config-driven per `schemas/config/routing.v1.json`. **`executor` is the only required role** (the catch-all that runs the §2.5 loop and acts as the fallback for any plan step without a role tag). **`planner` and `critic` are well-known optional roles** with specific UI semantics: planner emits `plan_update` at task start; critic runs in the §10 side pane. **Any additional role name is free-form** — common examples: `documenter`, `web_trawler`, `architect`, `reviewer`. The dispatcher routes a turn to a custom role when the active plan step (§5 `PlanStep`) carries a matching `role` tag in its `constraints`. Per-repo `<repo>/.atelier/routing.json` overrides global `~/.atelier/routing.json`. When absent, all roles fall back to the executor. Handoff between roles is via conversation transcript + Model Protocol envelope (§2), not raw token streams.
+
+This is the lever for cost-aware multi-model workflows: e.g., `documenter: ollama:llama3.2:3b` for low-cost documentation and web-trawling tasks, `architect: anthropic:claude-opus-4-7` for deep design reasoning and code review. See `examples/config/routing_multimodel.v1.json` for a worked example.
 
 ### Cost ledger
 Every call records: prompt / completion / cached tokens, latency, model ID, `$` cost. Local cost is latency-weighted: `wall_clock_seconds × local_rate`. **`local_rate` defaults to `$0.00028/sec`** (PROVISIONAL — derived as a cloud A100 hourly rate / 3600; calibration: survey actual user hardware costs once §13 telemetry yields usage data, then default to the median override). User can override to `$0` or any other value. Surfacing local cost in the ledger lets per-task routing make rational planner/executor choices.
@@ -602,6 +604,36 @@ A low-cost model critiques every parent-agent output in an advisory side pane. O
   - `atelier whoami` — lists configured providers without revealing keys.
 - **Audit:** §12 egress audit records `Authorization` headers as redacted; `${keychain:…}` and `${env:…}` interpolation is resolved at request time and never persisted in the audit record.
 
+### Credentials abstraction (non-API-key providers)
+Not every adapter authenticates with a static API key. AWS Bedrock signs each request with SigV4 over the AWS credential chain; GCP Vertex AI uses Application Default Credentials (ADC); local LLMs (Ollama, llama.cpp, MLX-LM) typically need no auth at all. To keep the §1 `Adapter` trait clean of provider-specific auth code, `atelier-core` exposes a small `CredentialsProvider` trait that adapters consume:
+
+```
+pub trait CredentialsProvider: Send + Sync {
+    fn shape(&self) -> CredentialShape;
+    fn resolve(&self) -> Result<ResolvedCredentials, CredentialError>;
+}
+
+pub enum CredentialShape {
+    ApiKey,           // header injection — current keychain/env flow
+    AwsSigV4,         // per-request request signer
+    GcpAdc,           // bearer token from google-cloud-auth
+    Local,            // no auth
+}
+```
+
+Each `CredentialShape` has its own resolution logic:
+- **`ApiKey`** — env → keychain → typed error (the existing flow above).
+- **`AwsSigV4`** — AWS credential chain (env `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` → `~/.aws/credentials` profile → IAM instance role → SSO refresh). Pluggable via `aws-config` crate.
+- **`GcpAdc`** — Application Default Credentials chain (env `GOOGLE_APPLICATION_CREDENTIALS` → `gcloud auth application-default login` cache → service-account JSON → GCE metadata server). Pluggable via the `google-cloud-auth` crate or equivalent.
+- **`Local`** — no-op; resolves to empty credentials.
+
+CLI surface extends accordingly:
+- `atelier login bedrock` — verifies the AWS credential chain resolves; if not, prompts for SSO start-url or access-key.
+- `atelier login vertex` — verifies ADC resolves; if not, prompts for `gcloud auth application-default login`.
+- `atelier login ollama` (or any `Local` provider) — no-op with a confirmation message.
+
+Audit (§12) records the resolved `CredentialShape` (not the credentials themselves) so users can see *how* a remote call authenticated without exposing secrets.
+
 ### `atelier init` — project bootstrap
 Idempotent project-scaffold command (provided by `atelier-gui` / `atelier-tui`, backed by `atelier-core::init`). Run from a repo root, it:
 
@@ -839,6 +871,34 @@ Phases group pillars that ship together. **Phase A + B is the internal backend m
 
 **Gate:** 10-file rename mechanical; context-panel API assertions.
 
+**Data-layer prerequisites (land in `atelier-core` before the UI work begins).** The Phase C UIs consume typed APIs, not stubs. Four modules in `atelier-core` carry the data the GUI / TUI render — they're built first so the UI work can target a stable surface rather than reshape it from `Vec<serde_json::Value>` placeholders later:
+
+1. **Context manager** — typed `ContextItem` with token counts, why-here provenance trace, pin / unpin / evict operations; eviction emits a `cache_bust` ledger entry per §1.
+2. **Typed memory** — replaces `session.memory: Vec<Value>` with `MemoryCard` (matches the schema's `{id, content, created_at, last_used, pinned}`); operations: add, touch, pin/unpin, evict, promote (write to the global memory dir).
+3. **Typed plan** — replaces `session.plan.steps: Vec<Value>` with `PlanStep` (matches the schema's `{id, text, status, constraints?}`); operations: add, reorder, mark_done, mark_skipped, add_constraint.
+4. **Incremental diff event stream** — per-tool-call `EditStaged { path, hunks }` events on the §2.5 broadcast bus, derived from §3 staging's commit report by diffing the pre-image against the staged bytes. Feeds the §3 "Live diff updates as the agent edits" requirement at the granularity the agent loop actually produces (per tool call, not per token).
+
+**UI unblockers (atelier-core).** The data layer above is necessary but not sufficient: the UIs assume a running agent loop driving real envelopes through that data layer. Five items in `atelier-core` (and one in `atelier-cli`) close the loop. They land in dependency order; each is unit-testable in isolation:
+
+1. **§1 BYOM adapter trait** — `Adapter` with `chat`, `stream`, `count_tokens(source: TokenSource)`, `capabilities()`, `conformance()` (backed by the §2 `ConformanceRingBuffer` already built). Carries `Capabilities`, `CapabilityClaim::{Supported, ClaimedButBroken, Unsupported}`, `ContextOverflowError`. Mock impl for downstream tests.
+2. **§1 Typed cost ledger** — `LedgerEntry::{ModelCall, ToolCall, CacheBust}` mirroring `schemas/session/v1.json` `cost_ledger[]`. Replaces `OnDiskSession.cost_ledger: Vec<Value>`. Append-only; consumed by every adapter / dispatcher / context eviction.
+3. **§15 tool dispatcher** — `Tool` trait + `Dispatcher`. Per tool-call: §15 pre-tool hooks → execute inside §11 sandbox profile → §3 atomic staging (for writes) → §15 post-tool hooks → publish `Event::EditStaged` (via the `edit_staged_events` helper already built) → append `LedgerEntry::ToolCall`. Mock `Tool` for tests.
+4. **§15 built-in tool implementations** — `read_file`, `write_file`, `edit_file`, `list_dir`, `grep`, `ast_grep`, `shell`. Manifests already bundled at `crates/atelier-core/tools/`; each gets a Rust `Tool` impl. Lands across multiple commits; the dispatcher does not block on all seven being present. The `shell` tool and the §15 `ShellHookExecutor` share a single subprocess + sandbox + warn-but-never-block-timeout helper (`crates/atelier-core/src/subprocess.rs`) so the §11 plumbing isn't duplicated between the two consumers.
+5. **§1 Anthropic adapter** — concrete `Adapter` against the Anthropic Messages API. Streaming via SSE; native tool-use channel for §2 strategy 1. Tests against recorded HTTP fixtures rather than live calls.
+
+A thin `SessionDispatcher` wraps the pure [`Dispatcher`](#) with a `&Ledger` and the session bus, so the agent-loop integration code calls one method instead of reimplementing the "append entry + broadcast events" boilerplate per call. The pure `Dispatcher` stays the test surface; `SessionDispatcher` is the runtime surface.
+
+**Phase C UI-gate unblock actions (in dependency order).** Once the items above land, four wiring steps turn the Phase C gates from "blocked on no driver" into "runnable":
+
+1. **`atelier run` CLI subcommand** (`crates/atelier-cli`) — wires the §2.5 actor + `Dispatcher` + `ToolRegistry` (all 7 built-in tools) + `HookSet` + `DodConfig` + `SandboxPolicy` + `Ledger` into a runnable loop. Reads prompt from arg or stdin; subscribes to the broadcast bus; loops turns until `claimed_done: true`; transitions to `Verifying` for DoD checks; saves the session via `OnDiskSession::save_to`. Drives the §3 mechanical gate (10-file scripted rename, byte-equal final diff) against `MockAdapter` immediately; same code runs against any later adapter without changes.
+2. **§1 Anthropic adapter** — turns "agent loop runs against a mock" into "agent loop runs against a real model." After this, Phase B's ≥95% real-model conformance gate becomes runnable, and the GUI / TUI gates have real envelopes to render.
+3. **Tauri GUI bootstrap** (`crates/atelier-gui`) — `cargo tauri init` (D1–D4 interactive: bundle id, app name, frontend stack, dev server URL) plus the mechanical M1–M6 per the crate README. First panel subscribes to `Handle::subscribe` and renders `Event::EditStaged`.
+4. **TUI widgets** (`crates/atelier-tui`) — `ratatui` + `crossterm` against the same broadcast bus; ships the §3 TUI subset (conversation, textual diff, file tree, plan canvas, cost + context meters, timeline scrubber).
+
+Steps 1 + 2 close §3's 10-file-rename gate and §5's context-panel-API + cache-bust-ledger gates. Steps 3 + 4 close the per-frontend snapshot gates and the UX targets.
+
+The MCP client (`rmcp`) and the LiteLLM adapter follow once Q7 (rmcp spike) and the Anthropic adapter are in. Step 3's interactive `cargo tauri init` is the one moment the build needs a human — `crates/atelier-gui/README.md` separates D1–D4 (irreversible decisions) from M1–M6 (mechanical setup) so it's fast.
+
 ### Phase D — Time and steerability
 - §4 Time travel
 - §6 Steerability
@@ -850,12 +910,15 @@ Phases group pillars that ship together. **Phase A + B is the internal backend m
 - §9 Uncertainty UI
 - §12 Privacy
 - §13 Telemetry
+- §1 **Native cloud adapters** — AWS Bedrock (SigV4 auth via the new §11 `CredentialsProvider::AwsSigV4`) and GCP Vertex AI (ADC auth via `CredentialsProvider::GcpAdc`). The Phase A LiteLLM proxy gets you both day-one at the cost of an extra hop; the native adapters here are for first-class streaming, capability advertisement, and per-provider cost reporting that the routing UI needs.
+- §1 **Per-task routing UI** — surfaces the `schemas/config/routing.v1.json` configuration in the GUI / TUI, including free-form custom roles (e.g., `documenter`, `architect`). Depends on ≥3 adapters being available so the cost-aware planner-vs-executor split has something to choose between.
 
-**Gate:** §8 learning + per-path mechanical; §9 snapshot; §12 redaction mechanical.
+**Gate:** §8 learning + per-path mechanical; §9 snapshot; §12 redaction mechanical; routing UI demonstrably switches models per role on the canonical workload.
 
 ### Phase F — Deferred
 - §10 Multi-agent
-- §1 OpenAI and local adapters; per-task routing
+- §1 OpenAI adapter (native) — Phase A's LiteLLM proxy covers it; native lands here for parity with Anthropic
+- §1 **Local LLM adapters** — Ollama first (HTTP/SSE; simplest), then llama.cpp (native bindings or HTTP server mode), then MLX-LM (Apple-Silicon-specific). All consume `CredentialsProvider::Local` (no-op auth) and benefit from the latency-weighted `local_rate` cost model from §1.
 - §7 Tier 1 (Go, Rust, then Java, C#); Tier 2 (Python, Ruby, PHP); Tier 3; auto-scaffolding
 - §15 Tool plug-in manifest; community adapter packaging
 

@@ -1,11 +1,7 @@
-//! atelier-gui: Tauri 2.x shell. Scaffold only.
-//!
-//! Spec §3. Implementation step 1: run `cargo install create-tauri-app` then
-//! `cargo tauri init` from this directory to generate `tauri.conf.json` and the
-//! frontend skeleton. Uncomment the Tauri deps in `Cargo.toml` once init completes.
+// Suppress the console window on Windows in release builds — Tauri shells
+// don't want a stray cmd.exe popping up alongside the webview.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    println!(
-        "atelier-gui: scaffold; not yet implemented. See spec §3 and crates/atelier-gui/README.md."
-    );
+    atelier_gui::run();
 }

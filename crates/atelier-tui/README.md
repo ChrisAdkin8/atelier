@@ -16,19 +16,51 @@ Not in TUI (GUI-only): drag-and-drop, Mermaid/D2 inline rendering, browser previ
 
 ## Current state
 
-Scaffold only. `ratatui` and `crossterm` deps are declared in the workspace but commented in this crate's `Cargo.toml` until the first widget lands.
+**Phase C unblock (4) — bootstrapped (v40).** `cargo run -p atelier-tui` opens an alternate-screen UI that subscribes to the `atelier-core` broadcast bus and renders the event log + an `EditStaged` counter live. `cargo test -p atelier-tui` exercises 10 unit tests against the pure `render` + `apply` + `handle_key` surface.
 
-## Bootstrap (implementor's first day)
+Multi-pane widgets (conversation, diff, file tree, plan canvas, cost + context meters, timeline scrubber) sit on top of this foundation. The bootstrap intentionally ships one panel: the smallest snapshot that proves the broadcast bus reaches the terminal.
 
-Unlike `atelier-gui`, there is no interactive init step — `ratatui` is just a Rust crate.
+## Quick start
 
-1. **Uncomment** `ratatui`, `crossterm`, `tokio`, and `tracing-subscriber` in this crate's `Cargo.toml`.
-2. **Pick a layout primitive.** `ratatui::layout::Layout::new(Direction::Vertical, [...])` is the standard; the §3 TUI subset (conversation, diff, file tree, plan canvas, two meters, scrubber) maps to nested `Layout`s. Sketch the geometry before writing widgets.
-3. **Wire input.** Spawn a blocking thread (or `tokio::task::spawn_blocking`) around `crossterm::event::read` and feed an `mpsc` into the main event loop. Key bindings for the spec: `[` `]` scrubber step, `g <n>` jump, plus the usual Vim-ish navigation.
-4. **Subscribe to `atelier-core`.** Open a `tokio::sync::broadcast::Receiver` from the core's session-event channel; redraw on receive. The same channel feeds the GUI — keep render logic out of `atelier-core`.
-5. **First milestone.** Conversation pane + cost meter rendering live from a real `atelier-core` session. Diff pane and scrubber come next; the plan-canvas tree last.
+```sh
+cargo run -p atelier-tui       # opens the TUI; q / Esc / Ctrl-C to quit
+cargo test -p atelier-tui      # 10 unit tests on the pure render + state
+```
+
+## Architecture
+
+```
+   ┌──────────────────────────────┐
+   │ crates/atelier-tui/src/      │
+   │   lib.rs                     │
+   │   - AppState (pure)          │   draws onto
+   │   - render(buf, area, state) │──────────────┐
+   │   - handle_key(KeyEvent)     │              ▼
+   │   - run() (tokio loop)       │      ratatui::Terminal
+   └──────────────────────────────┘     (CrosstermBackend, raw mode,
+                 │ subscribes to                alternate screen)
+                 ▼
+   ┌──────────────────────────────┐
+   │ atelier_core::session::      │   broadcast::Receiver<Event>
+   │   spawn(...) → Handle        │
+   └──────────────────────────────┘
+```
+
+The split is deliberate:
+
+- **`AppState`** + **`apply`** + **`project_event`** + **`render`** + **`handle_key`** are pure. No I/O. Tests exercise them via `Buffer::empty(Rect)` instead of a real terminal.
+- **`run`** owns the impure parts: raw mode, alternate screen, the `tokio::select!` loop, `spawn_blocking` around `crossterm::event::poll`. It also installs a `TerminalGuard` RAII restorer so a panic past terminal-setup still puts the user's terminal back into a sane state.
+
+Adding a new `Event` variant means one match arm in `project_event` and (if it changes display state) one arm in `apply`. Widgets compose by adding rows to the `Layout` constraints in `render`.
 
 ## Anti-bootstrap
 
 - Don't depend on Tauri or anything web-stack from this crate. TUI is a separate binary; the only shared code is via `atelier-core`.
 - Don't put loop logic here. Events come from `atelier-core`; this crate only renders and forwards user input.
+- Don't read events directly off the broadcast inside the render path. Mutate `AppState` in `apply`; render reads `AppState`. Mixing the two is what makes terminal UIs become unmaintainable.
+- Don't add a Cancel command from the TUI yet. The §2.5 actor's cancel semantics are typed and tested; wiring a keypress into them needs the typed-command direction added first (mirrors the `ping`-only IPC in `atelier-gui`).
+
+## Spec references
+
+- §3 Workspace UI (TUI subset)
+- §2.5 Agent loop (this crate is an event consumer, not a producer of loop state)

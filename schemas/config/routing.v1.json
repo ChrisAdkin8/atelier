@@ -2,15 +2,18 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://atelier.example/schemas/config/routing.v1.json",
   "title": "Per-task model routing",
-  "description": "Maps the three §1 roles (planner / executor / critic) to provider+model strings. Lives at `<repo>/.atelier/routing.json` (per-repo, takes precedence) or `~/.atelier/routing.json` (global fallback). When absent, all roles default to the user's configured default executor; the critic is `null` (matches §10's 'off by default').",
+  "description": "Maps role names to provider+model strings. `executor` is required (the catch-all that runs the §2.5 loop). `planner` and `critic` are well-known optional roles with specific §1 / §10 UI semantics (planner emits `plan_update` at task start; critic runs in the §10 side pane). Any **additional role key** is a free-form custom role — e.g., `documenter`, `web_trawler`, `architect`, `reviewer` — which the dispatcher routes to when a plan step carries a matching `role` tag (per §5 `PlanStep.constraints`). Lives at `<repo>/.atelier/routing.json` (per-repo, takes precedence) or `~/.atelier/routing.json` (global fallback). When absent, all roles default to the user's configured default executor; the critic is `null` (matches §10's 'off by default').",
   "type": "object",
   "required": ["version", "executor"],
-  "additionalProperties": false,
+  "additionalProperties": {
+    "oneOf": [{"$ref": "#/$defs/model_ref"}, {"type": "null"}],
+    "description": "Custom roles map to a provider+model or null (role disabled). Use this for fine-grained per-task routing: e.g., `documenter: ollama:llama3.2:3b` for low-cost doc-updates, `architect: anthropic:claude-opus-4-7` for deep design reasoning."
+  },
   "properties": {
     "version": {"const": 1},
     "executor": {
       "$ref": "#/$defs/model_ref",
-      "description": "Required. Runs the §2.5 agent loop turn-by-turn; emits the §2 envelope."
+      "description": "Required. Runs the §2.5 agent loop turn-by-turn; emits the §2 envelope. Acts as the fallback for any plan step without a `role` tag."
     },
     "planner": {
       "oneOf": [{"$ref": "#/$defs/model_ref"}, {"type": "null"}],
@@ -25,7 +28,7 @@
     "model_ref": {
       "type": "string",
       "pattern": "^[a-z][a-z0-9_-]*:[a-zA-Z0-9._/:-]+$",
-      "description": "Format: '<provider>:<model_id>'. Provider names must match a registered §1 adapter (e.g., `anthropic`, `openai`, `litellm`, `ollama`, `mlx`, `llamacpp`). Model IDs are provider-specific (e.g., `anthropic:claude-sonnet-4-6`, `ollama:qwen2.5-coder:7b`)."
+      "description": "Format: '<provider>:<model_id>'. Provider names must match a registered §1 adapter (e.g., `anthropic`, `openai`, `bedrock`, `vertex`, `litellm`, `ollama`, `mlx`, `llamacpp`). Model IDs are provider-specific (e.g., `anthropic:claude-sonnet-4-6`, `ollama:qwen2.5-coder:7b`, `bedrock:amazon.nova-pro-v1:0`, `vertex:gemini-2.0-flash-exp`)."
     }
   }
 }

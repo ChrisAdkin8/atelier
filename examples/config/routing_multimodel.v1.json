@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "executor": "anthropic:claude-sonnet-4-6",
+  "planner": "anthropic:claude-opus-4-7",
+  "critic": null,
+  "architect": "anthropic:claude-opus-4-7",
+  "reviewer": "anthropic:claude-opus-4-7",
+  "documenter": "ollama:qwen2.5-coder:7b",
+  "web_trawler": "ollama:llama3.2:3b"
+}

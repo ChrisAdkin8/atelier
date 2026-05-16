@@ -62,6 +62,44 @@ tower-lsp = "0.20"
 # Atomic diff application (§3) — temp directory for staged writes
 tempfile = "3"
 
+# Content-addressed hashing for §3 conflict detection (pre-edit hash check) and
+# §14 checkpoint blobs.
+sha2 = "0.10"
+
+# §3 pre-commit syntax check — tree-sitter core; grammars are per-language deps.
+tree-sitter = "0.25"
+tree-sitter-json = "0.24"
+
+# §3 line-based diff for incremental hunk events (Phase C data layer).
+similar = "2.7"
+
+# §15 built-in tools — `grep` content search (regex) and `list_dir` / `grep`
+# directory walking. Both std-library-only would mean re-implementing
+# regex + recursive walk; these crates are small and battle-tested.
+regex = "1.11"
+walkdir = "2.5"
+
+# Non-poisoning locks for the §1 cost ledger. std::sync::RwLock poisons on
+# panic-holding-the-write-guard, making every subsequent read panic and
+# turning the ledger into a panic amplifier. `parking_lot` doesn't poison.
+parking_lot = "0.12"
+
+# `atelier run` integration tests — spawn the CLI binary and assert on
+# stdout/stderr/exit-code. dev-only.
+assert_cmd = "2"
+predicates = "3"
+
+# §1 Anthropic adapter — local HTTP stub for tests so SSE parsing, native
+# tool-use, and error-mapping paths are covered without a live API key.
+# dev-only.
+wiremock = "0.6"
+
+# §1 Anthropic adapter — SSE byte stream type from reqwest's `bytes_stream`.
+bytes = "1"
+
+# Session IDs (§14 — on-disk session lives at .atelier/sessions/<uuid>/)
+uuid = { version = "1", features = ["v4", "serde"] }
+
 # Internal crate references
 atelier-core = { path = "crates/atelier-core" }
 

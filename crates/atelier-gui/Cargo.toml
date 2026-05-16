@@ -10,20 +10,22 @@ description = "Atelier Tauri 2.x shell. Consumes atelier-core over a broadcast c
 name = "atelier-gui"
 path = "src/main.rs"
 
+[lib]
+name = "atelier_gui"
+path = "src/lib.rs"
+# The Rust shell is consumed by the binary in this crate only. cdylib would
+# be added later when mobile targets land; not needed for desktop.
+crate-type = ["lib"]
+
 [dependencies]
 atelier-core = { workspace = true }
+tauri = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = "0.1"
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 
-# === IMPLEMENTOR: DO NOT UNCOMMENT THESE LINES YET ===
-#
-# Uncommenting `tauri` without first running `cargo tauri init` (which generates
-# tauri.conf.json, build.rs, icons/, capabilities/, and a frontend skeleton)
-# produces a confusing build failure. See crates/atelier-gui/README.md →
-# "Bootstrap" for the numbered checklist; choices made there (frontend stack,
-# bundle identifier, capability set) shouldn't be made in a hurry.
-#
-# tauri = { workspace = true }
-# tokio = { workspace = true }
-# tracing-subscriber = { workspace = true }
-
-# [build-dependencies]
-# tauri-build = { workspace = true }   # uncomment after tauri init produces build.rs
+[build-dependencies]
+tauri-build = { workspace = true }

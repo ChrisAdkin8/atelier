@@ -1,8 +1,11 @@
-//! atelier-tui: ratatui + crossterm frontend. Scaffold only.
-//!
-//! Spec §3 — TUI subset: conversation, textual diff, file tree, plan canvas
-//! (collapsible tree), cost meter, context meter, timeline scrubber.
+use std::process::ExitCode;
 
-fn main() {
-    println!("atelier-tui: scaffold; not yet implemented. See spec §3 (TUI subset) and crates/atelier-tui/README.md.");
+fn main() -> ExitCode {
+    match atelier_tui::run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("atelier-tui: {e}");
+            ExitCode::from(1)
+        }
+    }
 }
