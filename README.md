@@ -36,7 +36,7 @@ The spec is in [`coding-harness-spec.md`](coding-harness-spec.md). Where the bui
 
 ## Quick start
 
-Everything you need to install, bootstrap, configure, and drive the harness lives in this section. The Mock provider drives the full agent loop with **no network and no model** — useful as a 30-second smoke test that the loop, dispatcher, staging, and persistence are all wired up on your machine.
+Install, bootstrap, configure, and drive — all in this section. The Mock provider runs the full agent loop with **no network and no model** — a 30-second smoke test that loop, dispatcher, staging, and persistence are all wired up.
 
 ```sh
 cargo install --path crates/atelier-cli          # builds + installs the `atelier` binary
@@ -58,44 +58,38 @@ atelier run --provider openai-compat \
 
 ### Bootstrap — what `atelier init` lays down
 
-From the root of any repo:
-
 ```sh
 atelier init                # current directory
 atelier init /path/to/repo  # explicit path
 ```
 
-This creates `<repo>/.atelier/{sessions,tools,hooks}/`, writes a seeded `ATELIER.md` at the repo root if none is present (template: [`crates/atelier-core/templates/ATELIER.md`](crates/atelier-core/templates/ATELIER.md)), and appends `.atelier/` to an existing `.gitignore`. The command is **idempotent** and **never overwrites an existing `ATELIER.md`** — re-running on an initialised repo prints `atelier init: no changes (repo already initialised)`.
+Idempotent — re-running on an initialised repo prints `atelier init: no changes (repo already initialised)`, and an existing `ATELIER.md` is never overwritten. The command creates `.atelier/{sessions,tools,hooks}/`, writes a seeded `ATELIER.md` (template: [`crates/atelier-core/templates/ATELIER.md`](crates/atelier-core/templates/ATELIER.md)) if none is present, and appends `.atelier/` to an existing `.gitignore`:
 
 ```
 <repo>/
 ├── .atelier/
-│   ├── sessions/         # per-session state, checkpoints, ledger (.atelier/sessions/<uuid>/)
-│   ├── tools/            # user-supplied tool manifests; see examples/tools/
-│   ├── hooks/            # pre-tool / post-tool / on-verify-* hook scripts; see examples/hooks/
-│   └── providers.toml    # provider profiles + runtime config (see below); optional, write after init
-├── ATELIER.md            # system-prompt config; edit freely
-└── .gitignore            # ".atelier/" appended if a .gitignore exists
+│   ├── sessions/       # per-session state, checkpoints, ledger
+│   ├── tools/          # user tool manifests; see examples/tools/
+│   ├── hooks/          # pre-/post-tool / on-verify-* scripts; see examples/hooks/
+│   └── providers.toml  # provider profiles + runtime config (see below); optional
+├── ATELIER.md          # system-prompt config; edit freely
+└── .gitignore          # ".atelier/" appended if a .gitignore exists
 ```
 
-`ATELIER.md` is the project-level user-config file — the harness reads it at session start and injects it into the system prompt. Equivalent to Cursor's `.cursorrules` / Claude Code's `CLAUDE.md`.
-
-Reference manifests for tools, hooks, skills, sub-agents, and config (`mcp_servers.json`, `permission_shapes.json`, …) live in [`examples/`](examples/). Validate them against `schemas/` before wiring them in.
+`ATELIER.md` is the project-level user-config file — injected into the system prompt at session start, equivalent to Cursor's `.cursorrules` / Claude Code's `CLAUDE.md`. Reference manifests for tools, hooks, skills, sub-agents, and config (`mcp_servers.json`, `permission_shapes.json`, …) live in [`examples/`](examples/); validate against `schemas/` before wiring them in.
 
 ### Pin defaults — `.atelier/providers.toml`  *(v53)*
 
-Re-typing `--provider openai-compat --base-url … --model …` every invocation gets old fast. Drop a small TOML file in the repo and `atelier run` picks it up automatically — you can keep several named profiles (`local`, `cloud`, `staging`, …) side by side and switch between them with one flag.
+Re-typing `--provider … --base-url … --model …` gets old fast. Drop a small TOML file in the repo and `atelier run` picks it up automatically — keep several named profiles (`local`, `cloud`, `staging`, …) side by side and switch with `--profile <NAME>`.
 
-**Where the file lives.** Two scopes are searched, in order. The first that exists wins:
+**Where it lives.** Two scopes are searched in order; the first that exists wins. Both are optional — missing both falls through to built-in defaults (provider `mock`, max-turns 32, probe `auto`).
 
 | Path | Scope | Typical use |
 |---|---|---|
-| `<repo>/.atelier/providers.toml` | **Project** | The repo wants Anthropic with a specific model on every clone. Committed. |
-| `~/.atelier/providers.toml`      | **User**    | Your machine talks to a local LM Studio. Not committed; lives in your home dir. |
+| `<repo>/.atelier/providers.toml` | **Project** (committed) | Repo wants Anthropic with a specific model on every clone. |
+| `~/.atelier/providers.toml`      | **User** (not committed) | Your machine talks to a local LM Studio. |
 
-Both files are optional. Missing both is fine — `atelier run` falls through to built-in defaults (provider `mock`, max-turns 32, probe `auto`).
-
-**Shape.** Profiles live under `[providers.<name>]` tables; `default = "<name>"` (optional) picks which one `atelier run` uses when no `--profile` flag is given. Every field inside a profile is optional — a profile with only `provider = "anthropic"` is valid and inherits defaults for the rest.
+**Shape.** Profiles live under `[providers.<name>]` tables; the optional top-level `default` picks the one used when `--profile` is absent. Every field inside a profile is optional — a profile with only `provider = "anthropic"` inherits defaults for the rest.
 
 ```toml
 # .atelier/providers.toml
@@ -132,41 +126,19 @@ policy = "auto"                          # "auto" | "skip" | "force"
 
 </details>
 
-**Override precedence.** Top wins; layers compose:
+**Override precedence**, top wins:
 
 ```text
-  1. CLI flags                                    (per-invocation)
-  2. Resolved profile (from providers.toml)       (named, persisted)
-  3. Built-in defaults                            (mock, 32 turns, auto probe)
+  1. CLI flags                              (per-invocation)
+  2. Resolved profile (from providers.toml) (named, persisted)
+  3. Built-in defaults                      (mock, 32 turns, auto probe)
 ```
 
-The "resolved profile" is whichever `[providers.<name>]` table matches `--profile <NAME>` from the CLI, or the file's `default` field, or nothing at all (in which case the CLI must specify the relevant flags directly). Per-field flags (`--provider`, `--model`, `--base-url`, `--max-turns`, `--no-probe`/`--force-probe`) still override individual fields of the resolved profile.
+The resolved profile is whichever `[providers.<name>]` matches `--profile <NAME>`, or the file's `default`, or nothing (then the CLI must specify the relevant flags). Per-field flags (`--provider`, `--model`, `--base-url`, `--max-turns`, `--no-probe`/`--force-probe`) still override individual fields of the resolved profile. With the file above, `atelier run "…"` uses `local`/openai-compat; `atelier run --profile cloud "…"` flips to Anthropic; `atelier run --provider mock "…"` overrides the resolved profile's provider only (its `model`/`base_url` drop because they don't apply to `mock`).
 
-Concrete examples, given the file above:
+**Verifying what's active.** Every `atelier run` prints which config file (if any) loaded and which profile resolved (`atelier run: using config /Users/you/proj/.atelier/providers.toml (profile "local")`). Once the loop starts, the GUI footer (bottom-right) and TUI footer render the active model id + §2 strategy + probe outcome, e.g. `local:qwen2.5-coder:7b · json_sentinel · cache_hit`. The same surfaces also show the v53 §5 **Context panel** — per-row listing of every item in the agent's context window with a token count (cyan exact / yellow approx / dim unavailable) and why-here badge (`init` / `usr` / `tool` / `mem` / `pin` / `asst`). If what's active isn't what you expected, re-check the precedence above — most surprises are "user-scope file edited but project-scope file is winning."
 
-| Command | Resolved profile | Adapter | Notes |
-|---|---|---|---|
-| `atelier run "fix it"`            | `local` (via `default`)   | openai-compat | What you'd run day-to-day. |
-| `atelier run --profile cloud "…"` | `cloud` (via CLI)         | anthropic     | Same file, different profile. |
-| `atelier run --provider mock "…"` | `local` (still resolved) → overridden | mock | CLI wins; `model`/`base_url` from the profile drop because they don't apply to `mock`. |
-
-**Verifying what's active.** On every `atelier run` the binary prints exactly which config file (if any) it loaded, and which profile it resolved:
-
-```text
-atelier run: using config /Users/you/proj/.atelier/providers.toml (profile "local")
-```
-
-Once the loop starts, the GUI footer (bottom-right) and the TUI footer (right side of the help line) both render the active model id, §2 strategy, and probe outcome:
-
-```text
-local:qwen2.5-coder:7b · json_sentinel · cache_hit
-```
-
-The same surfaces show the v53 §5 **Context panel** in the bottom-right of the workspace — per-row listing of every item in the agent's context window with a token count (colour-cued by source: cyan exact / yellow approx / dim unavailable) and a why-here badge (`init` / `usr` / `tool` / `mem` / `pin` / `asst`). Useful when you want to know exactly what the model is seeing.
-
-If something isn't what you expected there, re-check the precedence above — most surprises are "I edited the user-scope file but the project-scope file is winning."
-
-**When the config is rejected.** A file that exists but doesn't parse (typo, wrong type, unknown field, `default` referencing a missing profile, `base_url` paired with a non-openai-compat provider) is **fatal**: `atelier run` exits with code 2 and tells you which file + what's wrong. Silently ignoring a malformed config would let a typo silently fall back to defaults, which is exactly the surprise this layer exists to prevent.
+**Errors are fatal.** A file that exists but doesn't parse (typo, wrong type, unknown field, `default` referencing a missing profile, `base_url` paired with a non-openai-compat provider) exits with code 2 and a message naming the file + what's wrong — no silent fall-through to defaults.
 
 ```text
 atelier run: config error: config at /Users/you/proj/.atelier/providers.toml
@@ -188,7 +160,7 @@ atelier run --provider openai-compat \
 
 Other servers, same `--provider openai-compat` switch — only `--base-url` changes: LM Studio (`http://localhost:1234/v1`), llama-server (`http://localhost:8080/v1`), vLLM / sglang (`http://localhost:8000/v1`), OpenAI itself (omit `--base-url`; set `OPENAI_API_KEY`).
 
-On first use the harness fires a short calibration probe (one native tool-call test + one JSON-sentinel envelope test) and writes a `ModelProfile` to `~/.atelier/model_profiles/<hash>.json`. Subsequent runs against the same `(model, base_url)` pair use the cached profile. The §1 conformance tracker still degrades at runtime if the live model misbehaves — the cached profile is the *initial* strategy hint, not a contract.
+First use against a given `(model, base_url)` fires a short calibration probe (one native tool-call test + one JSON-sentinel envelope test) and caches the resulting `ModelProfile` to `~/.atelier/model_profiles/<hash>.json` for subsequent runs. The §1 conformance tracker still degrades at runtime if the live model misbehaves — the cached profile is the *initial* strategy hint, not a contract.
 
 <details>
 <summary><b>All <code>atelier run</code> flags</b></summary>
