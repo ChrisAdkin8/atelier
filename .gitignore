@@ -48,4 +48,3 @@ crates/atelier-gui/dist/
 crates/atelier-gui/ui/node_modules/
 crates/atelier-gui/ui/dist/
 crates/atelier-gui/ui/.svelte-kit/
-.atelier/
