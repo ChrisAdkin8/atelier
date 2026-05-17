@@ -1,5 +1,70 @@
 # Atelier Spec — Changelog
 
+## v51 — 2026-05-17
+
+**Probe-on-first-use model adaptation (§1).** Atelier now fires a short calibration round-trip the first time it encounters a new `(model_id, base_url)` pair, observes whether the model handles native tool calls and JSON-sentinel envelopes, picks the appropriate §2 strategy, and caches the result to `~/.atelier/model_profiles/<hash>.json` so subsequent runs skip the probe. The cached profile is emitted on the bus as a new `Event::ModelProfileLoaded` so the GUI and TUI can render the active strategy badge. The Anthropic and Mock adapters skip the probe (they're well-characterised); only `openai-compat` is probed by default. CLI flags `--no-probe` and `--force-probe` override.
+
+### New surface
+
+- **`crates/atelier-core/src/adapter/model_profile.rs`** (NEW, ~900 lines):
+  - `ModelProfile` struct: schema-versioned on-disk shape with model_id, base_url, probed_at, strategy, supports_native_tools, supports_streaming, utf8_clean, context_window_tokens, max_tokens, notes. Atomic `save_to` / `load_from` mirror `persistence.rs` idioms (tempfile + persist + fsync_dir_best_effort); load rejects mismatched `PROFILE_SCHEMA_VERSION` with `ProfileError::IncompatibleVersion`.
+  - `ProbeObservation` struct + `decide_strategy(&obs) -> Strategy` pure function. Preference order: `NativeTool > JsonSentinel > RegexProse`. Eight branch tests lock the decision rule.
+  - `probe_model(adapter)` async driver: fires two calibration calls — (A) ask the model to invoke a `harness_calibration_echo` tool with `{"value": "ok"}` and check round-trip, (B) ask for an exact `<<<harness_meta>>>{"claimed_done":true}<<<end>>>` and parse with `parse_json_sentinel`. UTF-8 cleanliness (U+FFFD detection) recorded as a side signal. Fatal adapter errors (`Auth`, `NotConfigured`, `Unreachable`, `ContextOverflow`) propagate; transient errors (`Malformed`, `Provider`, `RateLimited`) record a note and the strategy flag stays `false`.
+  - `ProfileStore` cache: `user_default()` honours `ATELIER_PROFILE_DIR` then `~/.atelier/model_profiles/`. `load_or_probe(adapter, base_url, force_reprobe, probed_at)` is the entry point — returns `(ModelProfile, ProbeLoadOutcome)` where the outcome distinguishes `CacheHit / Probed / Reprobed / NotCached`. Best-effort persistence: a save failure downgrades the outcome to `NotCached` but never fails the run. 34 unit tests cover save/load round-trip, version-mismatch rejection, cache hit doesn't call adapter, force-reprobe overwrites, stale-schema reprobes, ephemeral store, fatal probe error doesn't leave stale state on disk.
+  - Cache key: `sha256(model_id || "\n" || base_url)[..16]` (64 bits) — stable, collision-resistant against the `("ab", "cd")` vs `("a", "bcd")` ambiguity (test `cache_path_does_not_collide_via_concat_ambiguity`).
+- **`crates/atelier-core/src/session.rs`** — new `Event::ModelProfileLoaded { model_id, base_url, strategy, outcome }` variant. Emitted by the Runner once, after the probe step resolves, before the first turn. UI consumers render a "strategy badge" off it.
+- **`crates/atelier-cli/src/runner.rs`** — new `ProbePolicy::{Auto, Skip, Force}` enum and `Runner::with_probe_policy` builder. `Runner::new` sets per-provider defaults: `Mock` and `Anthropic` → `Skip` (well-known); `OpenAiCompat` → `Auto` (cache-first, probe on miss). The Runner's `run()` resolves a `ModelProfile` before the turn loop and broadcasts `Event::ModelProfileLoaded`. A probe failure logs a warning and falls back to a stub profile so the run continues — the §1 conformance tracker still drives runtime strategy selection.
+- **`crates/atelier-cli/src/main.rs`** — `--no-probe` and `--force-probe` CLI flags. Mutually exclusive (exit 2 on both). Usage text updated.
+- **`crates/atelier-gui/src/lib.rs`** — `bridge_event` adds a `ModelProfileLoaded` projection so the webview can render the badge.
+- **`crates/atelier-tui/src/lib.rs`** — `project_event` adds a `ModelProfile` event line; `apply` includes the variant in the no-op set (informational, doesn't change pane state).
+
+### What the probe *does* and *doesn't* change in v51
+
+- **Does:** populate a cached `ModelProfile` per `(model_id, base_url)`, broadcast it on the bus, log the cache-hit / probe outcome, and surface strategy guidance to UIs.
+- **Doesn't yet:** rewire the adapter's initial strategy from the cached value. The adapter still picks its own strategy at construction time; the §1 conformance tracker degrades from there at runtime if the model misbehaves. Threading `profile.strategy` into the adapter as an initial-strategy hint is a v52 follow-on — the present commit lands the observation layer with all the cache + invariants in place, so v52 is a one-call wiring change.
+
+### Demo flow
+
+```text
+$ cargo run -p atelier-cli -- run --provider openai-compat \
+    --base-url http://localhost:11434/v1 --model local:qwen2.5-coder:7b \
+    "add a hello function"
+
+# First run — probe round-trips:
+[INFO atelier::probe] model profile probed and cached
+    model_id=local:qwen2.5-coder:7b base_url=http://localhost:11434/v1
+    strategy=json_sentinel cache_path=~/.atelier/model_profiles/<hash>.json
+    forced=false
+# Bus emits: ModelProfileLoaded { strategy: JsonSentinel, outcome: Probed }
+
+# Second run — cache hit:
+[INFO atelier::probe] model profile cache hit
+    strategy=json_sentinel
+# Bus emits: ModelProfileLoaded { strategy: JsonSentinel, outcome: CacheHit }
+
+# Force re-probe (e.g., after a model upgrade):
+$ cargo run -p atelier-cli -- run --provider openai-compat \
+    --base-url http://localhost:11434/v1 --model local:qwen2.5-coder:7b \
+    --force-probe "..."
+# Bus emits: ModelProfileLoaded { strategy: ?, outcome: Reprobed }
+```
+
+### Verified
+
+- `cargo fmt --check` clean.
+- `cargo clippy --workspace --all-targets -- -D warnings` clean.
+- `cargo test --workspace` → **atelier-core 472** (was 438; +34 from `adapter::model_profile`) + **atelier-cli 14** + **atelier-gui 12** + **atelier-tui 46** = **544 passing**.
+- `make check` — schemas + 52 artifacts + 112 rig tests + 11 dry-runs all OK.
+
+### Rig counts
+- **21 schemas / 52 artifacts / 112 tests / 11 dry-runs / 472 atelier-core unit tests + 14 atelier-cli integration tests + 12 atelier-gui unit tests + 46 atelier-tui unit tests** (atelier-core +34 from v50).
+
+### §1 capability/conformance status
+- **Adapter trait surface**: `chat`, `stream`, `count_tokens`, `capabilities`, `conformance` — all live since v38.
+- **Conformance ring buffer + degradation** (§2): live since v15.
+- **Capability matrix as machine-readable config**: deferred — the static-table approach (option 1 of the v51 design discussion) is a separate path that would land a `capabilities.toml` lookup before construction. Probe-on-first-use is the dynamic counterpart; both can coexist.
+- **"Claimed-but-broken" column**: surfaced via `CapabilityClaim::ClaimedButBroken`; the probe doesn't write this yet — it records observations directly. A v52 cross-walk between `ProbeObservation` and `CapabilityClaim` is the natural next step.
+
 ## v50 — 2026-05-17
 
 **OpenAI-compatible adapter lands + v49 LOW residuals closed.** Atelier now talks to any server speaking `POST /v1/chat/completions` — LM Studio, llama.cpp's `llama-server`, vLLM, sglang, Ollama (via its `/v1/` compat layer), and OpenAI itself. Pair with the existing Anthropic adapter and the `Mock` for tests, that's three of the four §1 BYOM providers in. Companion to the adapter: four v49 LOW residuals (LR-1..4) cleaned up from the rescan.

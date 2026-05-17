@@ -39,10 +39,10 @@ Atelier is a **Rust workspace**. Four crates under [`crates/`](crates/):
 
 | Crate | Role |
 |---|---|
-| [`atelier-core`](crates/atelier-core/) | Agent loop, BYOM adapters, MCP client, session state, checkpoints, cost ledger. **No UI dependencies.** The §2.5 state machine lives here. |
-| [`atelier-cli`](crates/atelier-cli/) | Headless `atelier` binary. Currently provides `atelier init`; future home for `atelier run` (Phase A) and `atelier login/logout/rotate/whoami` (spec §11). |
-| [`atelier-gui`](crates/atelier-gui/) | Tauri 2.x shell consuming `atelier-core` via a broadcast channel. Scaffold. |
-| [`atelier-tui`](crates/atelier-tui/) | `ratatui` + `crossterm` frontend over the same broadcast channel. Scaffold. |
+| [`atelier-core`](crates/atelier-core/) | Agent loop, BYOM adapters (Mock + Anthropic + OpenAI-compatible as of v50), session state, dispatcher, seven built-in tools, cost ledger, §1 probe-on-first-use cache (v51). **No UI dependencies.** The §2.5 state machine lives here. |
+| [`atelier-cli`](crates/atelier-cli/) | Hybrid lib + binary. The `atelier` binary provides `atelier init` and `atelier run` (the end-to-end agent-loop driver); the library exports a `Runner` the GUI and TUI link against for their own driver modes. |
+| [`atelier-gui`](crates/atelier-gui/) | Tauri 2.x + Svelte 5 driver. Multi-pane workspace (conversation / diff / plan / meters / composer); hunk accept-reject wired through the live `SessionDispatcher`; concurrent-run guard + per-run UUID workspaces. |
+| [`atelier-tui`](crates/atelier-tui/) | `ratatui` + `crossterm` driver. Same panes as the GUI plus scrubber keys `[` `]` `g`; `y` / `n` route through `SessionDispatcher::submit_approval`. Run with `cargo run -p atelier-tui -- "<prompt>"` for driver mode, no argument for viewer mode. |
 
 Top-level tree:
 
@@ -126,7 +126,7 @@ For `rmcp` dependency wiring and troubleshooting (`edition2024` error, proxy/net
 
 ## Configure and run
 
-Until the Phase A agent loop lands, the runnable surface is **(a)** `atelier init` to bootstrap a project, and **(b)** `make check` to drive the calibration rig that will verify the harness as it's built. The planned `atelier run` flow is sketched at the bottom of this section.
+The runnable surface today (v51): **(a)** `atelier init` to bootstrap a project, **(b)** `atelier run` to drive the end-to-end agent loop against Mock / Anthropic / any OpenAI-compatible server, **(c)** the GUI and TUI driver modes for the same loop with a visible workspace, and **(d)** `make check` to drive the calibration rig that verifies the harness on every push.
 
 ### 1. Bootstrap a project — `atelier init`
 
@@ -177,24 +177,70 @@ make summary          # one-line OK/FAIL per task
 make clean            # remove __pycache__ and .pytest_cache trees
 ```
 
-### 4. Drive the harness — `atelier run` *(coming with Phase A)*
+### 4. Drive the harness — `atelier run`
 
-The Phase A target is a single subcommand that drives the §2.5 loop end-to-end:
+The end-to-end agent-loop driver. Three providers live today (v51):
 
 ```sh
-atelier run "fix the failing test in src/parser.rs"
+# Mock — for tests + dev-loop walkthroughs (no network)
+atelier run --provider mock "anything goes"
+
+# Anthropic Messages API (set ANTHROPIC_API_KEY)
+atelier run --provider anthropic --model anthropic:claude-opus-4-7 \
+    "fix the failing test in src/parser.rs"
+
+# OpenAI-compatible — any server speaking POST /v1/chat/completions
+# (Ollama, LM Studio, llama-server, vLLM, sglang, OpenAI itself)
+atelier run --provider openai-compat \
+    --base-url http://localhost:11434/v1 \
+    --model local:qwen2.5-coder:7b \
+    "add a hello() function to src/main.rs"
 ```
 
-This will: load `ATELIER.md` into the system prompt, open a session under `.atelier/sessions/<uuid>/`, call the configured BYOM adapter (Anthropic first; LiteLLM-shaped next), stream tool calls through the unified MCP dispatch (built-in + external servers), apply edits atomically (`tempfile` + tree-sitter pre-commit check, spec §3), and either transition to `Verifying` on `claimed_done: true` or fail explicitly. Cost-ledger entries land per call; session JSON conforms to `schemas/session/v1.json`.
+What this does: loads `ATELIER.md` into the system prompt, opens a session under `.atelier/sessions/<uuid>/`, calls the configured BYOM adapter, streams tool calls through the §15 dispatcher (seven built-in tools — MCP-hosted external tools land when the `rmcp` spike clears), applies edits atomically (`tempfile` + tree-sitter pre-commit check, spec §3), and either transitions to `Verifying` on `claimed_done: true` or bails after `--max-turns`. Cost-ledger entries land per call; session JSON conforms to `schemas/session/v1.json`.
 
-Piece-by-piece state of the Phase A build — what's done, what's planned, where each piece lands in the tree — is in [`STATUS.md`](STATUS.md#phase-a--piece-by-piece-tracker).
+Useful flags:
+
+| Flag | Purpose |
+|---|---|
+| `--provider {mock,anthropic,openai-compat}` | Which adapter. |
+| `--model <ID>` | Model id (`anthropic:claude-opus-4-7`, `local:llama3:8b`, `openai:gpt-4o-mini`, …). |
+| `--base-url <URL>` | OpenAI-compat only. e.g. `http://localhost:11434/v1` for Ollama. |
+| `--workspace <PATH>` | Repo root; defaults to current dir. |
+| `--max-turns <N>` | Bail-out cap (default 32). |
+| `--prompt-file <PATH>` | Read prompt from file; `-` for stdin. |
+| `--no-probe` / `--force-probe` | Skip / force the v51 probe-on-first-use calibration. |
+
+### 5. Running against a local LLM
+
+Quickest path on macOS / Linux:
+
+```sh
+brew install ollama && brew services start ollama   # macOS; or `ollama serve` in a terminal
+ollama pull qwen2.5-coder:7b                        # ~4.7 GB; fits comfortably on an M1 Pro
+atelier run --provider openai-compat \
+    --base-url http://localhost:11434/v1 \
+    --model local:qwen2.5-coder:7b \
+    "<prompt>"
+```
+
+On first use the harness fires a short calibration probe (one native tool-call test + one JSON-sentinel envelope test) and writes a `ModelProfile` to `~/.atelier/model_profiles/<hash>.json`. Subsequent runs against the same `(model, base_url)` pair use the cached profile. The §1 conformance tracker still degrades at runtime if the live model misbehaves — the cached profile is the *initial* strategy hint, not a contract.
+
+LM Studio (`http://localhost:1234/v1`), llama-server (`http://localhost:8080/v1`), vLLM / sglang (`http://localhost:8000/v1`), and OpenAI itself (omit `--base-url`; set `OPENAI_API_KEY`) all work through the same `--provider openai-compat` switch.
+
+### 6. Driver-mode GUI and TUI
+
+The same `Runner` powers both UIs. Run the GUI with `cargo tauri dev` (in `crates/atelier-gui/`); type a prompt into the Composer and the multi-pane workspace renders conversation / diff / plan / meters live. The TUI runs as `cargo run -p atelier-tui -- "<prompt>"` (driver mode) or `cargo run -p atelier-tui` (viewer mode). Both speak the same broadcast bus and the same `SessionDispatcher::submit_approval` round-trip for hunk accept/reject.
+
+Piece-by-piece state of the build — what's landed, what's planned, where each piece lives in the tree — is in [`STATUS.md`](STATUS.md#phase-a--piece-by-piece-tracker).
 
 ---
 
 ## What's intentionally absent
 
 - **No CI provider beyond GitHub Actions.** The Makefile is portable; other providers (Buildkite, GitLab CI) can wrap `make check` similarly.
-- **No agent-loop runtime yet.** The spec describes one; the rig is ready to measure it; Phase A is building it.
+- **No MCP client yet.** Built-in tools (file ops + shell + search) run end-to-end through the dispatcher; the `rmcp`-based MCP client for external tool servers is gated on the spike at [`experiments/rmcp_spike/`](experiments/rmcp_spike/).
+- **No Bedrock / Vertex adapters yet.** Phase E/F. The OpenAI-compatible adapter covers the bulk of the local-LLM space and OpenAI itself; the LiteLLM-shaped gateway may not need a separate adapter once that surface is in.
 
 ---
 

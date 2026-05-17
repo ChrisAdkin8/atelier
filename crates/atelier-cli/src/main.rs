@@ -57,6 +57,19 @@ SUBCOMMANDS:
                                    Default 32 (PROVISIONAL).
     --prompt-file <PATH>           Read the prompt from PATH instead of argv.
                                    Use `-` for stdin.
+    --no-probe                     Skip the v51 probe-on-first-use
+                                   calibration. Falls back to a default
+                                   strategy from `Adapter::capabilities()`.
+                                   The §1 conformance tracker still
+                                   degrades at runtime if the model
+                                   misbehaves. Useful when running
+                                   offline or against a server you
+                                   know is fine.
+    --force-probe                  Re-probe even when a cached profile
+                                   is present. Overwrites the cache
+                                   entry on success. `--no-probe` and
+                                   `--force-probe` are mutually
+                                   exclusive.
 
 OPTIONS:
     -h, --help     Print this message.
@@ -125,6 +138,8 @@ fn run_run(mut args: impl Iterator<Item = String>) -> ExitCode {
     let mut max_turns: Option<usize> = None;
     let mut prompt_file: Option<PathBuf> = None;
     let mut prompt_args: Vec<String> = Vec::new();
+    let mut no_probe = false;
+    let mut force_probe = false;
 
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -174,9 +189,16 @@ fn run_run(mut args: impl Iterator<Item = String>) -> ExitCode {
                     return ExitCode::from(2);
                 }
             },
+            "--no-probe" => no_probe = true,
+            "--force-probe" => force_probe = true,
             // Everything else is treated as positional prompt text.
             _ => prompt_args.push(a),
         }
+    }
+
+    if no_probe && force_probe {
+        eprintln!("atelier run: --no-probe and --force-probe are mutually exclusive");
+        return ExitCode::from(2);
     }
 
     let provider_choice = match provider.as_str() {
@@ -274,6 +296,11 @@ fn run_run(mut args: impl Iterator<Item = String>) -> ExitCode {
         };
     if let Some(n) = max_turns {
         runner = runner.with_max_turns(n);
+    }
+    if no_probe {
+        runner = runner.with_probe_policy(runner::ProbePolicy::Skip);
+    } else if force_probe {
+        runner = runner.with_probe_policy(runner::ProbePolicy::Force);
     }
 
     match rt.block_on(runner.run(prompt)) {

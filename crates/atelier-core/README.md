@@ -1,12 +1,12 @@
 # atelier-core
 
-The Atelier harness core. No UI dependencies. Everything the agent loop, BYOM adapters, MCP client, session state, checkpoints, and ledger need lives here. `atelier-gui` and `atelier-tui` consume this crate over a broadcast channel.
+The Atelier harness core. No UI dependencies. Everything the agent loop, BYOM adapters, session state, dispatcher, built-in tools, ledger, and the §1 probe-on-first-use cache need lives here. `atelier-cli::Runner` ties them together; `atelier-gui` and `atelier-tui` consume the crate over a broadcast channel.
 
 Spec references: §1, §2, §2.5, §3, §4, §7, §11, §14, §15.
 
 ## Current state
 
-Phase A foundation + Phase B protocol/verification subset + Phase C data-layer prerequisites + Phase C UI unblockers (adapter trait, typed ledger, dispatcher with `HookExecutor` wired in + `validate_args` gate + `SessionDispatcher` wrapper, subprocess+sandbox helper, all 7 built-in tools with symlink containment + blocking-pool isolation + `ShellHookExecutor`) have landed; **361 unit tests, all green**. Only the §1 Anthropic adapter against the real Messages API remains before the canonical-workload mechanical gate can run against a live model. The crate is not yet end-to-end runnable — there is no BYOM adapter and no MCP client yet, so nothing drives a real turn. The pieces that don't depend on a live model are all in place:
+The crate is **end-to-end runnable** for Phase A/B/C scope: three BYOM adapters live (Mock, Anthropic, OpenAI-compatible — the third covers LM Studio, llama-server, vLLM, sglang, Ollama, OpenAI itself), seven built-in tools route through the §15 dispatcher with §11 sandbox enforcement, hunk accept/reject lives end-to-end via `SessionDispatcher::submit_approval`, and v51 adds probe-on-first-use model adaptation. **472 unit tests, all green** (v51: +34 from `adapter::model_profile`). The only big Phase A item still outstanding is the §15 MCP client (gated on the `rmcp` spike outcome) — the built-in tool dispatcher is the same surface a future MCP client will share, so all hook / ledger / verification wiring is in place.
 
 | Module | Spec | What it gives you |
 |---|---|---|
@@ -21,7 +21,7 @@ Phase A foundation + Phase B protocol/verification subset + Phase C data-layer p
 | `src/context.rs` | §5 (Phase C) | Typed `ContextItem` + insertion-ordered `ContextManager`. `Payload::{FileRef, InlineText, BlobRef}` and `Provenance::{Initial, UserAttached, ToolResult, MemoryPromoted, PinnedByUser}` carry the why-here trace. `evict` returns a `CacheBustEvent` for the §1 cost ledger. `TokenSnapshot` splits known from `Unavailable` so the meter never silently underreports. |
 | `src/memory.rs` | §5 (Phase C) | Typed `MemoryCard` matching the schema; `MemoryStore` with `add / touch / pin / unpin / evict`. `promote_to_global` returns `PromoteOutput { relative_path, bytes }` for the caller to write — keeps the module pure of I/O. `OnDiskSession.memory` retyped from `Vec<Value>` to `Vec<MemoryCard>` with on-disk round-trip preserved. |
 | `src/plan.rs` | §5 (Phase C) | Typed `PlanStep` + `PlanCanvas` with auto-id `add`, `insert`, `remove`, `mark_status`, idempotent `add_constraint`, and `reorder` that validates membership before mutating. `apply_envelope(&PlanUpdate)` consumes the §2 `plan_update` field (text-match for complete/remove; envelope-driven `reorder` intentionally dropped). |
-| `src/adapter.rs` | §1 (Phase C unblocker) | Async `Adapter` trait + typed `Capabilities` matrix + `CapabilityClaim::{Supported, ClaimedButBroken, Unsupported}` + `AdapterError` with `requires_user_decision()` for §2.5 routing. `MockAdapter` queues pre-built `ChunkStream`s for downstream tests (dispatcher, end-to-end loop) — no network anywhere in the test suite. |
+| `src/adapter/` | §1 | Async `Adapter` trait + typed `Capabilities` matrix + `CapabilityClaim::{Supported, ClaimedButBroken, Unsupported}` + `AdapterError` with `requires_user_decision()` for §2.5 routing. `MockAdapter` (in `mod.rs`) queues pre-built `ChunkStream`s for downstream tests. **Real adapters:** `anthropic.rs` (v38; Messages API, SSE streaming, native tool use, 18 wiremock tests), `openai_compat.rs` (v50; any `POST /v1/chat/completions` server — LM Studio / llama-server / vLLM / sglang / Ollama / OpenAI; 19 wiremock tests), `model_profile.rs` (v51; probe-on-first-use cache — `ModelProfile`, `ProbeObservation`, `decide_strategy`, `probe_model`, `ProfileStore::load_or_probe`; 34 tests). No network anywhere in the test suite — every adapter is exercised against `wiremock`. |
 | `src/ledger.rs` | §1 (Phase C unblocker) | Typed `LedgerEntry::{ModelCall, ToolCall, CacheBust}` enforcing the schema's per-kind required fields at compile time. `Ledger` append-only (`parking_lot::RwLock<Vec>` — no poisoning, so a panicking writer can't brick later reads) with `total_cost_usd / entries_without_cost / total_tokens` for the §3 cost meter. `local_cost_usd` + `DEFAULT_LOCAL_RATE_USD_PER_SEC` for latency-weighted local cost. `OnDiskSession.cost_ledger` retyped. Share via `Arc<Ledger>`, never `clone`. |
 | `src/dispatcher.rs` | §15 (Phase C unblocker) | Async `Tool` trait + `ToolRegistry` + `Dispatcher::dispatch` walking the per-tool-call lifecycle (lookup → identify hooks via `HookSet::for_tool_event` → execute → translate `CommitReport` → per-file `Event::EditStaged` → build `LedgerEntry::ToolCall`). Returns a pure `DispatchOutcome` — caller side-effects. `SessionDispatcher` wraps it with `Arc<Ledger>` + `broadcast::Sender<Event>` for the runtime path. `HookExecutor` trait + `ShellHookExecutor` (concrete, via the subprocess helper) + `NoopHookExecutor` (test default). |
 | `src/subprocess.rs` | §11 / §15 (Phase C unblocker) | Shared `run(program, args, &SubprocessSpec)` over `tokio::process` with concurrent stdout/stderr drain + timeout + reap. `sandboxed_argv(argv, &SandboxPolicy)` produces the macOS sandbox-exec / Linux bwrap-wrapped argv. Powers both the `shell` built-in tool and `ShellHookExecutor` so the §11 plumbing isn't duplicated. |
@@ -38,7 +38,7 @@ Phase A foundation + Phase B protocol/verification subset + Phase C data-layer p
 
 ```
 cargo build -p atelier-core
-cargo test  -p atelier-core   # 361 tests
+cargo test  -p atelier-core   # 472 tests (v51)
 ```
 
 ## `rmcp` dependency wiring
@@ -91,15 +91,15 @@ For the standalone `rmcp` maturity-assessment spike — a separate experiment, n
 
 ## What's still planned
 
-The Phase A foundation table above lists what exists today. Outstanding (in roughly the order they unblock each other):
+The table above lists what exists today. Outstanding (in roughly the order they unblock each other):
 
-- `adapter` — BYOM `Adapter` trait + first-party adapters (Anthropic first; LiteLLM-shaped next; OpenAI / Ollama deferred to Phase F). Unblocks the canonical-workload mechanical gate.
-- `mcp` — MCP client wrapping `rmcp`; stdio + HTTP/SSE transports; server registration from `mcp_servers.json`. Gated on the `rmcp` maturity spike at `../../experiments/rmcp_spike/`.
-- `dispatcher` — unified tool dispatch (built-in tools + MCP-routed tools through the same path), responsible for tracking the read-set that §14 file-watching observes and for invoking the §15 hook lifecycle around each call.
-- `protocol` — Model Protocol envelope types + emission/parsing for the three §2 strategies. Lands with the adapter.
-- `verify` — §7 verification gate runner; did-it-do-what-it-said diff comparing envelope `claimed_changes` against the post-state produced by `staging`.
-- `secrets` — OS keychain (`keyring`) + env-var fallback; `${env:…}` / `${keychain:…}` interpolation per spec §11.
+- `mcp` — MCP client wrapping `rmcp`; stdio + HTTP/SSE transports; server registration from `mcp_servers.json`. Gated on the `rmcp` maturity spike at `../../experiments/rmcp_spike/`. The dispatcher is already structured around the `Tool` trait; the MCP client lands as a new `Tool` impl shape that wraps `rmcp::Client`.
+- LiteLLM-shaped adapter — likely subsumed by `openai_compat` if the LiteLLM gateway speaks the OpenAI chat-completions surface, which it does. Re-evaluate once a concrete LiteLLM regression is in the canonical workload.
+- Bedrock + Vertex adapters (Phase E/F).
+- DoD-check executor — the loader is in but the runtime that actually shells out to `dod.checks[].command` and folds results into the `Verifying` transition is stubbed. The Runner emits a one-shot warning when a DoD config is present so callers see that checks aren't being honoured.
+- `secrets` — OS keychain (`keyring`) + env-var fallback; `${env:…}` / `${keychain:…}` interpolation per spec §11. Today `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` are read directly from the environment.
 - `checkpoint` — §4 diff-blob storage under `.atelier/sessions/<uuid>/diffs/`; integrates with `persistence::OnDiskSession::checkpoints`.
-- `watcher` — `notify` integration for §14 concurrent-edit detection; queues at tool-call boundary, never cancels mid-stream.
+- `watcher` — `notify` integration for §14 concurrent-edit detection; queues at tool-call boundary, never cancels mid-stream. The crate already declares the `notify` dep in the workspace; the integration is gated on the dispatcher exposing its read-set.
+- Probe-driven initial-strategy hint — v51 lands the observation layer; threading `ModelProfile.strategy` into the adapter's first-turn strategy (so the warm-up doesn't waste a downshift cycle) is a v52 one-line wiring change.
 
-The 8 built-in tool manifests live under `tools/`; subagent type manifests under `subagents/`; skill manifests under `skills/`; the MCP catalog at `catalog/mcp_servers.json`. The `dispatcher` will read them at session start.
+The 8 built-in tool manifests live under `tools/`; subagent type manifests under `subagents/`; skill manifests under `skills/`; the MCP catalog at `catalog/mcp_servers.json`. The dispatcher reads the tool manifests at session start.

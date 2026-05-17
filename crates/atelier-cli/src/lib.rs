@@ -28,7 +28,8 @@
 pub mod runner;
 
 pub use runner::{
-    DispatcherHandle, EventSink, MockResponse, ProviderChoice, RunError, RunReport, Runner,
+    DispatcherHandle, EventSink, MockResponse, ProbePolicy, ProviderChoice, RunError, RunReport,
+    Runner,
 };
 
 // v50: re-export ApprovalPolicy from atelier-core so a downstream

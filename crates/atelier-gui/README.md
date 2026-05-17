@@ -4,13 +4,21 @@ Tauri 2.x shell. Consumes `atelier-core` over a broadcast channel; renders the w
 
 ## Current state
 
-**Phase C unblock (3) — bootstrapped (v39).** `cargo build -p atelier-gui`, `cargo tauri info`, `npm run check`, and `npm run build` all pass. The Rust shell in `src/lib.rs` spawns an `atelier_core::session::Handle`, forwards its broadcast bus to the webview as `atelier://event`, and exposes a trivial `ping` IPC command. The Svelte panel in `ui/src/App.svelte` subscribes to the event bus and counts `EditStaged` events.
+**Driver-mode workspace (v45–v49).** Multi-pane Svelte 5 layout backed by a hybrid `atelier-cli` crate that the GUI links against to drive scripted runs end-to-end. `cargo build -p atelier-gui`, `cargo tauri info`, `npm run check` (clean: 94 files, 0 errors / 0 warnings), and `npm run build` (~62 kB JS / 22 kB gzip) all pass. `cargo test -p atelier-gui` → 12 unit tests on `bridge_event`.
+
+What's wired:
+
+- **Panes**: Header / ConversationPane / DiffPane / PlanPane / MetersPane / Composer, composed in `App.svelte` as a CSS grid.
+- **Event bus**: subscribes to `atelier://event` and folds events through a pure-TS `applyEvent` reducer mirroring the TUI state machine. The new v51 `ModelProfileLoaded` event is projected through `bridge_event` so the strategy badge can render off it.
+- **Driver mode**: the `start_demo_run` Tauri command builds a `Runner` with `ApprovalPolicy::AwaitApproval` and a scripted `MockAdapter`, runs it end-to-end against a per-run UUID workspace under `$TMP/atelier-gui-{pid}/{run_uuid}`, and pumps events back to the webview via `EventSink::Callback`.
+- **Hunk accept/reject** (v46 contract + v47 GUI driver wiring): DiffPane renders a pending banner with per-file checkboxes and accept/reject buttons; `submit_approval` Tauri command routes the accept set through the live `SessionDispatcher::submit_approval`.
+- **Defensive plumbing** (v49 audit fixes): concurrent-run guard via `Arc<AtomicBool>`, 64 KB prompt cap, per-run workspace cleanup via `RunCleanup` drop guard, `listenerReady` gate so a fast user can't lose the first run's events, prototype-pollution mitigation via `Object.create(null)` in the diff pane's accept set, `submit_approval` errors surfaced inline.
 
 What's intentionally *not* here yet:
 
-- The multi-pane workspace (conversation, diff, file tree, plan canvas, cost + context meters, timeline scrubber). The current panel is the smallest end-to-end demonstration — Phase C gates that need a richer UI ride on top.
-- Webview → Rust commands beyond `ping`. Start session / advance / cancel land alongside the multi-pane workspace.
-- Real icons. `icons/icon.png` is a 32×32 transparent placeholder so dev builds succeed; replace before the first signed release.
+- File tree pane (needs `OnDiskSession.files` snapshot the actor doesn't surface yet).
+- Drag-and-drop, inline Mermaid/D2/image previews, "why this change?" UI.
+- Real icons. `icons/icon.png` is a 32×32 placeholder so dev builds succeed; replace before the first signed release.
 - Codesign / notarization / installers. Local dev only.
 
 ## Quick start
@@ -26,7 +34,7 @@ cd crates/atelier-gui && cargo tauri dev              # spins up Vite + Rust she
 For tests without the webview:
 
 ```sh
-cargo test -p atelier-gui              # 6 unit tests on bridge_event
+cargo test -p atelier-gui              # 12 unit tests on bridge_event
 npm --prefix crates/atelier-gui/ui run check   # svelte-check + tsc
 npm --prefix crates/atelier-gui/ui run build   # production frontend build
 ```

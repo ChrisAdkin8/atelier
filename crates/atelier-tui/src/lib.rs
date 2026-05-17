@@ -52,7 +52,8 @@ use tokio::sync::broadcast::error::RecvError;
 /// without taking the runtime's copy.
 ///
 /// The conversation / plan / cost / context fields are populated by the
-/// host runtime (see [`run_async`] for the broadcast-bus wiring) and from
+/// host runtime (see the crate-private `run_async` for the
+/// broadcast-bus wiring) and from
 /// out-of-band channels that the §2.5 actor doesn't yet emit on the bus
 /// — populating them via `set_*` mutators lets the unit tests cover
 /// rendering without needing the producer side to exist yet.
@@ -298,7 +299,8 @@ impl AppState {
                 // files arrive separately and populate `recent_edits`.
                 self.pending_approval = None;
             }
-            SessionEvent::IllegalTransitionAttempted { .. }
+            SessionEvent::ModelProfileLoaded { .. }
+            | SessionEvent::IllegalTransitionAttempted { .. }
             | SessionEvent::Cancelled
             | SessionEvent::Shutdown => {}
         }
@@ -452,6 +454,19 @@ pub fn project_event(evt: &SessionEvent) -> EventLine {
         SessionEvent::EditStaged { path, .. } => EventLine {
             kind: "EditStaged",
             detail: path.display().to_string(),
+        },
+        SessionEvent::ModelProfileLoaded {
+            model_id,
+            strategy,
+            outcome,
+            ..
+        } => EventLine {
+            kind: "ModelProfile",
+            detail: format!(
+                "{model_id} · strategy={} · {}",
+                strategy.as_str(),
+                format!("{outcome:?}").to_lowercase()
+            ),
         },
         SessionEvent::Shutdown => EventLine {
             kind: "Shutdown",

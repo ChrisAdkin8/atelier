@@ -490,8 +490,9 @@ pub enum StrategyError {
     /// the reply is malformed; fail loudly rather than rubber-stamp.
     ///
     /// `length` is the total trailing-content byte length; `prefix`
-    /// carries up to [`TRAILING_PREFIX_BYTES`] of the trailing content
-    /// so a developer triaging the failure can tell "looks like a second
+    /// carries up to the module-private `TRAILING_PREFIX_BYTES` of the
+    /// trailing content so a developer triaging the failure can tell
+    /// "looks like a second
     /// sentinel" from "looks like leftover prose" without re-deriving
     /// from logs.
     #[error("non-whitespace content after sentinel close tag (length {length} bytes; prefix: {prefix:?})")]

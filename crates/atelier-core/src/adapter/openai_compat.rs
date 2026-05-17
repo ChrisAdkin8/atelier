@@ -162,7 +162,8 @@ impl OpenAiCompatAdapter {
     }
 
     /// Override `max_tokens`. OpenAI/llama-server require this on
-    /// every request; defaults to [`DEFAULT_MAX_TOKENS`].
+    /// every request; defaults to the module-private `DEFAULT_MAX_TOKENS`
+    /// constant.
     pub fn with_max_tokens(mut self, n: u32) -> Self {
         self.max_tokens = n;
         self

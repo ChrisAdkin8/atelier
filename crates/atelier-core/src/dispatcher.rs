@@ -101,8 +101,9 @@ impl SideEffectClass {
 /// the tool produced edits via §3 staging; the dispatcher publishes one
 /// `EditStaged` event per file once the batch commits.
 ///
-/// As of v46 the tool hands back a [`StagedBatch`] (validated + staged on
-/// disk, NOT renamed). The dispatcher's [`ApprovalPolicy`] decides
+/// As of v46 the tool hands back a [`crate::staging::StagedBatch`]
+/// (validated + staged on disk, NOT renamed). The dispatcher's
+/// [`ApprovalPolicy`] decides
 /// whether to call `commit_all` immediately (the v45 behaviour, default)
 /// or to emit `StagingPendingApproval` and wait for a user decision
 /// (spec §3 "Hunk accept / reject"). Tools therefore call
@@ -221,7 +222,7 @@ pub enum RegisterError {
 /// files commit — auto-approve all (the default [`AutoApprove`]
 /// behaviour, identical to v45), or block on a user decision routed
 /// through the broadcast bus (the production
-/// [`PendingApprovalGate`] used by [`SessionDispatcher`] when its
+/// the module-private `PendingApprovalGate` used by [`SessionDispatcher`] when its
 /// policy is [`ApprovalPolicy::AwaitApproval`]).
 ///
 /// The trait is async because real implementations wait on a `oneshot`
@@ -268,7 +269,7 @@ impl ApprovalGate for AutoApprove {
 /// (pre-tool + post-tool), and the [`ApprovalGate`] that decides which
 /// staged writes commit (spec §3 hunk accept/reject). Defaults are
 /// [`NoopHookExecutor`] + [`AutoApprove`]; production wires in
-/// [`ShellHookExecutor`] + [`PendingApprovalGate`] via the builder
+/// [`ShellHookExecutor`] + the module-private `PendingApprovalGate` via the builder
 /// methods.
 pub struct Dispatcher {
     registry: ToolRegistry,
@@ -297,7 +298,7 @@ impl Dispatcher {
 
     /// Replace the approval gate. Default is [`AutoApprove`].
     /// [`SessionDispatcher::with_approval_policy`] constructs a
-    /// [`PendingApprovalGate`] and threads it in.
+    /// the module-private `PendingApprovalGate` and threads it in.
     pub fn with_approval_gate(mut self, gate: Arc<dyn ApprovalGate>) -> Self {
         self.approval_gate = gate;
         self
@@ -413,7 +414,7 @@ impl Dispatcher {
         //    The pure `Dispatcher` invokes its `approval_gate` between
         //    stage and commit. The default [`AutoApprove`] returns
         //    every pending path so behaviour is identical to pre-v46.
-        //    `SessionDispatcher` installs a [`PendingApprovalGate`]
+        //    `SessionDispatcher` installs a the module-private `PendingApprovalGate`
         //    when its [`ApprovalPolicy::AwaitApproval`] is set —
         //    that gate emits `StagingPendingApproval` on the bus and
         //    awaits the user's accept-set via

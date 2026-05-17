@@ -423,6 +423,20 @@ pub fn bridge_event(evt: &SessionEvent) -> BridgedEvent {
                     .collect::<Vec<_>>(),
             }),
         },
+        SessionEvent::ModelProfileLoaded {
+            model_id,
+            base_url,
+            strategy,
+            outcome,
+        } => BridgedEvent {
+            kind: "ModelProfileLoaded",
+            payload: json!({
+                "model_id": model_id,
+                "base_url": base_url,
+                "strategy": strategy.as_str(),
+                "outcome": format!("{outcome:?}").to_lowercase(),
+            }),
+        },
         SessionEvent::Shutdown => BridgedEvent {
             kind: "Shutdown",
             payload: Value::Null,

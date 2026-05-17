@@ -20,6 +20,7 @@
 //! tests off the network and lets us inject specific failure modes.
 
 pub mod anthropic;
+pub mod model_profile;
 pub mod openai_compat;
 
 use async_trait::async_trait;

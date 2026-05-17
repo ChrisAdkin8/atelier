@@ -65,8 +65,8 @@ pub enum LedgerEntry {
     CacheBust {
         timestamp: String,
         /// Required by the schema — the `note` is the explanation surfaced
-        /// in the UI ("evicted context-item: <kind/provenance>", or
-        /// "ContextOverflowError -> <chosen action>", etc.).
+        /// in the UI (`evicted context-item: <kind/provenance>`, or
+        /// `ContextOverflowError -> <chosen action>`, etc.).
         note: String,
     },
 }

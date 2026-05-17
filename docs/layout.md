@@ -17,12 +17,12 @@ Full tree with one-line annotations. The top-level [README.md](../README.md) lis
 │   │   ├── subagents/                 bundled sub-agent types (researcher, test-runner, general-purpose)
 │   │   ├── tools/                     bundled built-in tool manifests (read_file, write_file, edit_file, list_dir, grep, ast_grep, shell, spawn_subagent) — matches spec §15
 │   │   └── templates/                 ATELIER.md seed template
-│   ├── atelier-cli/                   headless `atelier` binary (entry point for `atelier init`; spec §11)
-│   ├── atelier-gui/                   Tauri 2.x shell (scaffold)
-│   └── atelier-tui/                   ratatui + crossterm frontend (scaffold)
+│   ├── atelier-cli/                   hybrid lib+bin: the `atelier` binary (`init`, `run`) + a `Runner` library the GUI/TUI link against
+│   ├── atelier-gui/                   Tauri 2.x + Svelte 5 driver (multi-pane workspace, hunk accept/reject)
+│   └── atelier-tui/                   ratatui + crossterm driver (same panes; `cargo run -p atelier-tui -- "<prompt>"` for driver mode)
 ├── pyproject.toml                     rig manifest (jsonschema, pytest)
 ├── Makefile                           one-command rig orchestration
-├── schemas/                           20 JSON Schemas (see schemas/README.md)
+├── schemas/                           21 JSON Schemas (see schemas/README.md)
 ├── tasks/
 │   └── todo.md                        phased build plan + open questions
 ├── tests/

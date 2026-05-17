@@ -176,6 +176,30 @@ impl Drop for DispatcherHandleGuard<'_> {
     }
 }
 
+/// v51 — Probe-on-first-use policy. The Runner uses this to decide
+/// whether to call [`atelier_core::adapter::model_profile::ProfileStore::load_or_probe`]
+/// before the first turn, or to short-circuit with a stub profile
+/// (Mock and Anthropic are well-characterised; probing them would be
+/// wasted round-trips).
+///
+/// `#[allow(dead_code)]`: same rationale as [`ProviderChoice`] —
+/// `Force` is only constructed by the `atelier` binary's
+/// `--force-probe` path; the integration tests stay on `Auto`/`Skip`
+/// implicit-via-`ProviderChoice::Mock` defaults.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbePolicy {
+    /// Cache-first: reuse a cached profile when present, probe on
+    /// miss. Default for `openai-compat`.
+    Auto,
+    /// Never probe; build a stub profile from the adapter's
+    /// [`atelier_core::adapter::Capabilities`]. Default for `mock` and
+    /// `anthropic`; also the result of `--no-probe`.
+    Skip,
+    /// Always probe, even when cached. CLI `--force-probe`.
+    Force,
+}
+
 pub struct Runner {
     workspace: PathBuf,
     adapter: Arc<dyn Adapter>,
@@ -192,6 +216,12 @@ pub struct Runner {
     /// SessionDispatcher is constructed. Lets the GUI thread a
     /// `submit_approval` Tauri command to the live dispatcher.
     dispatcher_handle: Option<DispatcherHandle>,
+    /// v51 — probe policy chosen at construction time. The CLI
+    /// flips this for `--no-probe` / `--force-probe`.
+    probe_policy: ProbePolicy,
+    /// v51 — base URL used as part of the probe cache key. Empty
+    /// for adapters that don't speak HTTP (Mock, Anthropic).
+    probe_base_url: String,
 }
 
 impl Runner {
@@ -204,35 +234,53 @@ impl Runner {
         provider: ProviderChoice,
         sink: EventSink,
     ) -> Result<Self, RunError> {
-        let adapter: Arc<dyn Adapter> = match provider {
-            ProviderChoice::Mock { responses } => Arc::new(build_mock_adapter(responses)),
-            ProviderChoice::Anthropic { model_id } => {
-                Arc::new(AnthropicAdapter::from_env(model_id).map_err(adapter_to_run_error)?)
-            }
-            ProviderChoice::OpenAiCompat { model_id, base_url } => {
-                // Empty OPENAI_API_KEY is OK — most local servers
-                // (LM Studio, llama-server, vLLM, Ollama-compat)
-                // don't require auth. A 401 from a server that
-                // *does* require it surfaces as AdapterError::Auth
-                // at first call.
-                //
-                // base_url None → adapter default (OpenAI). Local
-                // servers must be explicit via --base-url (or
-                // OPENAI_BASE_URL via from_env), since pointing at
-                // OpenAI by accident with a `local:` model id would
-                // 404 in a confusing way.
-                let api_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
-                let base = base_url.unwrap_or_else(|| {
-                    std::env::var("OPENAI_BASE_URL")
-                        .unwrap_or_else(|_| "https://api.openai.com/v1".to_string())
-                });
-                Arc::new(
-                    atelier_core::adapter::openai_compat::OpenAiCompatAdapter::new(
-                        api_key, model_id, base,
-                    ),
-                )
-            }
-        };
+        // v51: per-provider probe defaults. Mock + Anthropic are
+        // well-characterised — no point spending two calibration
+        // round-trips on them. OpenAI-compat is the unknown:
+        // self-hosted models vary widely, so we cache-and-probe by
+        // default. The CLI flips this for `--no-probe` / `--force-probe`.
+        let (adapter, probe_policy, probe_base_url): (Arc<dyn Adapter>, ProbePolicy, String) =
+            match provider {
+                ProviderChoice::Mock { responses } => (
+                    Arc::new(build_mock_adapter(responses)),
+                    ProbePolicy::Skip,
+                    String::new(),
+                ),
+                ProviderChoice::Anthropic { model_id } => (
+                    Arc::new(AnthropicAdapter::from_env(model_id).map_err(adapter_to_run_error)?),
+                    ProbePolicy::Skip,
+                    String::new(),
+                ),
+                ProviderChoice::OpenAiCompat { model_id, base_url } => {
+                    // Empty OPENAI_API_KEY is OK — most local servers
+                    // (LM Studio, llama-server, vLLM, Ollama-compat)
+                    // don't require auth. A 401 from a server that
+                    // *does* require it surfaces as AdapterError::Auth
+                    // at first call.
+                    //
+                    // base_url None → adapter default (OpenAI). Local
+                    // servers must be explicit via --base-url (or
+                    // OPENAI_BASE_URL via from_env), since pointing at
+                    // OpenAI by accident with a `local:` model id would
+                    // 404 in a confusing way.
+                    let api_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
+                    let base = base_url.unwrap_or_else(|| {
+                        std::env::var("OPENAI_BASE_URL")
+                            .unwrap_or_else(|_| "https://api.openai.com/v1".to_string())
+                    });
+                    (
+                        Arc::new(
+                            atelier_core::adapter::openai_compat::OpenAiCompatAdapter::new(
+                                api_key,
+                                model_id,
+                                base.clone(),
+                            ),
+                        ),
+                        ProbePolicy::Auto,
+                        base,
+                    )
+                }
+            };
         Ok(Self {
             workspace,
             adapter,
@@ -240,6 +288,8 @@ impl Runner {
             max_turns: 32,
             approval_policy: atelier_core::dispatcher::ApprovalPolicy::AutoApproveAll,
             dispatcher_handle: None,
+            probe_policy,
+            probe_base_url,
         })
     }
 
@@ -265,6 +315,20 @@ impl Runner {
     /// motivating use case.
     pub fn with_dispatcher_handle(mut self, handle: DispatcherHandle) -> Self {
         self.dispatcher_handle = Some(handle);
+        self
+    }
+
+    /// v51 — override the probe policy. Defaults are per-provider
+    /// (set in [`Self::new`]); the CLI's `--no-probe` / `--force-probe`
+    /// flags use this to overlay user intent on top of the provider
+    /// default.
+    ///
+    /// `#[allow(dead_code)]`: only the binary's `--no-probe` /
+    /// `--force-probe` paths reach this; tests rely on the per-provider
+    /// default set in [`Self::new`].
+    #[allow(dead_code)]
+    pub fn with_probe_policy(mut self, policy: ProbePolicy) -> Self {
+        self.probe_policy = policy;
         self
     }
 
@@ -320,6 +384,88 @@ impl Runner {
         //    after we Shutdown below).
         let mut event_rx = session_handle.subscribe();
         let sink_handle = spawn_sink_drain(&self.sink, &mut event_rx);
+
+        // 4b. v51 — resolve the model profile (cached or freshly
+        //     probed) and broadcast it so UIs can render the active
+        //     §2 strategy badge before the first turn lands. For
+        //     `Skip` policy adapters (Mock, Anthropic) we build a
+        //     stub from `Adapter::capabilities()`; for `Auto`/`Force`
+        //     we call into `ProfileStore::load_or_probe`. A probe
+        //     failure logs + falls back to a stub so the run still
+        //     proceeds — better to lose a probe than to refuse to
+        //     start.
+        let profile_now = now_rfc3339();
+        let caps = self.adapter.capabilities();
+        let (profile, outcome) = match self.probe_policy {
+            ProbePolicy::Skip => {
+                let strategy = if caps.native_tool_use.is_usable() {
+                    atelier_core::protocol_strategy::Strategy::NativeTool
+                } else {
+                    atelier_core::protocol_strategy::Strategy::JsonSentinel
+                };
+                let p = atelier_core::adapter::model_profile::ModelProfile::skipped_for_well_known(
+                    self.adapter.model_id(),
+                    strategy,
+                    caps.context_window_tokens,
+                    atelier_core::adapter::model_profile::DEFAULT_PROFILE_MAX_TOKENS,
+                    profile_now.clone(),
+                );
+                (
+                    p,
+                    atelier_core::adapter::model_profile::ProbeLoadOutcome::CacheHit,
+                )
+            }
+            ProbePolicy::Auto | ProbePolicy::Force => {
+                let force = matches!(self.probe_policy, ProbePolicy::Force);
+                let store = atelier_core::adapter::model_profile::ProfileStore::user_default();
+                match store
+                    .load_or_probe(
+                        self.adapter.as_ref(),
+                        &self.probe_base_url,
+                        force,
+                        profile_now.clone(),
+                    )
+                    .await
+                {
+                    Ok((p, o)) => (p, o),
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "model probe failed; falling back to a default profile and \
+                             continuing with §1 conformance-tracker-driven strategy selection"
+                        );
+                        let strategy = if caps.native_tool_use.is_usable() {
+                            atelier_core::protocol_strategy::Strategy::NativeTool
+                        } else {
+                            atelier_core::protocol_strategy::Strategy::JsonSentinel
+                        };
+                        let p = atelier_core::adapter::model_profile::ModelProfile::skipped_for_well_known(
+                            self.adapter.model_id(),
+                            strategy,
+                            caps.context_window_tokens,
+                            atelier_core::adapter::model_profile::DEFAULT_PROFILE_MAX_TOKENS,
+                            profile_now,
+                        );
+                        (
+                            p,
+                            atelier_core::adapter::model_profile::ProbeLoadOutcome::NotCached,
+                        )
+                    }
+                }
+            }
+        };
+        let _ = bus.send(Event::ModelProfileLoaded {
+            model_id: profile.model_id.clone(),
+            base_url: profile.base_url.clone(),
+            strategy: profile.strategy,
+            outcome,
+        });
+        // The profile itself is informational in v51 — the §1
+        // conformance tracker still drives runtime strategy
+        // selection at the adapter level. A v52 follow-on can
+        // thread `profile.strategy` into the adapter's initial
+        // strategy so the first turn skips the warm-up period.
+        let _initial_strategy_hint = profile.strategy;
 
         // 5. Turn loop.
         let session_id = session_handle.id();

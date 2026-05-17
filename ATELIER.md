@@ -1,12 +1,13 @@
 # Atelier — project context
 
-Atelier is a **coding harness mid-build**: agent loop, BYOM adapters, MCP transport, verification gates, hooks, cost ledger. Phase A foundation, Phase B protocol/verification subset, and Phase C data-layer prerequisites have all landed in `atelier-core` (§2.5 actor, §3 atomic staging + incremental diff stream, §11 sandbox profiles, §14 on-disk session + recovery log + registry, §15 hook loader + first-use approval, §2 typed envelope + 3 emission strategies + conformance tracker, §7 did-it-do-what-it-said + DoD loader, §5 typed context/memory/plan) on top of the existing state machine, error taxonomy, and `atelier init`. The agent loop is **not yet end-to-end runnable** — no BYOM adapter or MCP client yet — but the runtime mechanics and the data layer that everything else hangs off are in place. The Phase C UIs (Tauri + ratatui) are still scaffold-only and need the adapter to drive real envelopes. The harness is the product; the supporting rig (schemas + canonical workload + self-tests) is what verifies it as the remaining modules land. See `tasks/todo.md` for what's done vs. in flight.
+Atelier is a **coding harness, end-to-end runnable on Phase A/B/C scope**: agent loop, BYOM adapters, verification gates, hooks, cost ledger, GUI + TUI. As of v51 the full pipeline runs against three providers (Mock, Anthropic, OpenAI-compatible — which covers LM Studio / llama-server / vLLM / sglang / Ollama / OpenAI itself), with hunk accept/reject, GUI driver mode, TUI driver mode, and probe-on-first-use model adaptation. `atelier-core` carries the §2.5 actor, §3 atomic staging + incremental diff stream, §11 sandbox profiles, §14 on-disk session + recovery log + registry, §15 hook loader + first-use approval + dispatcher + seven built-in tools, §2 typed envelope + three emission strategies + conformance tracker, §7 did-it-do-what-it-said + DoD loader, §5 typed context/memory/plan, and §1 probe-on-first-use cache. The §15 MCP-over-`rmcp` client is the remaining big-ticket Phase A item; the harness drives built-in tools end-to-end today. See `tasks/todo.md` for what's done vs. in flight; `CHANGELOG.md` for the version-by-version trail (latest: v51).
 
 ## Stack
 
-- **Rust workspace**, pinned to 1.85 (`rust-toolchain.toml`). Three crates: `atelier-core` (agent loop, MCP client, session state, ledger — no UI), `atelier-gui` (Tauri 2.x scaffold), `atelier-tui` (ratatui + crossterm scaffold). GUI and TUI both consume `atelier-core` via a broadcast channel.
+- **Rust workspace**, pinned to 1.85 (`rust-toolchain.toml`). Four crates: `atelier-core` (agent loop, BYOM adapters, session state, ledger — no UI), `atelier-cli` (hybrid lib+bin; the `atelier` binary plus a `Runner` library the GUI/TUI link against), `atelier-gui` (Tauri 2.x + Svelte 5 driver), `atelier-tui` (ratatui + crossterm driver). GUI and TUI both consume `atelier-core` via a broadcast channel and embed `atelier-cli::Runner` to drive scripted runs.
 - **Python rig** in `tests/` validates schemas, artifacts, and workload runs. Pinned via `pyproject.toml [optional-dependencies.rig]`.
-- **MCP-first tool transport** via `rmcp` crate. Built-in and external tools share the MCP interface.
+- **MCP-first tool transport** via `rmcp` crate (gated on the spike at `experiments/rmcp_spike/`). Built-in tools (seven landed: `read_file`, `list_dir`, `grep`, `write_file`, `edit_file`, `ast_grep`, `shell`) share the dispatcher with the future MCP-hosted external tools — hooks, ledger, trust budget, and verification gates treat them uniformly.
+- **BYOM providers landed (v51):** Mock (always), Anthropic Messages API (`anthropic:` model prefix, `ANTHROPIC_API_KEY`), OpenAI-compatible (`openai-compat` with `--base-url`; works against LM Studio, llama-server, vLLM, sglang, Ollama's `/v1/` compat surface, and OpenAI itself; `OPENAI_API_KEY` honoured but optional). Bedrock + Vertex sit in Phase E/F.
 
 ## Canonical commands
 
@@ -21,7 +22,25 @@ Atelier is a **coding harness mid-build**: agent loop, BYOM adapters, MCP transp
 - `schemas/` — 21 JSON Schemas. Cross-schema `$ref`s resolve via `tests/_schema_helpers.py`.
 - `tests/workload/canonical/` — 11 task fixtures. Don't run pytest *inside* canonical/; the runner copies each to a tempdir (`pyproject.toml` excludes it).
 - `tasks/todo.md` — current phased build plan. Active state lives here, not in this file.
-- `CHANGELOG.md` — spec + rig revisions.
+- `CHANGELOG.md` — spec + rig revisions; v51 = latest.
+- `crates/atelier-core/src/adapter/` — the BYOM surface: `mod.rs` (trait + Mock), `anthropic.rs` (Messages API), `openai_compat.rs` (v50; OpenAI-compatible against LM Studio / llama-server / vLLM / Ollama / OpenAI), `model_profile.rs` (v51; probe-on-first-use cache).
+- `crates/atelier-cli/src/runner.rs` — the `Runner` that wires the §2.5 actor + dispatcher + ledger + adapter + probe into a runnable loop. Linked by both `atelier-cli` (binary) and the GUI/TUI (driver mode).
+
+## Running a local LLM through the harness (v50+)
+
+`atelier-compat` works with any OpenAI-style chat-completions server. Quickest path:
+
+```sh
+brew install ollama && brew services start ollama
+ollama pull qwen2.5-coder:7b
+cargo run -p atelier-cli -- run \
+    --provider openai-compat \
+    --base-url http://localhost:11434/v1 \
+    --model local:qwen2.5-coder:7b \
+    "<prompt>"
+```
+
+On first use the harness fires a short calibration probe (one tool-call test + one JSON-sentinel test) and caches the resulting `ModelProfile` to `~/.atelier/model_profiles/<hash>.json`. Override with `--no-probe` (skip; use capability defaults) or `--force-probe` (re-probe even if cached). LM Studio (`:1234`), llama-server (`:8080`), vLLM (`:8000`), and OpenAI itself (no `--base-url`, set `OPENAI_API_KEY`) all work through the same flag.
 
 ## Verification convention
 

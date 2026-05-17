@@ -112,7 +112,7 @@ impl AnthropicAdapter {
     }
 
     /// Override the `max_tokens` cap Anthropic requires on every request.
-    /// Defaults to [`DEFAULT_MAX_TOKENS`].
+    /// Defaults to the module-private `DEFAULT_MAX_TOKENS` constant.
     pub fn with_max_tokens(mut self, n: u32) -> Self {
         self.max_tokens = n;
         self

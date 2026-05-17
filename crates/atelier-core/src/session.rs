@@ -161,11 +161,14 @@ pub enum Event {
     /// Spec §3 "Hunk accept / reject": a tool staged writes and the
     /// dispatcher is waiting for the user's accept-set decision before
     /// the rename phase. UI consumers render each `files[i]` (path +
-    /// hunks) with an accept/reject control and send
-    /// [`Command::ApproveCommit`] (or equivalent dispatcher call —
-    /// see `SessionDispatcher::submit_approval`) carrying the accepted
+    /// hunks) with an accept/reject control and call
+    /// `SessionDispatcher::submit_approval` carrying the accepted
     /// paths. The `commit_id` is the correlation token; the
-    /// dispatcher only acts on a matching approval.
+    /// dispatcher only acts on a matching approval. (Pre-v46 the
+    /// design called for a `Command::ApproveCommit` actor message
+    /// here; the spec §3 follow-on landed as a direct dispatcher
+    /// call instead so the approval round-trip stays out of the
+    /// session command queue.)
     StagingPendingApproval {
         commit_id: Uuid,
         files: Vec<PendingFile>,
@@ -196,6 +199,27 @@ pub enum Event {
         commit_id: Uuid,
         committed: Vec<PathBuf>,
         dropped: Vec<PathBuf>,
+    },
+
+    /// v51 — probe-on-first-use (§1). Emitted by the Runner once,
+    /// before the first turn, once the model profile (cached or
+    /// freshly probed) has been resolved. UIs render the active §2
+    /// strategy badge ("native tool · cached", "json sentinel ·
+    /// probed", …) off this event.
+    ///
+    /// `model_id` is `<provider>:<model>`, `base_url` is empty for
+    /// adapters that don't speak HTTP (Mock, Anthropic). `strategy`
+    /// is the [`crate::protocol_strategy::Strategy`] the profile
+    /// recommends as the *initial* §2 mode; the runtime conformance
+    /// tracker may still degrade if the model misbehaves. `outcome`
+    /// distinguishes cache-hit / probed / re-probed / not-cached —
+    /// useful for the user to know whether a probe round-trip just
+    /// happened.
+    ModelProfileLoaded {
+        model_id: String,
+        base_url: String,
+        strategy: crate::protocol_strategy::Strategy,
+        outcome: crate::adapter::model_profile::ProbeLoadOutcome,
     },
 
     /// The actor is shutting down. No further events will be emitted.

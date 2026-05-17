@@ -221,7 +221,7 @@ impl DodConfig {
 
     /// The paths [`Self::load`] would (or did) consult, in priority order.
     /// Useful for telling the user *why* DoD discovery returned `None` —
-    /// e.g. logging "no DoD configured (searched: <paths>)" instead of
+    /// e.g. logging `no DoD configured (searched: <paths>)` instead of
     /// silently degrading.
     pub fn paths_searched(repo_root: &Path) -> Vec<PathBuf> {
         let mut out = vec![Self::per_repo_path(repo_root)];

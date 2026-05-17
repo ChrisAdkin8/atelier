@@ -239,7 +239,7 @@ pub enum StagingError {
 
 /// Per-file post-commit annotation. UI consumes this to render
 /// "syntax-check: pass | fail | not-applicable | grammar-missing" badges per
-/// spec §3, plus the [`Hunks`] payload the live-diff renderer consumes.
+/// spec §3, plus the [`crate::diff::Hunks`] payload the live-diff renderer consumes.
 #[derive(Debug, Clone)]
 pub struct FileOutcome {
     pub path: PathBuf,
