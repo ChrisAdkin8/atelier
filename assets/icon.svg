@@ -1,8 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- atelier app icon — capital A in the macOS system UI font (SF Pro Regular,
-     `.SFNS-Regular`). Matches the font GitHub renders the README in on macOS.
+<!-- atelier app icon — lowercase 'a' in the macOS system UI font (SF Pro
+     Regular, `.SFNS-Regular`). Lowercase to mirror the all-lowercase "atelier"
+     wordmark in assets/banner-loop.svg; font matches what GitHub renders the
+     README in on macOS.
 
-     The 'A' is a baked glyph path rather than an SVG <text> element: rsvg/Pango
+     The glyph is a baked path rather than an SVG <text> element: rsvg/Pango
      can't access the protected system font directly, and at icon sizes any
      fallback selection produces a visibly different glyph. Baking the SF Pro
      outline at design time via Core Text removes the font-selection step;
@@ -10,9 +12,9 @@
 
      Path generated via assets/glyph-to-path.swift; the centring transform puts
      the path's bbox centre on canvas (512, 512). Regenerate after a macOS font
-     update by re-running the helper with arguments "system A 660". -->
+     update by re-running the helper with arguments "system a 900". -->
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024"
-     role="img" aria-label="atelier — A monogram">
+     role="img" aria-label="atelier — a monogram">
   <title>atelier</title>
 
   <!-- Apple's macOS Big Sur+ "Production icon" template: 1024×1024 canvas with
@@ -22,12 +24,13 @@
        side. -->
   <rect x="100" y="100" width="824" height="824" rx="185" ry="185" fill="#0e1116"/>
 
-  <!-- Baked 'A' glyph from .SFNS-Regular at font-size 660.
-       scale(1 -1) flips Core Text's Y-up coordinates to SVG's Y-down;
-       translate(302.36 744.51) centres the glyph's bbox on canvas (512, 512).
-       Numbers from assets/glyph-to-path.swift output (bbox center cx=209.64,
-       cy=232.51 → 512-209.64=302.36, 512-(-232.51)=744.51). -->
-  <g transform="translate(302.36 744.51) scale(1 -1)" fill="#f0ead6">
-    <path d="M8.056640625 0.0 L181.11328125 465.029296875 L223.974609375 465.029296875 L223.974609375 395.419921875 L209.150390625 395.419921875 L68.96484375 0.0 Z M87.333984375 133.095703125 L106.669921875 182.40234375 L312.919921875 182.40234375 L332.255859375 133.095703125 Z M350.302734375 0.0 L210.439453125 395.419921875 L210.439453125 465.029296875 L238.4765625 465.029296875 L411.2109375 0.0 Z"/>
+  <!-- Baked 'a' glyph from .SFNS-Regular at font-size 900 (chosen so the
+       lowercase x-height occupies similar visual space to the previous 'A'
+       at font-size 660). scale(1 -1) flips Core Text's Y-up coordinates to
+       SVG's Y-down; translate(294.25 740.52) centres the glyph's bbox on
+       canvas (512, 512). Numbers from glyph-to-path.swift output (bbox
+       center cx=217.75, cy=228.52 → 512-217.75=294.25, 512-(-228.52)=740.52). -->
+  <g transform="translate(294.25 740.52) scale(1 -1)" fill="#f0ead6">
+    <path d="M183.251953125 -8.7890625 Q137.98828125 -8.7890625 103.7109375 8.349609375 Q69.43359375 25.48828125 50.3173828125 56.689453125 Q31.201171875 87.890625 31.201171875 129.19921875 L31.201171875 130.078125 Q31.201171875 169.189453125 50.7568359375 197.75390625 Q70.3125 226.318359375 107.4462890625 243.017578125 Q144.580078125 259.716796875 196.875 262.79296875 L366.064453125 272.4609375 L366.064453125 213.134765625 L205.6640625 203.466796875 Q159.9609375 200.830078125 134.6923828125 181.494140625 Q109.423828125 162.158203125 109.423828125 130.078125 L109.423828125 129.19921875 Q109.423828125 96.240234375 134.2529296875 76.904296875 Q159.08203125 57.568359375 200.390625 57.568359375 Q236.42578125 57.568359375 265.2099609375 72.7294921875 Q293.994140625 87.890625 310.9130859375 114.2578125 Q327.83203125 140.625 327.83203125 173.583984375 L327.83203125 308.49609375 Q327.83203125 350.244140625 301.6845703125 374.1943359375 Q275.537109375 398.14453125 227.63671875 398.14453125 Q183.69140625 398.14453125 156.6650390625 379.0283203125 Q129.638671875 359.912109375 123.046875 329.150390625 L122.16796875 325.1953125 L48.33984375 325.1953125 L48.779296875 330.029296875 Q52.294921875 367.822265625 74.4873046875 398.583984375 Q96.6796875 429.345703125 135.791015625 447.5830078125 Q174.90234375 465.8203125 228.515625 465.8203125 Q282.568359375 465.8203125 321.8994140625 447.36328125 Q361.23046875 428.90625 382.763671875 395.2880859375 Q404.296875 361.669921875 404.296875 315.966796875 L404.296875 0.0 L327.83203125 0.0 L327.83203125 74.267578125 L326.07421875 74.267578125 Q312.890625 49.21875 290.91796875 30.5419921875 Q268.9453125 11.865234375 241.4794921875 1.5380859375 Q214.013671875 -8.7890625 183.251953125 -8.7890625 Z"/>
   </g>
 </svg>
