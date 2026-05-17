@@ -28,9 +28,8 @@ The spec is in [`coding-harness-spec.md`](coding-harness-spec.md). Where the bui
 - **Bring-your-own-model from day one.** Not a vendor wrapper. Provider adapters are pluggable; `atelier-core` has no SDK bias and no hardcoded host paths.
 - **Verification is a state, not a claim.** The agent loop has an explicit `Verifying` transition (spec §2.5). A task is "done" only when the harness can prove it — tests pass, schemas validate, gates clear — not when the model asserts so.
 - **MCP-first tool transport.** Built-in tools (file ops, shell, search) and external MCP servers (filesystem, GitHub, databases, custom) share one interface via `rmcp`. Hooks, ledger, trust budget, and verification gates treat them uniformly (spec §15).
-- **Headless core, swappable frontends.** `atelier-core` ships no UI. The Tauri GUI and `ratatui` TUI consume the same broadcast channel; a third frontend is additive, not invasive.
+- **A workspace with swappable frontends.** The agent is a collaborator with explicit sessions, checkpoints, hooks, and file boundaries — not a chat box with side effects. `atelier-core` ships no UI; the Tauri GUI and `ratatui` TUI consume the same broadcast channel, and a third frontend is additive.
 - **Cost ledger and trust budget as first-class concerns.** Every tool call, token, and side effect is accounted for. Observability is built in, not bolted on.
-- **The AI is a collaborator in a workspace, not a chat box with side effects.** Sessions, checkpoints, hooks, and file boundaries are explicit.
 
 ---
 
@@ -314,6 +313,14 @@ make clean            # remove __pycache__ and .pytest_cache trees
 - **No Bedrock / Vertex adapters yet.** Phase E/F. The OpenAI-compatible adapter covers the bulk of the local-LLM space and OpenAI itself; the LiteLLM-shaped gateway may not need a separate adapter once that surface is in.
 
 ---
+
+## Maintainers
+
+[@ChrisAdkin8](https://github.com/ChrisAdkin8)
+
+## Security
+
+See [`SECURITY.md`](SECURITY.md) for the supported-versions policy and how to report a vulnerability privately. Please don't open a public issue for suspected security defects — use the channel in `SECURITY.md` instead.
 
 ## License
 
