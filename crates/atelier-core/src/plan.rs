@@ -16,6 +16,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::protocol::{PlanOp, PlanOpKind, PlanUpdate};
 
+/// v60 — plan-text safety guard shared by `PlanCanvas::from_vec` (the
+/// session-snapshot reload path) and `apply_envelope_op` (the model-
+/// controlled envelope path). Routes through
+/// [`crate::text_safety::validate_user_text`] with the frontmatter
+/// check off (plan steps aren't promoted to markdown).
+fn validate_plan_step_text(text: &str) -> Result<(), PlanError> {
+    crate::text_safety::validate_user_text(text, /* check_frontmatter */ false)
+        .map_err(PlanError::InvalidContent)
+}
+
 /// Status of a plan step. Matches the schema's `status` enum exactly so the
 /// typed shape and the on-disk JSON stay locked together.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -42,6 +52,20 @@ impl PlanStatus {
     /// are terminal; `Pending` and `InProgress` are not.
     pub fn is_terminal(self) -> bool {
         matches!(self, Self::Done | Self::Skipped)
+    }
+
+    /// v58 (MED-smell-2) — parse a wire-format label back into a
+    /// `PlanStatus`. Single source of truth so the GUI's wire parser
+    /// can't drift from the serde `rename_all = "snake_case"`
+    /// projection.
+    pub fn from_wire_label(s: &str) -> Option<Self> {
+        match s {
+            "pending" => Some(Self::Pending),
+            "in_progress" => Some(Self::InProgress),
+            "done" => Some(Self::Done),
+            "skipped" => Some(Self::Skipped),
+            _ => None,
+        }
     }
 }
 
@@ -77,6 +101,14 @@ pub enum PlanError {
         got: usize,
         missing: Vec<String>,
     },
+
+    /// v59 (MED-sec-2) — plan-step text or constraint contained a
+    /// byte we won't accept: NUL / other ASCII control characters
+    /// (except `\n` / `\t`), Unicode line/paragraph separators
+    /// (`U+2028`/`U+2029`), or bidirectional marks/overrides that
+    /// would render the step reversed in the GUI/TUI.
+    #[error("plan content is invalid: {0}")]
+    InvalidContent(String),
 }
 
 /// Insertion-ordered list of plan steps. The plan canvas renders in this
@@ -99,9 +131,20 @@ impl PlanCanvas {
 
     /// Build from a serialised list (e.g., loaded from
     /// `OnDiskSession.plan.steps`). Rejects duplicate ids.
+    ///
+    /// v60 (HIGH-bug-2 fix) — also validates each step's `text` and
+    /// every constraint against the shared
+    /// `text_safety::validate_user_text` predicate. Symmetric with
+    /// `MemoryStore::from_vec` so a hand-edited session snapshot
+    /// can't reintroduce Trojan-Source bidi marks or control bytes
+    /// that the live add path rejects.
     pub fn from_vec(steps: Vec<PlanStep>) -> Result<Self, PlanError> {
         let mut c = Self::default();
         for s in steps {
+            validate_plan_step_text(&s.text)?;
+            for constraint in &s.constraints {
+                validate_plan_step_text(constraint)?;
+            }
             c.insert(s)?;
         }
         Ok(c)
@@ -255,6 +298,17 @@ impl PlanCanvas {
     fn apply_envelope_op(&mut self, op: &PlanOp) -> Result<(), &'static str> {
         match op.op {
             PlanOpKind::Add => {
+                // v60 (HIGH-bug-1 fix) — model-controlled envelope
+                // path must pass the same text-safety predicate as
+                // the UI `add_plan_step` mutator. Pre-v60 a hostile
+                // model could land a bidi-override or control byte
+                // into the plan via this envelope op even though
+                // `SessionDispatcher::add_plan_step` rejected the
+                // identical content. Surfaces as a dropped op so the
+                // ApplyReport tells callers what didn't land.
+                if validate_plan_step_text(&op.step).is_err() {
+                    return Err("step text rejected by text-safety validator");
+                }
                 self.add(op.step.clone());
                 Ok(())
             }
@@ -319,6 +373,78 @@ mod tests {
     }
 
     // ---------- add / insert / iter / serde round-trip ----------
+
+    #[test]
+    fn plan_status_wire_label_round_trips_through_serde() {
+        // Regression for MED-smell-2 — `from_wire_label` is the
+        // single source of truth, shared with `#[serde(rename_all =
+        // "snake_case")]`. Pin the agreement so a variant rename
+        // can't drift.
+        for st in [
+            PlanStatus::Pending,
+            PlanStatus::InProgress,
+            PlanStatus::Done,
+            PlanStatus::Skipped,
+        ] {
+            let json = serde_json::to_value(st).unwrap();
+            let serde_label = json.as_str().expect("PlanStatus serializes as a string");
+            assert_eq!(serde_label, st.as_str());
+            assert_eq!(PlanStatus::from_wire_label(serde_label), Some(st));
+        }
+        assert_eq!(PlanStatus::from_wire_label("blocked"), None);
+    }
+
+    #[test]
+    fn from_vec_rejects_trojan_source_in_step_text() {
+        // Regression for v60 HIGH-bug-2 — `from_vec` is the
+        // session-snapshot reload path; a hand-edited or attacker-
+        // controlled snapshot must NOT bypass the v59 validator.
+        let steps = vec![PlanStep {
+            id: "step-0".into(),
+            text: "do thing \u{202E} reversed".into(),
+            status: PlanStatus::Pending,
+            constraints: vec![],
+        }];
+        let err = PlanCanvas::from_vec(steps).unwrap_err();
+        assert!(matches!(err, PlanError::InvalidContent(_)));
+    }
+
+    #[test]
+    fn from_vec_rejects_trojan_source_in_constraint() {
+        let steps = vec![PlanStep {
+            id: "step-0".into(),
+            text: "harmless step".into(),
+            status: PlanStatus::Pending,
+            constraints: vec!["safe".into(), "evil \u{202E} reversed".into()],
+        }];
+        let err = PlanCanvas::from_vec(steps).unwrap_err();
+        assert!(matches!(err, PlanError::InvalidContent(_)));
+    }
+
+    #[test]
+    fn apply_envelope_drops_op_with_trojan_source_text() {
+        // Regression for v60 HIGH-bug-1 — model-controlled envelope
+        // path must drop ops whose `step` text would render reversed.
+        use crate::protocol::{PlanOp, PlanOpKind, PlanUpdate};
+        let mut c = PlanCanvas::new();
+        let update = PlanUpdate {
+            ops: vec![
+                PlanOp {
+                    op: PlanOpKind::Add,
+                    step: "clean step".into(),
+                },
+                PlanOp {
+                    op: PlanOpKind::Add,
+                    step: "evil \u{202E} reversed".into(),
+                },
+            ],
+        };
+        let report = c.apply_envelope(&update);
+        assert_eq!(report.applied, 1);
+        assert_eq!(report.dropped.len(), 1);
+        assert!(report.dropped[0].1.contains("text-safety"));
+        assert_eq!(c.len(), 1, "only the clean step lands in the canvas");
+    }
 
     #[test]
     fn add_returns_unique_ids_and_appends() {

@@ -27,6 +27,13 @@
 // migrating tests off the module path) is a one-line change.
 pub mod runner;
 
+/// v60 — shared "promote a memory card to disk" writer. Both
+/// drivers (GUI Tauri command + TUI mutation handler) route through
+/// here so the v58/v59 hardening (HOME validation, canonical-root
+/// containment, atomic write, size cap) applies uniformly. See the
+/// module-level doc for the failure modes it closes.
+pub mod memory_promote;
+
 pub use runner::{
     DispatcherHandle, EventSink, MockResponse, ProbePolicy, ProviderChoice, RunError, RunReport,
     Runner,

@@ -19,11 +19,60 @@
   // from a broken pane.
 
   import type { MemoryCardSummary } from '../state'
+  import { invoke } from '@tauri-apps/api/core'
 
   interface Props {
     cards: MemoryCardSummary[]
   }
   let { cards }: Props = $props()
+
+  // v55 — editable round-trips. The dispatcher mutator re-emits
+  // `MemoryCards` on each successful op so we don't update local
+  // state; we just wait for the snapshot to land. Promote is the
+  // only one with a non-bool return — it writes to
+  // `~/.atelier/memory/` and reports the resulting path.
+  let draft: string = $state('')
+  let toast: string | null = $state(null)
+  let toastError: boolean = $state(false)
+
+  async function add() {
+    const content = draft.trim()
+    if (!content) return
+    try {
+      await invoke<string>('add_memory_card', { content })
+      draft = ''
+    } catch (e) {
+      showToast(String(e), true)
+    }
+  }
+
+  async function deleteCard(id: string) {
+    try {
+      await invoke<null>('delete_memory_card', { id })
+    } catch (e) {
+      showToast(String(e), true)
+    }
+  }
+
+  async function promote(id: string) {
+    try {
+      const r = await invoke<{ path: string; bytes: number }>(
+        'promote_memory_card',
+        { id },
+      )
+      showToast(`promoted → ${r.path} (${r.bytes} bytes)`, false)
+    } catch (e) {
+      showToast(String(e), true)
+    }
+  }
+
+  function showToast(msg: string, isError: boolean) {
+    toast = msg
+    toastError = isError
+    setTimeout(() => {
+      if (toast === msg) toast = null
+    }, 4500)
+  }
 
   /// "2026-05-17T12:34:56Z" → "2026-05-17 12:34". The full
   /// timestamp is kept in the `title` tooltip; the badge is the
@@ -47,6 +96,16 @@
 <section class="pane memory-pane">
   <header class="pane-title">§5 Memory</header>
 
+  <form class="composer" onsubmit={(e) => { e.preventDefault(); void add() }}>
+    <textarea
+      bind:value={draft}
+      placeholder="add a memory card…"
+      rows="2"
+      aria-label="new memory card content"
+    ></textarea>
+    <button type="submit" disabled={!draft.trim()}>add</button>
+  </form>
+
   {#if cards.length === 0}
     <p class="empty">no memory cards yet</p>
   {:else}
@@ -63,6 +122,24 @@
             {/if}
             <span class="title">{card.title || '(untitled)'}</span>
             <span class="when">{shortTimestamp(card.last_used)}</span>
+            <span class="row-actions">
+              <button
+                class="action"
+                onclick={() => void promote(card.id)}
+                title="promote to ~/.atelier/memory/"
+                aria-label="promote {card.id}"
+              >
+                ↑ promote
+              </button>
+              <button
+                class="action danger"
+                onclick={() => void deleteCard(card.id)}
+                title="delete"
+                aria-label="delete {card.id}"
+              >
+                ✕
+              </button>
+            </span>
           </div>
           {#if card.body_preview}
             <p class="preview">{card.body_preview}</p>
@@ -70,6 +147,10 @@
         </li>
       {/each}
     </ul>
+  {/if}
+
+  {#if toast}
+    <p class="toast" class:toast-error={toastError}>{toast}</p>
   {/if}
 </section>
 
@@ -124,9 +205,84 @@
   }
   .row-head {
     display: grid;
-    grid-template-columns: auto 1fr auto;
+    grid-template-columns: auto 1fr auto auto;
     gap: 0.4rem;
     align-items: baseline;
+  }
+  .composer {
+    display: flex;
+    gap: 0.4rem;
+    align-items: stretch;
+    padding: 0.35rem 0.6rem;
+    border-bottom: 1px dotted var(--border-pane);
+  }
+  .composer textarea {
+    flex: 1;
+    resize: vertical;
+    min-height: 1.6rem;
+    background: var(--bg-input, rgba(255, 255, 255, 0.03));
+    border: 1px solid var(--border-pane);
+    color: var(--fg-default, #ddd);
+    border-radius: 3px;
+    padding: 0.25rem 0.4rem;
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+  }
+  .composer button {
+    background: transparent;
+    border: 1px solid var(--border-pane);
+    border-radius: 3px;
+    color: var(--fg-default, #ddd);
+    cursor: pointer;
+    font-family: inherit;
+    font-size: 0.75rem;
+    padding: 0 0.7rem;
+  }
+  .composer button:hover:not(:disabled) {
+    background: var(--bg-hover, rgba(255, 255, 255, 0.06));
+  }
+  .composer button:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+  .row-actions {
+    display: inline-flex;
+    gap: 0.2rem;
+    opacity: 0.4;
+    transition: opacity 0.1s;
+  }
+  .row:hover .row-actions {
+    opacity: 1;
+  }
+  .action {
+    background: transparent;
+    border: 1px solid var(--border-pane);
+    border-radius: 3px;
+    color: var(--fg-default, #ddd);
+    cursor: pointer;
+    font-family: inherit;
+    font-size: 0.7rem;
+    padding: 0 0.3rem;
+    line-height: 1.2;
+  }
+  .action:hover {
+    background: var(--bg-hover, rgba(255, 255, 255, 0.06));
+  }
+  .action.danger:hover {
+    color: #f88;
+    border-color: #844;
+  }
+  .toast {
+    margin: 0;
+    padding: 0.3rem 0.6rem;
+    font-size: 0.72rem;
+    color: var(--fg-dim);
+    border-top: 1px dotted var(--border-pane);
+    background: rgba(0, 200, 100, 0.04);
+  }
+  .toast-error {
+    color: #f88;
+    background: rgba(200, 0, 0, 0.05);
   }
   .pin {
     font-size: 0.7rem;

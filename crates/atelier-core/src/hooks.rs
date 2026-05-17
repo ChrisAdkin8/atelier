@@ -421,6 +421,31 @@ mod tests {
     }
 
     #[test]
+    fn hook_event_as_str_agrees_with_serde() {
+        // Regression for v60 MED-C — `HookEvent::as_str` and the
+        // `#[serde(rename_all = "kebab-case")]` projection must
+        // produce identical strings, mirroring the v60 discipline
+        // applied to `MessageRole`, `ProbeLoadOutcome`, `Provenance`,
+        // `PlanStatus`, `ClaimedChangeKind`, and `SideEffectClass`.
+        for ev in [
+            HookEvent::PreTool,
+            HookEvent::PostTool,
+            HookEvent::OnVerifyPass,
+            HookEvent::OnVerifyFail,
+        ] {
+            let serde_label = serde_json::to_value(ev).unwrap();
+            let serde_str = serde_label
+                .as_str()
+                .expect("HookEvent serializes as a string");
+            assert_eq!(
+                serde_str,
+                ev.as_str(),
+                "as_str({ev:?}) must match serde projection"
+            );
+        }
+    }
+
+    #[test]
     fn parses_bundled_example_manifest() {
         let bytes = std::fs::read(
             // repo-relative path; tests run with cwd = crate dir, walk up to repo root.

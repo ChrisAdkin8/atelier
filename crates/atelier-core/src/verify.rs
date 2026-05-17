@@ -136,12 +136,12 @@ impl Discrepancy {
     }
 }
 
+// v59 (MED-smell-2 fix) — `kind_label` retired in favour of the
+// canonical `ClaimedChangeKind::wire_label`. Inlined at call sites
+// below.
+#[inline]
 fn kind_label(k: ClaimedChangeKind) -> &'static str {
-    match k {
-        ClaimedChangeKind::Edit => "edit",
-        ClaimedChangeKind::Create => "create",
-        ClaimedChangeKind::Delete => "delete",
-    }
+    k.wire_label()
 }
 
 /// Run the §7 did-it-do-what-it-said comparison. Returns an empty vec on

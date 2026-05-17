@@ -59,6 +59,20 @@ pub enum ClaimedChangeKind {
     Delete,
 }
 
+impl ClaimedChangeKind {
+    /// v59 (MED-smell-2) — canonical lowercase wire label. Matches the
+    /// `#[serde(rename_all = "lowercase")]` projection. Single source
+    /// of truth so the runner's projection into `ClaimedChangeSummary`
+    /// and any UI string-match logic stay in sync with serde.
+    pub fn wire_label(self) -> &'static str {
+        match self {
+            Self::Edit => "edit",
+            Self::Create => "create",
+            Self::Delete => "delete",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Uncertainty {
@@ -186,6 +200,25 @@ impl Envelope {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claimed_change_kind_wire_label_agrees_with_serde() {
+        // Regression for v59 MED-smell-2 — pin `wire_label` to the
+        // `#[serde(rename_all = "lowercase")]` projection. Single
+        // source of truth across the runner's bus projection,
+        // verify::kind_label, and any UI string-match logic.
+        for k in [
+            ClaimedChangeKind::Edit,
+            ClaimedChangeKind::Create,
+            ClaimedChangeKind::Delete,
+        ] {
+            let json = serde_json::to_value(k).unwrap();
+            let serde_label = json
+                .as_str()
+                .expect("ClaimedChangeKind serializes as a string");
+            assert_eq!(serde_label, k.wire_label());
+        }
+    }
 
     #[test]
     fn round_trips_minimal_edit_example_from_fewshot() {

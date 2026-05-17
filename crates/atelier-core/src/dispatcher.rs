@@ -227,17 +227,21 @@ pub enum RegisterError {
 ///
 /// The trait is async because real implementations wait on a `oneshot`
 /// channel; the trivial impl returns instantly.
+///
+/// v56: return type widened from `Vec<PathBuf>` to
+/// [`crate::staging::HunkSelection`] so the gate can carry per-hunk
+/// decisions through to `commit_selected_hunks`.
 #[async_trait]
 pub trait ApprovalGate: Send + Sync {
-    /// Decide which of `pending` to commit. Returns the accepted paths
-    /// (subset of `pending[i].path`). An empty return = full reject.
-    /// `commit_id` is the correlation token the implementation may use
-    /// for round-tripping over the bus.
+    /// Decide which of `pending` to commit and at what granularity.
+    /// Paths absent from the returned `HunkSelection` are fully
+    /// rejected. `commit_id` is the correlation token the
+    /// implementation may use for round-tripping over the bus.
     async fn approve(
         &self,
         commit_id: uuid::Uuid,
         pending: &[crate::staging::FileOutcome],
-    ) -> Vec<std::path::PathBuf>;
+    ) -> crate::staging::HunkSelection;
 
     // v49 — `notify_outcome` removed. `CommitDecision` emission moved
     // to `SessionDispatcher::dispatch` so the bus ordering
@@ -259,8 +263,11 @@ impl ApprovalGate for AutoApprove {
         &self,
         _commit_id: uuid::Uuid,
         pending: &[crate::staging::FileOutcome],
-    ) -> Vec<std::path::PathBuf> {
-        pending.iter().map(|f| f.path.clone()).collect()
+    ) -> crate::staging::HunkSelection {
+        pending
+            .iter()
+            .map(|f| (f.path.clone(), crate::staging::FileApproval::All))
+            .collect()
     }
 }
 
@@ -432,13 +439,11 @@ impl Dispatcher {
                         .iter()
                         .map(|f| f.path.clone())
                         .collect();
-                    let accepted_vec = self
+                    let selection = self
                         .approval_gate
                         .approve(commit_id, batch.pending_files())
                         .await;
-                    let accepted: std::collections::HashSet<std::path::PathBuf> =
-                        accepted_vec.into_iter().collect();
-                    match batch.commit_selected(&accepted) {
+                    match batch.commit_selected_hunks(&selection) {
                         Ok(report) => {
                             let committed: Vec<std::path::PathBuf> =
                                 report.files.iter().map(|f| f.path.clone()).collect();
@@ -594,7 +599,7 @@ struct PendingApprovalGate {
         parking_lot::Mutex<
             std::collections::HashMap<
                 uuid::Uuid,
-                tokio::sync::oneshot::Sender<Vec<std::path::PathBuf>>,
+                tokio::sync::oneshot::Sender<crate::staging::HunkSelection>,
             >,
         >,
     >,
@@ -606,12 +611,23 @@ impl ApprovalGate for PendingApprovalGate {
         &self,
         commit_id: uuid::Uuid,
         pending: &[crate::staging::FileOutcome],
-    ) -> Vec<std::path::PathBuf> {
+    ) -> crate::staging::HunkSelection {
         // Register a oneshot and emit the bus event. The consumer
-        // calls SessionDispatcher::submit_approval(commit_id, accepted)
+        // calls SessionDispatcher::submit_approval(commit_id, selection)
         // which fulfils the oneshot, unblocking this await.
+        //
+        // v57 (H1 fix) — a `PendingEntryGuard` holds the
+        // `pending`-map lifetime so a cancelled dispatch future
+        // (caller times out, GUI tab closes, etc.) removes the
+        // entry on drop. Without the guard, the `tx` lingered in
+        // the HashMap forever and a long-running session with
+        // frequent cancellations grew unboundedly.
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.pending.lock().insert(commit_id, tx);
+        let _guard = PendingEntryGuard {
+            pending: self.pending.clone(),
+            commit_id,
+        };
 
         let pending_files: Vec<crate::session::PendingFile> = pending
             .iter()
@@ -627,8 +643,33 @@ impl ApprovalGate for PendingApprovalGate {
 
         // If the sender is dropped (consumer crashed mid-decision)
         // the receiver errors. Treat that as full reject — safer than
-        // committing without user consent.
+        // committing without user consent. The guard drops here too
+        // — on the success path the entry was already removed by
+        // `submit_approval`, so the second `remove` is a no-op.
         rx.await.unwrap_or_default()
+    }
+}
+
+/// v57 — drop guard for the `PendingApprovalGate.pending` HashMap.
+/// On any exit from `approve` (success, failure, cancellation,
+/// panic) the entry is removed so a stale `oneshot::Sender` can't
+/// linger. `submit_approval` on the success path removes the entry
+/// first; the guard's drop becomes a no-op.
+struct PendingEntryGuard {
+    pending: Arc<
+        parking_lot::Mutex<
+            std::collections::HashMap<
+                uuid::Uuid,
+                tokio::sync::oneshot::Sender<crate::staging::HunkSelection>,
+            >,
+        >,
+    >,
+    commit_id: uuid::Uuid,
+}
+
+impl Drop for PendingEntryGuard {
+    fn drop(&mut self) {
+        let _ = self.pending.lock().remove(&self.commit_id);
     }
 }
 
@@ -643,6 +684,99 @@ impl ApprovalGate for PendingApprovalGate {
 /// The pure [`Dispatcher`] stays the unit-test surface (no `Arc`, no
 /// `Sender`); `SessionDispatcher` is the production surface that the
 /// `atelier run` CLI / agent-loop wiring builds at session start.
+/// v57 (M-sec-4) / v58 (L-sec-2) — substring keys that almost always
+/// carry secrets. A value whose key contains any of these (ASCII
+/// case-insensitive) is replaced with `"<redacted>"` before the
+/// payload lands in the `ATELIER_HOOK_PAYLOAD` env var.
+///
+/// The list is deliberately broad — false-positive redactions cost a
+/// hook a useful debug payload, false-negatives cost a user-pasted
+/// API key.
+///
+/// v58 additions cover AWS access keys (matched via `access_key`),
+/// GitHub PATs (`_pat`), private keys (`private_key`), bearer
+/// tokens (`bearer`), and HTTP cookies / session cookies (`cookie`).
+const SECRET_KEY_SUBSTRINGS: &[&str] = &[
+    "api_key",
+    "apikey",
+    "access_key",
+    "private_key",
+    "secret",
+    "password",
+    "passwd",
+    "token",
+    "authorization",
+    "auth_token",
+    "bearer",
+    "session_id",
+    "credentials",
+    "cookie",
+    "_pat",
+];
+
+fn key_looks_secret(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    SECRET_KEY_SUBSTRINGS.iter().any(|s| lower.contains(s))
+}
+
+/// Walk `payload` and replace the value of any key whose name matches
+/// [`SECRET_KEY_SUBSTRINGS`] with `"<redacted>"`. Non-object values are
+/// returned unchanged. Arrays are recursed into so a nested
+/// `{"headers":[{"name":"authorization","value":"Bearer X"}]}` still
+/// gets its `value` masked when the matching name suggests a secret.
+fn redact_secrets(payload: &serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match payload {
+        Value::Object(map) => {
+            let mut out = serde_json::Map::with_capacity(map.len());
+            for (k, v) in map {
+                if key_looks_secret(k) {
+                    out.insert(k.clone(), Value::String("<redacted>".into()));
+                } else {
+                    out.insert(k.clone(), redact_secrets(v));
+                }
+            }
+            Value::Object(out)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(redact_secrets).collect()),
+        other => other.clone(),
+    }
+}
+
+/// v60 (MED-A fix) — memory-card content validator. Thin wrapper
+/// over `crate::text_safety::validate_user_text` (with frontmatter
+/// check on) so the rule set lives in one place across the live
+/// add path, `MemoryStore::from_vec`, the plan path, and any future
+/// free-form-text consumer.
+fn validate_memory_card_content(content: &str) -> Result<(), crate::memory::MemoryError> {
+    crate::text_safety::validate_user_text(content, /* check_frontmatter */ true)
+        .map_err(crate::memory::MemoryError::InvalidContent)
+}
+
+/// v59 (MED-sec-2) / v60 (MED-A fix) — plan-step text validator.
+/// Skips the frontmatter check (plan steps aren't promoted to
+/// markdown) but otherwise shares the rule set via
+/// [`crate::text_safety::validate_user_text`].
+pub(crate) fn validate_plan_text(text: &str) -> Result<(), crate::plan::PlanError> {
+    crate::text_safety::validate_user_text(text, /* check_frontmatter */ false)
+        .map_err(crate::plan::PlanError::InvalidContent)
+}
+
+/// Parse a `ContextItemId` from its stringified UUID form
+/// (`ContextItemSummary::id`).
+///
+/// v57 (L cleanup) — returns `ContextError::Malformed(id)` for
+/// invalid UUIDs instead of `NotFound(nil-uuid)`. The pre-v57 nil
+/// UUID rendered as "context item 00000000-0000-… not found" in the
+/// UI for a simple typo — misleading.
+fn parse_context_item_id(
+    id: &str,
+) -> Result<crate::context::ContextItemId, crate::context::ContextError> {
+    uuid::Uuid::parse_str(id)
+        .map(crate::context::ContextItemId)
+        .map_err(|_| crate::context::ContextError::Malformed(id.to_string()))
+}
+
 pub struct SessionDispatcher {
     dispatcher: Dispatcher,
     ledger: Arc<crate::ledger::Ledger>,
@@ -655,10 +789,20 @@ pub struct SessionDispatcher {
         parking_lot::Mutex<
             std::collections::HashMap<
                 uuid::Uuid,
-                tokio::sync::oneshot::Sender<Vec<std::path::PathBuf>>,
+                tokio::sync::oneshot::Sender<crate::staging::HunkSelection>,
             >,
         >,
     >,
+    /// v55 — §5 shared state. The runner constructs these `Arc`s once
+    /// and clones one set into the dispatcher via
+    /// [`Self::with_shared_state`] so the UI's pin / unpin / evict /
+    /// add-card / mark-step-done mutators land on the same store the
+    /// runner reads at each turn boundary. `new` seeds each with a
+    /// fresh empty instance so `SessionDispatcher` is constructible
+    /// without the runner — unit tests still work.
+    context_manager: Arc<parking_lot::Mutex<crate::context::ContextManager>>,
+    memory_store: Arc<parking_lot::Mutex<crate::memory::MemoryStore>>,
+    plan_canvas: Arc<parking_lot::Mutex<crate::plan::PlanCanvas>>,
 }
 
 impl SessionDispatcher {
@@ -672,51 +816,97 @@ impl SessionDispatcher {
             ledger,
             events,
             pending: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+            context_manager: Arc::new(parking_lot::Mutex::new(
+                crate::context::ContextManager::new(),
+            )),
+            memory_store: Arc::new(parking_lot::Mutex::new(crate::memory::MemoryStore::new())),
+            plan_canvas: Arc::new(parking_lot::Mutex::new(crate::plan::PlanCanvas::new())),
         }
+    }
+
+    /// v55 — share the runner's §5 state with this dispatcher. The
+    /// runner owns one set of `Arc`s and clones them into the
+    /// dispatcher at construction; UI mutator methods on
+    /// `SessionDispatcher` then mutate the same stores the runner
+    /// re-emits from at each turn boundary.
+    pub fn with_shared_state(
+        mut self,
+        context_manager: Arc<parking_lot::Mutex<crate::context::ContextManager>>,
+        memory_store: Arc<parking_lot::Mutex<crate::memory::MemoryStore>>,
+        plan_canvas: Arc<parking_lot::Mutex<crate::plan::PlanCanvas>>,
+    ) -> Self {
+        self.context_manager = context_manager;
+        self.memory_store = memory_store;
+        self.plan_canvas = plan_canvas;
+        self
     }
 
     /// Install the spec §3 hunk-accept-reject policy. With
     /// `AwaitApproval`, [`Self::dispatch`] for tools that produce staged
     /// writes emits `Event::StagingPendingApproval` and blocks until
     /// the consumer calls [`Self::submit_approval`].
+    ///
+    /// v57 (M-bug-2 fix) — `AutoApproveAll` now actively re-installs
+    /// the [`AutoApprove`] gate. The pre-v57 path treated this arm as
+    /// a no-op, which silently broke any caller that toggled
+    /// `AwaitApproval → AutoApproveAll` to "revert" — the inner
+    /// gate stayed at `PendingApprovalGate` and dispatch kept parking
+    /// on the pending channel.
     pub fn with_approval_policy(mut self, policy: ApprovalPolicy) -> Self {
-        match policy {
-            ApprovalPolicy::AutoApproveAll => {
-                // Default; nothing to do — the pure dispatcher's
-                // default gate is AutoApprove.
-            }
-            ApprovalPolicy::AwaitApproval => {
-                let gate = Arc::new(PendingApprovalGate {
-                    events: self.events.clone(),
-                    pending: self.pending.clone(),
-                });
-                // Swap the inner dispatcher to one with the new gate.
-                // Builder consumes self; we re-construct in place.
-                let old = std::mem::replace(
-                    &mut self.dispatcher,
-                    Dispatcher::new(ToolRegistry::new(), HookSet::empty()),
-                );
-                self.dispatcher = old.with_approval_gate(gate);
-            }
-        }
+        let gate: Arc<dyn ApprovalGate> = match policy {
+            ApprovalPolicy::AutoApproveAll => Arc::new(AutoApprove),
+            ApprovalPolicy::AwaitApproval => Arc::new(PendingApprovalGate {
+                events: self.events.clone(),
+                pending: self.pending.clone(),
+            }),
+        };
+        // Swap the inner dispatcher to one with the new gate. Builder
+        // consumes self; we re-construct in place.
+        let old = std::mem::replace(
+            &mut self.dispatcher,
+            Dispatcher::new(ToolRegistry::new(), HookSet::empty()),
+        );
+        self.dispatcher = old.with_approval_gate(gate);
         self
     }
 
     /// Spec §3 follow-on to `Event::StagingPendingApproval`: deliver
-    /// the user's accept set for a pending commit. Returns `false`
-    /// when `commit_id` doesn't match an outstanding pending (e.g.
-    /// already approved, or the dispatcher dropped its receiver
-    /// because the consumer disconnected).
+    /// the user's [`crate::staging::HunkSelection`] for a pending
+    /// commit. Returns `false` when `commit_id` doesn't match an
+    /// outstanding pending (e.g. already approved, or the dispatcher
+    /// dropped its receiver because the consumer disconnected).
+    ///
+    /// v56 widened from `Vec<PathBuf>` to `HunkSelection` so the
+    /// consumer can carry per-hunk decisions. To preserve pre-v56
+    /// call ergonomics, see [`Self::submit_approval_files`] which
+    /// translates a path list into an `All` selection.
     pub fn submit_approval(
+        &self,
+        commit_id: uuid::Uuid,
+        selection: crate::staging::HunkSelection,
+    ) -> bool {
+        let sender = self.pending.lock().remove(&commit_id);
+        match sender {
+            Some(tx) => tx.send(selection).is_ok(),
+            None => false,
+        }
+    }
+
+    /// Pre-v56-compat wrapper. Builds a `FileApproval::All` selection
+    /// from `accepted` and delegates to [`Self::submit_approval`].
+    /// Used by callers that still think in terms of file-level
+    /// accept/reject — tests, the v47 GUI/TUI path before per-hunk
+    /// selection lands.
+    pub fn submit_approval_files(
         &self,
         commit_id: uuid::Uuid,
         accepted: Vec<std::path::PathBuf>,
     ) -> bool {
-        let sender = self.pending.lock().remove(&commit_id);
-        match sender {
-            Some(tx) => tx.send(accepted).is_ok(),
-            None => false,
-        }
+        let selection: crate::staging::HunkSelection = accepted
+            .into_iter()
+            .map(|p| (p, crate::staging::FileApproval::All))
+            .collect();
+        self.submit_approval(commit_id, selection)
     }
 
     /// Access the underlying pure dispatcher (useful when tests need to
@@ -724,6 +914,172 @@ impl SessionDispatcher {
     /// registry / hook-set state).
     pub fn dispatcher(&self) -> &Dispatcher {
         &self.dispatcher
+    }
+
+    // ----- v55 §5 mutator surface -----
+    //
+    // Each method acquires the relevant lock, calls the pure data-layer
+    // op, drops the lock, then re-broadcasts the matching Snapshot
+    // event so subscribed UIs converge. The pure data layer stays I/O-
+    // free; this layer owns the side effects (lock + emit + ledger).
+
+    fn emit_context_items(&self) {
+        let items = self.context_manager.lock().summarise();
+        let _ = self.events.send(Event::ContextItems { items });
+    }
+
+    fn emit_memory_cards(&self) {
+        let cards = self.memory_store.lock().summarise();
+        let _ = self.events.send(Event::MemoryCards { cards });
+    }
+
+    fn emit_plan_snapshot(&self) {
+        let steps = self.plan_canvas.lock().to_vec();
+        let _ = self.events.send(Event::PlanSnapshot { steps });
+    }
+
+    /// Pin a context item. UI handler. Returns `Ok` on success, with
+    /// the matching `ContextItems` snapshot already broadcast; UI
+    /// state converges on receipt rather than from the return value.
+    pub fn pin_context_item(&self, id: &str) -> Result<(), crate::context::ContextError> {
+        let item_id = parse_context_item_id(id)?;
+        self.context_manager.lock().pin(item_id)?;
+        self.emit_context_items();
+        Ok(())
+    }
+
+    pub fn unpin_context_item(&self, id: &str) -> Result<(), crate::context::ContextError> {
+        let item_id = parse_context_item_id(id)?;
+        self.context_manager.lock().unpin(item_id)?;
+        self.emit_context_items();
+        Ok(())
+    }
+
+    /// Evict a context item. Also appends a `CacheBust` ledger entry
+    /// (spec §5 "cache-bust cost is invisible unless ledgered") and
+    /// emits `LedgerAppended` so the cost meter ticks. Returns the
+    /// `CacheBustEvent` so the caller can surface "freed N tokens" in
+    /// a confirm-result toast.
+    pub fn evict_context_item(
+        &self,
+        id: &str,
+        evicted_at: &str,
+    ) -> Result<crate::context::CacheBustEvent, crate::context::ContextError> {
+        let item_id = parse_context_item_id(id)?;
+        let event = self.context_manager.lock().evict(item_id, evicted_at)?;
+        let entry = crate::ledger::LedgerEntry::cache_bust_from(&event);
+        self.ledger.append(entry.clone());
+        let _ = self.events.send(Event::LedgerAppended { entry });
+        self.emit_context_items();
+        Ok(event)
+    }
+
+    /// Add a memory card with a freshly minted id. The dispatcher
+    /// owns id generation so the UI doesn't have to.
+    ///
+    /// v57 (M-sec-5 fix) — rejects content that:
+    ///   * contains NUL or other ASCII control bytes (except `\n` and
+    ///     `\t`), which would render as binary in grep/git and break
+    ///     any downstream tooling that scans `~/.atelier/memory/`,
+    ///   * contains a line starting with `---` (YAML frontmatter
+    ///     delimiter), which would forge frontmatter in the promoted
+    ///     markdown file and pollute `mempromote` / `memrecall`.
+    pub fn add_memory_card(
+        &self,
+        content: String,
+        now: &str,
+    ) -> Result<String, crate::memory::MemoryError> {
+        validate_memory_card_content(&content)?;
+        let id = format!("mem-{}", uuid::Uuid::new_v4());
+        let card = crate::memory::MemoryCard {
+            id: id.clone(),
+            content,
+            created_at: now.to_string(),
+            last_used: now.to_string(),
+            pinned: false,
+        };
+        self.memory_store.lock().add(card)?;
+        self.emit_memory_cards();
+        Ok(id)
+    }
+
+    pub fn delete_memory_card(&self, id: &str) -> Result<(), crate::memory::MemoryError> {
+        self.memory_store.lock().evict(id)?;
+        self.emit_memory_cards();
+        Ok(())
+    }
+
+    /// Promote a memory card. Returns the bytes the caller writes to
+    /// `~/.atelier/memory/<filename>`; this method advances the card's
+    /// `last_used` and re-emits so the UI shows the "just-promoted"
+    /// timestamp tick.
+    pub fn promote_memory_card(
+        &self,
+        id: &str,
+        now: &str,
+    ) -> Result<crate::memory::PromoteOutput, crate::memory::MemoryError> {
+        let mut store = self.memory_store.lock();
+        let output = store.promote_to_global(id)?;
+        store.touch(id, now)?;
+        drop(store);
+        self.emit_memory_cards();
+        Ok(output)
+    }
+
+    /// Add a plan step. Returns the auto-assigned `step-N` id.
+    ///
+    /// v59 (MED-sec-2 fix) — validates the text against Trojan Source
+    /// / control-byte rejection so a hostile model can't make a plan
+    /// step display reversed in the GUI/TUI footer. The pre-v59
+    /// signature was infallible; the new `Result` returns the
+    /// rejection reason. Callers that don't care can `.ok()` or
+    /// `.expect()` — but the GUI / TUI surface the error to the
+    /// user, which is the intent.
+    pub fn add_plan_step(&self, text: String) -> Result<String, crate::plan::PlanError> {
+        validate_plan_text(&text)?;
+        let id = self.plan_canvas.lock().add(text);
+        self.emit_plan_snapshot();
+        Ok(id)
+    }
+
+    pub fn remove_plan_step(&self, id: &str) -> Result<(), crate::plan::PlanError> {
+        self.plan_canvas.lock().remove(id)?;
+        self.emit_plan_snapshot();
+        Ok(())
+    }
+
+    /// Set a plan step's status. UI cycler maps button click → status
+    /// → this method.
+    pub fn mark_plan_step_status(
+        &self,
+        id: &str,
+        status: crate::plan::PlanStatus,
+    ) -> Result<(), crate::plan::PlanError> {
+        self.plan_canvas.lock().mark_status(id, status)?;
+        self.emit_plan_snapshot();
+        Ok(())
+    }
+
+    pub fn add_plan_step_constraint(
+        &self,
+        id: &str,
+        constraint: String,
+    ) -> Result<(), crate::plan::PlanError> {
+        // v59 (MED-sec-2 fix) — same Trojan-Source rejection as
+        // `add_plan_step`. Constraint strings also render in the
+        // GUI/TUI plan pane and persist to session.json.
+        validate_plan_text(&constraint)?;
+        self.plan_canvas.lock().add_constraint(id, constraint)?;
+        self.emit_plan_snapshot();
+        Ok(())
+    }
+
+    /// Rewrite the plan order. `new_order` must contain every existing
+    /// id exactly once; otherwise the canvas is unchanged.
+    pub fn reorder_plan_steps(&self, new_order: Vec<String>) -> Result<(), crate::plan::PlanError> {
+        self.plan_canvas.lock().reorder(new_order)?;
+        self.emit_plan_snapshot();
+        Ok(())
     }
 
     /// Dispatch one tool call and perform the side effects. Returns the
@@ -859,9 +1215,18 @@ impl HookExecutor for ShellHookExecutor {
         // Payload is forwarded as ATELIER_HOOK_PAYLOAD env-var (compact
         // single-line JSON). Hooks that need richer transport can shell out
         // to `jq` / `python` on this var.
+        //
+        // v57 (M-sec-4 fix) — redact obvious-secret keys before
+        // landing the payload in env. An approved hook with
+        // `allow_net: true` could otherwise exfiltrate API keys
+        // pasted into tool arguments. The redaction is intentionally
+        // conservative (substring-match on the key name): if the
+        // model emits `{"api_key": "..."}`, `{"AuthorizationToken":
+        // "..."}` etc. the value is replaced by `"<redacted>"`.
+        let redacted = redact_secrets(payload);
         spec.env.insert(
             "ATELIER_HOOK_PAYLOAD".into(),
-            serde_json::to_string(payload).unwrap_or_else(|_| "{}".into()),
+            serde_json::to_string(&redacted).unwrap_or_else(|_| "{}".into()),
         );
 
         match crate::subprocess::run(&program, &wrapped, &spec).await {
@@ -907,7 +1272,12 @@ mod tests {
         /// We rebuild a fresh `StagedBatch` per call against the
         /// `ctx.workspace_root` (a real tempdir in dispatcher tests),
         /// because `StagedBatch` owns a `TempDir` and can't be cloned.
-        staged_paths: Option<Vec<String>>,
+        ///
+        /// v56: each entry carries an optional explicit content; `None`
+        /// keeps the pre-v56 default of "x" so existing tests are
+        /// unchanged. Tests that need a meaningful diff (per-hunk
+        /// accept/reject) use [`Self::with_staged_writes`].
+        staged_paths: Option<Vec<(String, Option<String>)>>,
         err: Option<ToolError>,
     }
 
@@ -922,7 +1292,17 @@ mod tests {
         }
 
         fn with_staged(mut self, paths: Vec<&str>) -> Self {
-            self.staged_paths = Some(paths.iter().map(|s| s.to_string()).collect());
+            self.staged_paths = Some(paths.iter().map(|s| (s.to_string(), None)).collect());
+            self
+        }
+
+        fn with_staged_writes(mut self, writes: Vec<(&str, &str)>) -> Self {
+            self.staged_paths = Some(
+                writes
+                    .into_iter()
+                    .map(|(p, c)| (p.to_string(), Some(c.to_string())))
+                    .collect(),
+            );
             self
         }
 
@@ -982,8 +1362,9 @@ mod tests {
             let staged_writes = if let Some(paths) = &self.staged_paths {
                 let check = crate::staging::NoopSyntaxCheck;
                 let mut s = crate::staging::Staging::new(ctx.workspace_root, &check);
-                for p in paths {
-                    s.add(crate::staging::StagedWrite::new(p.clone(), "x".to_string()))
+                for (p, content) in paths {
+                    let body = content.clone().unwrap_or_else(|| "x".to_string());
+                    s.add(crate::staging::StagedWrite::new(p.clone(), body))
                         .map_err(|e| ToolError::ExecutionFailed {
                             tool: self.name.clone(),
                             exit_code: -1,
@@ -1057,6 +1438,35 @@ mod tests {
             ("irreversible", SideEffectClass::Irreversible),
         ] {
             assert_eq!(serde_json::to_string(&c).unwrap(), format!("\"{lit}\""));
+        }
+    }
+
+    #[test]
+    fn side_effect_as_str_agrees_with_serde() {
+        // Regression for v60 MED-B — `as_str()` and the
+        // `#[serde(rename_all = "kebab-case")]` projection must
+        // produce identical strings. Pre-v60 nothing tied them
+        // together; a rename of `SideEffectClass::SharedState` →
+        // `SideEffectClass::Shared` would leave the serde derive
+        // happy with `"shared"` while `as_str()` kept returning
+        // `"shared-state"` (caught at compile if exhaustive — but
+        // the wire strings could still drift if both ends were
+        // updated to different values).
+        for c in [
+            SideEffectClass::LocalSafe,
+            SideEffectClass::LocalRisky,
+            SideEffectClass::SharedState,
+            SideEffectClass::Irreversible,
+        ] {
+            let serde_label = serde_json::to_value(c).unwrap();
+            let serde_str = serde_label
+                .as_str()
+                .expect("SideEffectClass serializes as a string");
+            assert_eq!(
+                serde_str,
+                c.as_str(),
+                "as_str({c:?}) must match serde projection"
+            );
         }
     }
 
@@ -1638,7 +2048,7 @@ mod tests {
                     assert_eq!(files.len(), 2, "two pending files");
                     let accepted = vec![std::path::PathBuf::from("accept.txt")];
                     assert!(
-                        sd.submit_approval(cid, accepted),
+                        sd.submit_approval_files(cid, accepted),
                         "submit_approval should hit a registered pending"
                     );
                     break cid;
@@ -1706,7 +2116,7 @@ mod tests {
             match next_event(&mut rx).await {
                 Event::StagingPendingApproval { commit_id, .. } => {
                     // Empty accept set = full reject.
-                    sd.submit_approval(commit_id, Vec::new());
+                    sd.submit_approval_files(commit_id, Vec::new());
                     break;
                 }
                 _ => continue,
@@ -1726,6 +2136,582 @@ mod tests {
     async fn submit_approval_for_unknown_commit_id_returns_false() {
         let (sd, _ledger, _rx) = build_session_dispatcher(vec![Arc::new(EchoTool::new("echo"))]);
         let sd = sd.with_approval_policy(ApprovalPolicy::AwaitApproval);
-        assert!(!sd.submit_approval(uuid::Uuid::new_v4(), Vec::new()));
+        assert!(!sd.submit_approval_files(uuid::Uuid::new_v4(), Vec::new()));
+    }
+
+    #[tokio::test]
+    async fn with_approval_policy_auto_after_await_reverts_to_autoapprove() {
+        // Regression for M-bug-2 — pre-v57 the AutoApproveAll arm of
+        // with_approval_policy was a no-op, so toggling
+        // AwaitApproval → AutoApproveAll kept the inner gate at
+        // PendingApprovalGate and dispatch kept parking. The fix
+        // installs AutoApprove explicitly on both arms.
+        let tool = Arc::new(EchoTool::new("write_thing").with_staged(vec!["a.rs"]));
+        let (sd, _ledger, _rx) = build_session_dispatcher(vec![tool]);
+        let sd = sd
+            .with_approval_policy(ApprovalPolicy::AwaitApproval)
+            .with_approval_policy(ApprovalPolicy::AutoApproveAll);
+        let workspace = tempfile::TempDir::new().unwrap();
+        let policy = SandboxPolicy::restrictive(workspace.path()).unwrap();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            sd.dispatch(
+                &call("write_thing", json!({})),
+                &ctx_in_workspace(workspace.path(), &policy),
+                now,
+            ),
+        )
+        .await
+        .expect("dispatch must NOT park on AutoApproveAll");
+        assert!(outcome.result.is_ok());
+        assert!(
+            workspace.path().join("a.rs").exists(),
+            "file should commit immediately under AutoApprove"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_dispatch_future_does_not_leak_pending_entry() {
+        // Regression for H1 — a cancelled / aborted dispatch must
+        // remove its entry from PendingApprovalGate.pending so the
+        // HashMap doesn't grow unboundedly. Spawn a dispatch, wait
+        // for the StagingPendingApproval bus event (= entry
+        // registered), abort the task, give a moment for the guard
+        // to drop, then peek the pending map.
+        let tool = Arc::new(EchoTool::new("writer").with_staged(vec!["a.txt"]));
+        let (sd, _ledger, mut rx) = build_session_dispatcher(vec![tool]);
+        let sd = Arc::new(sd.with_approval_policy(ApprovalPolicy::AwaitApproval));
+        let workspace = tempfile::TempDir::new().unwrap();
+        let ws_path = workspace.path().to_path_buf();
+        let sd_dispatch = sd.clone();
+        let task = tokio::spawn(async move {
+            let p = SandboxPolicy::restrictive(&ws_path).unwrap();
+            sd_dispatch
+                .dispatch(
+                    &call("writer", json!({})),
+                    &ctx_in_workspace(&ws_path, &p),
+                    now,
+                )
+                .await
+        });
+        // Wait until we see the pending event — proves the entry
+        // was registered.
+        loop {
+            match next_event(&mut rx).await {
+                Event::StagingPendingApproval { .. } => break,
+                _ => continue,
+            }
+        }
+        // Cancel mid-await.
+        task.abort();
+        let _ = task.await; // resolves to JoinError(Cancelled)
+                            // Let the abort propagate + the guard's Drop run.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            sd.pending.lock().is_empty(),
+            "pending map should be empty after a cancelled dispatch"
+        );
+    }
+
+    // ---------- v56 hunk-level approval ----------
+
+    #[tokio::test]
+    async fn submit_approval_with_per_hunk_selection_routes_to_commit_selected_hunks() {
+        // Pre-image with two non-adjacent changes → two hunks. Accept
+        // only hunk 0; reject hunk 1. The file should land with hunk 0
+        // applied and hunk 1 reverted to pre-image.
+        let workspace = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            workspace.path().join("a.txt"),
+            b"one\ntwo\nthree\nfour\nfive\n",
+        )
+        .unwrap();
+        let tool = Arc::new(
+            EchoTool::new("rewriter")
+                .with_staged_writes(vec![("a.txt", "ONE\ntwo\nthree\nfour\nFIVE\n")]),
+        );
+        let (sd, _ledger, mut rx) = build_session_dispatcher(vec![tool]);
+        let sd = Arc::new(sd.with_approval_policy(ApprovalPolicy::AwaitApproval));
+        let ws_path = workspace.path().to_path_buf();
+        let sd_dispatch = sd.clone();
+        let dispatch_task = tokio::spawn(async move {
+            let p = SandboxPolicy::restrictive(&ws_path).unwrap();
+            sd_dispatch
+                .dispatch(
+                    &call("rewriter", json!({})),
+                    &ctx_in_workspace(&ws_path, &p),
+                    now,
+                )
+                .await
+        });
+
+        loop {
+            match next_event(&mut rx).await {
+                Event::StagingPendingApproval { commit_id, .. } => {
+                    let mut sel = crate::staging::HunkSelection::new();
+                    sel.insert(
+                        std::path::PathBuf::from("a.txt"),
+                        crate::staging::FileApproval::Hunks(vec![0]),
+                    );
+                    assert!(sd.submit_approval(commit_id, sel));
+                    break;
+                }
+                _ => continue,
+            }
+        }
+        let outcome = dispatch_task.await.unwrap();
+        assert!(outcome.result.is_ok());
+        assert_eq!(
+            std::fs::read(workspace.path().join("a.txt")).unwrap(),
+            b"ONE\ntwo\nthree\nfour\nfive\n",
+            "hunk 0 accepted; hunk 1 reverted to pre-image"
+        );
+    }
+
+    // ---------- v55 §5 mutator round-trips ----------
+
+    use crate::context::{
+        ContextItem, ContextItemId, Payload as ContextPayload, Provenance, TokenCount, TokenSource,
+    };
+    use crate::memory::MemoryStore;
+    use crate::plan::{PlanCanvas, PlanStatus};
+
+    #[allow(clippy::type_complexity)]
+    fn build_v55_dispatcher() -> (
+        SessionDispatcher,
+        Arc<parking_lot::Mutex<crate::context::ContextManager>>,
+        Arc<parking_lot::Mutex<MemoryStore>>,
+        Arc<parking_lot::Mutex<PlanCanvas>>,
+        Arc<Ledger>,
+        broadcast::Receiver<Event>,
+    ) {
+        let dispatcher = Dispatcher::new(ToolRegistry::new(), HookSet::empty());
+        let ledger = Arc::new(Ledger::new());
+        let (tx, rx) = broadcast::channel(64);
+        let cm = Arc::new(parking_lot::Mutex::new(
+            crate::context::ContextManager::new(),
+        ));
+        let ms = Arc::new(parking_lot::Mutex::new(MemoryStore::new()));
+        let pc = Arc::new(parking_lot::Mutex::new(PlanCanvas::new()));
+        let sd = SessionDispatcher::new(dispatcher, ledger.clone(), tx).with_shared_state(
+            cm.clone(),
+            ms.clone(),
+            pc.clone(),
+        );
+        (sd, cm, ms, pc, ledger, rx)
+    }
+
+    fn seed_context_item(
+        cm: &Arc<parking_lot::Mutex<crate::context::ContextManager>>,
+        tokens: u32,
+    ) -> ContextItemId {
+        let item = ContextItem {
+            id: ContextItemId::new(),
+            payload: ContextPayload::InlineText { text: "x".into() },
+            tokens: TokenCount {
+                count: tokens,
+                source: TokenSource::Approx,
+            },
+            provenance: Provenance::UserAttached { note: None },
+            pinned: false,
+            added_at: "2026-05-17T10:00:00Z".into(),
+            last_used: "2026-05-17T10:00:00Z".into(),
+        };
+        let id = item.id;
+        cm.lock().add(item);
+        id
+    }
+
+    #[tokio::test]
+    async fn pin_context_item_marks_pinned_and_emits_snapshot() {
+        let (sd, cm, _ms, _pc, _ledger, mut rx) = build_v55_dispatcher();
+        let id = seed_context_item(&cm, 10);
+        sd.pin_context_item(&id.to_string()).unwrap();
+        assert!(cm.lock().get(id).unwrap().pinned);
+        match next_event(&mut rx).await {
+            Event::ContextItems { items } => {
+                assert_eq!(items.len(), 1);
+                assert!(items[0].pinned);
+            }
+            other => panic!("expected ContextItems, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn unpin_context_item_clears_pinned() {
+        let (sd, cm, _ms, _pc, _ledger, _rx) = build_v55_dispatcher();
+        let id = seed_context_item(&cm, 10);
+        cm.lock().pin(id).unwrap();
+        sd.unpin_context_item(&id.to_string()).unwrap();
+        assert!(!cm.lock().get(id).unwrap().pinned);
+    }
+
+    #[tokio::test]
+    async fn evict_context_item_appends_cache_bust_to_ledger_and_emits() {
+        let (sd, cm, _ms, _pc, ledger, mut rx) = build_v55_dispatcher();
+        let id = seed_context_item(&cm, 128);
+        let ev = sd
+            .evict_context_item(&id.to_string(), "2026-05-17T10:05:00Z")
+            .unwrap();
+        assert_eq!(ev.tokens_freed, 128);
+        assert_eq!(cm.lock().len(), 0);
+        // Ledger has a single CacheBust entry.
+        let entries = ledger.to_vec();
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(entries[0], LedgerEntry::CacheBust { .. }));
+        // Event order: LedgerAppended, then ContextItems.
+        match next_event(&mut rx).await {
+            Event::LedgerAppended { entry } => {
+                assert!(matches!(entry, LedgerEntry::CacheBust { .. }))
+            }
+            other => panic!("expected LedgerAppended first, got {other:?}"),
+        }
+        match next_event(&mut rx).await {
+            Event::ContextItems { items } => assert!(items.is_empty()),
+            other => panic!("expected ContextItems second, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn evict_pinned_context_item_returns_error_and_does_not_emit() {
+        let (sd, cm, _ms, _pc, ledger, mut rx) = build_v55_dispatcher();
+        let id = seed_context_item(&cm, 5);
+        cm.lock().pin(id).unwrap();
+        let err = sd
+            .evict_context_item(&id.to_string(), "2026-05-17T10:05:00Z")
+            .unwrap_err();
+        assert!(matches!(err, crate::context::ContextError::EvictPinned(_)));
+        assert_eq!(cm.lock().len(), 1, "pinned item must stay");
+        assert_eq!(ledger.len(), 0, "no ledger entry on refused evict");
+        assert!(
+            matches!(rx.try_recv(), Err(broadcast::error::TryRecvError::Empty)),
+            "no event on refused evict"
+        );
+    }
+
+    #[tokio::test]
+    async fn pin_with_malformed_id_returns_malformed_error() {
+        // v57 (L cleanup) — distinguish "garbage input" from "valid
+        // UUID that just isn't in the store" so the error message in
+        // the UI is precise.
+        let (sd, _cm, _ms, _pc, _ledger, _rx) = build_v55_dispatcher();
+        let err = sd.pin_context_item("not-a-uuid").unwrap_err();
+        assert!(matches!(err, crate::context::ContextError::Malformed(s) if s == "not-a-uuid"));
+    }
+
+    #[tokio::test]
+    async fn pin_with_valid_uuid_not_in_store_returns_not_found() {
+        let (sd, _cm, _ms, _pc, _ledger, _rx) = build_v55_dispatcher();
+        let fresh_id = uuid::Uuid::new_v4().to_string();
+        let err = sd.pin_context_item(&fresh_id).unwrap_err();
+        assert!(matches!(err, crate::context::ContextError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn add_memory_card_inserts_and_emits_snapshot() {
+        let (sd, _cm, ms, _pc, _ledger, mut rx) = build_v55_dispatcher();
+        let id = sd
+            .add_memory_card("a note worth keeping".into(), "2026-05-17T10:00:00Z")
+            .unwrap();
+        assert!(id.starts_with("mem-"));
+        assert_eq!(ms.lock().len(), 1);
+        match next_event(&mut rx).await {
+            Event::MemoryCards { cards } => {
+                assert_eq!(cards.len(), 1);
+                assert_eq!(cards[0].id, id);
+            }
+            other => panic!("expected MemoryCards, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn redact_secrets_masks_obvious_keys_at_any_depth() {
+        // Regression for M-sec-4 — secret-looking keys in hook
+        // payloads must be redacted before landing in env.
+        let payload = serde_json::json!({
+            "command": "shell",
+            "arguments": {
+                "api_key": "sk-deadbeef",
+                "headers": [{"Authorization": "Bearer x"}],
+                "harmless": "value"
+            },
+            "metadata": {
+                "session_id": "abcd",
+                "OPENAI_API_KEY": "sk-y",
+                "nested": {"password": "p"}
+            }
+        });
+        let out = redact_secrets(&payload);
+        assert_eq!(out["arguments"]["api_key"], "<redacted>");
+        assert_eq!(
+            out["arguments"]["headers"][0]["Authorization"],
+            "<redacted>"
+        );
+        assert_eq!(out["arguments"]["harmless"], "value");
+        assert_eq!(out["metadata"]["session_id"], "<redacted>");
+        assert_eq!(out["metadata"]["OPENAI_API_KEY"], "<redacted>");
+        assert_eq!(out["metadata"]["nested"]["password"], "<redacted>");
+        assert_eq!(out["command"], "shell");
+    }
+
+    #[test]
+    fn redact_secrets_v58_covers_cloud_and_session_creds() {
+        // Regression for L-sec-2 — the v57 list missed common cloud /
+        // session creds. v58 expanded with `access_key`,
+        // `private_key`, `bearer`, `cookie`, `_pat`.
+        let payload = serde_json::json!({
+            "aws_access_key_id": "AKIA...",
+            "aws_secret_access_key": "...",
+            "ssh_private_key": "----- BEGIN RSA -----",
+            "Authorization": "Bearer X",
+            "Set-Cookie": "session=abc; HttpOnly",
+            "github_pat_xyz": "ghp_...",
+            "harmless": "value"
+        });
+        let out = redact_secrets(&payload);
+        assert_eq!(out["aws_access_key_id"], "<redacted>");
+        assert_eq!(out["aws_secret_access_key"], "<redacted>");
+        assert_eq!(out["ssh_private_key"], "<redacted>");
+        assert_eq!(out["Authorization"], "<redacted>");
+        assert_eq!(out["Set-Cookie"], "<redacted>");
+        assert_eq!(out["github_pat_xyz"], "<redacted>");
+        assert_eq!(out["harmless"], "value");
+    }
+
+    #[test]
+    fn redact_secrets_leaves_non_object_payloads_alone() {
+        let n = redact_secrets(&serde_json::json!(42));
+        assert_eq!(n, serde_json::json!(42));
+        let s = redact_secrets(&serde_json::json!("just a string"));
+        assert_eq!(s, serde_json::json!("just a string"));
+    }
+
+    #[tokio::test]
+    async fn add_memory_card_rejects_nul_and_other_control_bytes() {
+        // Regression for M-sec-5 — NUL / control bytes break grep
+        // and git tooling that scans `~/.atelier/memory/` markdown.
+        let (sd, _cm, _ms, _pc, _ledger, _rx) = build_v55_dispatcher();
+        let err = sd
+            .add_memory_card("hello\0world".into(), "2026-05-17T10:00:00Z")
+            .unwrap_err();
+        assert!(matches!(err, crate::memory::MemoryError::InvalidContent(_)));
+    }
+
+    #[tokio::test]
+    async fn add_memory_card_rejects_forged_yaml_frontmatter_delimiters() {
+        // Regression for M-sec-5 — a `---` line would close (or
+        // reopen) the YAML frontmatter that `MemoryStore::promote_to_global`
+        // wraps the content in, polluting the promoted file's
+        // metadata.
+        let (sd, _cm, _ms, _pc, _ledger, _rx) = build_v55_dispatcher();
+        let hostile = "harmless prefix\n---\nforged: malicious\n";
+        let err = sd
+            .add_memory_card(hostile.into(), "2026-05-17T10:00:00Z")
+            .unwrap_err();
+        assert!(matches!(err, crate::memory::MemoryError::InvalidContent(_)));
+    }
+
+    #[tokio::test]
+    async fn add_memory_card_rejects_unicode_control_chars_v58() {
+        // Regression for L-sec-3 — v57 only rejected ASCII controls;
+        // v58 expanded to DEL, C1 controls (incl. NEL U+0085),
+        // U+2028/U+2029 (line/paragraph separators), and bidi
+        // marks/overrides (U+200E/F, U+202A-E — Trojan Source).
+        let (sd, _cm, _ms, _pc, _ledger, _rx) = build_v55_dispatcher();
+        let cases = [
+            ('\u{007F}', "DEL"),
+            ('\u{0085}', "NEL"),
+            ('\u{0091}', "C1 PU1"),
+            ('\u{2028}', "LINE SEP"),
+            ('\u{2029}', "PARA SEP"),
+            ('\u{200E}', "LRM"),
+            ('\u{200F}', "RLM"),
+            ('\u{202E}', "RLO (Trojan Source)"),
+            // v59 (L-sec-3 extension) — bidi isolate variants.
+            ('\u{2066}', "LRI"),
+            ('\u{2067}', "RLI"),
+            ('\u{2068}', "FSI"),
+            ('\u{2069}', "PDI"),
+        ];
+        for (c, label) in cases {
+            let content = format!("hi {c} world");
+            let err = sd
+                .add_memory_card(content, "2026-05-17T10:00:00Z")
+                .unwrap_err();
+            assert!(
+                matches!(err, crate::memory::MemoryError::InvalidContent(_)),
+                "{label} (U+{:04X}) should be rejected",
+                c as u32
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn add_memory_card_accepts_normal_unicode() {
+        // Sanity — printable non-ASCII Unicode (CJK, emoji,
+        // accented Latin) must be allowed.
+        let (sd, _cm, _ms, _pc, _ledger, mut rx) = build_v55_dispatcher();
+        sd.add_memory_card(
+            "Café — 日本語 — 🦀 rusty crab".into(),
+            "2026-05-17T10:00:00Z",
+        )
+        .unwrap();
+        let _ = next_event(&mut rx).await;
+    }
+
+    #[tokio::test]
+    async fn add_memory_card_accepts_tabs_and_newlines() {
+        // Sanity — tabs + newlines are content, not control bytes.
+        let (sd, _cm, _ms, _pc, _ledger, mut rx) = build_v55_dispatcher();
+        sd.add_memory_card(
+            "line1\n\tindented line2\nline3".into(),
+            "2026-05-17T10:00:00Z",
+        )
+        .unwrap();
+        let _ = next_event(&mut rx).await;
+    }
+
+    #[tokio::test]
+    async fn delete_memory_card_removes_and_emits() {
+        let (sd, _cm, ms, _pc, _ledger, mut rx) = build_v55_dispatcher();
+        let id = sd
+            .add_memory_card("ephemeral".into(), "2026-05-17T10:00:00Z")
+            .unwrap();
+        // Drop the add's snapshot event.
+        let _ = next_event(&mut rx).await;
+        sd.delete_memory_card(&id).unwrap();
+        assert_eq!(ms.lock().len(), 0);
+        match next_event(&mut rx).await {
+            Event::MemoryCards { cards } => assert!(cards.is_empty()),
+            other => panic!("expected MemoryCards, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_memory_card_unknown_id_errors() {
+        let (sd, _cm, _ms, _pc, _ledger, _rx) = build_v55_dispatcher();
+        let err = sd.delete_memory_card("nope").unwrap_err();
+        assert!(matches!(err, crate::memory::MemoryError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn promote_memory_card_returns_bytes_and_touches_last_used() {
+        let (sd, _cm, ms, _pc, _ledger, mut rx) = build_v55_dispatcher();
+        let id = sd
+            .add_memory_card("important fact".into(), "2026-05-17T10:00:00Z")
+            .unwrap();
+        let _ = next_event(&mut rx).await; // initial MemoryCards from add
+        let out = sd.promote_memory_card(&id, "2026-05-17T11:00:00Z").unwrap();
+        assert!(out.relative_path.ends_with(".md"));
+        assert!(!out.bytes.is_empty());
+        assert_eq!(
+            ms.lock().get(&id).unwrap().last_used,
+            "2026-05-17T11:00:00Z"
+        );
+        // Re-emit fires after promote.
+        match next_event(&mut rx).await {
+            Event::MemoryCards { .. } => {}
+            other => panic!("expected MemoryCards, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn add_plan_step_rejects_trojan_source_and_control_bytes() {
+        // Regression for v59 MED-sec-2 — plan text rendered in the
+        // GUI/TUI footer + plan pane + session.json must NOT accept
+        // bidi overrides (U+202E) or other control characters.
+        let (sd, _cm, _ms, _pc, _ledger, _rx) = build_v55_dispatcher();
+        for hostile in ["hi \u{202E} world", "step\0name", "two\u{2028}lines"] {
+            let err = sd.add_plan_step(hostile.into()).unwrap_err();
+            assert!(matches!(err, crate::plan::PlanError::InvalidContent(_)));
+        }
+    }
+
+    #[tokio::test]
+    async fn add_plan_step_constraint_rejects_trojan_source() {
+        let (sd, _cm, _ms, _pc, _ledger, mut rx) = build_v55_dispatcher();
+        let id = sd.add_plan_step("step".into()).unwrap();
+        let _ = next_event(&mut rx).await;
+        let err = sd
+            .add_plan_step_constraint(&id, "harmless prefix \u{202E} reversed".into())
+            .unwrap_err();
+        assert!(matches!(err, crate::plan::PlanError::InvalidContent(_)));
+    }
+
+    #[tokio::test]
+    async fn add_plan_step_returns_id_and_emits_snapshot() {
+        let (sd, _cm, _ms, pc, _ledger, mut rx) = build_v55_dispatcher();
+        let id = sd.add_plan_step("write the test".into()).unwrap();
+        assert!(id.starts_with("step-"));
+        assert_eq!(pc.lock().len(), 1);
+        match next_event(&mut rx).await {
+            Event::PlanSnapshot { steps } => {
+                assert_eq!(steps.len(), 1);
+                assert_eq!(steps[0].id, id);
+            }
+            other => panic!("expected PlanSnapshot, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mark_plan_step_status_updates_and_emits() {
+        let (sd, _cm, _ms, pc, _ledger, mut rx) = build_v55_dispatcher();
+        let id = sd.add_plan_step("do it".into()).unwrap();
+        let _ = next_event(&mut rx).await; // initial PlanSnapshot
+        sd.mark_plan_step_status(&id, PlanStatus::Done).unwrap();
+        assert_eq!(pc.lock().get(&id).unwrap().status, PlanStatus::Done);
+        match next_event(&mut rx).await {
+            Event::PlanSnapshot { steps } => assert_eq!(steps[0].status, PlanStatus::Done),
+            other => panic!("expected PlanSnapshot, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn add_plan_step_constraint_appends_and_emits() {
+        let (sd, _cm, _ms, pc, _ledger, mut rx) = build_v55_dispatcher();
+        let id = sd.add_plan_step("review".into()).unwrap();
+        let _ = next_event(&mut rx).await;
+        sd.add_plan_step_constraint(&id, "must not break api".into())
+            .unwrap();
+        assert_eq!(pc.lock().get(&id).unwrap().constraints.len(), 1);
+        match next_event(&mut rx).await {
+            Event::PlanSnapshot { steps } => {
+                assert_eq!(steps[0].constraints, vec!["must not break api".to_string()]);
+            }
+            other => panic!("expected PlanSnapshot, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn reorder_plan_steps_rewrites_order_and_emits() {
+        let (sd, _cm, _ms, _pc, _ledger, mut rx) = build_v55_dispatcher();
+        let a = sd.add_plan_step("a".into()).unwrap();
+        let b = sd.add_plan_step("b".into()).unwrap();
+        // drop two PlanSnapshots
+        let _ = next_event(&mut rx).await;
+        let _ = next_event(&mut rx).await;
+        sd.reorder_plan_steps(vec![b.clone(), a.clone()]).unwrap();
+        match next_event(&mut rx).await {
+            Event::PlanSnapshot { steps } => {
+                assert_eq!(
+                    steps.iter().map(|s| s.id.clone()).collect::<Vec<_>>(),
+                    vec![b, a]
+                );
+            }
+            other => panic!("expected PlanSnapshot, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn remove_plan_step_drops_and_emits() {
+        let (sd, _cm, _ms, pc, _ledger, mut rx) = build_v55_dispatcher();
+        let id = sd.add_plan_step("temp".into()).unwrap();
+        let _ = next_event(&mut rx).await;
+        sd.remove_plan_step(&id).unwrap();
+        assert!(pc.lock().is_empty());
+        match next_event(&mut rx).await {
+            Event::PlanSnapshot { steps } => assert!(steps.is_empty()),
+            other => panic!("expected PlanSnapshot, got {other:?}"),
+        }
     }
 }

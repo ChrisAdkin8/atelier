@@ -126,6 +126,7 @@ impl LedgerEntry {
             crate::context::Provenance::ToolResult { .. } => "tool-result",
             crate::context::Provenance::MemoryPromoted { .. } => "memory-promoted",
             crate::context::Provenance::PinnedByUser { .. } => "pinned-by-user",
+            crate::context::Provenance::AssistantTurn => "assistant-turn",
         };
         Self::CacheBust {
             timestamp: event.evicted_at.clone(),

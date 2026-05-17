@@ -30,6 +30,8 @@ pub mod session;
 pub mod staging;
 pub mod state;
 pub mod subprocess;
+pub mod text_safety;
+pub mod time;
 pub mod tools;
 pub mod verify;
 

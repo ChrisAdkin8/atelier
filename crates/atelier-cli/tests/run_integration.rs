@@ -508,7 +508,7 @@ async fn await_approval_via_runner_with_dispatcher_handle_round_trips() {
                 let sd = handle
                     .get()
                     .expect("DispatcherHandle populated by runner before staging");
-                assert!(sd.submit_approval(commit_id, vec![PathBuf::from("approved.txt")]));
+                assert!(sd.submit_approval_files(commit_id, vec![PathBuf::from("approved.txt")]));
                 submitted = true;
                 break;
             }
@@ -574,7 +574,7 @@ async fn await_approval_via_runner_with_full_reject_drops_the_write() {
         for ev in snapshot {
             if let Event::StagingPendingApproval { commit_id, .. } = ev {
                 let sd = handle.get().unwrap();
-                assert!(sd.submit_approval(commit_id, vec![]));
+                assert!(sd.submit_approval_files(commit_id, vec![]));
                 submitted = true;
                 break;
             }
@@ -593,4 +593,404 @@ async fn await_approval_via_runner_with_full_reject_drops_the_write() {
         !workspace.path().join("rejected.txt").exists(),
         "rejected file should not land"
     );
+}
+
+// ---------- v55 §5 mutator round-trips ----------
+//
+// These exercise the new SessionDispatcher mutator surface end-to-end
+// through the Runner: a scripted MockAdapter run brings the
+// ContextManager / MemoryStore / PlanCanvas into a known state via the
+// snapshot bus, then the test invokes a mutator via the live
+// `DispatcherHandle` and asserts the follow-up snapshot reflects the
+// change.
+
+/// v57 (M-smell-2) — tightened poll interval + tokio::time::timeout
+/// wrapper. The pre-v57 helper slept 20 ms between polls of the
+/// captured-events Vec, which gave up to a 20 ms reaction-delay per
+/// event and a real flake budget on loaded CI runners. The new shape:
+///
+///   * `yield_now` between checks rather than a fixed sleep — keeps
+///     CPU bounded but reacts to a newly-pushed event within one
+///     scheduler tick;
+///   * `tokio::time::timeout` so the deadline is wall-clock (the
+///     `Instant::now` loop was technically equivalent but
+///     `tokio::time::timeout` plays nicer with paused-clock tests
+///     should those land);
+///   * a single sleep at the loop tail so a stuck `f` doesn't busy
+///     spin the tokio worker when no event ever lands.
+///
+/// `EventSink::Capture` is still the underlying read surface; a
+/// future refactor to use a fresh `broadcast::Receiver` would
+/// eliminate the Vec lock entirely.
+async fn wait_until<F: FnMut() -> bool>(mut f: F, deadline: std::time::Duration, label: &str) {
+    let fut = async {
+        loop {
+            if f() {
+                return;
+            }
+            tokio::task::yield_now().await;
+            // Single small sleep so a never-firing predicate doesn't
+            // hot-spin the tokio worker — the loop is otherwise
+            // tight.
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    };
+    if tokio::time::timeout(deadline, fut).await.is_err() {
+        panic!("timed out waiting for {label}");
+    }
+}
+
+#[tokio::test]
+async fn v55_pin_context_item_round_trips_through_dispatcher() {
+    let workspace = tempfile::TempDir::new().unwrap();
+    let responses = vec![MockResponse {
+        assistant_text: "ok".into(),
+        tool_calls: vec![mock_envelope_tool_call(&envelope_done())],
+    }];
+    let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let handle = DispatcherHandle::new();
+    let runner = Runner::new(
+        workspace.path().to_path_buf(),
+        ProviderChoice::Mock { responses },
+        EventSink::Capture(events.clone()),
+    )
+    .expect("mock runner construction is infallible")
+    .with_dispatcher_handle(handle.clone())
+    .with_max_turns(2);
+
+    let runner_task = tokio::spawn(async move { runner.run("hello".into()).await });
+
+    // Wait for the first ContextItems snapshot — captures the user
+    // prompt + the assistant turn. The user-prompt item is the first
+    // one and is the one we'll pin.
+    let mut target_id: Option<String> = None;
+    wait_until(
+        || {
+            let snap = events.lock().clone();
+            for ev in snap {
+                if let Event::ContextItems { items } = ev {
+                    if let Some(first) = items.first() {
+                        target_id = Some(first.id.clone());
+                        return true;
+                    }
+                }
+            }
+            false
+        },
+        std::time::Duration::from_secs(10),
+        "initial ContextItems",
+    )
+    .await;
+    let target = target_id.expect("first item present");
+    let before = events.lock().len();
+
+    let sd = handle.get().expect("DispatcherHandle populated");
+    sd.pin_context_item(&target).expect("pin succeeds");
+
+    // Assert: a subsequent ContextItems event shows pinned=true on the
+    // target id.
+    wait_until(
+        || {
+            let snap = events.lock().clone();
+            for ev in snap.into_iter().skip(before) {
+                if let Event::ContextItems { items } = ev {
+                    if items.iter().any(|i| i.id == target && i.pinned) {
+                        return true;
+                    }
+                }
+            }
+            false
+        },
+        std::time::Duration::from_secs(10),
+        "ContextItems with pinned=true after pin_context_item",
+    )
+    .await;
+
+    let _ = runner_task.await;
+}
+
+#[tokio::test]
+async fn v55_add_memory_card_round_trips_through_dispatcher() {
+    let workspace = tempfile::TempDir::new().unwrap();
+    let responses = vec![MockResponse {
+        assistant_text: "ok".into(),
+        tool_calls: vec![mock_envelope_tool_call(&envelope_done())],
+    }];
+    let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let handle = DispatcherHandle::new();
+    let runner = Runner::new(
+        workspace.path().to_path_buf(),
+        ProviderChoice::Mock { responses },
+        EventSink::Capture(events.clone()),
+    )
+    .expect("mock runner construction is infallible")
+    .with_dispatcher_handle(handle.clone())
+    .with_max_turns(2);
+
+    let runner_task = tokio::spawn(async move { runner.run("hi".into()).await });
+
+    // Wait until the DispatcherHandle is populated by the runner.
+    wait_until(
+        || handle.get().is_some(),
+        std::time::Duration::from_secs(10),
+        "DispatcherHandle populated",
+    )
+    .await;
+    let sd = handle.get().unwrap();
+
+    let id = sd
+        .add_memory_card("a long-lived fact".into(), "2026-05-17T10:00:00Z")
+        .expect("add memory card");
+    assert!(id.starts_with("mem-"));
+
+    // Wait for a MemoryCards event that carries the new card.
+    wait_until(
+        || {
+            let snap = events.lock().clone();
+            for ev in snap {
+                if let Event::MemoryCards { cards } = ev {
+                    if cards.iter().any(|c| c.id == id) {
+                        return true;
+                    }
+                }
+            }
+            false
+        },
+        std::time::Duration::from_secs(10),
+        "MemoryCards event with the new card id",
+    )
+    .await;
+
+    let _ = runner_task.await;
+}
+
+#[tokio::test]
+async fn v55_mark_plan_step_done_round_trips_through_dispatcher() {
+    use atelier_core::plan::PlanStatus;
+
+    let workspace = tempfile::TempDir::new().unwrap();
+    let responses = vec![MockResponse {
+        assistant_text: "ok".into(),
+        tool_calls: vec![mock_envelope_tool_call(&envelope_done())],
+    }];
+    let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let handle = DispatcherHandle::new();
+    let runner = Runner::new(
+        workspace.path().to_path_buf(),
+        ProviderChoice::Mock { responses },
+        EventSink::Capture(events.clone()),
+    )
+    .expect("mock runner construction is infallible")
+    .with_dispatcher_handle(handle.clone())
+    .with_max_turns(2);
+
+    let runner_task = tokio::spawn(async move { runner.run("plan it".into()).await });
+
+    wait_until(
+        || handle.get().is_some(),
+        std::time::Duration::from_secs(10),
+        "DispatcherHandle populated",
+    )
+    .await;
+    let sd = handle.get().unwrap();
+
+    let step_id = sd.add_plan_step("first step".into()).unwrap();
+
+    sd.mark_plan_step_status(&step_id, PlanStatus::Done)
+        .expect("mark done");
+
+    wait_until(
+        || {
+            let snap = events.lock().clone();
+            for ev in snap {
+                if let Event::PlanSnapshot { steps } = ev {
+                    if steps
+                        .iter()
+                        .any(|s| s.id == step_id && s.status == PlanStatus::Done)
+                    {
+                        return true;
+                    }
+                }
+            }
+            false
+        },
+        std::time::Duration::from_secs(10),
+        "PlanSnapshot with mark_done applied",
+    )
+    .await;
+
+    let _ = runner_task.await;
+}
+
+// ---------- v56 §3 Phase C mechanical gate (production scale) ----------
+//
+// The spec §3 mechanical gate names a "10-file rename" scenario as the
+// production target. The pre-v56 test at the top of this file
+// (`run_scripted_multi_file_rename_drives_phase_c_mechanical_gate`)
+// ships at N=3 for brevity; this test pins the N=10 contract:
+//
+//   * agent emits one write_file per file, then a claimed_done envelope,
+//   * live-diff incremental — one `EditStaged` event per write, in
+//     commit order, BEFORE the final claimed_done arrives,
+//   * final on-disk state is byte-equal to the reference for every
+//     file.
+
+#[tokio::test]
+async fn v56_phase_c_mechanical_gate_at_ten_files_lines_up_live_diff_and_final_state() {
+    let workspace = tempfile::TempDir::new().unwrap();
+    for n in 1..=10 {
+        std::fs::write(
+            workspace.path().join(format!("file_{n:02}.txt")),
+            format!("old contents {n}"),
+        )
+        .unwrap();
+    }
+
+    let mut responses = Vec::new();
+    for n in 1..=10 {
+        responses.push(MockResponse {
+            assistant_text: format!("rewriting file_{n:02}"),
+            tool_calls: vec![ToolCallRequest {
+                id: format!("tc-{n}"),
+                name: "write_file".into(),
+                arguments: serde_json::json!({
+                    "path": format!("file_{n:02}.txt"),
+                    "content": format!("new contents {n}"),
+                }),
+            }],
+        });
+    }
+    responses.push(MockResponse {
+        assistant_text: "all ten renamed".into(),
+        tool_calls: vec![mock_envelope_tool_call(&envelope_done())],
+    });
+
+    let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let runner = Runner::new(
+        workspace.path().to_path_buf(),
+        ProviderChoice::Mock { responses },
+        EventSink::Capture(events.clone()),
+    )
+    .expect("mock runner construction is infallible")
+    .with_max_turns(20);
+
+    let report = runner.run("rename 10 files".into()).await.unwrap();
+    assert_eq!(report.final_state, State::Done);
+    assert_eq!(report.turns, 11, "10 write turns + 1 done turn");
+
+    // Final on-disk state byte-equal for every file.
+    for n in 1..=10 {
+        let got = std::fs::read(workspace.path().join(format!("file_{n:02}.txt"))).unwrap();
+        assert_eq!(
+            got,
+            format!("new contents {n}").as_bytes(),
+            "file_{n:02} mismatch"
+        );
+    }
+
+    // Live-diff incremental — exactly 10 EditStaged events, in commit
+    // order matching the scripted writes.
+    let captured = events.lock();
+    let edit_staged_paths: Vec<PathBuf> = captured
+        .iter()
+        .filter_map(|e| match e {
+            Event::EditStaged { path, .. } => Some(path.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        edit_staged_paths.len(),
+        10,
+        "expected exactly 10 EditStaged events, got {}",
+        edit_staged_paths.len()
+    );
+    for (i, path) in edit_staged_paths.iter().enumerate() {
+        let expected = format!("file_{:02}.txt", i + 1);
+        assert_eq!(
+            path,
+            &PathBuf::from(&expected),
+            "EditStaged event #{i} should be for {expected}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn v57_initial_context_items_event_fires_before_first_turn() {
+    // Regression for M-bug-3 — pre-v57 the first `ContextItems`
+    // snapshot only landed at the end of turn 1. A run with
+    // max_turns=0 never produced one, so a UI subscriber saw
+    // `MessageCommitted{User}` but an empty Context panel forever.
+    let workspace = tempfile::TempDir::new().unwrap();
+    let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let runner = Runner::new(
+        workspace.path().to_path_buf(),
+        ProviderChoice::Mock {
+            responses: Vec::new(),
+        },
+        EventSink::Capture(events.clone()),
+    )
+    .expect("mock runner construction is infallible")
+    .with_max_turns(0);
+
+    let _ = runner.run("greetings".into()).await.unwrap();
+
+    let captured = events.lock();
+    let mut saw_initial_items = false;
+    for ev in captured.iter() {
+        if let Event::ContextItems { items } = ev {
+            if items.iter().any(|i| i.label.contains("greetings")) {
+                saw_initial_items = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        saw_initial_items,
+        "ContextItems with the user prompt must fire before turn-loop bails on max_turns=0"
+    );
+}
+
+#[tokio::test]
+async fn v56_envelope_claimed_changes_surfaces_as_bus_event() {
+    use atelier_core::protocol::{ClaimedChange, ClaimedChangeKind};
+
+    let workspace = tempfile::TempDir::new().unwrap();
+    let env = Envelope {
+        claimed_done: Some(true),
+        claimed_changes: Some(vec![ClaimedChange {
+            path: "src/lib.rs".into(),
+            kind: ClaimedChangeKind::Edit,
+            summary: "fix off-by-one in the parser".into(),
+        }]),
+        ..Default::default()
+    };
+    let responses = vec![MockResponse {
+        assistant_text: "explanation".into(),
+        tool_calls: vec![mock_envelope_tool_call(&env)],
+    }];
+    let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let runner = Runner::new(
+        workspace.path().to_path_buf(),
+        ProviderChoice::Mock { responses },
+        EventSink::Capture(events.clone()),
+    )
+    .expect("mock runner construction is infallible")
+    .with_max_turns(2);
+
+    let report = runner.run("explain".into()).await.unwrap();
+    assert_eq!(report.final_state, State::Done);
+
+    let captured = events.lock();
+    let mut saw = false;
+    for ev in captured.iter() {
+        if let Event::ClaimedChanges { changes } = ev {
+            assert_eq!(changes.len(), 1);
+            assert_eq!(changes[0].path, "src/lib.rs");
+            assert_eq!(changes[0].kind, "edit");
+            assert_eq!(changes[0].summary, "fix off-by-one in the parser");
+            saw = true;
+            break;
+        }
+    }
+    assert!(saw, "no ClaimedChanges event observed on the bus");
 }

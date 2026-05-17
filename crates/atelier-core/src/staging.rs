@@ -349,6 +349,7 @@ impl<'a> Staging<'a> {
                 staging_dir,
                 workspace_root: self.workspace_root.to_path_buf(),
                 outcomes: Vec::new(),
+                pre_images: BTreeMap::new(),
             });
         }
 
@@ -361,6 +362,7 @@ impl<'a> Staging<'a> {
         })?;
 
         let mut outcomes: Vec<FileOutcome> = Vec::with_capacity(self.writes.len());
+        let mut pre_images: BTreeMap<PathBuf, Option<Vec<u8>>> = BTreeMap::new();
 
         for (rel, write) in &self.writes {
             // 1a. Symlink containment. `Staging::add` already rejects
@@ -431,6 +433,9 @@ impl<'a> Staging<'a> {
                 syntax: outcome,
                 hunks,
             });
+            // v56: retain the pre-image so a downstream
+            // `commit_selected_hunks` can splice old + new lines.
+            pre_images.insert(rel.clone(), pre_image);
         }
 
         // 1f. Durability barrier on the staging tree. The staged files
@@ -454,15 +459,41 @@ impl<'a> Staging<'a> {
             staging_dir,
             workspace_root: self.workspace_root.to_path_buf(),
             outcomes,
+            pre_images,
         })
     }
 }
 
+/// v56 — per-file decision returned by the approval gate. Replaces the
+/// pre-v56 `Vec<PathBuf>` accept-list with a richer shape that can
+/// carry sub-file (per-hunk) selection. A path absent from the parent
+/// [`HunkSelection`] map is "fully rejected" (no bytes commit).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileApproval {
+    /// Commit every staged byte for this file. For `Hunks::Lines` this
+    /// means every hunk; for `Created` / `Deleted` / `Binary` / `Same`
+    /// this is the only meaningful approval shape and matches pre-v56
+    /// behaviour exactly.
+    All,
+    /// Commit only the listed hunk indices. Only meaningful for
+    /// `Hunks::Lines`. For other variants the empty list = drop,
+    /// non-empty list = `All` (since there are no individually
+    /// addressable hunks to splice). Indices outside the hunk list are
+    /// silently ignored.
+    Hunks(Vec<usize>),
+}
+
+/// v56 — caller-supplied accept set. Each key is a repo-relative path
+/// from the matching `Event::StagingPendingApproval` payload; absent
+/// keys are fully rejected.
+pub type HunkSelection = std::collections::HashMap<PathBuf, FileApproval>;
+
 /// A validated, staged-but-not-yet-renamed batch of writes. Spec §3
 /// "Hunk accept / reject" lives here: the caller (typically the
 /// dispatcher) exposes the pending files to the user, collects the
-/// accept/reject decision, and calls [`Self::commit_selected`] with
-/// the accepted set.
+/// accept/reject decision, and calls [`Self::commit_selected_hunks`]
+/// (or the file-level wrapper [`Self::commit_selected`]) with the
+/// accepted set.
 ///
 /// Dropping a [`StagedBatch`] without committing discards the temp
 /// tree — same all-or-nothing semantic as the v45 `Staging::commit()`.
@@ -475,6 +506,14 @@ pub struct StagedBatch {
     staging_dir: TempDir,
     workspace_root: PathBuf,
     outcomes: Vec<FileOutcome>,
+    /// v56 — pre-image bytes per staged path, captured during
+    /// [`Staging::stage`]. Required by
+    /// [`Self::commit_selected_hunks`] when a `FileApproval::Hunks`
+    /// selection splices old + new lines together. `None` for fresh
+    /// files (`Hunks::Created`); the partial-hunk path for those
+    /// degrades to `FileApproval::All` since there's no pre-image to
+    /// interleave with.
+    pre_images: BTreeMap<PathBuf, Option<Vec<u8>>>,
 }
 
 impl StagedBatch {
@@ -488,49 +527,159 @@ impl StagedBatch {
 
     /// Commit every staged file. Equivalent to v45 `Staging::commit()`.
     pub fn commit_all(self) -> Result<CommitReport, StagingError> {
-        let paths: std::collections::HashSet<PathBuf> =
-            self.outcomes.iter().map(|o| o.path.clone()).collect();
-        self.commit_selected(&paths)
+        let selection: HunkSelection = self
+            .outcomes
+            .iter()
+            .map(|o| (o.path.clone(), FileApproval::All))
+            .collect();
+        self.commit_selected_hunks(&selection)
     }
 
-    /// Commit only the files whose relative path is in `accepted`.
-    /// Files NOT in the set are dropped — the temp tree's `Drop` does
-    /// the cleanup. Paths in `accepted` that aren't in the staged set
-    /// are silently ignored (idempotent: a UI that sends back its
-    /// initial pending list always works).
-    ///
-    /// `CommitReport.files` is the subset that was actually renamed,
-    /// preserving the original order. An empty `accepted` set is a
-    /// valid full-reject — returns an empty report.
+    /// File-level wrapper. Pre-v56 compatibility surface: every path in
+    /// `accepted` becomes a `FileApproval::All`; everything else is
+    /// dropped. New callers should prefer
+    /// [`Self::commit_selected_hunks`] directly so per-hunk decisions
+    /// are explicit at the API boundary.
     pub fn commit_selected(
         self,
         accepted: &std::collections::HashSet<PathBuf>,
     ) -> Result<CommitReport, StagingError> {
-        // Renames in lexicographic order (BTreeMap iter is sorted) so
-        // any partial-failure list is deterministic. `applied` (index
-        // of the next pending file) equals the count of files already
-        // in their final place when a failure fires; `remaining` is
-        // what's left including the failing one.
-        let selected: Vec<FileOutcome> = self
-            .outcomes
-            .into_iter()
-            .filter(|o| accepted.contains(&o.path))
+        let selection: HunkSelection = accepted
+            .iter()
+            .map(|p| (p.clone(), FileApproval::All))
             .collect();
-        let total = selected.len();
+        self.commit_selected_hunks(&selection)
+    }
+
+    /// v56 — commit each staged file per the caller's [`HunkSelection`].
+    /// Paths absent from the map are dropped. `FileApproval::All`
+    /// renames the staged file as-is (pre-v56 behaviour). For a
+    /// `Hunks::Lines` file with `FileApproval::Hunks(indices)`, the
+    /// staged file is rewritten in place with a splice of pre-image
+    /// lines for rejected hunks + staged lines for accepted hunks
+    /// before the rename. Non-Lines variants ignore the index list:
+    /// non-empty `Hunks(…)` is treated as `All`; empty `Hunks(vec![])`
+    /// drops the file.
+    ///
+    /// Order is the same as the source `Staging` (lexicographic by
+    /// path) so any partial-failure list is deterministic.
+    ///
+    /// **Syntax-check trade-off**: a partial-hunk splice is NOT
+    /// re-validated against the file's syntax check (the pre-commit
+    /// check ran against the agent's full new file). A spliced output
+    /// may parse-fail; surfacing that is on the UI for v0. Callers
+    /// that need to guarantee parseability should accept entire hunks
+    /// only.
+    pub fn commit_selected_hunks(
+        self,
+        selection: &HunkSelection,
+    ) -> Result<CommitReport, StagingError> {
+        // Classify each staged outcome against the selection. Order
+        // preserved from `self.outcomes` (lexicographic by path).
+        enum CommitMode {
+            All,
+            PartialHunks(std::collections::HashSet<usize>),
+        }
+        let mut planned: Vec<(FileOutcome, CommitMode)> = Vec::new();
+        for outcome in &self.outcomes {
+            let mode = match selection.get(&outcome.path) {
+                None => continue,
+                Some(FileApproval::All) => CommitMode::All,
+                Some(FileApproval::Hunks(indices)) => match &outcome.hunks {
+                    crate::diff::Hunks::Lines { hunks } => {
+                        if indices.is_empty() {
+                            // No hunks selected = drop. The pre-image
+                            // is already on disk; nothing to rename.
+                            continue;
+                        }
+                        let valid: std::collections::HashSet<usize> = indices
+                            .iter()
+                            .copied()
+                            .filter(|i| *i < hunks.len())
+                            .collect();
+                        if valid.is_empty() {
+                            continue;
+                        }
+                        if valid.len() == hunks.len() {
+                            CommitMode::All
+                        } else {
+                            CommitMode::PartialHunks(valid)
+                        }
+                    }
+                    // Created / Deleted / Binary / Same have no
+                    // addressable hunks — non-empty selection = take
+                    // the whole file; empty selection = drop.
+                    _ => {
+                        if indices.is_empty() {
+                            continue;
+                        }
+                        CommitMode::All
+                    }
+                },
+            };
+            planned.push((outcome.clone(), mode));
+        }
+        // v57 (C1 fix) — two-pass commit. The pre-v57 path interleaved
+        // splice + rename per file; a splice or rename failure halfway
+        // through left files 0..k-1 already renamed, breaking the
+        // "all-or-nothing" §3 guarantee for partial-hunk batches.
+        //
+        // Pass 1: do every per-file pre-rename mutation (mkdir target
+        // parent, splice into the staged tempfile for partial-hunk
+        // commits). Any failure here aborts before *any* workspace
+        // file has moved.
+        //
+        // Pass 2: rename each staged path into the workspace. The
+        // existing PartialCommit error semantics are retained for
+        // this pass — a mid-rename failure can still leave some files
+        // landed, but the splice failure mode is now closed.
+        let total = planned.len();
         let mut parents_to_sync: std::collections::BTreeSet<PathBuf> =
             std::collections::BTreeSet::new();
-        for (applied, outcome) in selected.iter().enumerate() {
+        // Pass 1 — splice + mkdir; no rename yet.
+        //
+        // v58 (M-sec-6 fix) — re-validate each target's symlink
+        // containment immediately before `create_dir_all`.
+        // `Staging::stage` ran the same check, but between stage and
+        // `commit_selected_hunks` (which can wait an arbitrarily long
+        // time on user approval) a concurrent process can plant a
+        // symlink in the workspace. The pre-v58 path then followed
+        // it via `create_dir_all` and landed the file outside the
+        // repo. The recheck closes the TOCTOU window.
+        for (outcome, mode) in planned.iter() {
             let staged_path = self.staging_dir.path().join(&outcome.path);
             let target = self.workspace_root.join(&outcome.path);
+            ensure_target_inside_workspace(&self.workspace_root, &target, &outcome.path)?;
             if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| StagingError::PartialCommit {
-                    applied,
-                    failed_path: outcome.path.clone(),
-                    remaining: total - applied,
+                std::fs::create_dir_all(parent).map_err(|e| StagingError::Io {
+                    path: parent.to_path_buf(),
                     source: e,
                 })?;
                 parents_to_sync.insert(parent.to_path_buf());
             }
+            if let CommitMode::PartialHunks(accepted_hunk_indices) = mode {
+                if let crate::diff::Hunks::Lines { hunks } = &outcome.hunks {
+                    let pre = self
+                        .pre_images
+                        .get(&outcome.path)
+                        .and_then(|p| p.as_deref())
+                        .unwrap_or(b"");
+                    let new_bytes = std::fs::read(&staged_path).map_err(|e| StagingError::Io {
+                        path: staged_path.clone(),
+                        source: e,
+                    })?;
+                    let spliced = splice_hunks(pre, &new_bytes, hunks, accepted_hunk_indices);
+                    write_with_sync(&staged_path, &spliced).map_err(|e| StagingError::Io {
+                        path: staged_path.clone(),
+                        source: e,
+                    })?;
+                }
+            }
+        }
+        // Pass 2 — rename only.
+        for (applied, (outcome, _mode)) in planned.iter().enumerate() {
+            let staged_path = self.staging_dir.path().join(&outcome.path);
+            let target = self.workspace_root.join(&outcome.path);
             std::fs::rename(&staged_path, &target).map_err(|e| StagingError::PartialCommit {
                 applied,
                 failed_path: outcome.path.clone(),
@@ -545,8 +694,83 @@ impl StagedBatch {
             let _ = fsync_dir_best_effort(parent);
         }
 
-        Ok(CommitReport { files: selected })
+        Ok(CommitReport {
+            files: planned.into_iter().map(|(o, _)| o).collect(),
+        })
     }
+}
+
+/// v56 — splice a partial-hunk commit. Walks `pre_image` linewise,
+/// emitting unchanged context up to each hunk, then either the
+/// staged hunk (accepted) or the original hunk (rejected). Lines are
+/// preserved verbatim via `split_inclusive('\n')` so the
+/// trailing-newline convention of the file is carried through.
+///
+/// Both buffers must be UTF-8; non-UTF-8 inputs short-circuit to
+/// `Hunks::Binary` in [`crate::diff::hunks_for`] so partial-hunk
+/// selection isn't reachable for binary files.
+fn splice_hunks(
+    pre_image: &[u8],
+    new_bytes: &[u8],
+    hunks: &[crate::diff::Hunk],
+    accepted: &std::collections::HashSet<usize>,
+) -> Vec<u8> {
+    let Ok(pre_text) = std::str::from_utf8(pre_image) else {
+        // Should be unreachable: a non-UTF-8 pre-image would have
+        // produced `Hunks::Binary` and the partial-hunk path is gated
+        // on `Hunks::Lines`. Defensive fallback: keep the pre-image.
+        return pre_image.to_vec();
+    };
+    let Ok(new_text) = std::str::from_utf8(new_bytes) else {
+        return pre_image.to_vec();
+    };
+    let pre_lines: Vec<&str> = pre_text.split_inclusive('\n').collect();
+    let new_lines: Vec<&str> = new_text.split_inclusive('\n').collect();
+
+    let mut out = String::with_capacity(pre_image.len().max(new_bytes.len()));
+    let mut cursor_old = 0usize;
+    for (idx, hunk) in hunks.iter().enumerate() {
+        // v59 (audit LOW-4 fix) — skip out-of-order or overlapping
+        // hunks rather than emit ambiguous spliced output. The
+        // in-tree `diff::hunks_for` producer is monotonic; an
+        // overlap can only come from a future MCP-hosted tool
+        // emitting a malformed `Hunks::Lines`. Skipping is
+        // deterministic-by-spec; the pre-v59 clamp produced
+        // accidentally-correct-by-luck output that depended on
+        // exact slice math.
+        if hunk.old_range.start < cursor_old {
+            tracing::warn!(
+                hunk_index = idx,
+                cursor = cursor_old,
+                hunk_start = hunk.old_range.start,
+                "splice_hunks: skipping out-of-order / overlapping hunk"
+            );
+            continue;
+        }
+        let start = hunk.old_range.start.min(pre_lines.len());
+        for line in &pre_lines[cursor_old..start] {
+            out.push_str(line);
+        }
+        if accepted.contains(&idx) {
+            let ns = hunk.new_range.start.min(new_lines.len());
+            let ne = hunk.new_range.end.min(new_lines.len()).max(ns);
+            for line in &new_lines[ns..ne] {
+                out.push_str(line);
+            }
+        } else {
+            let os = hunk.old_range.start.min(pre_lines.len());
+            let oe = hunk.old_range.end.min(pre_lines.len()).max(os);
+            for line in &pre_lines[os..oe] {
+                out.push_str(line);
+            }
+        }
+        cursor_old = hunk.old_range.end.min(pre_lines.len()).max(cursor_old);
+    }
+    // Tail: everything after the last hunk's old_range.end.
+    for line in &pre_lines[cursor_old..] {
+        out.push_str(line);
+    }
+    out.into_bytes()
 }
 
 /// Atomic-ish file write: create, write, sync_all, close. Used by the
@@ -1008,5 +1232,350 @@ mod tests {
         let r1 = s1.commit().unwrap();
         assert_eq!(r1.files.len(), 1);
         assert_eq!(std::fs::read(ws.join("a.txt")).unwrap(), b"xx");
+    }
+
+    // ---------- v56 hunk-rewrite contract ----------
+
+    use std::collections::HashSet;
+
+    fn write_to(ws: &Path, rel: &str, body: &[u8]) {
+        let p = ws.join(rel);
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(p, body).unwrap();
+    }
+
+    #[test]
+    fn commit_selected_hunks_with_all_matches_commit_selected_file_level() {
+        let dir = ws_dir();
+        let ws = dir.path();
+        write_to(ws, "a.txt", b"one\ntwo\nthree\n");
+        let check = NoopSyntaxCheck;
+        let mut s = Staging::new(ws, &check);
+        s.add(StagedWrite::new("a.txt", "ONE\ntwo\nTHREE\n"))
+            .unwrap();
+        let batch = s.stage().unwrap();
+        let mut sel = HunkSelection::new();
+        sel.insert(PathBuf::from("a.txt"), FileApproval::All);
+        let report = batch.commit_selected_hunks(&sel).unwrap();
+        assert_eq!(report.files.len(), 1);
+        assert_eq!(
+            std::fs::read(ws.join("a.txt")).unwrap(),
+            b"ONE\ntwo\nTHREE\n"
+        );
+    }
+
+    #[test]
+    fn commit_selected_hunks_partial_splices_pre_image_for_rejected_hunks() {
+        // Pre-image has 5 lines; staged version changes lines 0 and 4.
+        // Accept hunk 0 (line 0 change), reject hunk 1 (line 4 change).
+        // Expected on disk: ONE + line-1..3 (unchanged) + line-4 (reverted).
+        let dir = ws_dir();
+        let ws = dir.path();
+        write_to(ws, "a.txt", b"one\ntwo\nthree\nfour\nfive\n");
+        let check = NoopSyntaxCheck;
+        let mut s = Staging::new(ws, &check);
+        s.add(StagedWrite::new("a.txt", "ONE\ntwo\nthree\nfour\nFIVE\n"))
+            .unwrap();
+        let batch = s.stage().unwrap();
+        // Sanity: two hunks expected.
+        let pending = batch.pending_files();
+        assert_eq!(pending.len(), 1);
+        let hunk_count = match &pending[0].hunks {
+            crate::diff::Hunks::Lines { hunks } => hunks.len(),
+            other => panic!("expected Lines, got {other:?}"),
+        };
+        assert_eq!(hunk_count, 2, "two non-adjacent changes = two hunks");
+
+        let mut sel = HunkSelection::new();
+        sel.insert(PathBuf::from("a.txt"), FileApproval::Hunks(vec![0]));
+        let report = batch.commit_selected_hunks(&sel).unwrap();
+        assert_eq!(report.files.len(), 1);
+        assert_eq!(
+            std::fs::read(ws.join("a.txt")).unwrap(),
+            b"ONE\ntwo\nthree\nfour\nfive\n",
+            "hunk 0 accepted, hunk 1 reverted to pre-image"
+        );
+    }
+
+    #[test]
+    fn commit_selected_hunks_empty_indices_on_lines_drops_the_file() {
+        let dir = ws_dir();
+        let ws = dir.path();
+        write_to(ws, "a.txt", b"one\ntwo\n");
+        let check = NoopSyntaxCheck;
+        let mut s = Staging::new(ws, &check);
+        s.add(StagedWrite::new("a.txt", "ONE\ntwo\n")).unwrap();
+        let batch = s.stage().unwrap();
+        let mut sel = HunkSelection::new();
+        sel.insert(PathBuf::from("a.txt"), FileApproval::Hunks(vec![]));
+        let report = batch.commit_selected_hunks(&sel).unwrap();
+        assert!(report.files.is_empty(), "empty hunk set = drop");
+        assert_eq!(std::fs::read(ws.join("a.txt")).unwrap(), b"one\ntwo\n");
+    }
+
+    #[test]
+    fn commit_selected_hunks_created_file_with_any_hunks_treats_as_all() {
+        // Created files have no addressable hunks; non-empty selection
+        // takes the whole file. (Confirms the documented degradation.)
+        let dir = ws_dir();
+        let ws = dir.path();
+        let check = NoopSyntaxCheck;
+        let mut s = Staging::new(ws, &check);
+        s.add(StagedWrite::new("new.txt", "new contents\n"))
+            .unwrap();
+        let batch = s.stage().unwrap();
+        let mut sel = HunkSelection::new();
+        sel.insert(PathBuf::from("new.txt"), FileApproval::Hunks(vec![0]));
+        let report = batch.commit_selected_hunks(&sel).unwrap();
+        assert_eq!(report.files.len(), 1);
+        assert_eq!(
+            std::fs::read(ws.join("new.txt")).unwrap(),
+            b"new contents\n"
+        );
+    }
+
+    #[test]
+    fn commit_selected_hunks_created_file_with_empty_indices_drops() {
+        let dir = ws_dir();
+        let ws = dir.path();
+        let check = NoopSyntaxCheck;
+        let mut s = Staging::new(ws, &check);
+        s.add(StagedWrite::new("new.txt", "new\n")).unwrap();
+        let batch = s.stage().unwrap();
+        let mut sel = HunkSelection::new();
+        sel.insert(PathBuf::from("new.txt"), FileApproval::Hunks(vec![]));
+        let report = batch.commit_selected_hunks(&sel).unwrap();
+        assert!(report.files.is_empty());
+        assert!(!ws.join("new.txt").exists());
+    }
+
+    #[test]
+    fn commit_selected_hunks_omitted_path_is_fully_rejected() {
+        let dir = ws_dir();
+        let ws = dir.path();
+        let check = NoopSyntaxCheck;
+        let mut s = Staging::new(ws, &check);
+        s.add(StagedWrite::new("a.txt", "a")).unwrap();
+        s.add(StagedWrite::new("b.txt", "b")).unwrap();
+        let batch = s.stage().unwrap();
+        let mut sel = HunkSelection::new();
+        sel.insert(PathBuf::from("a.txt"), FileApproval::All);
+        let report = batch.commit_selected_hunks(&sel).unwrap();
+        assert_eq!(report.files.len(), 1);
+        assert!(ws.join("a.txt").exists());
+        assert!(!ws.join("b.txt").exists());
+    }
+
+    #[test]
+    fn commit_selected_hunks_invalid_indices_filtered_silently() {
+        // An index past the hunk-count is treated as "not selected"
+        // rather than an error — defensive against a stale UI snapshot.
+        let dir = ws_dir();
+        let ws = dir.path();
+        write_to(ws, "a.txt", b"one\ntwo\n");
+        let check = NoopSyntaxCheck;
+        let mut s = Staging::new(ws, &check);
+        s.add(StagedWrite::new("a.txt", "ONE\ntwo\n")).unwrap();
+        let batch = s.stage().unwrap();
+        let mut sel = HunkSelection::new();
+        // Only hunk 99 (doesn't exist) + hunk 0 (exists). Effective
+        // selection = {0}. Since there's one hunk total and one is
+        // selected, this is "all hunks" → commit as-is.
+        sel.insert(PathBuf::from("a.txt"), FileApproval::Hunks(vec![99, 0]));
+        let report = batch.commit_selected_hunks(&sel).unwrap();
+        assert_eq!(report.files.len(), 1);
+        assert_eq!(std::fs::read(ws.join("a.txt")).unwrap(), b"ONE\ntwo\n");
+    }
+
+    #[test]
+    fn splice_hunks_preserves_trailing_newline_convention() {
+        use crate::diff::{hunks_for, Hunks};
+        let pre = b"a\nb\nc\n";
+        let new = b"A\nb\nC\n";
+        let h = hunks_for(pre, new);
+        let Hunks::Lines { hunks } = h else {
+            panic!("expected Lines");
+        };
+        // Accept only the first hunk (a→A); reject the second (c→C).
+        let accepted: HashSet<usize> = [0].into_iter().collect();
+        let out = splice_hunks(pre, new, &hunks, &accepted);
+        assert_eq!(out, b"A\nb\nc\n");
+    }
+
+    #[test]
+    fn commit_selected_hunks_two_pass_keeps_workspace_unchanged_when_splice_blob_missing() {
+        // Regression for C1: a splice-phase I/O failure must NOT leave
+        // already-renamed files from earlier in the batch sitting in
+        // the workspace. We force the splice to fail for `b.txt` by
+        // deleting its staged blob between stage() and commit; b.txt
+        // is constructed with two hunks so selecting only hunk 0
+        // actually exercises the splice path (a full-hunk selection
+        // optimises to FileApproval::All and skips the splice).
+        let dir = ws_dir();
+        let ws = dir.path();
+        write_to(ws, "a.txt", b"a-old\n");
+        write_to(ws, "b.txt", b"one\ntwo\nthree\nfour\nfive\n");
+        let check = NoopSyntaxCheck;
+        let mut s = Staging::new(ws, &check);
+        s.add(StagedWrite::new("a.txt", "a-NEW\n")).unwrap();
+        s.add(StagedWrite::new("b.txt", "ONE\ntwo\nthree\nfour\nFIVE\n"))
+            .unwrap();
+        let batch = s.stage().unwrap();
+
+        // Sanity: b.txt actually produced two non-adjacent hunks.
+        let b_outcome = batch
+            .pending_files()
+            .iter()
+            .find(|f| f.path == PathBuf::from("b.txt"))
+            .unwrap();
+        assert!(matches!(
+            &b_outcome.hunks,
+            crate::diff::Hunks::Lines { hunks } if hunks.len() == 2
+        ));
+
+        // Reach into the staging temp tree and delete b.txt's blob so
+        // the splice's std::fs::read fails.
+        let staging_tree = batch.staging_dir.path().to_path_buf();
+        std::fs::remove_file(staging_tree.join("b.txt")).unwrap();
+
+        let mut sel = HunkSelection::new();
+        sel.insert(PathBuf::from("a.txt"), FileApproval::All);
+        sel.insert(PathBuf::from("b.txt"), FileApproval::Hunks(vec![0]));
+        let err = batch.commit_selected_hunks(&sel).unwrap_err();
+        // Splice-phase failures should NOT surface as PartialCommit —
+        // by definition no rename has run.
+        assert!(
+            matches!(err, StagingError::Io { .. }),
+            "expected Io error from pass-1 splice failure, got {err:?}"
+        );
+        // The workspace must be untouched.
+        assert_eq!(
+            std::fs::read(ws.join("a.txt")).unwrap(),
+            b"a-old\n",
+            "two-pass commit: a.txt must not have been renamed when b.txt's splice failed"
+        );
+        assert_eq!(
+            std::fs::read(ws.join("b.txt")).unwrap(),
+            b"one\ntwo\nthree\nfour\nfive\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn commit_selected_hunks_rejects_symlink_planted_between_stage_and_commit() {
+        // Regression for M-sec-6 — TOCTOU window between
+        // Staging::stage and StagedBatch::commit_selected_hunks. A
+        // concurrent process (or a chained tool from the same
+        // session before user approval lands) plants a symlink in
+        // the workspace; pre-v58 commit blindly followed it.
+        let dir = ws_dir();
+        let ws = dir.path();
+        let check = NoopSyntaxCheck;
+
+        // Stage a new file under a subdirectory that doesn't exist yet.
+        let mut s = Staging::new(ws, &check);
+        s.add(StagedWrite::new("sub/new.txt", "fresh")).unwrap();
+        let batch = s.stage().unwrap();
+
+        // Between stage and commit: plant `sub` as a symlink to an
+        // outside directory.
+        let outside = tempfile::TempDir::new().unwrap();
+        std::os::unix::fs::symlink(outside.path(), ws.join("sub")).unwrap();
+
+        let mut sel = HunkSelection::new();
+        sel.insert(PathBuf::from("sub/new.txt"), FileApproval::All);
+        let err = batch.commit_selected_hunks(&sel).unwrap_err();
+        // The recheck surfaces this as EscapesWorkspace via
+        // ensure_target_inside_workspace; the workspace never has
+        // the file landed under the outside directory.
+        assert!(
+            matches!(err, StagingError::EscapesWorkspace(_)),
+            "expected EscapesWorkspace, got {err:?}"
+        );
+        assert!(!outside.path().join("new.txt").exists());
+    }
+
+    #[test]
+    fn splice_hunks_preserves_eof_insertion_when_accepted() {
+        // Regression for H3 — for a file ending in `\n`, similar's
+        // `from_lines` tokens and our `split_inclusive('\n')` tokens
+        // must agree on line counts so an EOF-insertion hunk
+        // (old_range == [N, N] with N == line count) doesn't get
+        // mis-spliced. Accept the EOF insertion; output should be
+        // pre + new lines.
+        use crate::diff::{hunks_for, Hunks};
+        let pre = b"line0\n";
+        let new = b"line0\nline1\nline2\n";
+        let h = hunks_for(pre, new);
+        let Hunks::Lines { hunks } = h else {
+            panic!("expected Lines, got {h:?}");
+        };
+        let accepted: HashSet<usize> = (0..hunks.len()).collect();
+        let out = splice_hunks(pre, new, &hunks, &accepted);
+        assert_eq!(out, b"line0\nline1\nline2\n");
+    }
+
+    #[test]
+    fn splice_hunks_eof_insertion_rejected_keeps_pre_image() {
+        use crate::diff::{hunks_for, Hunks};
+        let pre = b"line0\n";
+        let new = b"line0\nline1\n";
+        let h = hunks_for(pre, new);
+        let Hunks::Lines { hunks } = h else {
+            panic!("expected Lines, got {h:?}");
+        };
+        // Reject every hunk — output equals pre-image.
+        let accepted: HashSet<usize> = HashSet::new();
+        let out = splice_hunks(pre, new, &hunks, &accepted);
+        assert_eq!(out, b"line0\n");
+    }
+
+    #[test]
+    fn splice_hunks_tolerates_out_of_order_hunks_without_panic() {
+        // Regression for the v57 audit's L-1 — `pre_lines[cursor_old..start]`
+        // would panic if a future producer emitted hunks out of
+        // order or overlapping. v58 clamps `start >= cursor_old` so
+        // the slice is always valid; the splice is best-effort
+        // rather than asserting producer correctness.
+        use crate::diff::{Hunk, LineRange};
+        let pre = b"one\ntwo\nthree\nfour\nfive\n";
+        let new = b"ONE\ntwo\nthree\nfour\nFIVE\n";
+        // Synthetic out-of-order hunks: second hunk's old_range.start
+        // is BEFORE first hunk's old_range.end.
+        let hunks = vec![
+            Hunk {
+                old_range: LineRange { start: 0, end: 3 },
+                new_range: LineRange { start: 0, end: 3 },
+                old_lines: vec!["one".into(), "two".into(), "three".into()],
+                new_lines: vec!["ONE".into(), "two".into(), "three".into()],
+            },
+            // Out-of-order: 1 < 3 (the prior hunk's end).
+            Hunk {
+                old_range: LineRange { start: 1, end: 2 },
+                new_range: LineRange { start: 1, end: 2 },
+                old_lines: vec!["two".into()],
+                new_lines: vec!["two!".into()],
+            },
+        ];
+        let accepted: HashSet<usize> = [0, 1].into_iter().collect();
+        // Pre-v58 this panicked with slice-index-out-of-order.
+        // Post-fix it just produces a best-effort output.
+        let _out = splice_hunks(pre, new, &hunks, &accepted);
+    }
+
+    #[test]
+    fn splice_hunks_handles_missing_trailing_newline() {
+        use crate::diff::{hunks_for, Hunks};
+        let pre = b"a\nb";
+        let new = b"A\nb";
+        let h = hunks_for(pre, new);
+        let Hunks::Lines { hunks } = h else {
+            panic!("expected Lines");
+        };
+        let accepted: HashSet<usize> = [0].into_iter().collect();
+        let out = splice_hunks(pre, new, &hunks, &accepted);
+        assert_eq!(out, b"A\nb");
     }
 }

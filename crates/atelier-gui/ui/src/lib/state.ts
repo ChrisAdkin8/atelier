@@ -194,6 +194,11 @@ export type AppState = {
   /// `ContextItems`. Distinct from context items: cards are
   /// durable across sessions; context items are per-turn.
   memoryCards: MemoryCardSummary[]
+  /// v56 — per-file rationale from the envelope's `claimed_changes`,
+  /// keyed by repo-relative path. The DiffPane renders this next to
+  /// the file header so the user can see the agent's stated "why".
+  /// Wholesale-replaced on each `ClaimedChanges` event.
+  claimedChanges: Record<string, string>
 }
 
 export function initialState(): AppState {
@@ -212,6 +217,7 @@ export function initialState(): AppState {
     currentModel: null,
     contextItems: [],
     memoryCards: [],
+    claimedChanges: {},
   }
 }
 
@@ -238,11 +244,11 @@ export function applyEvent(state: AppState, evt: BridgedEvent): AppState {
     }
     case 'MessageCommitted': {
       const p = evt.payload as { role: ConversationRole; text: string }
-      // Defensive: the bridge serialises Rust's `MessageRole` via Debug
-      // then lowercases, which on the four valid variants produces
-      // exactly our union — but a future variant added Rust-side would
-      // arrive here as a string we don't recognise. Coerce to a known
-      // role rather than rendering a blank prefix.
+      // v58 (stale-comment fix) — the bridge now serialises Rust's
+      // `MessageRole` via `MessageRole::wire_label()` (canonical
+      // lowercase). The defensive coercion stays as a guard against a
+      // future variant added Rust-side that the GUI doesn't yet know
+      // about — surfaces as "system" rather than a blank prefix.
       const role: ConversationRole = isConversationRole(p.role) ? p.role : 'system'
       const line: ConversationLine = { role, text: p.text }
       const conversation = pushBounded(state.conversation, line, MAX_CONVERSATION_LINES)
@@ -306,6 +312,19 @@ export function applyEvent(state: AppState, evt: BridgedEvent): AppState {
       const p = evt.payload as { cards: MemoryCardSummary[] }
       return { ...state, events, memoryCards: p.cards ?? [] }
     }
+    case 'ClaimedChanges': {
+      // v56 — wholesale-replace the path→rationale map. The DiffPane
+      // reads this to render the agent's "why this change?" summary
+      // next to the file header.
+      const p = evt.payload as {
+        changes: { path: string; kind: string; summary: string }[]
+      }
+      const map: Record<string, string> = Object.create(null)
+      for (const c of p.changes ?? []) {
+        map[c.path] = c.summary
+      }
+      return { ...state, events, claimedChanges: map }
+    }
     // Variants we don't fold into pane state — just the event log.
     case 'IllegalTransitionAttempted':
     case 'Cancelled':
@@ -365,74 +384,86 @@ function isConversationRole(s: string): s is ConversationRole {
 }
 
 export function projectEvent(evt: BridgedEvent): EventLogEntry {
+  // v58 (H7-residual + GUI label-drift fix) — `kind` comes from the
+  // BridgedEvent's `kind` field, which is sourced from Rust's
+  // `SessionEvent::kind()` (canonical variant names). Pre-v58 this
+  // function synthesised its own short labels (Message,
+  // PendingApproval, IllegalTransition, ModelProfile) which drifted
+  // from the TUI projection by construction.
+  const kind = evt.kind
   switch (evt.kind) {
     case 'MessageCommitted': {
       const p = evt.payload as { role: string; text: string }
       const firstLine = (p.text ?? '').split('\n')[0] ?? ''
-      return { kind: 'Message', detail: `${p.role}: ${firstLine.slice(0, 60)}` }
+      return { kind, detail: `${p.role}: ${firstLine.slice(0, 60)}` }
     }
     case 'PlanSnapshot': {
       const p = evt.payload as { steps: PlanStep[] }
-      return { kind: 'PlanSnapshot', detail: `${p.steps?.length ?? 0} steps` }
+      return { kind, detail: `${p.steps?.length ?? 0} steps` }
     }
     case 'LedgerAppended': {
       const p = evt.payload as { entry: LedgerEntry }
       const label = p.entry.kind === 'tool_call' ? `tool_call:${p.entry.tool_name}` : p.entry.kind
-      return { kind: 'LedgerAppended', detail: label }
+      return { kind, detail: label }
     }
     case 'ContextSnapshot': {
       const p = evt.payload as { known_tokens: number; unknown_tokens: number }
       return {
-        kind: 'ContextSnapshot',
+        kind,
         detail: `known=${p.known_tokens} unknown=${p.unknown_tokens}`,
       }
     }
     case 'StagingPendingApproval': {
       const p = evt.payload as { files: unknown[] }
       const n = Array.isArray(p.files) ? p.files.length : 0
-      return { kind: 'PendingApproval', detail: `${n} files awaiting approval` }
+      return { kind, detail: `${n} files awaiting approval` }
     }
     case 'CommitDecision': {
       const p = evt.payload as { committed: unknown[]; dropped: unknown[] }
       const c = Array.isArray(p.committed) ? p.committed.length : 0
       const d = Array.isArray(p.dropped) ? p.dropped.length : 0
-      return { kind: 'CommitDecision', detail: `committed=${c} dropped=${d}` }
+      return { kind, detail: `committed=${c} dropped=${d}` }
     }
     case 'Transitioned': {
       const p = evt.payload as { from: string; to: string }
-      return { kind: 'Transitioned', detail: `${p.from} → ${p.to}` }
+      return { kind, detail: `${p.from} → ${p.to}` }
     }
     case 'IllegalTransitionAttempted': {
       const p = evt.payload as { from: string; to: string }
-      return { kind: 'IllegalTransition', detail: `${p.from} ↛ ${p.to}` }
+      return { kind, detail: `${p.from} ↛ ${p.to}` }
     }
     case 'EditStaged': {
       const p = evt.payload as { path: string }
-      return { kind: 'EditStaged', detail: p.path }
+      return { kind, detail: p.path }
     }
     case 'ModelProfileLoaded': {
       const p = evt.payload as { model_id: string; strategy: string; outcome: string }
       return {
-        kind: 'ModelProfile',
+        kind,
         detail: `${p.model_id} · strategy=${p.strategy} · ${p.outcome}`,
       }
     }
     case 'ContextItems': {
       const p = evt.payload as { items?: unknown[] }
       const n = Array.isArray(p.items) ? p.items.length : 0
-      return { kind: 'ContextItems', detail: `${n} items` }
+      return { kind, detail: `${n} items` }
     }
     case 'MemoryCards': {
       const p = evt.payload as { cards?: unknown[] }
       const n = Array.isArray(p.cards) ? p.cards.length : 0
-      return { kind: 'MemoryCards', detail: `${n} cards` }
+      return { kind, detail: `${n} cards` }
+    }
+    case 'ClaimedChanges': {
+      const p = evt.payload as { changes?: unknown[] }
+      const n = Array.isArray(p.changes) ? p.changes.length : 0
+      return { kind, detail: `${n} file rationale(s)` }
     }
     case 'Cancelled':
-      return { kind: 'Cancelled', detail: '' }
+      return { kind, detail: '' }
     case 'Shutdown':
-      return { kind: 'Shutdown', detail: '' }
+      return { kind, detail: '' }
     default:
-      return { kind: evt.kind, detail: '' }
+      return { kind, detail: '' }
   }
 }
 

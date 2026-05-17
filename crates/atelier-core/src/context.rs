@@ -68,6 +68,13 @@ pub enum TokenSource {
 /// Why this item is in the agent's context. Drives the "why-here trace per
 /// item" requirement (spec §5). The enum is closed because the UI renders a
 /// distinct badge per variant; adding a source means adding a badge.
+///
+/// **Wire-label discipline (v58, MED-smell-1 fix)**: the snake_case
+/// label used everywhere — `ContextItemSummary::from_item`, the GUI
+/// badge map, the TUI badge map — comes from
+/// [`Provenance::wire_label`]. The `#[serde(rename_all = "snake_case")]`
+/// projection produces the same strings; a unit test below pins the
+/// agreement so a future variant rename can't drift.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "source", rename_all = "snake_case")]
 pub enum Provenance {
@@ -86,6 +93,52 @@ pub enum Provenance {
     /// Explicitly pinned by the user — pinning is itself a why-here signal
     /// distinct from how the item arrived, and survives independently.
     PinnedByUser { note: Option<String> },
+    /// The assistant's own past turn. Not pinnable in the usual sense
+    /// (you don't pin your own output), but counts toward the context
+    /// window and so appears in the §5 panel for honest token attribution.
+    AssistantTurn,
+}
+
+impl Provenance {
+    /// v58 (MED-smell-1) — canonical snake_case label, matching the
+    /// `#[serde(rename_all = "snake_case")]` projection. Single
+    /// source of truth across `ContextItemSummary::from_item`, GUI
+    /// `ContextPane.svelte` badge map, and TUI `provenance_badge`.
+    pub fn wire_label(&self) -> &'static str {
+        match self {
+            Self::Initial => "initial",
+            Self::UserAttached { .. } => "user_attached",
+            Self::ToolResult { .. } => "tool_result",
+            Self::MemoryPromoted { .. } => "memory_promoted",
+            Self::PinnedByUser { .. } => "pinned_by_user",
+            Self::AssistantTurn => "assistant_turn",
+        }
+    }
+}
+
+impl Payload {
+    /// v58 (MED-smell-1) — canonical snake_case kind label, matching
+    /// the `#[serde(tag = "kind", rename_all = "snake_case")]`
+    /// projection.
+    pub fn wire_label(&self) -> &'static str {
+        match self {
+            Self::FileRef { .. } => "file_ref",
+            Self::InlineText { .. } => "inline_text",
+            Self::BlobRef { .. } => "blob_ref",
+        }
+    }
+}
+
+impl TokenSource {
+    /// v58 (MED-smell-2) — canonical lowercase label, matching the
+    /// `#[serde(rename_all = "lowercase")]` projection.
+    pub fn wire_label(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::Approx => "approx",
+            Self::Unavailable => "unavailable",
+        }
+    }
 }
 
 /// Shape of the payload. The context manager never inspects payload bytes —
@@ -151,53 +204,44 @@ impl ContextItemSummary {
     /// Build a summary from a `ContextItem`. Caps the inline-text
     /// label at 80 characters so long pastes don't dominate the
     /// pane; the full payload remains on the actor side.
+    ///
+    /// v58 (MED-smell-1+2) — all the string fields now route through
+    /// `*::wire_label()` instead of hand-typed strings.
     pub fn from_item(item: &ContextItem) -> Self {
-        let (kind, label) = match &item.payload {
-            Payload::FileRef { path, line_range } => {
-                let label = match line_range {
-                    Some((s, e)) => format!("{path}:{s}-{e}"),
-                    None => path.clone(),
-                };
-                ("file_ref".to_string(), label)
-            }
+        let kind = item.payload.wire_label().to_string();
+        let label = match &item.payload {
+            Payload::FileRef { path, line_range } => match line_range {
+                Some((s, e)) => format!("{path}:{s}-{e}"),
+                None => path.clone(),
+            },
             Payload::InlineText { text } => {
                 let first_line = text.lines().next().unwrap_or("");
                 let truncated: String = first_line.chars().take(80).collect();
-                let label = if truncated.chars().count() < first_line.chars().count() {
+                if truncated.chars().count() < first_line.chars().count() {
                     format!("{truncated}…")
                 } else {
                     truncated
-                };
-                ("inline_text".to_string(), label)
+                }
             }
             Payload::BlobRef {
                 sha256_hex,
                 mime_type,
             } => {
                 let prefix: String = sha256_hex.chars().take(8).collect();
-                let label = match mime_type {
+                match mime_type {
                     Some(m) => format!("sha256:{prefix}… ({m})"),
                     None => format!("sha256:{prefix}…"),
-                };
-                ("blob_ref".to_string(), label)
+                }
             }
         };
-        let (provenance, provenance_detail) = match &item.provenance {
-            Provenance::Initial => ("initial".to_string(), None),
-            Provenance::UserAttached { note } => ("user_attached".to_string(), note.clone()),
-            Provenance::ToolResult { tool_call_id } => {
-                ("tool_result".to_string(), Some(tool_call_id.clone()))
-            }
-            Provenance::MemoryPromoted { card_id } => {
-                ("memory_promoted".to_string(), Some(card_id.clone()))
-            }
-            Provenance::PinnedByUser { note } => ("pinned_by_user".to_string(), note.clone()),
+        let provenance = item.provenance.wire_label().to_string();
+        let provenance_detail = match &item.provenance {
+            Provenance::Initial | Provenance::AssistantTurn => None,
+            Provenance::UserAttached { note } | Provenance::PinnedByUser { note } => note.clone(),
+            Provenance::ToolResult { tool_call_id } => Some(tool_call_id.clone()),
+            Provenance::MemoryPromoted { card_id } => Some(card_id.clone()),
         };
-        let token_source = match item.tokens.source {
-            TokenSource::Exact => "exact".to_string(),
-            TokenSource::Approx => "approx".to_string(),
-            TokenSource::Unavailable => "unavailable".to_string(),
-        };
+        let token_source = item.tokens.source.wire_label().to_string();
         Self {
             id: item.id.0.to_string(),
             kind,
@@ -258,6 +302,15 @@ pub enum ContextError {
 
     #[error("cannot evict pinned context item {0}; unpin first")]
     EvictPinned(ContextItemId),
+
+    /// v57 (L cleanup) — the wire-format id wasn't a valid UUID.
+    /// Pre-v57 the dispatcher's `parse_context_item_id` substituted
+    /// a nil UUID and returned `NotFound`, which surfaced as
+    /// "context item 00000000-0000-… not found" to the user — a
+    /// misleading error for what is actually a typo / malformed
+    /// input at the API boundary.
+    #[error("malformed context item id {0:?}")]
+    Malformed(String),
 }
 
 /// Insertion-ordered context store. Items render in the §5 panel in the
@@ -659,11 +712,94 @@ mod tests {
                 card_id: "m-7".into(),
             },
             Provenance::PinnedByUser { note: None },
+            Provenance::AssistantTurn,
         ] {
             let json = serde_json::to_string(&prov).unwrap();
             let back: Provenance = serde_json::from_str(&json).unwrap();
             assert_eq!(back, prov);
         }
+    }
+
+    #[test]
+    fn provenance_wire_label_agrees_with_serde_tag() {
+        // Regression for MED-smell-1 — `wire_label` is the single
+        // source of truth for the snake_case projection. Pin
+        // agreement with the `#[serde(tag = "source", rename_all =
+        // "snake_case")]` derive so a future variant rename can't
+        // drift between the hand match and serde.
+        for prov in [
+            Provenance::Initial,
+            Provenance::UserAttached { note: None },
+            Provenance::ToolResult {
+                tool_call_id: "tc".into(),
+            },
+            Provenance::MemoryPromoted {
+                card_id: "m".into(),
+            },
+            Provenance::PinnedByUser { note: None },
+            Provenance::AssistantTurn,
+        ] {
+            let json = serde_json::to_value(&prov).unwrap();
+            let source = json
+                .get("source")
+                .and_then(|v| v.as_str())
+                .expect("Provenance serializes with a `source` tag");
+            assert_eq!(
+                source,
+                prov.wire_label(),
+                "Provenance::{prov:?}.wire_label() must equal serde source tag"
+            );
+        }
+    }
+
+    #[test]
+    fn payload_wire_label_agrees_with_serde_tag() {
+        for p in [
+            Payload::FileRef {
+                path: "a".into(),
+                line_range: None,
+            },
+            Payload::InlineText { text: "x".into() },
+            Payload::BlobRef {
+                sha256_hex: "abc".into(),
+                mime_type: None,
+            },
+        ] {
+            let json = serde_json::to_value(&p).unwrap();
+            let kind = json
+                .get("kind")
+                .and_then(|v| v.as_str())
+                .expect("Payload serializes with a `kind` tag");
+            assert_eq!(kind, p.wire_label());
+        }
+    }
+
+    #[test]
+    fn token_source_wire_label_agrees_with_serde() {
+        for ts in [
+            TokenSource::Exact,
+            TokenSource::Approx,
+            TokenSource::Unavailable,
+        ] {
+            let json = serde_json::to_value(ts).unwrap();
+            let s = json.as_str().expect("TokenSource serializes as a string");
+            assert_eq!(s, ts.wire_label());
+        }
+    }
+
+    #[test]
+    fn summary_assistant_turn_maps_to_string_label() {
+        let i = item(
+            Payload::InlineText {
+                text: "ok I'll start by reading parser.rs".into(),
+            },
+            10,
+            TokenSource::Approx,
+            Provenance::AssistantTurn,
+        );
+        let s = ContextItemSummary::from_item(&i);
+        assert_eq!(s.provenance, "assistant_turn");
+        assert!(s.provenance_detail.is_none());
     }
 
     // ---------- v53: ContextItemSummary + summarise() ----------

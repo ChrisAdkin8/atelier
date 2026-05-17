@@ -14,7 +14,7 @@
 use async_trait::async_trait;
 use serde::Deserialize;
 
-use super::resolve_repo_path;
+use super::{ensure_inside_workspace_existing, resolve_repo_path};
 use crate::dispatcher::{SideEffectClass, Tool, ToolContext, ToolResult};
 use crate::error::ToolError;
 #[cfg(test)]
@@ -67,8 +67,22 @@ impl Tool for Shell {
         }
 
         // cwd, if provided, is repo-relative and path-validated.
+        //
+        // v57 (H8 fix) — the pre-v57 path called only `resolve_repo_path`,
+        // which is syntax-only (rejects `..` + absolute paths but does
+        // NOT follow symlinks). A model that wrote a symlink
+        // `escape -> /Users/me` inside the workspace via `write_file`
+        // could then call `shell` with `cwd: "escape"` and start the
+        // child under attacker-controlled cwd. macOS sandbox-exec
+        // still bounds the FS; Linux bwrap binds the original repo
+        // path. This added containment is defence-in-depth.
         let cwd_abs = if let Some(rel) = parsed.cwd.as_deref() {
-            Some(resolve_repo_path(ctx.workspace_root, NAME, rel)?)
+            let abs = resolve_repo_path(ctx.workspace_root, NAME, rel)?;
+            Some(ensure_inside_workspace_existing(
+                ctx.workspace_root,
+                NAME,
+                &abs,
+            )?)
         } else {
             None
         };
@@ -182,5 +196,30 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::PermissionDenied { .. }));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cwd_through_symlink_escaping_workspace_is_permission_denied() {
+        // Regression for H8 — `resolve_repo_path` was the only check
+        // pre-v57, and it didn't follow symlinks. A symlink inside the
+        // workspace pointing outside it should be rejected by
+        // `ensure_inside_workspace_existing`.
+        let workspace = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let link = workspace.path().join("escape");
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+        let s = SandboxPolicy::restrictive(workspace.path()).unwrap();
+        let err = Shell
+            .execute(
+                serde_json::json!({"command": "true", "cwd": "escape"}),
+                &ctx(workspace.path(), &s),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ToolError::PermissionDenied { .. }),
+            "shell with cwd through a symlink-out must be PermissionDenied; got {err:?}"
+        );
     }
 }

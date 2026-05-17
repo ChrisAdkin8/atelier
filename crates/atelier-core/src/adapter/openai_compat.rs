@@ -514,6 +514,48 @@ fn map_finish_reason(raw: Option<&str>) -> Option<StopReason> {
     })
 }
 
+/// v59 + v60 — priority-aware merge for `stop_reason` across multiple
+/// `finish_reason` chunks. Some compat servers emit `finish_reason`
+/// more than once per response and the order isn't guaranteed
+/// (Ollama / custom servers shipping `stop` *then* `tool_calls` is
+/// the v59 case). The merge picks the higher-priority reason so the
+/// runner reacts consistently regardless of arrival order.
+///
+/// **Priority order (highest → lowest), v60 (security L-3 fix):**
+///
+/// 1. `Refusal` — content-filter signal. Hard-overriding by design:
+///    the upstream moderation layer is telling us not to act on this
+///    output. v59 had `ToolUse > Refusal` which let a hostile/buggy
+///    server bypass refusal by also emitting a tool-call finish
+///    reason; v60 flips this so a moderation hit always wins.
+/// 2. `ToolUse` — tool calls must be dispatched when no refusal
+///    came through.
+/// 3. `MaxTokens` — completion truncated; user may resume.
+/// 4. `StopSequence` — configured stop sequence matched.
+/// 5. `EndTurn` — clean stop.
+/// 6. `Other` — unknown; takes whatever's there.
+///
+/// Tie-breaker: identical priorities → keep the earlier arrival.
+fn merge_stop_reason(
+    current: Option<StopReason>,
+    incoming: Option<StopReason>,
+) -> Option<StopReason> {
+    fn priority(r: StopReason) -> u8 {
+        match r {
+            StopReason::Refusal => 5,
+            StopReason::ToolUse => 4,
+            StopReason::MaxTokens => 3,
+            StopReason::StopSequence => 2,
+            StopReason::EndTurn => 1,
+            StopReason::Other => 0,
+        }
+    }
+    match (current, incoming) {
+        (None, x) | (x, None) => x,
+        (Some(a), Some(b)) => Some(if priority(b) > priority(a) { b } else { a }),
+    }
+}
+
 // ---------- HTTP error mapping ----------
 
 fn parse_retry_after_ms(headers: &reqwest::header::HeaderMap) -> Option<u64> {
@@ -597,6 +639,12 @@ struct OpenAiToolBlockInProgress {
     /// the JSON-encoded arguments; we concatenate then parse at end
     /// of the tool block.
     args: String,
+    /// v57 (H4 fix) — set on the first `ToolCallCompleted` emit so a
+    /// duplicate `finish_reason` chunk (some Ollama / custom compat
+    /// servers emit it twice) doesn't fire the completion a second
+    /// time. Without this, the dispatcher would see two completed
+    /// events for the same tool-call id and execute the tool twice.
+    completed: bool,
 }
 
 enum LineOutcome {
@@ -758,6 +806,7 @@ impl OpenAiSseSource {
                                 id: id_opt.unwrap_or_default().to_string(),
                                 name: name_opt.unwrap_or_default().to_string(),
                                 args: String::new(),
+                                completed: false,
                             }
                         });
                         // OpenAI sometimes ships id on later chunks
@@ -792,12 +841,32 @@ impl OpenAiSseSource {
                 }
             }
             if let Some(reason) = choice.get("finish_reason").and_then(|r| r.as_str()) {
-                self.stop_reason = map_finish_reason(Some(reason));
+                // v58 (H4-residual fix) + v59 (priority merge) —
+                // merge stop_reason with priority rather than latch
+                // on first. A malformed server emitting `stop` then
+                // `tool_calls` (reverse of the v58-tested order)
+                // would otherwise leave stop_reason at EndTurn and
+                // the runner would skip dispatching the pending tool
+                // calls. `merge_stop_reason` prefers ToolUse over
+                // EndTurn so either order resolves correctly.
+                let next = map_finish_reason(Some(reason));
+                self.stop_reason = merge_stop_reason(self.stop_reason, next);
                 // Emit ToolCallCompleted for each in-progress tool
                 // when finish_reason fires (matches Anthropic
                 // adapter's content_block_stop semantics).
+                //
+                // v57 (H4 fix) — guard on `block.completed` so a
+                // duplicate `finish_reason` chunk (Ollama and some
+                // custom compat servers ship it twice on a streamed
+                // tool-call run) doesn't fire ToolCallCompleted a
+                // second time. The dispatcher's per-tool-call
+                // execution path is not idempotent — double-emit
+                // would run the tool's side effects twice.
                 for idx in self.tool_order.clone() {
-                    if let Some(block) = self.tool_blocks.get(&idx) {
+                    if let Some(block) = self.tool_blocks.get_mut(&idx) {
+                        if block.completed {
+                            continue;
+                        }
                         let raw = if block.args.is_empty() {
                             "{}".to_string()
                         } else {
@@ -809,6 +878,7 @@ impl OpenAiSseSource {
                                 id: block.id.clone(),
                                 arguments: args,
                             });
+                        block.completed = true;
                     }
                 }
             }
@@ -1359,6 +1429,239 @@ mod tests {
         assert_eq!(r.tool_calls[0].name, "shell");
         assert_eq!(r.tool_calls[0].arguments["command"], "echo hi");
         assert_eq!(r.stop_reason, Some(StopReason::ToolUse));
+    }
+
+    #[tokio::test]
+    async fn stream_latches_first_finish_reason_when_two_arrive_with_different_values() {
+        // Regression for H4-residual — a noisy server sending
+        // `tool_calls` then `stop` in two consecutive finish_reason
+        // chunks must leave stop_reason at `ToolUse`, otherwise the
+        // runner won't dispatch the pending tool calls.
+        let server = MockServer::start().await;
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_z\",\"function\":{\"name\":\"shell\",\"arguments\":\"{}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
+
+        let mut s = adapter_for(&server)
+            .stream(&[user("hi")], &[])
+            .await
+            .unwrap();
+        let mut response = None;
+        while let Some(c) = s.next().await {
+            if let StreamChunk::Complete { response: r } = c {
+                response = Some(r);
+                break;
+            }
+        }
+        let r = response.expect("Complete should arrive");
+        assert_eq!(
+            r.stop_reason,
+            Some(StopReason::ToolUse),
+            "first finish_reason wins; later 'stop' must not clobber 'tool_calls'"
+        );
+    }
+
+    #[test]
+    fn merge_stop_reason_table_pins_priority_order() {
+        // Regression for v60 (security L-3 + smells HIGH-B) — pin the
+        // priority lattice with a direct table so a future edit to
+        // `merge_stop_reason` can't accidentally regress the order.
+        // `Refusal` must beat `ToolUse` so a content-filter signal
+        // can't be bypassed by a co-emitted tool call.
+        let pairs: &[(Option<StopReason>, Option<StopReason>, Option<StopReason>)] = &[
+            // None / Some interactions: incoming Some wins.
+            (None, Some(StopReason::EndTurn), Some(StopReason::EndTurn)),
+            (Some(StopReason::EndTurn), None, Some(StopReason::EndTurn)),
+            // Refusal beats everything.
+            (
+                Some(StopReason::ToolUse),
+                Some(StopReason::Refusal),
+                Some(StopReason::Refusal),
+            ),
+            (
+                Some(StopReason::Refusal),
+                Some(StopReason::ToolUse),
+                Some(StopReason::Refusal),
+            ),
+            (
+                Some(StopReason::EndTurn),
+                Some(StopReason::Refusal),
+                Some(StopReason::Refusal),
+            ),
+            // ToolUse beats MaxTokens / StopSequence / EndTurn / Other.
+            (
+                Some(StopReason::EndTurn),
+                Some(StopReason::ToolUse),
+                Some(StopReason::ToolUse),
+            ),
+            (
+                Some(StopReason::ToolUse),
+                Some(StopReason::EndTurn),
+                Some(StopReason::ToolUse),
+            ),
+            (
+                Some(StopReason::MaxTokens),
+                Some(StopReason::ToolUse),
+                Some(StopReason::ToolUse),
+            ),
+            // Ties keep the earlier arrival.
+            (
+                Some(StopReason::EndTurn),
+                Some(StopReason::EndTurn),
+                Some(StopReason::EndTurn),
+            ),
+            (
+                Some(StopReason::Other),
+                Some(StopReason::Other),
+                Some(StopReason::Other),
+            ),
+        ];
+        for (a, b, expected) in pairs {
+            assert_eq!(
+                merge_stop_reason(*a, *b),
+                *expected,
+                "merge_stop_reason({a:?}, {b:?})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_picks_refusal_over_tool_use_v60() {
+        // Regression for v60 security L-3 — a server emitting both
+        // `content_filter` and `tool_calls` (a hostile / buggy combo
+        // that lets a refusal sneak past a tool-dispatching agent)
+        // must resolve to Refusal so the runner doesn't run the
+        // pending tool call.
+        let server = MockServer::start().await;
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_z\",\"function\":{\"name\":\"shell\",\"arguments\":\"{}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: {\"choices\":[{\"finish_reason\":\"content_filter\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
+        let mut s = adapter_for(&server)
+            .stream(&[user("hi")], &[])
+            .await
+            .unwrap();
+        let mut response = None;
+        while let Some(c) = s.next().await {
+            if let StreamChunk::Complete { response: r } = c {
+                response = Some(r);
+                break;
+            }
+        }
+        let r = response.expect("Complete should arrive");
+        assert_eq!(
+            r.stop_reason,
+            Some(StopReason::Refusal),
+            "Refusal must win over ToolUse — content filter is hard-overriding"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_picks_tool_use_when_finish_reasons_arrive_in_reverse_order() {
+        // Regression for v59 (LOW-5 from v58 audit) — a server
+        // emitting `stop` THEN `tool_calls` should still cause the
+        // runner to dispatch the pending tool call. Pre-v59 the
+        // latch-first policy locked stop_reason at EndTurn.
+        let server = MockServer::start().await;
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_z\",\"function\":{\"name\":\"shell\",\"arguments\":\"{}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"choices\":[{\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
+        let mut s = adapter_for(&server)
+            .stream(&[user("hi")], &[])
+            .await
+            .unwrap();
+        let mut response = None;
+        while let Some(c) = s.next().await {
+            if let StreamChunk::Complete { response: r } = c {
+                response = Some(r);
+                break;
+            }
+        }
+        let r = response.expect("Complete should arrive");
+        assert_eq!(
+            r.stop_reason,
+            Some(StopReason::ToolUse),
+            "ToolUse must win over EndTurn regardless of arrival order"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_dedupes_tool_call_completed_when_finish_reason_arrives_twice() {
+        // Regression for H4 — some OpenAI-compatible servers (Ollama,
+        // custom inference servers) emit `finish_reason` on more
+        // than one chunk. Pre-v57 the per-tool ToolCallCompleted
+        // fired again on each duplicate, causing the dispatcher to
+        // execute the tool twice.
+        let server = MockServer::start().await;
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_z\",\"function\":{\"name\":\"shell\",\"arguments\":\"{}\"}}]}}]}\n\n",
+            // Two consecutive chunks with finish_reason set.
+            "data: {\"choices\":[{\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: {\"choices\":[{\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
+
+        let mut s = adapter_for(&server)
+            .stream(&[user("hi")], &[])
+            .await
+            .unwrap();
+        let mut completed_count = 0usize;
+        while let Some(c) = s.next().await {
+            match c {
+                StreamChunk::ToolCallCompleted { .. } => completed_count += 1,
+                StreamChunk::Complete { .. } => break,
+                StreamChunk::Error { error } => panic!("unexpected error: {error:?}"),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            completed_count, 1,
+            "duplicate finish_reason must NOT emit a second ToolCallCompleted"
+        );
     }
 
     // ---------- capabilities + counters ----------

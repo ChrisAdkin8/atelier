@@ -19,6 +19,9 @@ use atelier_core::{
         anthropic::AnthropicAdapter, Adapter, AdapterError, Message, MockAdapter, Role,
         ToolCallRequest, ToolSpec,
     },
+    context::{
+        ContextItem, ContextItemId, ContextManager, Payload, Provenance, TokenCount, TokenSource,
+    },
     dispatcher::{
         Dispatcher, SessionDispatcher, ShellHookExecutor, Tool, ToolContext, ToolRegistry,
     },
@@ -355,12 +358,25 @@ impl Runner {
             .with_executor(Arc::new(ShellHookExecutor::new(sandbox.clone())));
         let ledger = Arc::new(Ledger::new());
 
+        // v55 — §5 shared state. Owned here, cloned into the
+        // SessionDispatcher so the UI's mutator commands (pin / evict /
+        // add-card / mark-step-done) land on the same store the runner
+        // re-emits from at each turn boundary.
+        let context_manager = Arc::new(parking_lot::Mutex::new(ContextManager::new()));
+        let memory_store = Arc::new(parking_lot::Mutex::new(MemoryStore::new()));
+        let plan_canvas = Arc::new(parking_lot::Mutex::new(PlanCanvas::new()));
+
         // 3. Session actor + SessionDispatcher.
         let session_handle = session::spawn(Arc::new(NoopHook), Arc::new(NoopHook));
         let bus = session_handle.events_sender();
         let session_dispatcher = Arc::new(
             SessionDispatcher::new(dispatcher, ledger.clone(), bus.clone())
-                .with_approval_policy(self.approval_policy),
+                .with_approval_policy(self.approval_policy)
+                .with_shared_state(
+                    context_manager.clone(),
+                    memory_store.clone(),
+                    plan_canvas.clone(),
+                ),
         );
         // Publish the dispatcher to any caller-registered handle BEFORE
         // we start dispatching. The GUI's `submit_approval` Tauri
@@ -471,12 +487,10 @@ impl Runner {
         // 5. Turn loop.
         let session_id = session_handle.id();
         let mut messages: Vec<Message> = vec![Message::text(Role::User, prompt.clone())];
-        // v54 — per-run MemoryStore. Today empty: no card source is
-        // wired (no add-card tool, no session-replay loader). The
-        // Memory panel renders the empty-state until a future
-        // change populates the store; the event surface is in
-        // place so that future change is purely additive.
-        let memory_store = MemoryStore::new();
+        let prompt_now = now_rfc3339();
+        context_manager
+            .lock()
+            .add(context_item_for_user_prompt(&prompt, &prompt_now));
         // Broadcast the initial user prompt so the conversation pane
         // catches up before the first turn. Best-effort send (no
         // subscribers is fine — see SessionDispatcher::dispatch).
@@ -484,10 +498,17 @@ impl Runner {
             role: MessageRole::User,
             text: prompt,
         });
-        // Live plan canvas — `envelope.plan_update` accumulates into
-        // this. After each apply we broadcast a snapshot so the plan
-        // pane converges without replay.
-        let mut plan_canvas = PlanCanvas::new();
+        // v57 (M-bug-3 fix) — emit one ContextItems snapshot before
+        // entering the turn loop so a UI subscriber that joins
+        // immediately after `MessageCommitted{User}` doesn't see an
+        // empty Context panel until turn 1 finishes (which never
+        // happens for max_turns=0). The aggregate `ContextSnapshot`
+        // still fires per-turn; this pre-loop emission is the
+        // per-item snapshot only.
+        let initial_items = context_manager.lock().summarise();
+        let _ = bus.send(Event::ContextItems {
+            items: initial_items,
+        });
         let mut turns = 0;
         let mut final_state = State::Idle;
         let tools_spec = registry_to_tool_specs();
@@ -541,6 +562,10 @@ impl Runner {
                 tool_call_id: None,
                 tool_calls: response.tool_calls.clone(),
             });
+            context_manager.lock().add(context_item_for_assistant_turn(
+                &response.text,
+                &now_rfc3339(),
+            ));
             let _ = bus.send(Event::MessageCommitted {
                 role: MessageRole::Assistant,
                 text: response.text.clone(),
@@ -551,10 +576,31 @@ impl Runner {
             // same canvas — but we still broadcast on every turn so a
             // late-joining subscriber sees something promptly.
             if let Some(plan_update) = &envelope.plan_update {
-                let _report = plan_canvas.apply_envelope(plan_update);
-                let _ = bus.send(Event::PlanSnapshot {
-                    steps: plan_canvas.to_vec(),
-                });
+                let steps = {
+                    let mut canvas = plan_canvas.lock();
+                    let _report = canvas.apply_envelope(plan_update);
+                    canvas.to_vec()
+                };
+                let _ = bus.send(Event::PlanSnapshot { steps });
+            }
+            // v56 — surface the envelope's per-file rationale so the
+            // §3 "Why this change?" UI can render it. The bus event
+            // carries the same shape as the envelope, flattened to
+            // string `kind` so consumers don't import the protocol enum.
+            if let Some(claimed) = &envelope.claimed_changes {
+                let changes = claimed
+                    .iter()
+                    .map(|c| atelier_core::session::ClaimedChangeSummary {
+                        path: c.path.clone(),
+                        // v59 (MED-smell-2 fix) — route through
+                        // `ClaimedChangeKind::wire_label` so the
+                        // projection stays in sync with the serde
+                        // `rename_all = "lowercase"` derive.
+                        kind: c.kind.wire_label().to_string(),
+                        summary: c.summary.clone(),
+                    })
+                    .collect();
+                let _ = bus.send(Event::ClaimedChanges { changes });
             }
             let real_tool_calls: Vec<_> = response
                 .tool_calls
@@ -590,6 +636,11 @@ impl Runner {
                         role: MessageRole::Tool,
                         text: result_str.clone(),
                     });
+                    context_manager.lock().add(context_item_for_tool_result(
+                        &result_str,
+                        &outcome.tool_call_id,
+                        &now_rfc3339(),
+                    ));
                     messages.push(Message {
                         role: Role::Tool,
                         content: result_str,
@@ -603,7 +654,7 @@ impl Runner {
 
             turns = turn + 1;
 
-            // Per-turn ContextSnapshot + ContextItems (v53).
+            // Per-turn ContextSnapshot + ContextItems (v55).
             //
             // The aggregate `ContextSnapshot` drives the §5 token
             // meter; the per-item `ContextItems` stream feeds the
@@ -611,36 +662,32 @@ impl Runner {
             // boundary so the panel rows and the meter denominator
             // can never disagree.
             //
-            // Token attribution: the adapter only gives a *total*
-            // for the message list. We render per-item counts via a
-            // char/4 approximation tagged `TokenSource::Approx` —
-            // honest about being a rough number rather than a
-            // load-bearing exact count. When a real §5
-            // ContextManager replaces this projection (deferred), it
-            // will supply per-item counts at whatever source the
-            // adapter exposes.
+            // v55 — items now come from the live `ContextManager`
+            // populated in parallel with the chat transcript above.
+            // Per-item token attribution still uses the same char/4
+            // approximation tagged `TokenSource::Approx`; the
+            // adapter's `count_tokens` continues to drive the
+            // aggregate meter. Pin / unpin / evict from the §5 panel
+            // operate on this store; the dispatcher (Step 2) shares
+            // the Arc to mutate it from UI handlers.
             if let Ok(token_count) = self.adapter.count_tokens(&messages).await {
                 let _ = bus.send(Event::ContextSnapshot {
                     known_tokens: token_count.count,
                     unknown_tokens: 0,
                 });
             }
-            let context_items = summarise_messages(&messages);
+            let context_items = context_manager.lock().summarise();
             let _ = bus.send(Event::ContextItems {
                 items: context_items,
             });
 
-            // v54 — §5 Memory panel snapshot. The Runner doesn't
-            // yet wire a MemoryStore source (no card-add tool, no
-            // promote-from-context UI round-trip), so today this
-            // ships an empty snapshot — but the event surface is
-            // in place so the panel renders an "empty memory"
-            // placeholder rather than nothing at all, and any
-            // future card-source (a tool that calls
-            // `MemoryStore::add`, a session-replay loader, etc.)
-            // plugs in by populating the store + re-emitting.
+            // v55 — §5 Memory panel snapshot. The MemoryStore is now
+            // mutable from the UI via SessionDispatcher's add /
+            // delete / promote mutators (Step 3). The runner still
+            // re-emits at each turn boundary so a late-joining
+            // subscriber converges to the live state.
             let _ = bus.send(Event::MemoryCards {
-                cards: memory_store.summarise(),
+                cards: memory_store.lock().summarise(),
             });
 
             // 8. If the envelope or scripted response says done, exit.
@@ -763,14 +810,28 @@ fn registry_to_tool_specs() -> Vec<ToolSpec> {
 /// Pull the §2 envelope out of a native-tool response. The `harness_meta`
 /// tool-call's arguments ARE the envelope; everything else is a real tool
 /// call to dispatch.
+///
+/// v57 (M-bug-1 fix) — parse failures used to be swallowed via `.ok()`,
+/// which manifested as a model that "said it was done" but kept
+/// looping until `max_turns` (no `claimed_done` reached the run loop).
+/// Log via `tracing::warn` so the failure is visible in any harness
+/// running with `RUST_LOG=warn` or above.
 fn extract_native_envelope(calls: &[ToolCallRequest]) -> Option<Envelope> {
     for c in calls {
         if c.name == atelier_core::protocol_strategy::HARNESS_META_NAME {
-            return parse_native_tool(&NativeToolCall {
+            match parse_native_tool(&NativeToolCall {
                 name: c.name.clone(),
                 arguments: c.arguments.clone(),
-            })
-            .ok();
+            }) {
+                Ok(env) => return Some(env),
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "envelope: malformed harness_meta payload — treating as no envelope (claimed_done / plan_update / claimed_changes silently dropped)"
+                    );
+                    return None;
+                }
+            }
         }
     }
     None
@@ -786,105 +847,70 @@ async fn advance(handle: &SessionHandle, _from: State, to: State) -> Result<(), 
         .map_err(|e| RunError::Session(format!("send Advance({to}): {e}")))
 }
 
-/// v53 — projection from the live conversation onto the per-item
-/// shape the §5 Context panel wants. Each `Message` becomes a
-/// [`ContextItemSummary`] with:
-///
-///   * a `kind` mirroring the message role (`system_prompt` /
-///     `user_message` / `assistant_turn` / `tool_result`),
-///   * a 1-line `label` (first 80 chars of `content`),
-///   * a `provenance` string aligning with `context::Provenance`
-///     variants where they fit (and a synthetic `assistant_turn`
-///     where they don't — the typed enum will get the variant when a
-///     real ContextManager replaces this projection),
-///   * a char/4 approximation as the token count, tagged `approx`.
-///
-/// Stable per-message `id` derived from the message index + role so
-/// successive emissions during a run keep the same id for the same
-/// turn. (The Runner doesn't yet rebuild from a session.json
-/// replay; when it does, this id scheme will need a stable source —
-/// likely the conversation's serial position.)
-fn summarise_messages(messages: &[Message]) -> Vec<atelier_core::context::ContextItemSummary> {
-    use atelier_core::context::ContextItemSummary;
+/// v55 — char/4 approximation of message tokens, mirroring the
+/// `count_tokens` adapter fallback so per-item counts stay coherent
+/// with the aggregate meter the adapter reports.
+fn approx_tokens(s: &str) -> u32 {
+    let count = s.chars().count() / 4;
+    u32::try_from(count).unwrap_or(u32::MAX)
+}
 
-    fn first_line_label(s: &str) -> String {
-        let line = s.lines().next().unwrap_or("");
-        let truncated: String = line.chars().take(80).collect();
-        if truncated.chars().count() < line.chars().count() {
-            format!("{truncated}…")
-        } else {
-            truncated
-        }
+fn context_item_for_user_prompt(text: &str, now: &str) -> ContextItem {
+    ContextItem {
+        id: ContextItemId::new(),
+        payload: Payload::InlineText {
+            text: text.to_string(),
+        },
+        tokens: TokenCount {
+            count: approx_tokens(text),
+            source: TokenSource::Approx,
+        },
+        provenance: Provenance::UserAttached { note: None },
+        pinned: false,
+        added_at: now.to_string(),
+        last_used: now.to_string(),
     }
+}
 
-    fn approx_tokens(s: &str) -> u32 {
-        // Match `count_tokens` fallback heuristic — chars/4.
-        // Cap at u32::MAX defensively for absurdly long messages.
-        let count = s.chars().count() / 4;
-        u32::try_from(count).unwrap_or(u32::MAX)
+fn context_item_for_assistant_turn(text: &str, now: &str) -> ContextItem {
+    ContextItem {
+        id: ContextItemId::new(),
+        payload: Payload::InlineText {
+            text: text.to_string(),
+        },
+        tokens: TokenCount {
+            count: approx_tokens(text),
+            source: TokenSource::Approx,
+        },
+        provenance: Provenance::AssistantTurn,
+        pinned: false,
+        added_at: now.to_string(),
+        last_used: now.to_string(),
     }
-
-    messages
-        .iter()
-        .enumerate()
-        .map(|(idx, msg)| {
-            let (kind, provenance, provenance_detail) = match msg.role {
-                Role::System => ("system_prompt", "initial", None),
-                Role::User => ("user_message", "user_attached", None),
-                Role::Assistant => ("assistant_turn", "assistant_turn", None),
-                Role::Tool => ("tool_result", "tool_result", msg.tool_call_id.clone()),
-            };
-            ContextItemSummary {
-                id: format!("msg-{idx:04}-{kind}"),
-                kind: kind.to_string(),
-                label: first_line_label(&msg.content),
-                provenance: provenance.to_string(),
-                provenance_detail,
-                tokens: approx_tokens(&msg.content),
-                token_source: "approx".to_string(),
-                pinned: false,
-            }
-        })
-        .collect()
 }
 
-fn now_rfc3339() -> String {
-    // PROVISIONAL — uses `time::OffsetDateTime` if we add the dep, but for
-    // now a coarse second-precision via `SystemTime` keeps the cli dep-
-    // light. The format roughly matches RFC 3339 (`YYYY-MM-DDTHH:MM:SSZ`).
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    // Convert seconds-since-epoch to a date string with a tiny inline
-    // helper; we don't want chrono just for this.
-    let secs_in_day = 86_400u64;
-    let day = (now / secs_in_day) as i64;
-    let sod = now % secs_in_day;
-    let (h, m, s) = (
-        (sod / 3600) as u32,
-        ((sod / 60) % 60) as u32,
-        (sod % 60) as u32,
-    );
-    // Days since 1970-01-01 → date via the well-known algorithm.
-    let (y, mo, d) = days_to_ymd(day);
-    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
+fn context_item_for_tool_result(text: &str, tool_call_id: &str, now: &str) -> ContextItem {
+    ContextItem {
+        id: ContextItemId::new(),
+        payload: Payload::InlineText {
+            text: text.to_string(),
+        },
+        tokens: TokenCount {
+            count: approx_tokens(text),
+            source: TokenSource::Approx,
+        },
+        provenance: Provenance::ToolResult {
+            tool_call_id: tool_call_id.to_string(),
+        },
+        pinned: false,
+        added_at: now.to_string(),
+        last_used: now.to_string(),
+    }
 }
 
-/// Civil-from-days, Howard Hinnant's algorithm.
-fn days_to_ymd(z: i64) -> (i32, u32, u32) {
-    let z = z + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    let y = if m <= 2 { y + 1 } else { y };
-    (y as i32, m, d)
-}
+// v57 (H6 fix): `now_rfc3339` lifted into `atelier_core::time::now_rfc3339`.
+// Local re-export keeps the call sites in this module short.
+use atelier_core::time::now_rfc3339;
 
 fn build_mock_adapter(responses: Vec<MockResponse>) -> MockAdapter {
     let m = MockAdapter::new("mock:run");
@@ -992,78 +1018,41 @@ pub fn read_prompt(path: Option<&Path>) -> io::Result<String> {
 mod tests {
     use super::*;
 
-    fn msg(role: Role, content: &str) -> Message {
-        Message {
-            role,
-            content: content.into(),
-            tool_call_id: None,
-            tool_calls: Vec::new(),
+    #[test]
+    fn user_prompt_item_uses_inline_text_and_user_attached_provenance() {
+        let item = context_item_for_user_prompt("hello world", "2026-05-17T10:00:00Z");
+        assert!(matches!(item.payload, Payload::InlineText { ref text } if text == "hello world"));
+        assert!(matches!(
+            item.provenance,
+            Provenance::UserAttached { note: None }
+        ));
+        assert_eq!(item.tokens.source, TokenSource::Approx);
+        // chars/4 floor: "hello world" (11 chars) -> 2.
+        assert_eq!(item.tokens.count, 2);
+        assert!(!item.pinned);
+        assert_eq!(item.added_at, "2026-05-17T10:00:00Z");
+    }
+
+    #[test]
+    fn assistant_turn_item_uses_assistant_turn_provenance() {
+        let item = context_item_for_assistant_turn("ok I'll start", "2026-05-17T10:00:00Z");
+        assert!(matches!(item.provenance, Provenance::AssistantTurn));
+    }
+
+    #[test]
+    fn tool_result_item_carries_tool_call_id() {
+        let item = context_item_for_tool_result("file contents…", "tc-1", "2026-05-17T10:00:00Z");
+        match item.provenance {
+            Provenance::ToolResult { tool_call_id } => assert_eq!(tool_call_id, "tc-1"),
+            other => panic!("expected ToolResult provenance, got {other:?}"),
         }
     }
 
-    fn tool_msg(content: &str, tool_call_id: &str) -> Message {
-        Message {
-            role: Role::Tool,
-            content: content.into(),
-            tool_call_id: Some(tool_call_id.into()),
-            tool_calls: Vec::new(),
-        }
-    }
-
     #[test]
-    fn summarise_messages_maps_each_role_to_provenance() {
-        let messages = vec![
-            msg(Role::System, "you are a coding agent"),
-            msg(Role::User, "fix the failing test"),
-            msg(Role::Assistant, "ok I'll start by reading parser.rs"),
-            tool_msg("file contents…", "tc-1"),
-        ];
-        let v = summarise_messages(&messages);
-        assert_eq!(v.len(), 4);
-
-        assert_eq!(v[0].kind, "system_prompt");
-        assert_eq!(v[0].provenance, "initial");
-
-        assert_eq!(v[1].kind, "user_message");
-        assert_eq!(v[1].provenance, "user_attached");
-
-        assert_eq!(v[2].kind, "assistant_turn");
-        assert_eq!(v[2].provenance, "assistant_turn");
-
-        assert_eq!(v[3].kind, "tool_result");
-        assert_eq!(v[3].provenance, "tool_result");
-        assert_eq!(v[3].provenance_detail.as_deref(), Some("tc-1"));
-    }
-
-    #[test]
-    fn summarise_messages_truncates_long_first_lines() {
-        let long = "x".repeat(500);
-        let v = summarise_messages(&[msg(Role::User, &long)]);
-        assert_eq!(v[0].label.chars().count(), 81); // 80 + ellipsis
-        assert!(v[0].label.ends_with('…'));
-    }
-
-    #[test]
-    fn summarise_messages_token_source_is_approx() {
-        let v = summarise_messages(&[msg(Role::User, "hello world")]);
-        assert_eq!(v[0].token_source, "approx");
-        // chars/4 floor for "hello world" (11 chars) = 2.
-        assert_eq!(v[0].tokens, 2);
-    }
-
-    #[test]
-    fn summarise_messages_assigns_stable_ids_by_index() {
-        let messages = vec![msg(Role::User, "a"), msg(Role::Assistant, "b")];
-        let v1 = summarise_messages(&messages);
-        let v2 = summarise_messages(&messages);
-        let ids1: Vec<_> = v1.iter().map(|s| &s.id).collect();
-        let ids2: Vec<_> = v2.iter().map(|s| &s.id).collect();
-        assert_eq!(ids1, ids2);
-    }
-
-    #[test]
-    fn summarise_messages_empty_input_yields_empty_output() {
-        let v = summarise_messages(&[]);
-        assert!(v.is_empty());
+    fn approx_tokens_caps_floor_to_chars_div_four() {
+        assert_eq!(approx_tokens(""), 0);
+        assert_eq!(approx_tokens("abc"), 0);
+        assert_eq!(approx_tokens("abcd"), 1);
+        assert_eq!(approx_tokens("0123456789"), 2);
     }
 }

@@ -20,11 +20,67 @@
   // from a broken pane.
 
   import type { ContextItemSummary } from '../state'
+  import { invoke } from '@tauri-apps/api/core'
 
   interface Props {
     items: ContextItemSummary[]
   }
   let { items }: Props = $props()
+
+  // v55 — per-row mutator round-trip. The dispatcher mutator
+  // re-emits `ContextItems` on success, so we don't update state
+  // locally — we just wait for the next snapshot. `evict` opens an
+  // inline confirm (per spec §5 "cache-bust confirm") because
+  // eviction is destructive and ledgered.
+  let evictConfirmId: string | null = $state(null)
+  let toast: string | null = $state(null)
+  let toastError: boolean = $state(false)
+
+  async function pin(id: string) {
+    try {
+      await invoke<null>('pin_context_item', { id })
+    } catch (e) {
+      showToast(String(e), true)
+    }
+  }
+
+  async function unpin(id: string) {
+    try {
+      await invoke<null>('unpin_context_item', { id })
+    } catch (e) {
+      showToast(String(e), true)
+    }
+  }
+
+  function askEvict(id: string) {
+    evictConfirmId = id
+  }
+
+  function cancelEvict() {
+    evictConfirmId = null
+  }
+
+  async function confirmEvict() {
+    if (!evictConfirmId) return
+    const id = evictConfirmId
+    evictConfirmId = null
+    try {
+      const r = await invoke<{ tokens_freed: number }>('evict_context_item', {
+        id,
+      })
+      showToast(`evicted — freed ${r.tokens_freed} tokens`, false)
+    } catch (e) {
+      showToast(String(e), true)
+    }
+  }
+
+  function showToast(msg: string, isError: boolean) {
+    toast = msg
+    toastError = isError
+    setTimeout(() => {
+      if (toast === msg) toast = null
+    }, 4000)
+  }
 
   /// Map the snake_case provenance to a 4-char column-aligned label.
   /// Stable strings: the §5 mechanical gate asserts on them.
@@ -79,9 +135,53 @@
             <span class="pin" aria-label="pinned">📌</span>
           {/if}
           <span class="label">{item.label}</span>
+          <span class="actions">
+            {#if item.pinned}
+              <button
+                class="action"
+                onclick={() => unpin(item.id)}
+                title="unpin"
+                aria-label="unpin {item.label}"
+              >
+                un📌
+              </button>
+            {:else}
+              <button
+                class="action"
+                onclick={() => pin(item.id)}
+                title="pin"
+                aria-label="pin {item.label}"
+              >
+                📌
+              </button>
+            {/if}
+            <button
+              class="action danger"
+              onclick={() => askEvict(item.id)}
+              title="evict (cache-bust)"
+              aria-label="evict {item.label}"
+              disabled={item.pinned}
+            >
+              ✕
+            </button>
+          </span>
+          {#if evictConfirmId === item.id}
+            <div class="evict-confirm">
+              <span>
+                evict — frees ~{item.tokens} tokens. ledgered as cache-bust.
+              </span>
+              <span class="confirm-actions">
+                <button class="confirm" onclick={confirmEvict}>confirm</button>
+                <button class="cancel" onclick={cancelEvict}>cancel</button>
+              </span>
+            </div>
+          {/if}
         </li>
       {/each}
     </ul>
+  {/if}
+  {#if toast}
+    <p class="toast" class:toast-error={toastError}>{toast}</p>
   {/if}
 </section>
 
@@ -119,13 +219,91 @@
   }
   .row {
     display: grid;
-    grid-template-columns: 4ch 5ch auto 1fr;
+    grid-template-columns: 4ch 5ch auto 1fr auto;
+    grid-template-areas: 'tokens badge pin label actions' '. . . confirm confirm';
     gap: 0.45rem;
     align-items: baseline;
     padding: 0.15rem 0.6rem;
     font-family: var(--font-mono);
     font-size: 0.78rem;
     line-height: 1.3;
+  }
+  .actions {
+    grid-area: actions;
+    display: inline-flex;
+    gap: 0.2rem;
+    opacity: 0.4;
+    transition: opacity 0.1s;
+  }
+  .row:hover .actions {
+    opacity: 1;
+  }
+  .action {
+    background: transparent;
+    border: 1px solid var(--border-pane);
+    border-radius: 3px;
+    color: var(--fg-default, #ddd);
+    cursor: pointer;
+    font-family: inherit;
+    font-size: 0.7rem;
+    padding: 0 0.3rem;
+    line-height: 1.2;
+  }
+  .action:hover:not(:disabled) {
+    background: var(--bg-hover, rgba(255, 255, 255, 0.06));
+  }
+  .action:disabled {
+    opacity: 0.3;
+    cursor: not-allowed;
+  }
+  .action.danger:hover:not(:disabled) {
+    color: #f88;
+    border-color: #844;
+  }
+  .evict-confirm {
+    grid-area: confirm;
+    background: rgba(255, 200, 0, 0.06);
+    border: 1px solid rgba(255, 200, 0, 0.3);
+    border-radius: 3px;
+    padding: 0.25rem 0.5rem;
+    margin-top: 0.2rem;
+    font-size: 0.72rem;
+    color: var(--fg-default, #ddd);
+    display: flex;
+    justify-content: space-between;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+  }
+  .confirm-actions {
+    display: inline-flex;
+    gap: 0.25rem;
+  }
+  .confirm,
+  .cancel {
+    background: transparent;
+    border: 1px solid var(--border-pane);
+    border-radius: 3px;
+    color: var(--fg-default, #ddd);
+    cursor: pointer;
+    font-family: inherit;
+    font-size: 0.7rem;
+    padding: 0 0.4rem;
+  }
+  .confirm {
+    border-color: #c84;
+    color: #ec9;
+  }
+  .toast {
+    margin: 0;
+    padding: 0.3rem 0.6rem;
+    font-size: 0.72rem;
+    color: var(--fg-dim);
+    border-top: 1px dotted var(--border-pane);
+    background: rgba(0, 200, 100, 0.04);
+  }
+  .toast-error {
+    color: #f88;
+    background: rgba(200, 0, 0, 0.05);
   }
   .row:hover {
     background: var(--bg-hover, rgba(255, 255, 255, 0.04));

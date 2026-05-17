@@ -15,25 +15,31 @@
   type Props = {
     recentEdits: StagedEdit[]
     pendingApproval: PendingApproval | null
+    /// v56 — per-file "why this change?" rationale from the envelope's
+    /// `claimed_changes`. Keyed by repo-relative path. Optional so
+    /// pre-v56 callers and tests can omit it.
+    claimedChanges?: Record<string, string>
   }
 
-  let { recentEdits, pendingApproval }: Props = $props()
+  let {
+    recentEdits,
+    pendingApproval,
+    claimedChanges = {},
+  }: Props = $props()
 
   let head = $derived(recentEdits[0] ?? null)
 
-  // Per-file accept toggles. v49: `Object.create(null)` instead of a
-  // plain `Record<string, boolean>` literal so user-controlled paths
-  // like `__proto__` or `constructor` can't mutate Object.prototype
-  // (prototype pollution). Wrapped in `$state` so Svelte's reactivity
-  // proxy still triggers re-renders on assignment.
-  //
-  // We use a flat null-prototype object rather than a `Map` because
-  // Svelte 5's reactivity proxy doesn't track `Map` operations
-  // automatically, and a `SvelteSet` import path was unstable across
-  // the svelte versions present here. Reassigning the whole object
-  // via `acceptedPaths = { ...acceptedPaths, [k]: v }` is the safest
-  // pattern for the small N (≤16) we see in practice.
-  let acceptedPaths: Record<string, true> = $state(Object.create(null))
+  // v56 — per-file hunk-toggle map. For `Hunks::Lines` files this
+  // tracks which hunk indices are accepted; for other hunk kinds it's
+  // a single file-level boolean (`fileChecked` is the source of truth
+  // and `hunkChecked` is empty). The null-prototype wrap is preserved
+  // from v49 to keep hostile paths (`__proto__`, `constructor`) from
+  // reaching Object.prototype.
+  type FileToggle = {
+    fileChecked: boolean
+    hunkChecked: boolean[]
+  }
+  let toggles: Record<string, FileToggle> = $state(Object.create(null))
 
   // Error surfaced to the user if `submit_approval` returns false
   // (dispatcher rejected the commit_id — typically stale / already
@@ -45,18 +51,56 @@
     // `CommitDecision` that transitions pendingApproval to null
     // shouldn't wipe a just-surfaced error before the user reads it.
     if (pendingApproval) submitError = null
-    acceptedPaths = withNullProto(
-      pendingApproval ? Object.fromEntries(pendingApproval.files.map((f) => [f.path, true])) : {},
-    )
+    if (!pendingApproval) {
+      toggles = withNullProtoToggles({})
+      return
+    }
+    const init: Record<string, FileToggle> = {}
+    for (const f of pendingApproval.files) {
+      const hunkCount =
+        f.hunks.kind === 'lines' ? f.hunks.hunks.length : 0
+      init[f.path] = {
+        fileChecked: true,
+        hunkChecked: new Array(hunkCount).fill(true),
+      }
+    }
+    toggles = withNullProtoToggles(init)
   })
 
-  async function submit(accepted: string[]) {
+  type FileApprovalWire =
+    | { mode: 'all' }
+    | { mode: 'hunks'; indices: number[] }
+
+  function buildSelection(): Record<string, FileApprovalWire> {
+    const out: Record<string, FileApprovalWire> = Object.create(null)
+    if (!pendingApproval) return out
+    for (const f of pendingApproval.files) {
+      const t = toggles[f.path]
+      if (!t || !t.fileChecked) continue
+      if (f.hunks.kind === 'lines') {
+        const indices = t.hunkChecked
+          .map((c, i) => (c ? i : -1))
+          .filter((i) => i >= 0)
+        if (indices.length === 0) continue
+        if (indices.length === t.hunkChecked.length) {
+          out[f.path] = { mode: 'all' }
+        } else {
+          out[f.path] = { mode: 'hunks', indices }
+        }
+      } else {
+        out[f.path] = { mode: 'all' }
+      }
+    }
+    return out
+  }
+
+  async function submit(selection: Record<string, FileApprovalWire>) {
     if (!pendingApproval) return
     submitError = null
     try {
       const ok = await invoke<boolean>('submit_approval', {
         commitId: pendingApproval.commitId,
-        accepted,
+        selection,
       })
       if (!ok) {
         submitError =
@@ -68,32 +112,50 @@
   }
 
   function acceptSelected() {
-    void submit(Object.keys(acceptedPaths))
+    void submit(buildSelection())
   }
 
   function rejectAll() {
-    void submit([])
+    void submit({})
   }
 
-  function togglePath(path: string, checked: boolean) {
-    // v49 FIX-7 hardening: every replacement of `acceptedPaths` goes
-    // through `withNullProto` so a hostile path like `__proto__`
-    // can't reach Object.prototype. The naive spread / destructure
-    // pattern returns objects with the default prototype — losing
-    // the mitigation after the first toggle.
-    if (checked) {
-      acceptedPaths = withNullProto({ ...acceptedPaths, [path]: true })
-    } else {
-      const { [path]: _drop, ...rest } = acceptedPaths
-      acceptedPaths = withNullProto(rest)
+  function setFile(path: string, checked: boolean) {
+    const t = toggles[path]
+    if (!t) return
+    const next: FileToggle = {
+      fileChecked: checked,
+      hunkChecked: t.hunkChecked.map(() => checked),
     }
+    toggles = withNullProtoToggles({ ...toggles, [path]: next })
   }
 
-  /// Copy `source` into a fresh null-prototype object. Used to keep
-  /// `acceptedPaths` immune to prototype pollution across every
-  /// assignment (the spread/destructure patterns above produce
-  /// default-prototype objects that would lose the mitigation).
-  function withNullProto(source: Record<string, true>): Record<string, true> {
+  function setHunk(path: string, hunkIndex: number, checked: boolean) {
+    const t = toggles[path]
+    if (!t) return
+    const hunkChecked = t.hunkChecked.slice()
+    hunkChecked[hunkIndex] = checked
+    // File-level checkbox reflects: any hunk checked → true.
+    const fileChecked = hunkChecked.some((c) => c)
+    toggles = withNullProtoToggles({
+      ...toggles,
+      [path]: { fileChecked, hunkChecked },
+    })
+  }
+
+  function fileLabel(path: string): string {
+    const t = toggles[path]
+    if (!t) return ''
+    if (t.hunkChecked.length === 0) return ''
+    const accepted = t.hunkChecked.filter((c) => c).length
+    return `${accepted} / ${t.hunkChecked.length} hunks`
+  }
+
+  /// Copy `source` into a fresh null-prototype object. The
+  /// spread/destructure patterns above produce default-prototype
+  /// objects that would lose this mitigation otherwise.
+  function withNullProtoToggles(
+    source: Record<string, FileToggle>,
+  ): Record<string, FileToggle> {
     return Object.assign(Object.create(null), source)
   }
 </script>
@@ -122,16 +184,43 @@
       <ul class="pending-files">
         {#each pendingApproval.files as file (file.path)}
           <li>
-            <label>
+            <label class="file-row">
               <input
                 type="checkbox"
-                checked={acceptedPaths[file.path] === true}
-                onchange={(e) =>
-                  togglePath(file.path, e.currentTarget.checked)}
+                checked={toggles[file.path]?.fileChecked ?? false}
+                onchange={(e) => setFile(file.path, e.currentTarget.checked)}
               />
               <span class="file-path">{file.path}</span>
               <span class="hunks-kind">[{file.hunks.kind}]</span>
+              {#if file.hunks.kind === 'lines'}
+                <span class="hunks-count">{fileLabel(file.path)}</span>
+              {/if}
             </label>
+            {#if file.hunks.kind === 'lines' && file.hunks.hunks.length > 1}
+              <ul class="pending-hunks">
+                {#each file.hunks.hunks as hunk, hi (hi)}
+                  <li>
+                    <label class="hunk-row">
+                      <input
+                        type="checkbox"
+                        checked={toggles[file.path]?.hunkChecked[hi] ?? false}
+                        onchange={(e) =>
+                          setHunk(file.path, hi, e.currentTarget.checked)}
+                      />
+                      <span class="hunk-header">
+                        @@ -{hunk.old_range.start + 1},{hunk.old_range.end -
+                          hunk.old_range.start}
+                        +{hunk.new_range.start + 1},{hunk.new_range.end -
+                          hunk.new_range.start} @@
+                      </span>
+                      <span class="hunk-summary">
+                        −{hunk.old_lines.length} / +{hunk.new_lines.length}
+                      </span>
+                    </label>
+                  </li>
+                {/each}
+              </ul>
+            {/if}
           </li>
         {/each}
       </ul>
@@ -142,6 +231,12 @@
       <p class="empty">no edits yet</p>
     {:else}
       <div class="path">─── <strong>{head.path}</strong></div>
+      {#if claimedChanges[head.path]}
+        <p class="why">
+          <span class="why-label">why:</span>
+          {claimedChanges[head.path]}
+        </p>
+      {/if}
 
       {#if head.hunks.kind === 'same'}
         <p class="badge muted">no diff — byte-equal</p>
@@ -246,14 +341,17 @@
     margin: 0;
     padding: 0;
   }
-  .pending-files li label {
+  .pending-files > li {
+    margin-bottom: 0.25rem;
+  }
+  .file-row {
     display: flex;
     gap: 0.5rem;
     align-items: baseline;
     padding: 0.15rem 0;
     cursor: pointer;
   }
-  .pending-files li label:hover {
+  .file-row:hover {
     background: var(--bg-pane-alt);
   }
   .file-path {
@@ -264,6 +362,51 @@
     color: var(--accent-yellow);
     font-size: 0.7rem;
     text-transform: uppercase;
+  }
+  .hunks-count {
+    color: var(--fg-muted);
+    font-size: 0.7rem;
+    font-family: var(--font-mono);
+  }
+  .pending-hunks {
+    list-style: none;
+    margin: 0 0 0.25rem 1.6rem;
+    padding: 0;
+    border-left: 1px dotted var(--border-pane);
+    padding-left: 0.5rem;
+  }
+  .hunk-row {
+    display: flex;
+    gap: 0.4rem;
+    align-items: baseline;
+    padding: 0.05rem 0;
+    cursor: pointer;
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+  }
+  .hunk-row:hover {
+    background: var(--bg-pane-alt);
+  }
+  .hunk-row .hunk-header {
+    color: var(--accent-yellow);
+    flex: 0 0 auto;
+  }
+  .hunk-summary {
+    color: var(--fg-dim);
+    font-size: 0.68rem;
+  }
+  .why {
+    margin: 0.1rem 0 0.4rem 1.6rem;
+    color: var(--fg-muted);
+    font-style: italic;
+    font-size: 0.78rem;
+    font-family: var(--font-ui);
+  }
+  .why-label {
+    color: var(--fg-dim);
+    font-style: normal;
+    font-family: var(--font-mono);
+    margin-right: 0.3rem;
   }
   .submit-error {
     margin: 0.5rem 0 0 0;

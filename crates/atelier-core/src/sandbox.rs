@@ -56,6 +56,14 @@ impl SandboxPolicy {
         if !repo_root.is_absolute() {
             return Err(SandboxError::NonAbsolutePath(repo_root));
         }
+        // v57 (L cleanup) — fail-fast on non-printable characters
+        // in the repo root. The macOS `.sb` profile embeds the path
+        // as a Lisp string; a literal newline or control char would
+        // break the profile parser. Repo paths come from us, not the
+        // model, so this is just a contract assertion.
+        if has_unsafe_path_chars(&repo_root) {
+            return Err(SandboxError::UnsafePathCharacters(repo_root));
+        }
         Ok(Self {
             repo_root,
             allow_net: false,
@@ -76,6 +84,13 @@ impl SandboxPolicy {
         if !p.is_absolute() {
             return Err(SandboxError::NonAbsolutePath(p));
         }
+        // v59 (MED-sec-3 fix) — same control-char rejection as
+        // `restrictive()` so a config-driven allow_read path
+        // containing a newline can't break `.sb` profile parsing or
+        // smuggle injected forms past the macOS sandbox.
+        if has_unsafe_path_chars(&p) {
+            return Err(SandboxError::UnsafePathCharacters(p));
+        }
         self.extra_read_paths.push(p);
         Ok(self)
     }
@@ -84,6 +99,9 @@ impl SandboxPolicy {
         let p = path.into();
         if !p.is_absolute() {
             return Err(SandboxError::NonAbsolutePath(p));
+        }
+        if has_unsafe_path_chars(&p) {
+            return Err(SandboxError::UnsafePathCharacters(p));
         }
         if is_forbidden_write_target(&p) {
             return Err(SandboxError::ForbiddenWriteTarget(p));
@@ -112,10 +130,27 @@ pub enum SandboxError {
     /// violation never reaches the kernel.
     #[error("write target {0} is forbidden by §11 policy (/etc, /usr/local)")]
     ForbiddenWriteTarget(PathBuf),
+
+    /// v57 (L cleanup) — `.sb` profile strings are Lisp; embedding a
+    /// raw newline / control byte would either break the profile
+    /// parser or, worse, comment out the rest of the rules. We
+    /// reject up-front so the profile is always well-formed.
+    #[error("sandbox path {0} contains a non-printable / control character that cannot be safely embedded in a sandbox profile")]
+    UnsafePathCharacters(PathBuf),
 }
 
 fn is_forbidden_write_target(p: &Path) -> bool {
     p.starts_with("/etc") || p.starts_with("/usr/local")
+}
+
+/// v57 (L cleanup) — reject path strings that embed control bytes /
+/// non-printable characters. Used by `SandboxPolicy::restrictive`
+/// (and any future `allow_read` / `allow_write` callers that want to
+/// reuse it) to keep generated `.sb` profiles well-formed.
+fn has_unsafe_path_chars(p: &Path) -> bool {
+    p.to_string_lossy()
+        .chars()
+        .any(|c| (c as u32) < 0x20 || c == '\x7f')
 }
 
 /// Per spec §11 paths that any sandboxed subprocess needs read access to in
@@ -309,9 +344,30 @@ mod tests {
     }
 
     #[test]
+    fn restrictive_rejects_repo_root_with_control_characters() {
+        // Regression for L cleanup — a repo path with a literal
+        // newline would break the macOS `.sb` profile parser.
+        let err = SandboxPolicy::restrictive("/tmp/with\nnewline").unwrap_err();
+        assert!(matches!(err, SandboxError::UnsafePathCharacters(_)));
+    }
+
+    #[test]
     fn allow_read_rejects_relative_paths() {
         let err = policy().allow_read("rel").unwrap_err();
         assert!(matches!(err, SandboxError::NonAbsolutePath(_)));
+    }
+
+    #[test]
+    fn allow_read_rejects_control_chars_in_path() {
+        // Regression for v59 MED-sec-3 — `.sb` profile injection class.
+        let err = policy().allow_read("/tmp/with\nnewline").unwrap_err();
+        assert!(matches!(err, SandboxError::UnsafePathCharacters(_)));
+    }
+
+    #[test]
+    fn allow_write_rejects_control_chars_in_path() {
+        let err = policy().allow_write("/tmp/with\nnewline").unwrap_err();
+        assert!(matches!(err, SandboxError::UnsafePathCharacters(_)));
     }
 
     #[test]

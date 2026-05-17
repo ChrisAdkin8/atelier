@@ -188,6 +188,19 @@ pub enum Event {
         cards: Vec<crate::memory::MemoryCardSummary>,
     },
 
+    /// v56 — agent's per-file "why" rationale. Emitted when the
+    /// envelope carries `claimed_changes`. Powers spec §3
+    /// "Why this change? UI consuming §2 grounding" — the UI keys
+    /// each entry off `path` so the diff pane can display the
+    /// agent's summary next to the file header. `kind` is one of
+    /// `"edit"` / `"create"` / `"delete"`.
+    ///
+    /// The envelope's separate `grounding` field (textual-claim
+    /// citations) is intentionally out of scope here — that's a
+    /// different surface (sidebar / inline span annotations) and
+    /// lands separately.
+    ClaimedChanges { changes: Vec<ClaimedChangeSummary> },
+
     /// Spec §3 "Hunk accept / reject": a tool staged writes and the
     /// dispatcher is waiting for the user's accept-set decision before
     /// the rename phase. UI consumers render each `files[i]` (path +
@@ -256,6 +269,36 @@ pub enum Event {
     Shutdown,
 }
 
+impl Event {
+    /// v57 (H5 fix) — canonical wire-format label for this variant.
+    /// Matches the Rust enum variant name exactly so the GUI's
+    /// `bridge_event.kind` and the TUI's `project_event.kind`
+    /// strings can't drift. Pre-v57 those projections hand-typed the
+    /// labels and had already diverged
+    /// (`PendingApproval` vs `StagingPendingApproval`,
+    /// `IllegalTransition` vs `IllegalTransitionAttempted`,
+    /// `ModelProfile` vs `ModelProfileLoaded`).
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Transitioned { .. } => "Transitioned",
+            Self::IllegalTransitionAttempted { .. } => "IllegalTransitionAttempted",
+            Self::Cancelled => "Cancelled",
+            Self::EditStaged { .. } => "EditStaged",
+            Self::MessageCommitted { .. } => "MessageCommitted",
+            Self::PlanSnapshot { .. } => "PlanSnapshot",
+            Self::LedgerAppended { .. } => "LedgerAppended",
+            Self::ContextSnapshot { .. } => "ContextSnapshot",
+            Self::ContextItems { .. } => "ContextItems",
+            Self::MemoryCards { .. } => "MemoryCards",
+            Self::ClaimedChanges { .. } => "ClaimedChanges",
+            Self::StagingPendingApproval { .. } => "StagingPendingApproval",
+            Self::CommitDecision { .. } => "CommitDecision",
+            Self::ModelProfileLoaded { .. } => "ModelProfileLoaded",
+            Self::Shutdown => "Shutdown",
+        }
+    }
+}
+
 /// One pending file in a [`Event::StagingPendingApproval`]. Carries
 /// the same `hunks` payload as [`Event::EditStaged`] so the UI can
 /// render the diff before any rename has happened.
@@ -263,6 +306,17 @@ pub enum Event {
 pub struct PendingFile {
     pub path: PathBuf,
     pub hunks: Hunks,
+}
+
+/// v56 — one entry in [`Event::ClaimedChanges`]. Mirrors the envelope's
+/// `claimed_changes[i]` shape with `kind` flattened to its string form
+/// (`"edit"` / `"create"` / `"delete"`) so the bus consumers don't have
+/// to import the protocol enum to render badges.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimedChangeSummary {
+    pub path: String,
+    pub kind: String,
+    pub summary: String,
 }
 
 /// Speaker role for [`Event::MessageCommitted`]. Mirrors the adapter's
@@ -274,6 +328,21 @@ pub enum MessageRole {
     User,
     Assistant,
     Tool,
+}
+
+impl MessageRole {
+    /// v57 (H7 fix) — canonical lowercase wire label. Pre-v57 callers
+    /// rendered via `format!("{role:?}").to_lowercase()` which made
+    /// Rust's `Debug` output a wire format and would break the UI
+    /// the moment a variant got renamed.
+    pub fn wire_label(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::User => "user",
+            Self::Assistant => "assistant",
+            Self::Tool => "tool",
+        }
+    }
 }
 
 /// Translate a [`CommitReport`] into the matching sequence of
@@ -436,6 +505,19 @@ mod tests {
     use tokio::time::timeout;
 
     use super::*;
+
+    #[test]
+    fn message_role_wire_label_is_stable() {
+        // Regression for v58 HIGH-bug-1 — `MessageRole` doesn't
+        // derive `Serialize`, so its wire form is solely
+        // `wire_label`. Pin the four labels so a future variant
+        // rename forces a deliberate edit rather than silently
+        // shipping a different string to UIs.
+        assert_eq!(MessageRole::System.wire_label(), "system");
+        assert_eq!(MessageRole::User.wire_label(), "user");
+        assert_eq!(MessageRole::Assistant.wire_label(), "assistant");
+        assert_eq!(MessageRole::Tool.wire_label(), "tool");
+    }
 
     /// Hook impl that counts invocations — lets tests assert that hooks fired
     /// the expected number of times on the expected transitions.

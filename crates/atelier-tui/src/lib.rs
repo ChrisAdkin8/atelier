@@ -64,9 +64,12 @@ pub struct AppState {
     pub events: Vec<EventLine>,
     /// Cumulative `EditStaged` count — the §3 first-milestone indicator.
     pub edit_staged_count: usize,
-    /// Last `Transitioned` event's `to` field, formatted via `Debug`. Empty
-    /// before any transition; used in the header so the user knows what
-    /// state the session is in.
+    /// Last `Transitioned` event's `to` field, rendered via
+    /// `State::name()`. Empty string before any transition; used in
+    /// the header so the user knows what state the session is in.
+    /// (Pre-v57 this was `Debug`-formatted; v57 unified on
+    /// `State::name()`. A future cleanup could switch this to
+    /// `Option<State>` so the empty-sentinel goes away.)
     pub current_state: String,
     /// Conversation pane lines, newest-last. Bounded.
     pub conversation: VecDeque<ConversationLine>,
@@ -122,6 +125,80 @@ pub struct AppState {
     /// rows; cards are durable across sessions and distinct from
     /// the per-turn context items above.
     pub memory_cards: Vec<atelier_core::memory::MemoryCardSummary>,
+    /// v55 — focused pane for keyboard input. Tab cycles
+    /// Conversation → Context → Memory → Plan. The focused pane
+    /// renders with a highlighted border and is the target of
+    /// `j`/`k` selection + per-pane mutator keys.
+    pub focused_pane: FocusedPane,
+    /// v55 — selection index in the Context pane (`j`/`k` when
+    /// focused). Saturates at `len-1`; safe to be larger than
+    /// `context_items.len()` (consumers clamp at render time).
+    pub selected_context: usize,
+    pub selected_memory: usize,
+    pub selected_plan: usize,
+    /// v55 — modal input state. `Normal` is the default; the
+    /// modals are entered via per-pane keys (`a` for add, `c` for
+    /// constraint) and exited via Enter (submit) / Esc (cancel).
+    pub input_mode: InputMode,
+    /// v56 — per-file rationale from the envelope's `claimed_changes`,
+    /// keyed by path. The diff pane renders this next to the file
+    /// header so the user can see the agent's stated "why" for each
+    /// change. Wholesale-replaced on every `Event::ClaimedChanges`.
+    pub claimed_changes: std::collections::HashMap<String, String>,
+}
+
+/// v55 — which pane has keyboard focus. Tab cycles forward.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FocusedPane {
+    #[default]
+    Conversation,
+    Context,
+    Memory,
+    Plan,
+}
+
+impl FocusedPane {
+    /// Tab cycle (forward).
+    pub fn next(self) -> Self {
+        match self {
+            Self::Conversation => Self::Context,
+            Self::Context => Self::Memory,
+            Self::Memory => Self::Plan,
+            Self::Plan => Self::Conversation,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Conversation => "conversation",
+            Self::Context => "context",
+            Self::Memory => "memory",
+            Self::Plan => "plan",
+        }
+    }
+}
+
+/// v55 — what kind of text the active text-input modal collects.
+/// Carries the contextual id when the input is tied to an existing
+/// row (e.g. add-constraint targets a specific plan step).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TextInputKind {
+    AddMemoryCard,
+    AddPlanStep,
+    AddPlanConstraint { step_id: String },
+}
+
+/// v55 — top-level keyboard mode. `Normal` is the default; entering a
+/// modal grabs subsequent keystrokes until Enter/Esc.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum InputMode {
+    #[default]
+    Normal,
+    /// Text-input modal — `buffer` is the user's keystrokes so far.
+    TextInput { kind: TextInputKind, buffer: String },
+    /// Evict-confirm modal — `y` confirms, anything else cancels.
+    /// `id` is the stringified `ContextItemId` to evict.
+    EvictConfirm { id: String },
 }
 
 /// Snapshot of the active model + strategy. Mirror of the GUI's
@@ -235,27 +312,17 @@ impl ConversationRole {
     }
 }
 
+// v57 (H7 fix) — the `snake_case_debug` Debug→snake-case helper was
+// removed alongside its callers. Wire labels now come from canonical
+// `*::wire_label()` methods owned by atelier-core
+// (`MessageRole::wire_label`, `ProbeLoadOutcome::wire_label`) so
+// Rust's `Debug` is no longer a serialisation contract.
+
 /// Best-effort cost extraction from any `LedgerEntry` variant. Returns
 /// `None` for entries that don't carry a USD cost (some `CacheBust`
 /// entries today). The TUI's running total ignores `None` rather than
 /// treating it as zero so the meter isn't artificially deflated by
 /// no-cost bookkeeping rows.
-/// Convert a Debug-formatted enum variant (`"CacheHit"`,
-/// `"NotCached"`) into the snake_case wire form the rest of the
-/// system uses (`"cache_hit"`, `"not_cached"`). Used so the TUI's
-/// footer matches the GUI's `serde(rename_all = "snake_case")`
-/// projection byte-for-byte.
-fn snake_case_debug(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 4);
-    for (i, ch) in s.chars().enumerate() {
-        if ch.is_ascii_uppercase() && i > 0 {
-            out.push('_');
-        }
-        out.push(ch.to_ascii_lowercase());
-    }
-    out
-}
-
 fn ledger_entry_cost(entry: &LedgerEntry) -> Option<f64> {
     match entry {
         LedgerEntry::ModelCall { cost_usd, .. } | LedgerEntry::ToolCall { cost_usd, .. } => {
@@ -299,7 +366,9 @@ impl AppState {
                 }
             }
             SessionEvent::Transitioned { to, .. } => {
-                self.current_state = format!("{to:?}");
+                // v57 (H7 fix) — canonical name from atelier-core
+                // rather than Rust's `Debug` format.
+                self.current_state = to.name().to_string();
             }
             SessionEvent::MessageCommitted { role, text } => {
                 self.push_conversation(ConversationRole::from_message_role(*role), text.clone());
@@ -353,17 +422,19 @@ impl AppState {
                 outcome,
             } => {
                 // v52 — record the active model so the footer can
-                // render it. Outcome is Debug-then-lowercased to
-                // mirror the GUI's snake_case label (`cache_hit` etc.
-                // — `format!("{outcome:?}")` returns `CacheHit`; we
-                // convert in two steps so the wire shape matches the
-                // GUI exactly: insert an underscore at each lower-to-
-                // upper boundary, then lowercase the whole thing).
+                // render it.
+                //
+                // v57 (H7 fix) — `outcome.wire_label()` is the
+                // canonical snake_case label owned by atelier-core.
+                // Pre-v57 we did `format!("{outcome:?}")` and
+                // post-processed through `snake_case_debug`, which
+                // made Rust's Debug a wire format and would break
+                // silently on a variant rename.
                 self.current_model = Some(CurrentModel {
                     model_id: model_id.clone(),
                     base_url: base_url.clone(),
                     strategy: strategy.as_str(),
-                    outcome: snake_case_debug(&format!("{outcome:?}")),
+                    outcome: outcome.wire_label().to_string(),
                 });
             }
             SessionEvent::ContextItems { items } => {
@@ -378,6 +449,15 @@ impl AppState {
                 // ContextItems. Cards arrive at every turn so the
                 // panel never displays stale state.
                 self.memory_cards = cards.clone();
+            }
+            SessionEvent::ClaimedChanges { changes } => {
+                // v56 — wholesale-replace the path→rationale map.
+                // The diff pane reads this to render the agent's
+                // "why this change?" summary next to the file header.
+                self.claimed_changes = changes
+                    .iter()
+                    .map(|c| (c.path.clone(), c.summary.clone()))
+                    .collect();
             }
             SessionEvent::IllegalTransitionAttempted { .. }
             | SessionEvent::Cancelled
@@ -435,6 +515,59 @@ impl AppState {
         }
     }
 
+    /// v55 — selection length for the currently focused pane.
+    /// Returns 0 for Conversation (which has no per-row selection
+    /// surface in v55).
+    pub fn focused_pane_len(&self) -> usize {
+        match self.focused_pane {
+            FocusedPane::Conversation => 0,
+            FocusedPane::Context => self.context_items.len(),
+            FocusedPane::Memory => self.memory_cards.len(),
+            FocusedPane::Plan => self.plan.len(),
+        }
+    }
+
+    /// Read-only accessor used by `handle_key` / tests. Returns the
+    /// selected index for the focused pane; 0 when there's no
+    /// per-row surface.
+    pub fn focused_pane_selected(&self) -> usize {
+        match self.focused_pane {
+            FocusedPane::Conversation => 0,
+            FocusedPane::Context => self.selected_context,
+            FocusedPane::Memory => self.selected_memory,
+            FocusedPane::Plan => self.selected_plan,
+        }
+    }
+
+    /// v55 — `j`/`↓` in the focused pane. Saturates at `len-1`.
+    pub fn select_next(&mut self) {
+        let len = self.focused_pane_len();
+        if len == 0 {
+            return;
+        }
+        let cap = len.saturating_sub(1);
+        let s = match self.focused_pane {
+            FocusedPane::Conversation => return,
+            FocusedPane::Context => &mut self.selected_context,
+            FocusedPane::Memory => &mut self.selected_memory,
+            FocusedPane::Plan => &mut self.selected_plan,
+        };
+        if *s < cap {
+            *s += 1;
+        }
+    }
+
+    /// v55 — `k`/`↑` in the focused pane. Saturates at 0.
+    pub fn select_prev(&mut self) {
+        let s = match self.focused_pane {
+            FocusedPane::Conversation => return,
+            FocusedPane::Context => &mut self.selected_context,
+            FocusedPane::Memory => &mut self.selected_memory,
+            FocusedPane::Plan => &mut self.selected_plan,
+        };
+        *s = s.saturating_sub(1);
+    }
+
     /// Apply a scrubber command. Pure: the §4 time-travel machinery is
     /// downstream; the TUI just tracks the user's intent and the host
     /// reacts to changes in `scrub_offset`.
@@ -474,92 +607,70 @@ pub enum ScrubCommand {
 /// `EventLine`. Pure function — same role here as `bridge_event` plays for
 /// the GUI: keep variant-specific formatting out of the render path so
 /// adding a new event variant is a one-line change in one place.
+///
+/// v57 (H5 fix) — the `kind` label is sourced from
+/// [`SessionEvent::kind`] so it always agrees with the GUI bridge.
+/// The pre-v57 strings ("Message", "PendingApproval",
+/// "IllegalTransition", "ModelProfile") had drifted away from the
+/// Rust enum variant names.
 pub fn project_event(evt: &SessionEvent) -> EventLine {
-    match evt {
-        SessionEvent::MessageCommitted { role, text } => EventLine {
-            kind: "Message",
-            detail: format!(
-                "{:?}: {}",
-                role,
-                text.lines()
-                    .next()
-                    .unwrap_or("")
-                    .chars()
-                    .take(60)
-                    .collect::<String>()
-            ),
-        },
-        SessionEvent::PlanSnapshot { steps } => EventLine {
-            kind: "PlanSnapshot",
-            detail: format!("{} steps", steps.len()),
-        },
-        SessionEvent::LedgerAppended { entry } => EventLine {
-            kind: "LedgerAppended",
-            detail: match entry {
-                LedgerEntry::ModelCall { .. } => "model_call".to_string(),
-                LedgerEntry::ToolCall { tool_name, .. } => format!("tool_call:{tool_name}"),
-                LedgerEntry::CacheBust { .. } => "cache_bust".to_string(),
-            },
+    let kind = evt.kind();
+    let detail = match evt {
+        // v58 (H7-residual fix) — `role.wire_label()` /
+        // `from.name()` / `to.name()` are canonical labels owned by
+        // atelier-core. The pre-v58 path used `format!("{role:?}")` /
+        // `{from:?}` here even though the rest of the projection
+        // (kind, AppState::apply) had already moved off Debug.
+        SessionEvent::MessageCommitted { role, text } => format!(
+            "{}: {}",
+            role.wire_label(),
+            text.lines()
+                .next()
+                .unwrap_or("")
+                .chars()
+                .take(60)
+                .collect::<String>()
+        ),
+        SessionEvent::PlanSnapshot { steps } => format!("{} steps", steps.len()),
+        SessionEvent::LedgerAppended { entry } => match entry {
+            LedgerEntry::ModelCall { .. } => "model_call".to_string(),
+            LedgerEntry::ToolCall { tool_name, .. } => format!("tool_call:{tool_name}"),
+            LedgerEntry::CacheBust { .. } => "cache_bust".to_string(),
         },
         SessionEvent::ContextSnapshot {
             known_tokens,
             unknown_tokens,
-        } => EventLine {
-            kind: "ContextSnapshot",
-            detail: format!("known={known_tokens} unknown={unknown_tokens}"),
-        },
-        SessionEvent::StagingPendingApproval { files, .. } => EventLine {
-            kind: "PendingApproval",
-            detail: format!("{} files awaiting approval", files.len()),
-        },
+        } => format!("known={known_tokens} unknown={unknown_tokens}"),
+        SessionEvent::StagingPendingApproval { files, .. } => {
+            format!("{} files awaiting approval", files.len())
+        }
         SessionEvent::CommitDecision {
             committed, dropped, ..
-        } => EventLine {
-            kind: "CommitDecision",
-            detail: format!("committed={} dropped={}", committed.len(), dropped.len()),
-        },
-        SessionEvent::Transitioned { from, to } => EventLine {
-            kind: "Transitioned",
-            detail: format!("{from:?} → {to:?}"),
-        },
-        SessionEvent::IllegalTransitionAttempted { from, to } => EventLine {
-            kind: "IllegalTransition",
-            detail: format!("{from:?} ↛ {to:?}"),
-        },
-        SessionEvent::Cancelled => EventLine {
-            kind: "Cancelled",
-            detail: String::new(),
-        },
-        SessionEvent::EditStaged { path, .. } => EventLine {
-            kind: "EditStaged",
-            detail: path.display().to_string(),
-        },
+        } => format!("committed={} dropped={}", committed.len(), dropped.len()),
+        SessionEvent::Transitioned { from, to } => format!("{} → {}", from.name(), to.name()),
+        SessionEvent::IllegalTransitionAttempted { from, to } => {
+            format!("{} ↛ {}", from.name(), to.name())
+        }
+        SessionEvent::Cancelled => String::new(),
+        SessionEvent::EditStaged { path, .. } => path.display().to_string(),
         SessionEvent::ModelProfileLoaded {
             model_id,
             strategy,
             outcome,
             ..
-        } => EventLine {
-            kind: "ModelProfile",
-            detail: format!(
-                "{model_id} · strategy={} · {}",
-                strategy.as_str(),
-                format!("{outcome:?}").to_lowercase()
-            ),
-        },
-        SessionEvent::ContextItems { items } => EventLine {
-            kind: "ContextItems",
-            detail: format!("{} items", items.len()),
-        },
-        SessionEvent::MemoryCards { cards } => EventLine {
-            kind: "MemoryCards",
-            detail: format!("{} cards", cards.len()),
-        },
-        SessionEvent::Shutdown => EventLine {
-            kind: "Shutdown",
-            detail: String::new(),
-        },
-    }
+        } => format!(
+            "{model_id} · strategy={} · {}",
+            strategy.as_str(),
+            outcome.wire_label()
+        ),
+        SessionEvent::ContextItems { items } => format!("{} items", items.len()),
+        SessionEvent::MemoryCards { cards } => format!("{} cards", cards.len()),
+        SessionEvent::ClaimedChanges { changes } => {
+            format!("{} file rationale(s)", changes.len())
+        }
+        SessionEvent::Shutdown => String::new(),
+    };
+    EventLine { kind, detail }
 }
 
 /// Pure render — projects `AppState` onto the given `Buffer`. Tests call
@@ -761,6 +872,21 @@ fn render_diff(state: &AppState, area: Rect, buf: &mut Buffer) {
                 .add_modifier(Modifier::BOLD),
         ),
     ]));
+    // v56 — "Why this change?" rationale from the envelope's
+    // `claimed_changes`. Rendered as a single dim italic line under
+    // the file header so the user can see the agent's stated intent
+    // without clicking through.
+    if let Some(reason) = state.claimed_changes.get(&edit.path.display().to_string()) {
+        lines.push(Line::from(vec![
+            Span::styled("    why: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                reason.clone(),
+                Style::default()
+                    .fg(Color::Gray)
+                    .add_modifier(Modifier::ITALIC),
+            ),
+        ]));
+    }
     match &edit.hunks {
         Hunks::Same => {
             lines.push(Line::from(Span::styled(
@@ -1285,7 +1411,7 @@ fn model_badge_width(model: &CurrentModel) -> u16 {
 }
 
 /// Outcome of a single keypress, dispatched by [`run`]'s event loop.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputOutcome {
     Continue,
     Quit,
@@ -1299,46 +1425,195 @@ pub enum InputOutcome {
     /// reject). Same guard as `AcceptAll` — only returned when
     /// pending is set.
     RejectAll,
+    // v55 — §5 mutator + focus surface ------------------
+    /// Tab cycles to the next pane.
+    FocusNext,
+    /// `k` / Up — move selection back in the focused pane.
+    SelectPrev,
+    /// `j` / Down — move selection forward in the focused pane.
+    SelectNext,
+    /// Context pane: `p` (pin), `u` (unpin) on the selected item.
+    /// Carries the stringified `ContextItemId` so the run loop can
+    /// route to the dispatcher mutator directly.
+    PinContext(String),
+    UnpinContext(String),
+    /// Context pane: `e` — open the evict-confirm modal for the
+    /// selected item. The run loop sets `state.input_mode` to
+    /// `EvictConfirm`; the next `y` returns `EvictConfirmYes`.
+    EvictAsk(String),
+    /// In `EvictConfirm` mode: `y` confirms the evict.
+    EvictConfirmYes(String),
+    /// In any modal: Esc / `q` cancels back to Normal.
+    ModalCancel,
+    /// Memory pane: `d` deletes selected card.
+    DeleteMemory(String),
+    /// Memory pane: `P` promotes selected card to ~/.atelier/memory/.
+    PromoteMemory(String),
+    /// Plan pane: space cycles the selected step's status.
+    CyclePlanStatus {
+        id: String,
+        current: PlanStatus,
+    },
+    /// Plan pane: `x` removes the selected step.
+    RemovePlanStep(String),
+    /// Enter text-input modal of the given kind. Run loop sets
+    /// `state.input_mode = TextInput { kind, buffer: "" }`.
+    EnterTextInput(TextInputKind),
+    /// In TextInput mode: append a printable char to the buffer.
+    TextInputChar(char),
+    /// In TextInput mode: pop the last char.
+    TextInputBackspace,
+    /// In TextInput mode: submit. The run loop reads `state.input_mode`
+    /// (still `TextInput { kind, buffer }`) and routes to the right
+    /// dispatcher mutator, then resets to Normal.
+    TextInputSubmit,
 }
 
 /// Pure keypress dispatch. Centralised so the run loop is one match arm
-/// per input source.
+/// per input source. `state` is read-only here — outcomes describe
+/// *what* the run loop should do; the run loop mutates state.
 ///
-/// Bindings:
-/// - `q` / `Esc` / `Ctrl-C` — quit
-/// - `[` — scrubber: one step back
-/// - `]` — scrubber: one step forward
-/// - `g` — scrubber: jump to HEAD (live)
-/// - `y` — accept every pending file (only when pending_approval is set)
-/// - `n` — reject every pending file (only when pending_approval is set)
+/// Bindings (Normal mode):
+///   * `q` / `Esc` / `Ctrl-C` — quit (in Normal mode; Esc also closes a modal)
+///   * `[` / `]` / `g` — scrubber
+///   * `y` / `n` — accept / reject all pending hunks (only when pending set)
+///   * `Tab` — cycle focused pane
+///   * `j` / `↓` — select next row in focused pane
+///   * `k` / `↑` — select previous row in focused pane
 ///
-/// `pending` is passed by reference so handle_key can gate `y`/`n` on
-/// the presence of an outstanding approval. Without that gate, a stray
-/// keystroke during an inactive session would surprise a future text-
-/// input mode that wants to consume `y` / `n` literally.
+/// Per-focused-pane mutator keys (v55):
+///   * Context: `p` pin, `u` unpin, `e` evict-with-confirm
+///   * Memory:  `a` add (text-input modal), `d` delete, `P` promote
+///   * Plan:    `a` add step (text-input modal), space cycle status,
+///              `c` add constraint (text-input modal), `x` remove
 ///
-/// Spec §3 names a `g <n>` "jump to step n" prefix sequence; that needs
-/// a modal input mode (collect digits, then act on next non-digit). v0
-/// ships the `[` / `]` / `g` subset which proves the bus wiring; the
-/// digit-prefix sequence lands when the §4 time-travel target machinery
-/// has a concrete step-count to clamp against.
-pub fn handle_key(key: KeyEvent, pending: Option<&PendingApproval>) -> InputOutcome {
+/// Modal sub-modes consume keys before they reach pane bindings:
+///   * `InputMode::EvictConfirm`: `y` confirms, Esc/anything else cancels
+///   * `InputMode::TextInput`: printable chars append, Backspace pops,
+///     Enter submits, Esc cancels
+pub fn handle_key(key: KeyEvent, state: &AppState) -> InputOutcome {
+    // Modal sub-modes take precedence: a stray keystroke inside an
+    // open modal must NOT trigger a pane mutator.
+    match &state.input_mode {
+        InputMode::EvictConfirm { id } => {
+            return match (key.code, key.modifiers) {
+                (KeyCode::Char('y'), _) => InputOutcome::EvictConfirmYes(id.clone()),
+                (KeyCode::Esc, _) | (KeyCode::Char('n'), _) | (KeyCode::Char('q'), _) => {
+                    InputOutcome::ModalCancel
+                }
+                _ => InputOutcome::Continue,
+            };
+        }
+        InputMode::TextInput { .. } => {
+            return match (key.code, key.modifiers) {
+                (KeyCode::Esc, _) => InputOutcome::ModalCancel,
+                (KeyCode::Enter, _) => InputOutcome::TextInputSubmit,
+                (KeyCode::Backspace, _) => InputOutcome::TextInputBackspace,
+                (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) => {
+                    InputOutcome::TextInputChar(c)
+                }
+                _ => InputOutcome::Continue,
+            };
+        }
+        InputMode::Normal => {}
+    }
+
+    // Global keys first (work in any focused pane).
+    let pending = state.pending_approval.as_ref();
     match (key.code, key.modifiers) {
         (KeyCode::Char('q'), m) | (KeyCode::Esc, m)
             if !m.contains(KeyModifiers::CONTROL) || matches!(key.code, KeyCode::Char('q')) =>
         {
-            InputOutcome::Quit
+            return InputOutcome::Quit;
         }
-        (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => InputOutcome::Quit,
-        (KeyCode::Char('['), _) => InputOutcome::Scrub(ScrubCommand::Prev),
-        (KeyCode::Char(']'), _) => InputOutcome::Scrub(ScrubCommand::Next),
-        (KeyCode::Char('g'), _) => InputOutcome::Scrub(ScrubCommand::JumpToHead),
+        (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => return InputOutcome::Quit,
+        (KeyCode::Char('['), _) => return InputOutcome::Scrub(ScrubCommand::Prev),
+        (KeyCode::Char(']'), _) => return InputOutcome::Scrub(ScrubCommand::Next),
+        (KeyCode::Char('g'), _) => return InputOutcome::Scrub(ScrubCommand::JumpToHead),
         // Approval keys are gated on pending state — keeps the
         // interpretation deterministic when the user is between
         // approvals.
-        (KeyCode::Char('y'), _) if pending.is_some() => InputOutcome::AcceptAll,
-        (KeyCode::Char('n'), _) if pending.is_some() => InputOutcome::RejectAll,
-        _ => InputOutcome::Continue,
+        (KeyCode::Char('y'), _) if pending.is_some() => return InputOutcome::AcceptAll,
+        (KeyCode::Char('n'), _) if pending.is_some() => return InputOutcome::RejectAll,
+        (KeyCode::Tab, _) => return InputOutcome::FocusNext,
+        (KeyCode::Char('j'), _) | (KeyCode::Down, _) => return InputOutcome::SelectNext,
+        (KeyCode::Char('k'), _) | (KeyCode::Up, _) => return InputOutcome::SelectPrev,
+        _ => {}
+    }
+
+    // Pane-scoped mutator keys.
+    match state.focused_pane {
+        FocusedPane::Context => {
+            let Some(item) = state.context_items.get(state.selected_context) else {
+                return InputOutcome::Continue;
+            };
+            match (key.code, key.modifiers) {
+                (KeyCode::Char('p'), _) => InputOutcome::PinContext(item.id.clone()),
+                (KeyCode::Char('u'), _) => InputOutcome::UnpinContext(item.id.clone()),
+                (KeyCode::Char('e'), _) => InputOutcome::EvictAsk(item.id.clone()),
+                _ => InputOutcome::Continue,
+            }
+        }
+        FocusedPane::Memory => match (key.code, key.modifiers) {
+            (KeyCode::Char('a'), _) => InputOutcome::EnterTextInput(TextInputKind::AddMemoryCard),
+            (KeyCode::Char('d'), _) => {
+                let Some(card) = state.memory_cards.get(state.selected_memory) else {
+                    return InputOutcome::Continue;
+                };
+                InputOutcome::DeleteMemory(card.id.clone())
+            }
+            (KeyCode::Char('P'), _) => {
+                let Some(card) = state.memory_cards.get(state.selected_memory) else {
+                    return InputOutcome::Continue;
+                };
+                InputOutcome::PromoteMemory(card.id.clone())
+            }
+            _ => InputOutcome::Continue,
+        },
+        FocusedPane::Plan => {
+            // Plan steps come from `state.plan` (PlanCanvas). The
+            // canvas's `iter()` is order-preserving so `nth(idx)`
+            // matches the rendered row index.
+            match (key.code, key.modifiers) {
+                (KeyCode::Char('a'), _) => InputOutcome::EnterTextInput(TextInputKind::AddPlanStep),
+                (KeyCode::Char('c'), _) => {
+                    let Some(step) = state.plan.iter().nth(state.selected_plan) else {
+                        return InputOutcome::Continue;
+                    };
+                    InputOutcome::EnterTextInput(TextInputKind::AddPlanConstraint {
+                        step_id: step.id.clone(),
+                    })
+                }
+                (KeyCode::Char(' '), _) => {
+                    let Some(step) = state.plan.iter().nth(state.selected_plan) else {
+                        return InputOutcome::Continue;
+                    };
+                    InputOutcome::CyclePlanStatus {
+                        id: step.id.clone(),
+                        current: step.status,
+                    }
+                }
+                (KeyCode::Char('x'), _) => {
+                    let Some(step) = state.plan.iter().nth(state.selected_plan) else {
+                        return InputOutcome::Continue;
+                    };
+                    InputOutcome::RemovePlanStep(step.id.clone())
+                }
+                _ => InputOutcome::Continue,
+            }
+        }
+        FocusedPane::Conversation => InputOutcome::Continue,
+    }
+}
+
+/// v55 — the cycle a space-key press walks the focused plan step
+/// through. Mirrors the GUI's `nextStatus` cycler in PlanPane.svelte.
+pub fn next_plan_status(s: PlanStatus) -> PlanStatus {
+    match s {
+        PlanStatus::Pending => PlanStatus::InProgress,
+        PlanStatus::InProgress => PlanStatus::Done,
+        PlanStatus::Done => PlanStatus::Skipped,
+        PlanStatus::Skipped => PlanStatus::Pending,
     }
 }
 
@@ -1477,7 +1752,7 @@ async fn run_async(prompt: Option<String>) -> io::Result<()> {
             input = tokio::task::spawn_blocking(|| poll_one_key(Duration::from_millis(50))) => {
                 match input {
                     Ok(Ok(Some(key))) => {
-                        match handle_key(key, state.pending_approval.as_ref()) {
+                        match handle_key(key, &state) {
                             InputOutcome::Quit => break,
                             InputOutcome::Scrub(cmd) => state.apply_scrub(cmd),
                             InputOutcome::AcceptAll => {
@@ -1485,6 +1760,79 @@ async fn run_async(prompt: Option<String>) -> io::Result<()> {
                             }
                             InputOutcome::RejectAll => {
                                 submit_pending(&state, &dispatcher_handle, false);
+                            }
+                            InputOutcome::FocusNext => {
+                                state.focused_pane = state.focused_pane.next();
+                            }
+                            InputOutcome::SelectPrev => state.select_prev(),
+                            InputOutcome::SelectNext => state.select_next(),
+                            InputOutcome::PinContext(id) => {
+                                submit_mutation(&dispatcher_handle, Mutation::Pin(id));
+                            }
+                            InputOutcome::UnpinContext(id) => {
+                                submit_mutation(&dispatcher_handle, Mutation::Unpin(id));
+                            }
+                            InputOutcome::EvictAsk(id) => {
+                                state.input_mode = InputMode::EvictConfirm { id };
+                            }
+                            InputOutcome::EvictConfirmYes(id) => {
+                                state.input_mode = InputMode::Normal;
+                                submit_mutation(&dispatcher_handle, Mutation::Evict(id));
+                            }
+                            InputOutcome::ModalCancel => {
+                                state.input_mode = InputMode::Normal;
+                            }
+                            InputOutcome::DeleteMemory(id) => {
+                                submit_mutation(&dispatcher_handle, Mutation::DeleteMemory(id));
+                            }
+                            InputOutcome::PromoteMemory(id) => {
+                                submit_mutation(&dispatcher_handle, Mutation::PromoteMemory(id));
+                            }
+                            InputOutcome::CyclePlanStatus { id, current } => {
+                                let next = next_plan_status(current);
+                                submit_mutation(
+                                    &dispatcher_handle,
+                                    Mutation::PlanStatus(id, next),
+                                );
+                            }
+                            InputOutcome::RemovePlanStep(id) => {
+                                submit_mutation(&dispatcher_handle, Mutation::RemovePlan(id));
+                            }
+                            InputOutcome::EnterTextInput(kind) => {
+                                state.input_mode = InputMode::TextInput {
+                                    kind,
+                                    buffer: String::new(),
+                                };
+                            }
+                            InputOutcome::TextInputChar(c) => {
+                                if let InputMode::TextInput { buffer, .. } = &mut state.input_mode {
+                                    buffer.push(c);
+                                }
+                            }
+                            InputOutcome::TextInputBackspace => {
+                                if let InputMode::TextInput { buffer, .. } = &mut state.input_mode {
+                                    buffer.pop();
+                                }
+                            }
+                            InputOutcome::TextInputSubmit => {
+                                if let InputMode::TextInput { kind, buffer } =
+                                    std::mem::take(&mut state.input_mode)
+                                {
+                                    let text = buffer.trim().to_string();
+                                    state.input_mode = InputMode::Normal;
+                                    if !text.is_empty() {
+                                        let m = match kind {
+                                            TextInputKind::AddMemoryCard => {
+                                                Mutation::AddMemory(text)
+                                            }
+                                            TextInputKind::AddPlanStep => Mutation::AddPlanStep(text),
+                                            TextInputKind::AddPlanConstraint { step_id } => {
+                                                Mutation::AddPlanConstraint(step_id, text)
+                                            }
+                                        };
+                                        submit_mutation(&dispatcher_handle, m);
+                                    }
+                                }
                             }
                             InputOutcome::Continue => {}
                         }
@@ -1656,13 +2004,82 @@ fn submit_pending(
     } else {
         Vec::new()
     };
-    if !sd.submit_approval(pending.commit_id, accepted) {
+    if !sd.submit_approval_files(pending.commit_id, accepted) {
         tracing::warn!(
             commit_id = %pending.commit_id,
             "submit_pending: dispatcher rejected the accept-set (commit_id stale?)"
         );
     }
 }
+
+/// v55 — mutation request handed from the run loop to the
+/// dispatcher. Routes to the appropriate `SessionDispatcher`
+/// mutator. The dispatcher re-emits the relevant snapshot event
+/// on success so the TUI's state updates via the same path
+/// turn-boundary snapshots do.
+enum Mutation {
+    Pin(String),
+    Unpin(String),
+    Evict(String),
+    AddMemory(String),
+    DeleteMemory(String),
+    PromoteMemory(String),
+    AddPlanStep(String),
+    AddPlanConstraint(String, String),
+    PlanStatus(String, PlanStatus),
+    RemovePlan(String),
+}
+
+fn submit_mutation(handle: &Option<atelier_cli::runner::DispatcherHandle>, m: Mutation) {
+    let Some(handle) = handle else {
+        // Viewer mode: nothing to mutate.
+        return;
+    };
+    let Some(sd) = handle.get() else {
+        tracing::warn!("submit_mutation: DispatcherHandle empty (run already shut down?)");
+        return;
+    };
+    let now = atelier_core::time::now_rfc3339();
+    let result: Result<(), String> = match m {
+        Mutation::Pin(id) => sd.pin_context_item(&id).map_err(|e| e.to_string()),
+        Mutation::Unpin(id) => sd.unpin_context_item(&id).map_err(|e| e.to_string()),
+        Mutation::Evict(id) => sd
+            .evict_context_item(&id, &now)
+            .map(|_| ())
+            .map_err(|e| e.to_string()),
+        Mutation::AddMemory(content) => sd
+            .add_memory_card(content, &now)
+            .map(|_| ())
+            .map_err(|e| e.to_string()),
+        Mutation::DeleteMemory(id) => sd.delete_memory_card(&id).map_err(|e| e.to_string()),
+        Mutation::PromoteMemory(id) => match sd.promote_memory_card(&id, &now) {
+            // v60 (security M-1 fix) — route through the shared
+            // atelier-cli writer so the TUI gets the same HOME
+            // validation + canonical-root containment + atomic
+            // write the GUI has had since v58/v59. Pre-v60 the TUI
+            // wrote with `std::fs::write` directly, bypassing every
+            // hardening pass on this path.
+            Ok(output) => atelier_cli::memory_promote::write_promoted_card(&output).map(|_| ()),
+            Err(e) => Err(e.to_string()),
+        },
+        Mutation::AddPlanStep(text) => sd
+            .add_plan_step(text)
+            .map(|_| ())
+            .map_err(|e| e.to_string()),
+        Mutation::AddPlanConstraint(id, c) => sd
+            .add_plan_step_constraint(&id, c)
+            .map_err(|e| e.to_string()),
+        Mutation::PlanStatus(id, s) => sd.mark_plan_step_status(&id, s).map_err(|e| e.to_string()),
+        Mutation::RemovePlan(id) => sd.remove_plan_step(&id).map_err(|e| e.to_string()),
+    };
+    if let Err(e) = result {
+        tracing::warn!(error = %e, "submit_mutation: dispatcher rejected the request");
+    }
+}
+
+// v57 (H6 fix): the TUI's `now_rfc3339_for_tui` + `tui_days_to_ymd`
+// have been unified with the runner + GUI copies via
+// `atelier_core::time::now_rfc3339`.
 
 /// RAII restore of raw mode + alternate screen. Drops on panic.
 struct TerminalGuard;
@@ -1783,7 +2200,7 @@ mod tests {
                 to: State::Streaming
             })
             .kind,
-            "IllegalTransition"
+            "IllegalTransitionAttempted"
         );
     }
 
@@ -1855,15 +2272,6 @@ mod tests {
             strategy: "json_sentinel",
             outcome: "cache_hit".into(),
         }
-    }
-
-    #[test]
-    fn snake_case_debug_handles_camel_case() {
-        assert_eq!(snake_case_debug("CacheHit"), "cache_hit");
-        assert_eq!(snake_case_debug("NotCached"), "not_cached");
-        assert_eq!(snake_case_debug("Probed"), "probed");
-        // Leading uppercase doesn't get a leading underscore.
-        assert_eq!(snake_case_debug("A"), "a");
     }
 
     #[test]
@@ -2016,6 +2424,37 @@ mod tests {
     }
 
     #[test]
+    fn provenance_badge_covers_every_provenance_variant() {
+        // Regression for v59 MED-smell-1 — `provenance_badge` is keyed
+        // on the snake_case wire label produced by
+        // `Provenance::wire_label`. Walking every variant catches
+        // the case where a Rust-side rename ships a new wire label
+        // that the TUI badge map doesn't know about — pre-v59 those
+        // would silently fall through to `"????"`.
+        use atelier_core::context::Provenance;
+        for prov in [
+            Provenance::Initial,
+            Provenance::UserAttached { note: None },
+            Provenance::ToolResult {
+                tool_call_id: "tc".into(),
+            },
+            Provenance::MemoryPromoted {
+                card_id: "m".into(),
+            },
+            Provenance::PinnedByUser { note: None },
+            Provenance::AssistantTurn,
+        ] {
+            let badge = provenance_badge(prov.wire_label());
+            assert_ne!(
+                badge,
+                "????",
+                "provenance_badge fell through for {prov:?} (wire label {:?})",
+                prov.wire_label()
+            );
+        }
+    }
+
+    #[test]
     fn project_event_for_context_items_includes_count() {
         let line = project_event(&SessionEvent::ContextItems {
             items: vec![
@@ -2104,15 +2543,21 @@ mod tests {
     #[test]
     fn handle_key_quits_on_q_esc_and_ctrl_c() {
         assert_eq!(
-            handle_key(key(KeyCode::Char('q'), KeyModifiers::empty()), None),
+            handle_key(
+                key(KeyCode::Char('q'), KeyModifiers::empty()),
+                &AppState::new()
+            ),
             InputOutcome::Quit
         );
         assert_eq!(
-            handle_key(key(KeyCode::Esc, KeyModifiers::empty()), None),
+            handle_key(key(KeyCode::Esc, KeyModifiers::empty()), &AppState::new()),
             InputOutcome::Quit
         );
         assert_eq!(
-            handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL), None),
+            handle_key(
+                key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                &AppState::new()
+            ),
             InputOutcome::Quit
         );
     }
@@ -2120,17 +2565,23 @@ mod tests {
     #[test]
     fn handle_key_continues_on_other_keys() {
         assert_eq!(
-            handle_key(key(KeyCode::Char('a'), KeyModifiers::empty()), None),
+            handle_key(
+                key(KeyCode::Char('a'), KeyModifiers::empty()),
+                &AppState::new()
+            ),
             InputOutcome::Continue
         );
         assert_eq!(
-            handle_key(key(KeyCode::Enter, KeyModifiers::empty()), None),
+            handle_key(key(KeyCode::Enter, KeyModifiers::empty()), &AppState::new()),
             InputOutcome::Continue
         );
         // Ctrl-Q is not the quit binding (only Ctrl-C is) — guarantees
         // the modifier check is right.
         assert_eq!(
-            handle_key(key(KeyCode::Char('q'), KeyModifiers::CONTROL), None),
+            handle_key(
+                key(KeyCode::Char('q'), KeyModifiers::CONTROL),
+                &AppState::new()
+            ),
             InputOutcome::Quit, // 'q' alone quits, regardless of modifier
         );
     }
@@ -2331,7 +2782,10 @@ mod tests {
     #[test]
     fn handle_key_emits_scrub_prev_on_open_bracket() {
         assert_eq!(
-            handle_key(key(KeyCode::Char('['), KeyModifiers::empty()), None),
+            handle_key(
+                key(KeyCode::Char('['), KeyModifiers::empty()),
+                &AppState::new()
+            ),
             InputOutcome::Scrub(ScrubCommand::Prev)
         );
     }
@@ -2339,7 +2793,10 @@ mod tests {
     #[test]
     fn handle_key_emits_scrub_next_on_close_bracket() {
         assert_eq!(
-            handle_key(key(KeyCode::Char(']'), KeyModifiers::empty()), None),
+            handle_key(
+                key(KeyCode::Char(']'), KeyModifiers::empty()),
+                &AppState::new()
+            ),
             InputOutcome::Scrub(ScrubCommand::Next)
         );
     }
@@ -2347,7 +2804,10 @@ mod tests {
     #[test]
     fn handle_key_emits_jump_to_head_on_g() {
         assert_eq!(
-            handle_key(key(KeyCode::Char('g'), KeyModifiers::empty()), None),
+            handle_key(
+                key(KeyCode::Char('g'), KeyModifiers::empty()),
+                &AppState::new()
+            ),
             InputOutcome::Scrub(ScrubCommand::JumpToHead)
         );
     }
@@ -2499,7 +2959,7 @@ mod tests {
                 text: "hi".into(),
             })
             .kind,
-            "Message"
+            "MessageCommitted"
         );
         assert_eq!(
             project_event(&SessionEvent::PlanSnapshot { steps: vec![] }).kind,
@@ -2628,24 +3088,20 @@ mod tests {
 
     #[test]
     fn handle_key_emits_accept_all_on_y_when_pending() {
-        let pending = pending_with_files(&["a.txt"]);
+        let mut s = AppState::new();
+        s.pending_approval = Some(pending_with_files(&["a.txt"]));
         assert_eq!(
-            handle_key(
-                key(KeyCode::Char('y'), KeyModifiers::empty()),
-                Some(&pending),
-            ),
+            handle_key(key(KeyCode::Char('y'), KeyModifiers::empty()), &s),
             InputOutcome::AcceptAll
         );
     }
 
     #[test]
     fn handle_key_emits_reject_all_on_n_when_pending() {
-        let pending = pending_with_files(&["a.txt"]);
+        let mut s = AppState::new();
+        s.pending_approval = Some(pending_with_files(&["a.txt"]));
         assert_eq!(
-            handle_key(
-                key(KeyCode::Char('n'), KeyModifiers::empty()),
-                Some(&pending),
-            ),
+            handle_key(key(KeyCode::Char('n'), KeyModifiers::empty()), &s),
             InputOutcome::RejectAll
         );
     }
@@ -2657,11 +3113,17 @@ mod tests {
         // mis-fire submit_approval (which would no-op anyway but the
         // outcome semantics should match user intent).
         assert_eq!(
-            handle_key(key(KeyCode::Char('y'), KeyModifiers::empty()), None),
+            handle_key(
+                key(KeyCode::Char('y'), KeyModifiers::empty()),
+                &AppState::new()
+            ),
             InputOutcome::Continue
         );
         assert_eq!(
-            handle_key(key(KeyCode::Char('n'), KeyModifiers::empty()), None),
+            handle_key(
+                key(KeyCode::Char('n'), KeyModifiers::empty()),
+                &AppState::new()
+            ),
             InputOutcome::Continue
         );
     }
@@ -2730,6 +3192,230 @@ mod tests {
         assert_eq!(
             ConversationRole::from_message_role(MessageRole::System),
             ConversationRole::System
+        );
+    }
+
+    // ---------- v55: §5 mutator + focus ----------
+
+    use atelier_core::context::ContextItemSummary as CtxSum;
+    use atelier_core::memory::MemoryCardSummary as MemSum;
+
+    fn seed_context(state: &mut AppState, ids: &[&str]) {
+        state.context_items = ids
+            .iter()
+            .map(|id| CtxSum {
+                id: (*id).to_string(),
+                kind: "inline_text".into(),
+                label: format!("label for {id}"),
+                provenance: "user_attached".into(),
+                provenance_detail: None,
+                tokens: 5,
+                token_source: "approx".into(),
+                pinned: false,
+            })
+            .collect();
+    }
+
+    fn seed_memory(state: &mut AppState, ids: &[&str]) {
+        state.memory_cards = ids
+            .iter()
+            .map(|id| MemSum {
+                id: (*id).to_string(),
+                title: format!("title-{id}"),
+                body_preview: String::new(),
+                created_at: "2026-05-17T10:00:00Z".into(),
+                last_used: "2026-05-17T10:00:00Z".into(),
+                pinned: false,
+            })
+            .collect();
+    }
+
+    fn seed_plan(state: &mut AppState, texts: &[&str]) {
+        let mut pc = PlanCanvas::new();
+        for t in texts {
+            pc.add(*t);
+        }
+        state.plan = pc;
+    }
+
+    #[test]
+    fn focused_pane_cycles_via_tab() {
+        let mut s = AppState::new();
+        assert_eq!(s.focused_pane, FocusedPane::Conversation);
+        s.focused_pane = s.focused_pane.next();
+        assert_eq!(s.focused_pane, FocusedPane::Context);
+        s.focused_pane = s.focused_pane.next();
+        assert_eq!(s.focused_pane, FocusedPane::Memory);
+        s.focused_pane = s.focused_pane.next();
+        assert_eq!(s.focused_pane, FocusedPane::Plan);
+        s.focused_pane = s.focused_pane.next();
+        assert_eq!(s.focused_pane, FocusedPane::Conversation);
+    }
+
+    #[test]
+    fn handle_key_tab_emits_focus_next() {
+        let s = AppState::new();
+        assert_eq!(
+            handle_key(key(KeyCode::Tab, KeyModifiers::empty()), &s),
+            InputOutcome::FocusNext
+        );
+    }
+
+    #[test]
+    fn handle_key_jk_emit_select_next_and_prev_in_focused_pane() {
+        let mut s = AppState::new();
+        s.focused_pane = FocusedPane::Context;
+        seed_context(&mut s, &["a", "b"]);
+        assert_eq!(
+            handle_key(key(KeyCode::Char('j'), KeyModifiers::empty()), &s),
+            InputOutcome::SelectNext
+        );
+        assert_eq!(
+            handle_key(key(KeyCode::Char('k'), KeyModifiers::empty()), &s),
+            InputOutcome::SelectPrev
+        );
+    }
+
+    #[test]
+    fn select_next_and_prev_saturate_at_bounds() {
+        let mut s = AppState::new();
+        s.focused_pane = FocusedPane::Context;
+        seed_context(&mut s, &["a", "b", "c"]);
+        s.select_next();
+        s.select_next();
+        s.select_next(); // saturates at 2
+        assert_eq!(s.selected_context, 2);
+        s.select_prev();
+        s.select_prev();
+        s.select_prev(); // saturates at 0
+        assert_eq!(s.selected_context, 0);
+    }
+
+    #[test]
+    fn context_pane_p_key_emits_pin_for_selected_item() {
+        let mut s = AppState::new();
+        s.focused_pane = FocusedPane::Context;
+        seed_context(&mut s, &["id-0", "id-1"]);
+        s.selected_context = 1;
+        assert_eq!(
+            handle_key(key(KeyCode::Char('p'), KeyModifiers::empty()), &s),
+            InputOutcome::PinContext("id-1".to_string())
+        );
+    }
+
+    #[test]
+    fn context_pane_e_key_opens_evict_confirm() {
+        let mut s = AppState::new();
+        s.focused_pane = FocusedPane::Context;
+        seed_context(&mut s, &["uuid-here"]);
+        assert_eq!(
+            handle_key(key(KeyCode::Char('e'), KeyModifiers::empty()), &s),
+            InputOutcome::EvictAsk("uuid-here".to_string())
+        );
+    }
+
+    #[test]
+    fn evict_confirm_mode_consumes_y_and_n() {
+        let mut s = AppState::new();
+        s.input_mode = InputMode::EvictConfirm {
+            id: "the-id".to_string(),
+        };
+        assert_eq!(
+            handle_key(key(KeyCode::Char('y'), KeyModifiers::empty()), &s),
+            InputOutcome::EvictConfirmYes("the-id".to_string())
+        );
+        assert_eq!(
+            handle_key(key(KeyCode::Char('n'), KeyModifiers::empty()), &s),
+            InputOutcome::ModalCancel
+        );
+    }
+
+    #[test]
+    fn memory_pane_a_key_enters_add_card_text_input() {
+        let mut s = AppState::new();
+        s.focused_pane = FocusedPane::Memory;
+        assert_eq!(
+            handle_key(key(KeyCode::Char('a'), KeyModifiers::empty()), &s),
+            InputOutcome::EnterTextInput(TextInputKind::AddMemoryCard)
+        );
+    }
+
+    #[test]
+    fn memory_pane_d_and_promote_emit_per_selected_card() {
+        let mut s = AppState::new();
+        s.focused_pane = FocusedPane::Memory;
+        seed_memory(&mut s, &["mem-1", "mem-2"]);
+        s.selected_memory = 1;
+        assert_eq!(
+            handle_key(key(KeyCode::Char('d'), KeyModifiers::empty()), &s),
+            InputOutcome::DeleteMemory("mem-2".to_string())
+        );
+        assert_eq!(
+            handle_key(key(KeyCode::Char('P'), KeyModifiers::empty()), &s),
+            InputOutcome::PromoteMemory("mem-2".to_string())
+        );
+    }
+
+    #[test]
+    fn plan_pane_space_cycles_status_for_selected_step() {
+        let mut s = AppState::new();
+        s.focused_pane = FocusedPane::Plan;
+        seed_plan(&mut s, &["first"]);
+        let outcome = handle_key(key(KeyCode::Char(' '), KeyModifiers::empty()), &s);
+        match outcome {
+            InputOutcome::CyclePlanStatus { id, current } => {
+                assert!(id.starts_with("step-"));
+                assert_eq!(current, PlanStatus::Pending);
+            }
+            other => panic!("expected CyclePlanStatus, got {other:?}"),
+        }
+        assert_eq!(
+            next_plan_status(PlanStatus::Pending),
+            PlanStatus::InProgress
+        );
+        assert_eq!(next_plan_status(PlanStatus::Skipped), PlanStatus::Pending);
+    }
+
+    #[test]
+    fn plan_pane_a_and_c_open_text_input_modals() {
+        let mut s = AppState::new();
+        s.focused_pane = FocusedPane::Plan;
+        seed_plan(&mut s, &["first"]);
+        assert_eq!(
+            handle_key(key(KeyCode::Char('a'), KeyModifiers::empty()), &s),
+            InputOutcome::EnterTextInput(TextInputKind::AddPlanStep)
+        );
+        let outcome = handle_key(key(KeyCode::Char('c'), KeyModifiers::empty()), &s);
+        match outcome {
+            InputOutcome::EnterTextInput(TextInputKind::AddPlanConstraint { step_id }) => {
+                assert!(step_id.starts_with("step-"));
+            }
+            other => panic!("expected EnterTextInput(AddPlanConstraint), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn text_input_mode_appends_chars_and_backspaces() {
+        let mut s = AppState::new();
+        s.input_mode = InputMode::TextInput {
+            kind: TextInputKind::AddMemoryCard,
+            buffer: String::new(),
+        };
+        assert_eq!(
+            handle_key(key(KeyCode::Char('h'), KeyModifiers::empty()), &s),
+            InputOutcome::TextInputChar('h')
+        );
+        assert_eq!(
+            handle_key(key(KeyCode::Backspace, KeyModifiers::empty()), &s),
+            InputOutcome::TextInputBackspace
+        );
+        assert_eq!(
+            handle_key(key(KeyCode::Enter, KeyModifiers::empty()), &s),
+            InputOutcome::TextInputSubmit
+        );
+        assert_eq!(
+            handle_key(key(KeyCode::Esc, KeyModifiers::empty()), &s),
+            InputOutcome::ModalCancel
         );
     }
 }

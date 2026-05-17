@@ -45,6 +45,16 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+/// v59 (LOW-2 fix) / v60 (MED-A fix) — content-byte safety for
+/// cards loaded via `from_vec`. Routes through the single
+/// `crate::text_safety::validate_user_text` source of truth so the
+/// rule set can't drift between this snapshot-load path and the
+/// live add path (dispatcher).
+fn validate_card_content(content: &str) -> Result<(), MemoryError> {
+    crate::text_safety::validate_user_text(content, /* check_frontmatter */ true)
+        .map_err(MemoryError::InvalidContent)
+}
+
 /// Insertion-ordered store of cards. Mirrors [`crate::context::ContextManager`]
 /// — `BTreeMap` keyed on a monotonic counter so iteration is stable and
 /// lookup by id is `O(log N)`.
@@ -65,6 +75,13 @@ pub enum MemoryError {
 
     #[error("memory card {0:?} not found")]
     NotFound(String),
+
+    /// v57 (M-sec-5) — content contained a byte we won't promote
+    /// safely: NUL, ASCII control characters (other than `\n`/`\t`),
+    /// or a YAML frontmatter delimiter that would forge frontmatter
+    /// in the promoted markdown file.
+    #[error("memory card content is invalid: {0}")]
+    InvalidContent(String),
 }
 
 impl MemoryStore {
@@ -75,9 +92,17 @@ impl MemoryStore {
     /// Build from a serialised list (e.g., loaded from `OnDiskSession.memory`).
     /// Rejects duplicate ids — the schema doesn't enforce uniqueness, but a
     /// runtime store keyed by id can't tolerate it.
+    ///
+    /// v59 (LOW-2 from v58 audit) — applies the same content-validity
+    /// rules as `SessionDispatcher::add_memory_card` so an attacker-
+    /// controlled session snapshot (hand-edited `session.json`, replay
+    /// of an untrusted backup) can't reintroduce NUL bytes, C1
+    /// controls, Trojan-Source bidi marks, or forged YAML frontmatter
+    /// delimiters that v57 / v58 closed for the live add-card path.
     pub fn from_vec(cards: Vec<MemoryCard>) -> Result<Self, MemoryError> {
         let mut store = Self::default();
         for c in cards {
+            validate_card_content(&c.content)?;
             store.add(c)?;
         }
         Ok(store)

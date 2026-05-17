@@ -19,6 +19,13 @@ use crate::staging::{sha256, NoopSyntaxCheck, StagedWrite, Staging};
 
 pub const NAME: &str = "edit_file";
 
+/// v58 (M-sec-1b fix) — per-call cap on `new_text` size. Same
+/// rationale as `write_file`'s `MAX_WRITE_BYTES` — without a cap a
+/// hostile model can OOM the host with a multi-GB `new_text`, and
+/// the in-place `original_text.replace(&old_text, &new_text)`
+/// allocates O(N×M) when `expected_count > 1`.
+pub const MAX_EDIT_NEW_TEXT_BYTES: usize = 16 * 1024 * 1024;
+
 #[derive(Debug, Default)]
 pub struct EditFile;
 
@@ -61,6 +68,17 @@ impl Tool for EditFile {
             return Err(ToolError::SchemaViolation {
                 tool: NAME.into(),
                 error: "old_text must not be empty".into(),
+            });
+        }
+        // v58 (M-sec-1b fix) — reject oversized new_text at the
+        // boundary.
+        if parsed.new_text.len() > MAX_EDIT_NEW_TEXT_BYTES {
+            return Err(ToolError::SchemaViolation {
+                tool: NAME.into(),
+                error: format!(
+                    "new_text too long: {} bytes (max {MAX_EDIT_NEW_TEXT_BYTES} bytes)",
+                    parsed.new_text.len()
+                ),
             });
         }
 
@@ -146,6 +164,28 @@ mod tests {
             workspace_root: root,
             sandbox,
         }
+    }
+
+    #[tokio::test]
+    async fn rejects_oversized_new_text_at_the_boundary() {
+        // Regression for M-sec-1b — guard against multi-GB new_text
+        // exhausting host memory through the `replace` allocation.
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "alpha\n").unwrap();
+        let s = SandboxPolicy::restrictive(dir.path()).unwrap();
+        let huge = "x".repeat(MAX_EDIT_NEW_TEXT_BYTES + 1);
+        let err = EditFile
+            .execute(
+                serde_json::json!({
+                    "path": "a.txt",
+                    "old_text": "alpha",
+                    "new_text": huge,
+                }),
+                &ctx(dir.path(), &s),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::SchemaViolation { .. }));
     }
 
     #[tokio::test]

@@ -19,6 +19,14 @@ use crate::staging::{NoopSyntaxCheck, StagedWrite, Staging};
 
 pub const NAME: &str = "write_file";
 
+/// v58 (M-sec-1b fix) — per-call write cap. The model can ask to
+/// write any byte count it likes; without a cap a hostile or buggy
+/// emission of multi-GB content allocates through json deserialise →
+/// `into_bytes` → `write_with_sync`, plus a per-line hunk walk in
+/// `Staging::stage`. 16 MiB is large enough for any realistic source
+/// file and matches the order of magnitude of `read_file`'s cap.
+pub const MAX_WRITE_BYTES: usize = 16 * 1024 * 1024;
+
 #[derive(Debug, Default)]
 pub struct WriteFile;
 
@@ -51,6 +59,17 @@ impl Tool for WriteFile {
                 tool: NAME.into(),
                 error: e.to_string(),
             })?;
+        // v58 (M-sec-1b fix) — reject oversized writes at the boundary
+        // rather than allocating through stage().
+        if parsed.content.len() > MAX_WRITE_BYTES {
+            return Err(ToolError::SchemaViolation {
+                tool: NAME.into(),
+                error: format!(
+                    "content too long: {} bytes (max {MAX_WRITE_BYTES} bytes)",
+                    parsed.content.len()
+                ),
+            });
+        }
 
         let workspace_root = ctx.workspace_root.to_path_buf();
         // `Staging::commit` is all-synchronous I/O. Move it to the
@@ -92,8 +111,13 @@ impl Tool for WriteFile {
 
             let check = NoopSyntaxCheck;
             let mut staging = Staging::new(&workspace_root, &check);
+            // v57 (H2 fix): capture length before consuming `content`
+            // so `bytes_written` reflects the agent's content length
+            // regardless of the resulting `Hunks` variant.
+            let content_bytes = parsed.content.into_bytes();
+            let bytes_written = content_bytes.len();
             staging
-                .add(StagedWrite::new(&parsed.path, parsed.content.into_bytes()))
+                .add(StagedWrite::new(&parsed.path, content_bytes))
                 .map_err(|e| ToolError::ExecutionFailed {
                     tool: NAME.into(),
                     exit_code: -1,
@@ -110,14 +134,8 @@ impl Tool for WriteFile {
                 exit_code: -1,
                 stderr: format!("staging stage failed: {e}"),
             })?;
-            let bytes_written = batch
-                .pending_files()
-                .first()
-                .map(|f| match &f.hunks {
-                    crate::diff::Hunks::Created { new_byte_len, .. } => *new_byte_len,
-                    _ => 0,
-                })
-                .unwrap_or(0);
+            // v57 (H2 fix) — `bytes_written` was captured above before
+            // the content was consumed.
 
             Ok(ToolResult {
                 output: serde_json::json!({
@@ -160,10 +178,57 @@ mod tests {
         // ApprovalPolicy gates the rename. Without going through the
         // dispatcher this test commits the batch directly.
         assert!(r.staged_writes.is_some(), "should produce staged writes");
+        // v57 (H2): bytes_written is the content length, regardless of
+        // whether the diff is Create / Lines / Same.
+        assert_eq!(r.output["bytes_written"], 5);
         let report = r.staged_writes.unwrap().commit_all().unwrap();
         assert_eq!(report.files.len(), 1);
         assert_eq!(report.files[0].path, std::path::PathBuf::from("a.txt"));
         assert_eq!(std::fs::read(dir.path().join("a.txt")).unwrap(), b"hello");
+    }
+
+    #[tokio::test]
+    async fn rejects_oversized_content_at_the_boundary() {
+        // Regression for M-sec-1b — a model emitting multi-GB content
+        // would OOM the host through stage()'s allocations. Reject
+        // before staging touches the bytes.
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = SandboxPolicy::restrictive(dir.path()).unwrap();
+        let huge = "x".repeat(MAX_WRITE_BYTES + 1);
+        let err = WriteFile
+            .execute(
+                serde_json::json!({"path": "a.txt", "content": huge}),
+                &ctx(dir.path(), &s),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::SchemaViolation { .. }));
+    }
+
+    #[tokio::test]
+    async fn overwriting_an_existing_file_reports_content_len_not_zero() {
+        // Regression for H2 — pre-v57 the bytes_written field was
+        // derived from `Hunks::Created` and reported `0` for any
+        // overwrite (Lines / Same).
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"old contents").unwrap();
+        let s = SandboxPolicy::restrictive(dir.path()).unwrap();
+        let r = WriteFile
+            .execute(
+                serde_json::json!({"path": "a.txt", "content": "new content here"}),
+                &ctx(dir.path(), &s),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            r.output["bytes_written"], 16,
+            "bytes_written must equal new content length, not 0"
+        );
+        let _ = r.staged_writes.unwrap().commit_all().unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join("a.txt")).unwrap(),
+            b"new content here"
+        );
     }
 
     #[tokio::test]

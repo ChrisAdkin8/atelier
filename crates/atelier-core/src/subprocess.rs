@@ -378,9 +378,26 @@ fn kill_process_group(child: &mut tokio::process::Child, pid: Option<u32>) {
         // documented syscall; the worst a stray signal can do here is
         // be ignored (group already reaped). We never construct an
         // invalid pgid because we only kill groups we created.
-        let pgid = pid as i32;
-        unsafe {
-            libc::kill(-pgid, libc::SIGKILL);
+        //
+        // v57 (L cleanup) — `pid as i32` was an unchecked cast: on
+        // hosts with a raised `/proc/sys/kernel/pid_max` (Linux
+        // allows up to 2^22; theoretically more on 64-bit), a PID
+        // above `i32::MAX` would wrap to negative and `-pgid` would
+        // become positive — signalling a *different*,
+        // attacker-influenceable process. The wrap is not reachable
+        // on any current OS default, but the unchecked cast is wrong
+        // on principle.
+        match i32::try_from(pid) {
+            Ok(pgid) => unsafe {
+                libc::kill(-pgid, libc::SIGKILL);
+            },
+            Err(_) => {
+                tracing::warn!(
+                    pid,
+                    "subprocess: pid does not fit in i32; falling back to per-child kill (process group survives)"
+                );
+                let _ = child.start_kill();
+            }
         }
     } else {
         let _ = child.start_kill();

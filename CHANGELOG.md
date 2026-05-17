@@ -1,5 +1,156 @@
 # Atelier Spec — Changelog
 
+## v57–v60 — 2026-05-17 (four-round audit / fix sweep)
+
+Four consecutive deep-scan / fix rounds against the v56 codebase. Each round produced a synthesised audit report (bugs / smells / security in parallel) and closed every non-LOW finding in the next round. Trajectory:
+
+| Round | CRITICAL | HIGH | MEDIUM | LOW |
+|-------|---------:|-----:|-------:|----:|
+| v56 scan (post-§3 sweep) | 1 | 8 | 12 | ≥10 |
+| v57 scan | 0 | 3 | 8 | ~10 |
+| v58 scan | 0 | 1 | 6 | 10 |
+| v59 scan | 0 | 2 | 4 | 8 |
+| **v60 scan (final)** | **0** | **0** | **0** | **6** (deferred) |
+
+Net: **45+ correctness / security / hygiene fixes** with **~150 new tests** pinning the regressions. Workspace went from 689 → 711 tests; the rig (`make check`) stays green throughout. The remaining open items are six deferred smells (justified or low-impact: `ConversationRole`/`MessageRole` duplication, speculative `CheckpointHook`/`LedgerHook`, Svelte `each`-by-index key on bounded list, `AppState::default()` zero-sentinel, `with_approval_policy` mem::replace style, version-marker comment noise).
+
+### v60 — final fix sweep (this version)
+
+Closes the six MEDIUM-and-above findings from the v59 audit and consolidates the v57/v58/v59 disciplines into single sources of truth.
+
+- **HIGH-bug-1 / HIGH-bug-2: plan-text validation gaps.** `PlanCanvas::apply_envelope` (model-controlled) and `PlanCanvas::from_vec` (snapshot-reload) both bypassed v59's `validate_plan_text`. Closed by a new `plan::validate_plan_step_text` helper invoked from both paths; bad ops drop with reason via `ApplyReport`, bad snapshots fail to load with `PlanError::InvalidContent`. Tests for each.
+
+- **Security M-1: TUI promote_memory_card bypass.** The TUI `Mutation::PromoteMemory` had a copy-paste of the *pre-v58* unvalidated disk writer; the GUI got v58+v59 hardening but the TUI didn't. Closed by extracting `atelier_cli::memory_promote::write_promoted_card` and routing both drivers through it. The shared helper enforces HOME absolute + canonicalize != `/` (closes audit L-2: multi-slash / relative HOME bypass), filename hygiene (no separators / leading-dot / control chars / `..`), per-call size cap, canonical-root containment via `canonicalize(target.parent())`, and atomic `NamedTempFile::persist`. 4 unit tests.
+
+- **Security L-3: Refusal > ToolUse priority.** v59's `merge_stop_reason` ranked ToolUse above Refusal so a server emitting both `content_filter` and `tool_calls` would dispatch the tool. v60 inverts this — Refusal is hard-overriding by spec. Direct table-driven test pins every pair; new integration test for the reverse-order finish_reason case.
+
+- **MED-A: shared text-safety predicate.** Three byte-for-byte copies of the Trojan-Source / control-char rule set across `dispatcher.rs` and `memory.rs`. Lifted into a new `atelier_core::text_safety` module (`is_disallowed_control`, `validate_user_text`). Memory + plan + future free-form text validators all delegate. Adding a new disallowed code point is now one edit. Module ships with its own exhaustive C0/DEL/C1/separator/bidi tests.
+
+- **MED-B + MED-C: wire_label discipline on two more enums.** Added serde-agreement tests for `SideEffectClass::as_str` and `HookEvent::as_str`, mirroring the v58/v59 discipline on `Provenance` / `Payload` / `TokenSource` / `PlanStatus` / `ClaimedChangeKind` / `MessageRole` / `ProbeLoadOutcome`. Every enum that crosses the bus or the schema boundary now has a test asserting the hand-written label matches the serde rename projection.
+
+### v59 — fix sweep responding to v58 audit
+
+Closed the v58 audit's HIGH (TUI Debug-as-wire residual, GUI projectEvent label drift, OpenAI duplicate-completion stop_reason clobber) plus 7 MEDIUM items.
+
+- **H7-residual:** TUI `project_event` `detail` strings still used Rust `Debug` for `MessageRole` / `State`. Routed through `wire_label()` / `State::name()`.
+- **GUI projectEvent drift:** Svelte event-log emitted pre-v57 short labels (`PendingApproval`, `IllegalTransition`, `ModelProfile`); v59 routes `kind` from the BridgedEvent's canonical `kind` field set by Rust's `SessionEvent::kind()`.
+- **H4-residual:** OpenAi adapter latches stop_reason on first non-None — duplicate `finish_reason` chunks no longer clobber `tool_calls` with `stop`.
+- **M-sec-6:** Splice path re-validates symlink containment at commit time. The pre-v59 stage/commit gap could be exploited by a concurrent process planting a symlink between stage and approval.
+- **M-sec-1b:** `write_file` (`MAX_WRITE_BYTES = 16 MiB`) + `edit_file` (`MAX_EDIT_NEW_TEXT_BYTES = 16 MiB`) per-call size caps applied at the args boundary.
+- **M-sec-2 partial + regression:** `promote_memory_card` rejects `.` / `..` / leading-dot relative paths and canonicalizes `target.parent()` against the memory root. Held `tempfile::TempDir` in `SessionState` so RAII cleans the per-process workspace on shutdown (v58 `.keep()` was leaking the parent dir).
+- **L-sec-1:** `read_file` streams via `File::open` + `seek` + `take(MAX_READ_BYTES).read_to_end` — no full slurp before the cap is consulted. A 50 GB file is now correctly capped.
+- **L-sec-2 / L-sec-3:** `SECRET_KEY_SUBSTRINGS` expanded for cloud creds (AWS, GitHub PATs, cookies, bearer); `validate_memory_card_content` extended with U+2066–U+2069 bidi isolate codepoints.
+- **wire_label discipline:** added agreement tests across `Provenance`, `Payload`, `TokenSource`, `PlanStatus`, `MessageRole`, `ProbeLoadOutcome`, `ClaimedChangeKind`. Producer + serde projections can no longer drift.
+- **Plumbing:** `merge_stop_reason` priority-aware; `MemoryStore::from_vec` validates content; `SessionState.workspace_root` retired in favour of `workspace_root()` accessor; provenance_badge exhaustiveness test on the TUI side.
+
+### v58 — fix sweep responding to v57 audit
+
+Closed the v57 audit's CRITICAL (commit_selected_hunks atomicity), 7 of 8 HIGH, and 5 of 8 MEDIUM items.
+
+- **C1:** `commit_selected_hunks` is now two-pass — splice + mkdir in Pass 1, rename in Pass 2. A splice failure no longer leaves Pass-1 files already renamed. Regression test pins this.
+- **H1:** `PendingApprovalGate` registers a `PendingEntryGuard` Drop guard so a cancelled dispatch future doesn't leak a oneshot::Sender in the pending map.
+- **H2:** `WriteFile`'s `bytes_written` now uses `content.len()` (was deriving from `Hunks::Created` only — returned 0 for any overwrite).
+- **H4:** OpenAiCompatAdapter dedupes `ToolCallCompleted` on duplicate finish_reason chunks via a `block.completed` flag.
+- **H8 (security):** `Shell` tool's `cwd` now passes through `ensure_inside_workspace_existing` — closed the symlink-escape parallel to the v55 file tools.
+- **H5 / H6 / H7:** wire-format hygiene. `SessionEvent::kind()` canonical labels; `now_rfc3339` lifted into `atelier_core::time` (was 3 copies); `MessageRole::wire_label` + `State::name` + `ProbeLoadOutcome::wire_label` replace `Debug` as the wire format.
+- **M-sec-1 through M-sec-5:** Tauri command size caps; `promote_memory_card` hardening (canonicalize + atomic NamedTempFile::persist + size cap); `read_file` `MAX_READ_BYTES = 4 MiB`; hook payload secret redaction (`SECRET_KEY_SUBSTRINGS`); memory card content rejects NUL/control bytes + `---` frontmatter delimiter.
+- **L cleanup:** `ContextError::Malformed` distinct from `NotFound`; `start_demo_run` uses `tempfile::TempDir`; `kill_process_group` uses `i32::try_from(pid)`; `submit_approval` validates path keys at the IPC boundary; sandbox profile rejects control bytes in repo paths.
+
+### v57 — fix sweep responding to v56 audit
+
+Closed the v56 audit's CRITICAL + most HIGH/MEDIUM items.
+
+- **H6 / H7 / H8:** lifted `now_rfc3339`, started Debug→serde wire transition, Shell symlink containment.
+- **M-bug-1 through M-bug-3:** envelope parse errors log via `tracing::warn`; `with_approval_policy(AutoApproveAll)` reverts the gate (was a no-op); initial `ContextItems` snapshot emitted before turn loop.
+- Multi-round audit kicked off here.
+
+## v56 — 2026-05-17
+
+**§3 surface close-out.** Three checklist rows tick to `[x]` in one cohesive change: hunk rewrite (sub-file accept/reject), the production-scale 10-file mechanical gate test, and "Why this change?" UI rendering the envelope's `claimed_changes` rationale next to each diff. The §3 row count drops from six open to three (drag-and-drop, inline Mermaid/D2/images, UX-target measurement — all GUI-only finishing touches).
+
+### Hunk rewrite (sub-file accept/reject)
+
+The pre-v56 commit contract was file-level — accept the entire staged file or reject it whole. v56 widens it so the user can keep some hunks of a Lines diff and reject others; the staging layer splices pre-image lines for rejected hunks against new lines for accepted hunks and writes the spliced bytes through the existing rename phase.
+
+- **`crates/atelier-core/src/staging.rs`** — new `FileApproval { All | Hunks(Vec<usize>) }` enum + `HunkSelection = HashMap<PathBuf, FileApproval>` type alias. `StagedBatch` retains the pre-image bytes (`pre_images: BTreeMap<PathBuf, Option<Vec<u8>>>`) captured during `stage()` so partial-hunk commits can splice without a second read. New primary commit method `commit_selected_hunks(&HunkSelection)`; the pre-v56 `commit_selected(&HashSet<PathBuf>)` is retained as a thin file-level wrapper. New private `splice_hunks(pre, new, hunks, accepted)` uses `str::split_inclusive('\n')` so the file's trailing-newline convention survives the splice. For non-Lines hunk kinds (`Created` / `Deleted` / `Binary` / `Same`) per-hunk indices are meaningless — non-empty selection falls back to `All`, empty selection drops the file. 9 new tests: file-level parity, partial splice, drop-on-empty-Lines, created-fallback, omitted-path-is-rejected, invalid-index filtering, trailing-newline preservation (both with and without the final newline).
+
+  **Trade-off documented**: a partial-hunk splice is NOT re-validated against the syntax check (the pre-commit check ran against the agent's full new file). A spliced output may parse-fail; the UI is on the hook to surface this if it becomes a real issue.
+
+- **`crates/atelier-core/src/dispatcher.rs`** — `ApprovalGate::approve` widened from `Vec<PathBuf>` to `HunkSelection`. `AutoApprove` builds an `All` selection over every pending file (behaviour unchanged). `PendingApprovalGate` parks a `oneshot::Sender<HunkSelection>` (was `Sender<Vec<PathBuf>>`) and `SessionDispatcher::submit_approval(commit_id, HunkSelection)` is the new wire signature. `submit_approval_files(commit_id, Vec<PathBuf>)` retained as a file-level compat wrapper so existing callers (TUI's `submit_pending`, integration tests) keep their existing call sites. New dispatcher integration test (`submit_approval_with_per_hunk_selection_routes_to_commit_selected_hunks`) drives a 2-hunk file end-to-end through the AwaitApproval gate, accepts hunk 0, rejects hunk 1, asserts the on-disk content is the spliced result.
+
+- **`crates/atelier-gui/src/lib.rs`** — `submit_approval` Tauri command's payload changes from `accepted: Vec<String>` to `selection: HashMap<String, FileApprovalWire>` where `FileApprovalWire` is a tagged enum (`{"mode":"all"}` or `{"mode":"hunks","indices":[…]}`).
+
+- **`crates/atelier-gui/ui/src/lib/components/DiffPane.svelte`** — pending-approval UI replaces the per-file checkbox row with a file row + indented per-hunk checkbox list for Lines diffs. File-level checkbox toggles all hunks in lockstep; toggling individual hunks updates a `fileChecked` reflection (any-hunk-checked = file-included). The "accept selected" button submits the live toggle state as the new wire shape; "reject all" sends an empty selection. Hunk rows show `@@ -old,len +new,len @@` plus `−N / +M` counts so the user can pick from a glance.
+
+- **TUI deferred**: the terminal pending banner continues to ship file-level `y`/`n` approval via `submit_approval_files`. A per-hunk picker in the TUI needs a per-hunk focus + selection model layered on top of the v55 pane-focus model — a meaningful UX problem that deserves its own session, mirroring how v55's editable Memory and Plan flows trimmed to GUI-only for some interactions.
+
+### §3 10-file mechanical gate
+
+- **`crates/atelier-cli/tests/run_integration.rs`** — `v56_phase_c_mechanical_gate_at_ten_files_lines_up_live_diff_and_final_state` scripts a MockAdapter run with 10 sequential `write_file` tool calls + a final `claimed_done` envelope. Asserts: report shows 11 turns (10 writes + done); each on-disk file is byte-equal to the reference; exactly 10 `EditStaged` events on the bus, in commit order matching the scripted path sequence. The pre-v56 3-file `run_scripted_multi_file_rename_drives_phase_c_mechanical_gate` is retained as a brisker smoke test.
+
+### "Why this change?" UI (claimed_changes rationale)
+
+- **`crates/atelier-core/src/session.rs`** — new `Event::ClaimedChanges { changes: Vec<ClaimedChangeSummary> }` variant + matching `ClaimedChangeSummary { path, kind, summary }` struct (kind flattened to a string so consumers don't import the protocol enum just to render badges).
+
+- **`crates/atelier-cli/src/runner.rs`** — the turn loop emits `Event::ClaimedChanges` whenever the envelope carries `claimed_changes`. Renders alongside the existing `PlanSnapshot` emission point so all per-turn rationale arrives in one coherent batch.
+
+- **`crates/atelier-gui/src/lib.rs`** — `bridge_event` adds a `ClaimedChanges` arm projecting each entry as `{path, kind, summary}` JSON. New unit test `bridge_claimed_changes_passes_per_file_summary` covers the projection.
+
+- **`crates/atelier-gui/ui/src/lib/state.ts`** — `AppState.claimedChanges: Record<string, string>` (path → summary). New reducer arm wholesale-replaces the map on each event; `projectEvent` shows "N file rationale(s)" in the event log tail.
+
+- **`crates/atelier-gui/ui/src/lib/components/DiffPane.svelte`** — renders a `why:` line under each file header when `claimedChanges[path]` is set. Styled as dim italic so it sits visually behind the diff content.
+
+- **`crates/atelier-tui/src/lib.rs`** — new `AppState.claimed_changes: HashMap<String, String>` field. `apply` arm replaces the map; `render_diff` shows the rationale as a dim-italic line under the file header. `project_event` adds a `ClaimedChanges` event-log entry.
+
+- **`crates/atelier-cli/tests/run_integration.rs`** — `v56_envelope_claimed_changes_surfaces_as_bus_event` builds an envelope with `claimed_changes`, runs the MockAdapter, asserts the bus carries a `ClaimedChanges` event with the matching path/kind/summary.
+
+### Out of scope (deliberate)
+
+- The envelope's other rationale field, `grounding` (textual-claim citations to `tool:read` / `tool:grep` / `context:file` / `guess`), is a different surface — sidebar / inline span annotations — and lands separately.
+- Per-hunk TUI picker (see Hunk rewrite section). File-level `y`/`n` continues to work via the `submit_approval_files` compat wrapper.
+
+## v55 — 2026-05-17
+
+**§5 editable round-trips.** Closes the three `[~]` items in the §5 build tracker by adding the write-back path the panels were missing: pin / unpin / evict on context items, add / delete / promote on memory cards, add / status-cycle / constraint / reorder / remove on plan steps. The data layer (`ContextManager::{pin,unpin,evict}`, `MemoryStore::{add,evict,promote_to_global}`, `PlanCanvas::{add,mark_status,add_constraint,reorder,remove}`) was already pure-rust since v44; v55 wires it through the dispatcher to both UIs.
+
+One pre-requisite refactor landed alongside: the Runner now owns a real `Arc<parking_lot::Mutex<ContextManager>>` populated as messages append, replacing the v53 `summarise_messages(&messages)` transcript projection. Pin / evict on a transcript projection have no semantics; pin / evict on the manager do.
+
+### Plumbing (`atelier-core`)
+
+- **`crates/atelier-core/src/context.rs`** — new `Provenance::AssistantTurn` variant + matching `ContextItemSummary` mapping (renders as `"assistant_turn"` per the existing GUI badge). Round-trip test added to the variants-roundtrip suite.
+
+- **`crates/atelier-core/src/dispatcher.rs`** — `SessionDispatcher` gains three `Arc<parking_lot::Mutex<…>>` fields (`context_manager`, `memory_store`, `plan_canvas`) and a `with_shared_state(...)` builder. `new()` seeds each with a fresh empty instance so the unit-test surface is unchanged. 11 new mutator methods: `pin_context_item`, `unpin_context_item`, `evict_context_item`, `add_memory_card`, `delete_memory_card`, `promote_memory_card`, `add_plan_step`, `remove_plan_step`, `mark_plan_step_status`, `add_plan_step_constraint`, `reorder_plan_steps`. Each acquires the lock, calls the pure data-layer op, drops the lock, then re-emits the matching Snapshot event. `evict_context_item` additionally appends `LedgerEntry::cache_bust_from(&event)` to the ledger and emits `Event::LedgerAppended` so the cost meter ticks. 14 new tests covering happy path, idempotency, unknown-id error, and pinned-cannot-evict-without-ledger.
+
+- **`crates/atelier-core/src/ledger.rs`** — `cache_bust_from`'s match exhausts the new `Provenance::AssistantTurn` variant (label `"assistant-turn"`).
+
+### Runner (`atelier-cli`)
+
+- **`crates/atelier-cli/src/runner.rs`** — `Runner::run` constructs `Arc<Mutex<ContextManager>>` / `Arc<Mutex<MemoryStore>>` / `Arc<Mutex<PlanCanvas>>` once and clones the Arcs into the `SessionDispatcher` via `with_shared_state(...)`. Each message append (user prompt at start, assistant after chat, tool result after dispatch) now also adds a `ContextItem` to the manager via three small private helpers: `context_item_for_user_prompt`, `context_item_for_assistant_turn`, `context_item_for_tool_result` (each maps to the right `Provenance` variant and tags `TokenSource::Approx` chars/4 counts). `Event::ContextItems` payload now comes from `context_manager.lock().summarise()` instead of `summarise_messages(&messages)`. The old projection + its 5 tests have been deleted; 4 new tests cover the helpers' provenance + token mapping.
+
+### GUI
+
+- **`crates/atelier-gui/src/lib.rs`** — 11 new Tauri commands mirror the dispatcher mutators (one per mutator), plus a `require_dispatcher(state)` helper that 404s when no run is in flight. `promote_memory_card` does the actual disk write under `~/.atelier/memory/<relative_path>` so the data layer stays I/O-free. Wire-format status strings (`"pending"` / `"in_progress"` / `"done"` / `"skipped"`) are parsed into `PlanStatus` via `parse_plan_status`; unknown labels are rejected rather than coerced. 2 new tests on the parser.
+
+- **`crates/atelier-gui/ui/src/lib/components/ContextPane.svelte`** — per-row 📌/un-📌 toggle + ✕ evict button. The evict button opens an inline confirm card ("evict — frees ~N tokens. ledgered as cache-bust.") with confirm/cancel; confirm calls `evict_context_item` and surfaces "evicted — freed N tokens" in a 4-second toast.
+
+- **`crates/atelier-gui/ui/src/lib/components/MemoryPane.svelte`** — top textarea + add button; per-row "↑ promote" and "✕" delete buttons. Promote shows "promoted → /path/to/file.md (N bytes)" in a toast.
+
+- **`crates/atelier-gui/ui/src/lib/components/PlanPane.svelte`** — top text input + add button; per-row status cycler button (the glyph itself is the button — cycles `pending → in_progress → done → skipped → pending` on click), `↑` / `↓` reorder arrows, `+c` add-constraint (opens an inline form), `✕` remove.
+
+### TUI
+
+- **`crates/atelier-tui/src/lib.rs`** — `AppState` gains `focused_pane: FocusedPane`, `selected_context`/`selected_memory`/`selected_plan: usize`, and `input_mode: InputMode`. `FocusedPane::next()` is the Tab cycler. `InputMode` has three variants: `Normal`, `TextInput { kind: TextInputKind, buffer: String }`, `EvictConfirm { id: String }`. `handle_key`'s signature changed from `(KeyEvent, Option<&PendingApproval>)` to `(KeyEvent, &AppState)` so it can dispatch on focused pane + modal state. New keybindings (Normal mode): Tab cycles panes; `j`/`k` (or arrow keys) navigate within the focused pane. Per-pane mutator keys: Context = `p`/`u`/`e`; Memory = `a` (add modal) / `d` / `P`; Plan = `a` (add modal) / `space` (cycle status) / `c` (constraint modal) / `x`. Modal sub-modes grab keys before pane bindings — text-input modals append chars / backspace / Enter to submit / Esc to cancel; evict-confirm consumes `y` (confirm) / `n` or Esc (cancel). 12 new pure-fn unit tests on the keybind decoder + focus + select state. Mutations flow through a new private `submit_mutation` helper that mirrors `submit_pending`.
+
+### Integration tests
+
+- **`crates/atelier-cli/tests/run_integration.rs`** — 3 new end-to-end round-trips drive a scripted `MockAdapter` run, wait for the relevant snapshot event, invoke a dispatcher mutator via `DispatcherHandle::get()`, and assert that a follow-up snapshot reflects the change: `v55_pin_context_item_round_trips_through_dispatcher`, `v55_add_memory_card_round_trips_through_dispatcher`, `v55_mark_plan_step_done_round_trips_through_dispatcher`.
+
+### Deferred (deliberately out of scope)
+
+- Memory card in-place content edit (UI form-state machinery; add + delete + promote prove the round-trip).
+- Plan drag-and-drop reorder (the up/down arrow path covers the contract; drag-and-drop is a separate §3 GUI-only checklist row).
+- Non-destructive compaction / mental-model panel (separate §5 rows in the build tracker, untouched here).
+
 ## v54 — 2026-05-17
 
 **§5 Memory panel.** Companion to v53's Context panel: cards on the bus, rendered in the top-right column of both UIs above what the agent is about to do (Plan) — Memory is what the agent knows long-term, Plan is what it's about to act on. The `MemoryStore` data layer was already in `atelier-core` since v44; v54 adds the bus projection (`MemoryCardSummary` + `Event::MemoryCards`), wires the Runner to publish a snapshot per turn boundary, and lands matching Svelte + ratatui panels. The Runner ships an empty card list today (no card source is wired yet — no add-card tool, no session-replay loader); the event surface is in place so any future card source is purely additive.

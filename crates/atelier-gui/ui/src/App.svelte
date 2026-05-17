@@ -122,6 +122,7 @@
       <DiffPane
         recentEdits={app.recentEdits}
         pendingApproval={app.pendingApproval}
+        claimedChanges={app.claimedChanges}
       />
     </div>
     <div class="pane-slot meters-slot">

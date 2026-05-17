@@ -529,6 +529,21 @@ pub enum ProbeLoadOutcome {
     NotCached,
 }
 
+impl ProbeLoadOutcome {
+    /// v57 (H7 fix) — canonical snake_case wire label. Mirrors the
+    /// `serde(rename_all = "snake_case")` projection so consumers
+    /// don't have to round-trip through `serde_json::to_value` just
+    /// to render the badge.
+    pub fn wire_label(self) -> &'static str {
+        match self {
+            Self::CacheHit => "cache_hit",
+            Self::Probed => "probed",
+            Self::Reprobed => "reprobed",
+            Self::NotCached => "not_cached",
+        }
+    }
+}
+
 /// Filesystem-backed profile cache. `dir = None` means "probe every
 /// time, never persist" — used by tests and by callers that don't have
 /// a writable `$HOME` (sandboxed CI, container builds).
@@ -743,6 +758,29 @@ mod tests {
             context_window_tokens: 8192,
             max_tokens: 4096,
             notes: vec!["probe ok".to_string()],
+        }
+    }
+
+    #[test]
+    fn probe_load_outcome_wire_label_agrees_with_serde() {
+        // Regression for v58 HIGH-bug-1 — pin `wire_label` to the
+        // serde `rename_all = "snake_case"` projection so a variant
+        // rename can't drift between the hand match and serde.
+        for outcome in [
+            ProbeLoadOutcome::CacheHit,
+            ProbeLoadOutcome::Probed,
+            ProbeLoadOutcome::Reprobed,
+            ProbeLoadOutcome::NotCached,
+        ] {
+            let json = serde_json::to_value(outcome).unwrap();
+            let serde_label = json
+                .as_str()
+                .expect("ProbeLoadOutcome serializes as a string");
+            assert_eq!(
+                serde_label,
+                outcome.wire_label(),
+                "wire_label({outcome:?}) must match serde projection",
+            );
         }
     }
 

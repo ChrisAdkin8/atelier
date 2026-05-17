@@ -35,6 +35,10 @@ serde_json = { workspace = true }
 uuid = { workspace = true }
 # DispatcherHandle Mutex.
 parking_lot = { workspace = true }
+# v57 (M-sec-2) — atomic promote-memory-card disk writes via
+# NamedTempFile::persist so a crash mid-write can't leave a partial
+# file under ~/.atelier/memory/.
+tempfile = { workspace = true }
 
 [build-dependencies]
 tauri-build = { workspace = true }

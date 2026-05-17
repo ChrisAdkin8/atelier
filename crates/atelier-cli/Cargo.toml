@@ -31,11 +31,15 @@ serde_json = { workspace = true }
 parking_lot = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+# v60 — `memory_promote::write_promoted_card` uses
+# `NamedTempFile::persist` for atomic writes under
+# `~/.atelier/memory/`. Promoted from dev-deps so the GUI / TUI
+# drivers (which depend on atelier-cli) can both reach it.
+tempfile = { workspace = true }
 
 [dev-dependencies]
 assert_cmd = { workspace = true }
 predicates = { workspace = true }
-tempfile = { workspace = true }
 # Integration tests use `EventSink::Capture(Arc<parking_lot::Mutex<…>>)`
 # to drain the broadcast bus without going through stdout.
 parking_lot = { workspace = true }

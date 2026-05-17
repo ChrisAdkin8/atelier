@@ -55,8 +55,29 @@ pub struct BridgedEvent {
 /// still active. Cleared by the spawned task's `Drop`-style cleanup.
 pub struct SessionState {
     pub dispatcher_handle: DispatcherHandle,
-    pub workspace_root: std::path::PathBuf,
     pub run_in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// v58 (M-sec-2 regression fix) — own the per-process tempdir
+    /// handle so RAII removes the directory on app shutdown. The
+    /// pre-v58 path called `tempfile::TempDir::keep()` which leaked
+    /// `/tmp/atelier-gui-{pid}-XXXX/` forever; each launch left a
+    /// fresh empty directory in `/tmp`.
+    ///
+    /// v59 (audit LOW-7 fix) — single source of truth for the
+    /// per-process workspace root. Pre-v59 `workspace_root` was
+    /// stored as a separate `PathBuf` alongside this handle; a
+    /// future edit that mutated one and not the other would
+    /// silently desync. Callers read `workspace_root()` instead.
+    pub workspace_tempdir: tempfile::TempDir,
+}
+
+impl SessionState {
+    /// Per-process workspace root (the parent of every per-run UUID
+    /// subdir created by `start_demo_run`). Always points inside the
+    /// owned `workspace_tempdir` so RAII cleanup covers any descendant
+    /// left behind by `RunCleanup`.
+    pub fn workspace_root(&self) -> &std::path::Path {
+        self.workspace_tempdir.path()
+    }
 }
 
 /// Entry point. Spawned by `main.rs`; lives in `lib.rs` so the integration
@@ -68,21 +89,45 @@ pub fn run() {
         .setup(|app| {
             // v47: ephemeral workspace per process. Real "open project"
             // selection lands when the GUI grows a file-tree pane.
-            let workspace_root =
-                std::env::temp_dir().join(format!("atelier-gui-{}", std::process::id()));
-            std::fs::create_dir_all(&workspace_root)?;
+            //
+            // v57 (L cleanup) — use `tempfile::TempDir` for the
+            // per-process root so the directory inherits 0700 perms.
+            // The pre-v57 path was `std::env::temp_dir().join(pid)`
+            // with the umask default (typically 0755), which on
+            // multi-user Linux let any local user read staged files.
+            //
+            // v58 (M-sec-2 regression fix) — hold the `TempDir`
+            // handle in `SessionState` so RAII removes the dir on
+            // app shutdown. v57 called `.keep()` which leaked the
+            // directory forever.
+            let workspace_tempdir = tempfile::Builder::new()
+                .prefix(&format!("atelier-gui-{}-", std::process::id()))
+                .tempdir()
+                .map_err(|e| std::io::Error::other(format!("workspace tempdir: {e}")))?;
 
             app.manage(SessionState {
                 dispatcher_handle: DispatcherHandle::new(),
-                workspace_root,
                 run_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                workspace_tempdir,
             });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             ping,
             submit_approval,
-            start_demo_run
+            start_demo_run,
+            // v55 §5 mutator commands.
+            pin_context_item,
+            unpin_context_item,
+            evict_context_item,
+            add_memory_card,
+            delete_memory_card,
+            promote_memory_card,
+            add_plan_step,
+            remove_plan_step,
+            mark_plan_step_status,
+            add_plan_step_constraint,
+            reorder_plan_steps,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -96,23 +141,74 @@ fn ping() -> &'static str {
     "pong"
 }
 
+/// v56 — wire-format file decision the webview sends on
+/// `submit_approval`. Mirrors `atelier_core::staging::FileApproval`.
+#[derive(serde::Deserialize, Debug)]
+#[serde(tag = "mode", rename_all = "lowercase")]
+pub enum FileApprovalWire {
+    /// Commit every staged byte for this file.
+    All,
+    /// Commit only the listed hunk indices. Empty list = drop.
+    Hunks { indices: Vec<u32> },
+}
+
+impl FileApprovalWire {
+    fn into_core(self) -> atelier_core::staging::FileApproval {
+        match self {
+            Self::All => atelier_core::staging::FileApproval::All,
+            Self::Hunks { indices } => atelier_core::staging::FileApproval::Hunks(
+                indices.into_iter().map(|i| i as usize).collect(),
+            ),
+        }
+    }
+}
+
 /// Spec §3 hunk accept/reject — frontend bridge. Routed to the
 /// live `SessionDispatcher` via the `DispatcherHandle` in
 /// `SessionState`. Returns `false` when there's no active run
 /// (`start_demo_run` hasn't been called) or when `commit_id` doesn't
 /// match an outstanding pending (already approved / dispatcher torn
-/// down). `accepted` is the list of file paths (relative to the
-/// workspace root) the user OK'd.
+/// down).
+///
+/// v56: `selection` carries per-path decisions (and per-hunk indices
+/// for `Hunks::Lines` files); a path absent from the map is fully
+/// rejected.
+/// v57 (L cleanup) — defence-in-depth on the Tauri boundary. Pre-v57
+/// the path keys flowed straight to `PathBuf::from` and the staging
+/// layer rejected absolute / `..` paths later. Rejecting at the
+/// boundary makes the failure mode clearer in the IPC layer's logs.
+fn is_safe_repo_relative(p: &str) -> bool {
+    if p.is_empty() {
+        return false;
+    }
+    let path = std::path::Path::new(p);
+    if path.is_absolute() {
+        return false;
+    }
+    path.components()
+        .all(|c| !matches!(c, std::path::Component::ParentDir))
+}
+
 #[tauri::command]
 fn submit_approval(
     state: tauri::State<'_, SessionState>,
     commit_id: String,
-    accepted: Vec<String>,
+    selection: std::collections::HashMap<String, FileApprovalWire>,
 ) -> bool {
     let Ok(parsed_id) = uuid::Uuid::parse_str(&commit_id) else {
         tracing::warn!(commit_id, "submit_approval: malformed commit_id");
         return false;
     };
+    // v57 (L cleanup) — reject absolute / `..`-containing path keys
+    // at the IPC boundary. The staging layer rejects them later
+    // anyway; doing it here means the log line names the actual
+    // problem and dispatch never sees a hostile selection map.
+    for k in selection.keys() {
+        if !is_safe_repo_relative(k) {
+            tracing::warn!(path = %k, "submit_approval: rejecting unsafe path key");
+            return false;
+        }
+    }
     let Some(sd) = state.dispatcher_handle.get() else {
         tracing::warn!(
             commit_id,
@@ -120,9 +216,214 @@ fn submit_approval(
         );
         return false;
     };
-    let accepted_paths: Vec<std::path::PathBuf> =
-        accepted.into_iter().map(std::path::PathBuf::from).collect();
-    sd.submit_approval(parsed_id, accepted_paths)
+    let core_selection: atelier_core::staging::HunkSelection = selection
+        .into_iter()
+        .map(|(p, fa)| (std::path::PathBuf::from(p), fa.into_core()))
+        .collect();
+    sd.submit_approval(parsed_id, core_selection)
+}
+
+// v57 (H6 fix): `now_rfc3339` lifted into `atelier_core::time`. The
+// pre-v57 path had three byte-for-byte copies (this file, the runner,
+// the TUI).
+use atelier_core::time::now_rfc3339;
+
+/// What `evict_context_item` returns to the frontend so the confirm
+/// dialog can show "evicted — freed N tokens" without a follow-up
+/// round-trip.
+#[derive(Serialize, Debug)]
+pub struct EvictResult {
+    pub tokens_freed: u32,
+}
+
+/// What `promote_memory_card` returns. `path` is the absolute path
+/// the bytes were written to (under `~/.atelier/memory/`).
+#[derive(Serialize, Debug)]
+pub struct PromoteResult {
+    pub path: String,
+    pub bytes: usize,
+}
+
+fn require_dispatcher(
+    state: &tauri::State<'_, SessionState>,
+) -> Result<std::sync::Arc<atelier_core::dispatcher::SessionDispatcher>, String> {
+    state
+        .dispatcher_handle
+        .get()
+        .ok_or_else(|| "no active dispatcher (start a run first)".to_string())
+}
+
+#[tauri::command]
+fn pin_context_item(state: tauri::State<'_, SessionState>, id: String) -> Result<(), String> {
+    let sd = require_dispatcher(&state)?;
+    sd.pin_context_item(&id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn unpin_context_item(state: tauri::State<'_, SessionState>, id: String) -> Result<(), String> {
+    let sd = require_dispatcher(&state)?;
+    sd.unpin_context_item(&id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn evict_context_item(
+    state: tauri::State<'_, SessionState>,
+    id: String,
+) -> Result<EvictResult, String> {
+    let sd = require_dispatcher(&state)?;
+    let now = now_rfc3339();
+    sd.evict_context_item(&id, &now)
+        .map(|ev| EvictResult {
+            tokens_freed: ev.tokens_freed,
+        })
+        .map_err(|e| e.to_string())
+}
+
+/// v57 (M-sec-1) / v59 framework-limit note — per-Tauri-command size
+/// caps. Pre-v57 the v55 mutator commands accepted unbounded
+/// `String`s from the webview, each cloned through the dispatcher,
+/// the memory/plan store, and echoed over the bus to every
+/// subscriber. A hostile or buggy webview could land multi-GB
+/// strings; in a future browser-bound mode this is a realistic
+/// DoS path.
+///
+/// **Framework limitation (acknowledged in v59 audit MED-sec-1)**:
+/// Tauri 2.x deserialises the IPC payload into the handler's
+/// parameter types *before* the handler runs, so a multi-GB
+/// `String` is already allocated by the time `check_bytes` rejects
+/// it. The cap stops the value from escaping into the dispatcher /
+/// bus / disk, but the initial allocation is unavoidable without
+/// Tauri-side support for a per-window IPC body limit (no such
+/// option exists in `tauri.conf.json` as of Tauri 2.0.x). When the
+/// upstream API adds one, configure it via `app.security` in
+/// `tauri.conf.json` and these caps become defence-in-depth rather
+/// than the primary boundary.
+const MAX_MEMORY_CARD_BYTES: usize = 32 * 1024;
+const MAX_PLAN_STEP_BYTES: usize = 4 * 1024;
+const MAX_PLAN_CONSTRAINT_BYTES: usize = 1024;
+const MAX_PLAN_STEPS: usize = 256;
+
+fn check_bytes(label: &str, s: &str, max: usize) -> Result<(), String> {
+    if s.len() > max {
+        return Err(format!(
+            "{label} too long: {} bytes (max {max} bytes)",
+            s.len()
+        ));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn add_memory_card(
+    state: tauri::State<'_, SessionState>,
+    content: String,
+) -> Result<String, String> {
+    check_bytes("memory card content", &content, MAX_MEMORY_CARD_BYTES)?;
+    let sd = require_dispatcher(&state)?;
+    let now = now_rfc3339();
+    sd.add_memory_card(content, &now).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn delete_memory_card(state: tauri::State<'_, SessionState>, id: String) -> Result<(), String> {
+    let sd = require_dispatcher(&state)?;
+    sd.delete_memory_card(&id).map_err(|e| e.to_string())
+}
+
+/// Promote a card to `~/.atelier/memory/`. The dispatcher returns the
+/// bytes (pure); this command does the disk write via the shared
+/// [`atelier_cli::memory_promote::write_promoted_card`] helper so
+/// the GUI and TUI go through the same hardened path.
+///
+/// v60 (security M-1 fix) — pre-v60 the GUI's `promote_memory_card`
+/// and the TUI's `Mutation::PromoteMemory` carried independent
+/// copies of the HOME validation / canonical-root containment /
+/// atomic-write logic. The TUI copy was *not* updated for v58 / v59
+/// hardening, leaving the TUI driver as a bypass. v60 consolidates
+/// the hardening in `atelier-cli::memory_promote` and both drivers
+/// delegate.
+#[tauri::command]
+fn promote_memory_card(
+    state: tauri::State<'_, SessionState>,
+    id: String,
+) -> Result<PromoteResult, String> {
+    let sd = require_dispatcher(&state)?;
+    let now = now_rfc3339();
+    let output = sd
+        .promote_memory_card(&id, &now)
+        .map_err(|e| e.to_string())?;
+    let written = atelier_cli::memory_promote::write_promoted_card(&output)?;
+    Ok(PromoteResult {
+        path: written.path.to_string_lossy().to_string(),
+        bytes: written.bytes,
+    })
+}
+
+#[tauri::command]
+fn add_plan_step(state: tauri::State<'_, SessionState>, text: String) -> Result<String, String> {
+    check_bytes("plan step text", &text, MAX_PLAN_STEP_BYTES)?;
+    let sd = require_dispatcher(&state)?;
+    sd.add_plan_step(text).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn remove_plan_step(state: tauri::State<'_, SessionState>, id: String) -> Result<(), String> {
+    let sd = require_dispatcher(&state)?;
+    sd.remove_plan_step(&id).map_err(|e| e.to_string())
+}
+
+/// Map a wire-format status string onto [`atelier_core::plan::PlanStatus`].
+/// Rejects unknown labels rather than coercing silently.
+///
+/// v58 (MED-smell-2 fix) — routes through
+/// `PlanStatus::from_wire_label`, the single source of truth shared
+/// with the serde `rename_all = "snake_case"` projection.
+fn parse_plan_status(s: &str) -> Result<atelier_core::plan::PlanStatus, String> {
+    atelier_core::plan::PlanStatus::from_wire_label(s)
+        .ok_or_else(|| format!("unknown plan status {s:?}"))
+}
+
+#[tauri::command]
+fn mark_plan_step_status(
+    state: tauri::State<'_, SessionState>,
+    id: String,
+    status: String,
+) -> Result<(), String> {
+    let sd = require_dispatcher(&state)?;
+    let parsed = parse_plan_status(&status)?;
+    sd.mark_plan_step_status(&id, parsed)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn add_plan_step_constraint(
+    state: tauri::State<'_, SessionState>,
+    id: String,
+    constraint: String,
+) -> Result<(), String> {
+    check_bytes(
+        "plan step constraint",
+        &constraint,
+        MAX_PLAN_CONSTRAINT_BYTES,
+    )?;
+    let sd = require_dispatcher(&state)?;
+    sd.add_plan_step_constraint(&id, constraint)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn reorder_plan_steps(
+    state: tauri::State<'_, SessionState>,
+    ordering: Vec<String>,
+) -> Result<(), String> {
+    if ordering.len() > MAX_PLAN_STEPS {
+        return Err(format!(
+            "reorder list too long: {} items (max {MAX_PLAN_STEPS})",
+            ordering.len()
+        ));
+    }
+    let sd = require_dispatcher(&state)?;
+    sd.reorder_plan_steps(ordering).map_err(|e| e.to_string())
 }
 
 /// Start a mock-scripted run with `AwaitApproval` policy. v47 demo
@@ -182,7 +483,7 @@ fn start_demo_run(
     // but the directory isolation is defence in depth and survives a
     // future relaxation of the guard).
     let run_id = uuid::Uuid::new_v4();
-    let workspace = state.workspace_root.join(run_id.to_string());
+    let workspace = state.workspace_root().join(run_id.to_string());
     if let Err(e) = std::fs::create_dir_all(&workspace) {
         state
             .run_in_flight
@@ -336,131 +637,112 @@ fn emit_event(app: &AppHandle, evt: &SessionEvent) {
 /// Project an [`atelier_core::session::Event`] onto the JSON shape the
 /// webview consumes. Pure function — exercised by the unit tests below
 /// without booting Tauri.
+///
+/// v57 (H5 fix) — the `kind` label is sourced from
+/// [`SessionEvent::kind`] so the GUI and TUI projections can't drift
+/// from the Rust enum variant names again. Adding a new variant
+/// Rust-side is a one-line change in `Event::kind()`; this projection
+/// just adds a new `match` arm for the payload shape.
 pub fn bridge_event(evt: &SessionEvent) -> BridgedEvent {
-    match evt {
-        SessionEvent::Transitioned { from, to } => BridgedEvent {
-            kind: "Transitioned",
-            payload: json!({
-                "from": format!("{from:?}"),
-                "to": format!("{to:?}"),
-            }),
-        },
-        SessionEvent::IllegalTransitionAttempted { from, to } => BridgedEvent {
-            kind: "IllegalTransitionAttempted",
-            payload: json!({
-                "from": format!("{from:?}"),
-                "to": format!("{to:?}"),
-            }),
-        },
-        SessionEvent::Cancelled => BridgedEvent {
-            kind: "Cancelled",
-            payload: Value::Null,
-        },
-        SessionEvent::EditStaged { path, hunks } => BridgedEvent {
-            kind: "EditStaged",
-            payload: json!({
-                "path": path.to_string_lossy(),
-                "hunks": serde_json::to_value(hunks).unwrap_or(Value::Null),
-            }),
-        },
-        SessionEvent::MessageCommitted { role, text } => BridgedEvent {
-            kind: "MessageCommitted",
-            payload: json!({
-                "role": format!("{role:?}").to_lowercase(),
-                "text": text,
-            }),
-        },
-        SessionEvent::PlanSnapshot { steps } => BridgedEvent {
-            kind: "PlanSnapshot",
-            payload: json!({
-                "steps": serde_json::to_value(steps).unwrap_or(Value::Null),
-            }),
-        },
-        SessionEvent::LedgerAppended { entry } => BridgedEvent {
-            kind: "LedgerAppended",
-            payload: json!({
-                "entry": serde_json::to_value(entry).unwrap_or(Value::Null),
-            }),
-        },
+    let kind = evt.kind();
+    let payload = match evt {
+        // v57 (H7 fix) — `State::name()` / `MessageRole::wire_label()`
+        // are canonical labels owned by atelier-core; pre-v57 we
+        // shipped `format!("{from:?}")` which made Rust's Debug a
+        // wire format and would silently break the UI if a variant
+        // got renamed.
+        SessionEvent::Transitioned { from, to } => json!({
+            "from": from.name(),
+            "to": to.name(),
+        }),
+        SessionEvent::IllegalTransitionAttempted { from, to } => json!({
+            "from": from.name(),
+            "to": to.name(),
+        }),
+        SessionEvent::Cancelled => Value::Null,
+        SessionEvent::EditStaged { path, hunks } => json!({
+            "path": path.to_string_lossy(),
+            "hunks": serde_json::to_value(hunks).unwrap_or(Value::Null),
+        }),
+        SessionEvent::MessageCommitted { role, text } => json!({
+            "role": role.wire_label(),
+            "text": text,
+        }),
+        SessionEvent::PlanSnapshot { steps } => json!({
+            "steps": serde_json::to_value(steps).unwrap_or(Value::Null),
+        }),
+        SessionEvent::LedgerAppended { entry } => json!({
+            "entry": serde_json::to_value(entry).unwrap_or(Value::Null),
+        }),
         SessionEvent::ContextSnapshot {
             known_tokens,
             unknown_tokens,
-        } => BridgedEvent {
-            kind: "ContextSnapshot",
-            payload: json!({
-                "known_tokens": known_tokens,
-                "unknown_tokens": unknown_tokens,
-            }),
-        },
-        SessionEvent::StagingPendingApproval { commit_id, files } => BridgedEvent {
-            kind: "StagingPendingApproval",
-            payload: json!({
-                "commit_id": commit_id.to_string(),
-                "files": files
-                    .iter()
-                    .map(|f| json!({
-                        "path": f.path.to_string_lossy(),
-                        "hunks": serde_json::to_value(&f.hunks).unwrap_or(Value::Null),
-                    }))
-                    .collect::<Vec<_>>(),
-            }),
-        },
+        } => json!({
+            "known_tokens": known_tokens,
+            "unknown_tokens": unknown_tokens,
+        }),
+        SessionEvent::StagingPendingApproval { commit_id, files } => json!({
+            "commit_id": commit_id.to_string(),
+            "files": files
+                .iter()
+                .map(|f| json!({
+                    "path": f.path.to_string_lossy(),
+                    "hunks": serde_json::to_value(&f.hunks).unwrap_or(Value::Null),
+                }))
+                .collect::<Vec<_>>(),
+        }),
         SessionEvent::CommitDecision {
             commit_id,
             committed,
             dropped,
-        } => BridgedEvent {
-            kind: "CommitDecision",
-            payload: json!({
-                "commit_id": commit_id.to_string(),
-                "committed": committed
-                    .iter()
-                    .map(|p| p.to_string_lossy())
-                    .collect::<Vec<_>>(),
-                "dropped": dropped
-                    .iter()
-                    .map(|p| p.to_string_lossy())
-                    .collect::<Vec<_>>(),
-            }),
-        },
+        } => json!({
+            "commit_id": commit_id.to_string(),
+            "committed": committed
+                .iter()
+                .map(|p| p.to_string_lossy())
+                .collect::<Vec<_>>(),
+            "dropped": dropped
+                .iter()
+                .map(|p| p.to_string_lossy())
+                .collect::<Vec<_>>(),
+        }),
         SessionEvent::ModelProfileLoaded {
             model_id,
             base_url,
             strategy,
             outcome,
-        } => BridgedEvent {
-            kind: "ModelProfileLoaded",
-            payload: json!({
-                "model_id": model_id,
-                "base_url": base_url,
-                "strategy": strategy.as_str(),
-                // `ProbeLoadOutcome` derives `Serialize` with
-                // `rename_all = "snake_case"`, so `cache_hit` /
-                // `probed` / `reprobed` / `not_cached` land on the
-                // wire as legible labels suitable for direct UI use.
-                "outcome": serde_json::to_value(outcome).unwrap_or(Value::Null),
-            }),
-        },
-        SessionEvent::ContextItems { items } => BridgedEvent {
-            kind: "ContextItems",
-            payload: json!({
-                // `ContextItemSummary` already derives Serialize with
-                // snake_case fields — pass through verbatim.
-                "items": serde_json::to_value(items).unwrap_or(Value::Null),
-            }),
-        },
-        SessionEvent::MemoryCards { cards } => BridgedEvent {
-            kind: "MemoryCards",
-            payload: json!({
-                // `MemoryCardSummary` derives Serialize verbatim.
-                "cards": serde_json::to_value(cards).unwrap_or(Value::Null),
-            }),
-        },
-        SessionEvent::Shutdown => BridgedEvent {
-            kind: "Shutdown",
-            payload: Value::Null,
-        },
-    }
+        } => json!({
+            "model_id": model_id,
+            "base_url": base_url,
+            "strategy": strategy.as_str(),
+            // `ProbeLoadOutcome` derives `Serialize` with
+            // `rename_all = "snake_case"`, so `cache_hit` /
+            // `probed` / `reprobed` / `not_cached` land on the
+            // wire as legible labels suitable for direct UI use.
+            "outcome": serde_json::to_value(outcome).unwrap_or(Value::Null),
+        }),
+        SessionEvent::ContextItems { items } => json!({
+            // `ContextItemSummary` already derives Serialize with
+            // snake_case fields — pass through verbatim.
+            "items": serde_json::to_value(items).unwrap_or(Value::Null),
+        }),
+        SessionEvent::MemoryCards { cards } => json!({
+            // `MemoryCardSummary` derives Serialize verbatim.
+            "cards": serde_json::to_value(cards).unwrap_or(Value::Null),
+        }),
+        SessionEvent::ClaimedChanges { changes } => json!({
+            "changes": changes
+                .iter()
+                .map(|c| json!({
+                    "path": c.path,
+                    "kind": c.kind,
+                    "summary": c.summary,
+                }))
+                .collect::<Vec<_>>(),
+        }),
+        SessionEvent::Shutdown => Value::Null,
+    };
+    BridgedEvent { kind, payload }
 }
 
 #[cfg(test)]
@@ -658,6 +940,80 @@ mod tests {
         assert_eq!(wire[0]["label"], "fix the failing test");
         assert_eq!(wire[0]["token_source"], "approx");
         assert_eq!(wire[0]["pinned"], false);
+    }
+
+    #[test]
+    fn bridge_claimed_changes_passes_per_file_summary() {
+        use atelier_core::session::ClaimedChangeSummary;
+        let b = bridge_event(&SessionEvent::ClaimedChanges {
+            changes: vec![
+                ClaimedChangeSummary {
+                    path: "src/lib.rs".into(),
+                    kind: "edit".into(),
+                    summary: "tighten error handling around the parser".into(),
+                },
+                ClaimedChangeSummary {
+                    path: "tests/parser.rs".into(),
+                    kind: "create".into(),
+                    summary: "regression for issue #42".into(),
+                },
+            ],
+        });
+        assert_eq!(b.kind, "ClaimedChanges");
+        let arr = b.payload["changes"].as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["path"], "src/lib.rs");
+        assert_eq!(arr[0]["kind"], "edit");
+        assert_eq!(
+            arr[0]["summary"],
+            "tighten error handling around the parser"
+        );
+        assert_eq!(arr[1]["kind"], "create");
+    }
+
+    #[test]
+    fn parse_plan_status_accepts_all_four_labels() {
+        use atelier_core::plan::PlanStatus;
+        assert_eq!(parse_plan_status("pending").unwrap(), PlanStatus::Pending);
+        assert_eq!(
+            parse_plan_status("in_progress").unwrap(),
+            PlanStatus::InProgress
+        );
+        assert_eq!(parse_plan_status("done").unwrap(), PlanStatus::Done);
+        assert_eq!(parse_plan_status("skipped").unwrap(), PlanStatus::Skipped);
+    }
+
+    #[test]
+    fn parse_plan_status_rejects_unknown_label() {
+        let err = parse_plan_status("blocked").unwrap_err();
+        assert!(err.contains("blocked"));
+    }
+
+    #[test]
+    fn check_bytes_rejects_oversize_input() {
+        // Regression for M-sec-1 — Tauri command sizes are bounded so
+        // the webview can't ship arbitrarily large strings through the
+        // bus to every subscriber.
+        let s = "x".repeat(MAX_MEMORY_CARD_BYTES + 1);
+        let err = check_bytes("memory card content", &s, MAX_MEMORY_CARD_BYTES).unwrap_err();
+        assert!(err.contains("too long"));
+    }
+
+    #[test]
+    fn is_safe_repo_relative_accepts_normal_paths_rejects_escapes() {
+        assert!(is_safe_repo_relative("src/lib.rs"));
+        assert!(is_safe_repo_relative("a.txt"));
+        assert!(is_safe_repo_relative("nested/dir/file.go"));
+        assert!(!is_safe_repo_relative(""));
+        assert!(!is_safe_repo_relative("/etc/passwd"));
+        assert!(!is_safe_repo_relative("../escape"));
+        assert!(!is_safe_repo_relative("src/../../../etc/passwd"));
+    }
+
+    #[test]
+    fn check_bytes_accepts_at_boundary() {
+        let s = "x".repeat(MAX_MEMORY_CARD_BYTES);
+        assert!(check_bytes("memory card content", &s, MAX_MEMORY_CARD_BYTES).is_ok());
     }
 
     #[test]
