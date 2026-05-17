@@ -4,6 +4,7 @@
 
 <p align="center">
   <a href="#what-makes-it-different"><b>Why</b></a> ·
+  <a href="#quick-start"><b>Quick start</b></a> ·
   <a href="coding-harness-spec.md"><b>Spec</b></a> ·
   <a href="#build"><b>Build</b></a> ·
   <a href="#configure-and-run"><b>Run</b></a> ·
@@ -30,6 +31,34 @@ The spec is in [`coding-harness-spec.md`](coding-harness-spec.md). Where the bui
 - **Headless core, swappable frontends.** `atelier-core` ships no UI. The Tauri GUI and `ratatui` TUI consume the same broadcast channel; a third frontend is additive, not invasive.
 - **Cost ledger and trust budget as first-class concerns.** Every tool call, token, and side effect is accounted for. Observability is built in, not bolted on.
 - **The AI is a collaborator in a workspace, not a chat box with side effects.** Sessions, checkpoints, hooks, and file boundaries are explicit.
+
+---
+
+## Quick start
+
+The Mock provider drives the full agent loop with **no network and no model** — useful as a 30-second smoke test that the loop, dispatcher, staging, and persistence are all wired up on your machine.
+
+```sh
+cargo install --path crates/atelier-cli          # builds + installs the `atelier` binary
+atelier init                                      # bootstraps .atelier/ + a seeded ATELIER.md
+atelier run --provider mock "rename foo to bar"   # runs a turn; session lands in .atelier/sessions/<uuid>/
+```
+
+To drive a real model, swap the provider:
+
+```sh
+# Anthropic — Messages API (set ANTHROPIC_API_KEY)
+atelier run --provider anthropic --model anthropic:claude-opus-4-7 "<prompt>"
+
+# Any OpenAI-compatible server — local (Ollama / LM Studio / llama-server / vLLM / sglang) or cloud
+atelier run --provider openai-compat \
+    --base-url http://localhost:11434/v1 \
+    --model local:qwen2.5-coder:7b "<prompt>"
+```
+
+Re-typing the flags gets old; pin the defaults in `.atelier/config.toml` (see [§5 below](#5-configure-with-atelierconfigtoml--v52)). The Tauri GUI (`cargo tauri dev` from `crates/atelier-gui/`) and the ratatui TUI (`cargo run -p atelier-tui -- "<prompt>"`) drive the same loop with a live multi-pane workspace.
+
+For the deeper "what's happening under the hood" walkthrough, read on through **Configure and run** below. For first-time build prerequisites (rustup, pinned toolchain), see [Build](#build).
 
 ---
 
@@ -126,7 +155,12 @@ For `rmcp` dependency wiring and troubleshooting (`edition2024` error, proxy/net
 
 ## Configure and run
 
-The runnable surface today (v51): **(a)** `atelier init` to bootstrap a project, **(b)** `atelier run` to drive the end-to-end agent loop against Mock / Anthropic / any OpenAI-compatible server, **(c)** the GUI and TUI driver modes for the same loop with a visible workspace, and **(d)** `make check` to drive the calibration rig that verifies the harness on every push.
+Runnable surface today (v51):
+
+- **`atelier init`** — bootstrap a project.
+- **`atelier run`** — drive the end-to-end agent loop against Mock / Anthropic / any OpenAI-compatible server.
+- **GUI + TUI driver modes** — the same loop with a live, multi-pane workspace.
+- **`make check`** — the calibration rig that verifies the harness on every push.
 
 ### 1. Bootstrap a project — `atelier init`
 
@@ -199,7 +233,8 @@ atelier run --provider openai-compat \
 
 What this does: loads `ATELIER.md` into the system prompt, opens a session under `.atelier/sessions/<uuid>/`, calls the configured BYOM adapter, streams tool calls through the §15 dispatcher (seven built-in tools — MCP-hosted external tools land when the `rmcp` spike clears), applies edits atomically (`tempfile` + tree-sitter pre-commit check, spec §3), and either transitions to `Verifying` on `claimed_done: true` or bails after `--max-turns`. Cost-ledger entries land per call; session JSON conforms to `schemas/session/v1.json`.
 
-Useful flags:
+<details>
+<summary><b>All <code>atelier run</code> flags</b></summary>
 
 | Flag | Purpose |
 |---|---|
@@ -211,7 +246,92 @@ Useful flags:
 | `--prompt-file <PATH>` | Read prompt from file; `-` for stdin. |
 | `--no-probe` / `--force-probe` | Skip / force the v51 probe-on-first-use calibration. |
 
-### 5. Running against a local LLM
+</details>
+
+### 5. Configure with `.atelier/config.toml`  *(v52)*
+
+Re-typing `--provider openai-compat --base-url … --model …` every invocation gets old fast. Pin the defaults once in a small TOML file and `atelier run` picks them up automatically.
+
+#### Where the file lives
+
+Two scopes are searched, in order. The first that exists wins:
+
+| Path | Scope | Typical use |
+|---|---|---|
+| `<repo>/.atelier/config.toml` | **Project** | The repo wants Anthropic with a specific model on every clone. Committed. |
+| `~/.atelier/config.toml` | **User** | Your machine talks to a local LM Studio. Not committed; lives in your home dir. |
+
+Both files are optional. Missing both is fine — `atelier run` falls through to built-in defaults (provider `mock`, max-turns 32, probe `auto`).
+
+#### The shape
+
+Every section and every field is optional. A one-line `[provider] kind = "anthropic"` is a valid config and inherits defaults for everything else.
+
+```toml
+# .atelier/config.toml
+
+[provider]
+kind     = "openai-compat"           # "mock" | "anthropic" | "openai-compat"
+model    = "local:qwen2.5-coder:7b"  # sent verbatim to the provider
+base_url = "http://localhost:11434/v1"  # openai-compat only
+
+[runner]
+max_turns = 32
+
+[probe]
+policy = "auto"                      # "auto" | "skip" | "force"
+```
+
+<details>
+<summary><b>Field-by-field reference</b></summary>
+
+- **`[provider].kind`** — which adapter. Maps onto `--provider`. The supported values are `"mock"` (no network), `"anthropic"` (Messages API; reads `ANTHROPIC_API_KEY`), and `"openai-compat"` (any `POST /v1/chat/completions` server: LM Studio, llama-server, vLLM, sglang, Ollama, OpenAI itself; reads `OPENAI_API_KEY` — empty allowed for local servers).
+- **`[provider].model`** — the model id sent verbatim to the server. By convention `<provider>:<model>` (`anthropic:claude-opus-4-7`, `local:qwen2.5-coder:7b`, `openai:gpt-4o-mini`). The `<provider>:` prefix is the cost-ledger label; the part after the colon is what the server matches against.
+- **`[provider].base_url`** — full URL ending in `/v1`. **Only valid with `kind = "openai-compat"`** — combining it with `anthropic` or `mock` is a config error. Omit to default to `https://api.openai.com/v1` (OpenAI itself).
+- **`[runner].max_turns`** — bail after N turns without `claimed_done`. Maps onto `--max-turns`. Built-in default `32`.
+- **`[probe].policy`** — v51 probe-on-first-use. `"auto"` (cache-first; probe on miss; default for `openai-compat`), `"skip"` (never probe; default for `mock` + `anthropic`), or `"force"` (re-probe even when cached).
+
+</details>
+
+#### Override precedence
+
+Top wins; layers compose:
+
+```text
+  1. CLI flags                         (per-invocation overrides)
+  2. <repo>/.atelier/config.toml       (project scope)
+  3. ~/.atelier/config.toml            (user scope)
+  4. Built-in defaults                 (mock, 32 turns, auto probe)
+```
+
+A field absent at a higher layer falls through to the next. The CLI flag `--no-probe` overrides `[probe].policy = "auto"` for one run without editing the file; a project that pins `[provider].kind = "anthropic"` still lets a developer flip to a local model for one invocation with `--provider openai-compat --base-url …`.
+
+#### Verifying what's active
+
+On every `atelier run` the binary prints exactly which config file (if any) it loaded:
+
+```text
+atelier run: using config /Users/you/proj/.atelier/config.toml
+```
+
+Once the loop starts, the GUI footer (bottom-right) and the TUI footer (right side of the help line) both render the active model id, §2 strategy, and probe outcome:
+
+```text
+local:qwen2.5-coder:7b · json_sentinel · cache_hit
+```
+
+If you don't see what you expected there, re-check the precedence above — most surprises are "I edited the user-scope file but the project-scope file is winning."
+
+#### When the config is rejected
+
+A file that exists but doesn't parse (typo, wrong type, unknown field) is **fatal**: `atelier run` exits with code 2 and tells you which file + what's wrong. Silently ignoring a malformed config would let a typo silently fall back to defaults, which is exactly the surprise this layer exists to prevent.
+
+```text
+atelier run: config error: config at /Users/you/proj/.atelier/config.toml
+is not valid TOML: invalid type: string "thirty-two", expected isize for key "runner.max_turns"
+```
+
+### 6. Running against a local LLM
 
 Quickest path on macOS / Linux:
 
@@ -224,13 +344,26 @@ atelier run --provider openai-compat \
     "<prompt>"
 ```
 
+To make this the default for the project so future invocations only need a prompt, drop the same values into `<repo>/.atelier/config.toml` (see [section 5](#5-configure-with-atelierconfigtoml--v52)):
+
+```toml
+[provider]
+kind     = "openai-compat"
+base_url = "http://localhost:11434/v1"
+model    = "local:qwen2.5-coder:7b"
+```
+
+Now `atelier run "<prompt>"` is enough.
+
 On first use the harness fires a short calibration probe (one native tool-call test + one JSON-sentinel envelope test) and writes a `ModelProfile` to `~/.atelier/model_profiles/<hash>.json`. Subsequent runs against the same `(model, base_url)` pair use the cached profile. The §1 conformance tracker still degrades at runtime if the live model misbehaves — the cached profile is the *initial* strategy hint, not a contract.
 
 LM Studio (`http://localhost:1234/v1`), llama-server (`http://localhost:8080/v1`), vLLM / sglang (`http://localhost:8000/v1`), and OpenAI itself (omit `--base-url`; set `OPENAI_API_KEY`) all work through the same `--provider openai-compat` switch.
 
-### 6. Driver-mode GUI and TUI
+### 7. Driver-mode GUI and TUI
 
 The same `Runner` powers both UIs. Run the GUI with `cargo tauri dev` (in `crates/atelier-gui/`); type a prompt into the Composer and the multi-pane workspace renders conversation / diff / plan / meters live. The TUI runs as `cargo run -p atelier-tui -- "<prompt>"` (driver mode) or `cargo run -p atelier-tui` (viewer mode). Both speak the same broadcast bus and the same `SessionDispatcher::submit_approval` round-trip for hunk accept/reject.
+
+Both surfaces render the **active model in the bottom-right of their footer** (v52) — `local:qwen2.5-coder:7b · json_sentinel · cache_hit` — so a glance tells you which provider, strategy, and probe-cache outcome are in play. The badge populates as soon as the Runner emits its one-shot `Event::ModelProfileLoaded` at session start and stays for the lifetime of the run.
 
 Piece-by-piece state of the build — what's landed, what's planned, where each piece lives in the tree — is in [`STATUS.md`](STATUS.md#phase-a--piece-by-piece-tracker).
 
