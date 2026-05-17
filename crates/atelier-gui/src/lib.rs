@@ -434,7 +434,19 @@ pub fn bridge_event(evt: &SessionEvent) -> BridgedEvent {
                 "model_id": model_id,
                 "base_url": base_url,
                 "strategy": strategy.as_str(),
-                "outcome": format!("{outcome:?}").to_lowercase(),
+                // `ProbeLoadOutcome` derives `Serialize` with
+                // `rename_all = "snake_case"`, so `cache_hit` /
+                // `probed` / `reprobed` / `not_cached` land on the
+                // wire as legible labels suitable for direct UI use.
+                "outcome": serde_json::to_value(outcome).unwrap_or(Value::Null),
+            }),
+        },
+        SessionEvent::ContextItems { items } => BridgedEvent {
+            kind: "ContextItems",
+            payload: json!({
+                // `ContextItemSummary` already derives Serialize with
+                // snake_case fields — pass through verbatim.
+                "items": serde_json::to_value(items).unwrap_or(Value::Null),
             }),
         },
         SessionEvent::Shutdown => BridgedEvent {
@@ -589,5 +601,51 @@ mod tests {
         assert_eq!(b.payload["committed"][0], "a.rs");
         assert_eq!(b.payload["committed"][1], "b.rs");
         assert_eq!(b.payload["dropped"][0], "c.rs");
+    }
+
+    #[test]
+    fn bridge_context_items_passes_items_through_verbatim() {
+        use atelier_core::context::ContextItemSummary;
+
+        let items = vec![ContextItemSummary {
+            id: "msg-0001-user_message".into(),
+            kind: "user_message".into(),
+            label: "fix the failing test".into(),
+            provenance: "user_attached".into(),
+            provenance_detail: None,
+            tokens: 5,
+            token_source: "approx".into(),
+            pinned: false,
+        }];
+        let b = bridge_event(&SessionEvent::ContextItems {
+            items: items.clone(),
+        });
+        assert_eq!(b.kind, "ContextItems");
+        let wire = b.payload["items"].as_array().expect("items array");
+        assert_eq!(wire.len(), 1);
+        assert_eq!(wire[0]["kind"], "user_message");
+        assert_eq!(wire[0]["label"], "fix the failing test");
+        assert_eq!(wire[0]["token_source"], "approx");
+        assert_eq!(wire[0]["pinned"], false);
+    }
+
+    #[test]
+    fn bridge_model_profile_loaded_carries_id_strategy_and_outcome() {
+        use atelier_core::adapter::model_profile::ProbeLoadOutcome;
+        use atelier_core::protocol_strategy::Strategy;
+
+        let b = bridge_event(&SessionEvent::ModelProfileLoaded {
+            model_id: "local:qwen2.5-coder:7b".into(),
+            base_url: "http://localhost:11434/v1".into(),
+            strategy: Strategy::JsonSentinel,
+            outcome: ProbeLoadOutcome::CacheHit,
+        });
+        assert_eq!(b.kind, "ModelProfileLoaded");
+        assert_eq!(b.payload["model_id"], "local:qwen2.5-coder:7b");
+        assert_eq!(b.payload["base_url"], "http://localhost:11434/v1");
+        assert_eq!(b.payload["strategy"], "json_sentinel");
+        // Outcome is serialised through serde's snake_case rename,
+        // which is what the footer renders directly.
+        assert_eq!(b.payload["outcome"], "cache_hit");
     }
 }

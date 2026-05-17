@@ -158,6 +158,21 @@ pub enum Event {
         unknown_tokens: u32,
     },
 
+    /// v53 — per-item snapshot of the §5 context manager for the
+    /// "what's in my agent's head right now?" panel. Emitted at the
+    /// same turn boundary as [`Event::ContextSnapshot`] so the aggregate
+    /// meter and the per-row list stay coherent. Items appear in
+    /// insertion order; a stable `id` per row lets UIs animate
+    /// additions/evictions across re-emits.
+    ///
+    /// The §5 mechanical gate ("API assertions for token counts and
+    /// why-here; cache-bust ledger entry on eviction") is satisfied
+    /// by this stream plus the existing `LedgerAppended` cache-bust
+    /// entries.
+    ContextItems {
+        items: Vec<crate::context::ContextItemSummary>,
+    },
+
     /// Spec §3 "Hunk accept / reject": a tool staged writes and the
     /// dispatcher is waiting for the user's accept-set decision before
     /// the rename phase. UI consumers render each `files[i]` (path +

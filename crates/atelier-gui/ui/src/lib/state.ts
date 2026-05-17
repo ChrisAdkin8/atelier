@@ -116,6 +116,40 @@ export type PendingApproval = {
   files: PendingApprovalFile[]
 }
 
+/// v53 — one row in the §5 Context panel. Mirror of
+/// `atelier_core::context::ContextItemSummary`; bridged across
+/// `atelier://event` as the payload of the `ContextItems` event.
+export type ContextItemSummary = {
+  id: string
+  kind: string
+  label: string
+  provenance: string
+  provenance_detail?: string | null
+  tokens: number
+  /// `exact` / `approx` / `unavailable`.
+  token_source: string
+  pinned: boolean
+}
+
+/// v52 — the active BYOM model, populated by `ModelProfileLoaded`.
+/// Rendered in the footer (`App.svelte`) on the right-hand side so the
+/// user always knows which model + strategy the run is using.
+/// `null` until the Runner emits its one-shot `ModelProfileLoaded`
+/// event at session start.
+export type CurrentModel = {
+  /// `<provider>:<model>`, e.g. `local:qwen2.5-coder:7b`.
+  modelId: string
+  /// `http://localhost:11434/v1` etc. Empty for adapters that don't
+  /// speak HTTP (mock / anthropic).
+  baseUrl: string
+  /// `native_tool` / `json_sentinel` / `regex_prose`. See
+  /// `atelier_core::protocol_strategy::Strategy`.
+  strategy: string
+  /// `cache_hit` / `probed` / `reprobed` / `not_cached`. See
+  /// `atelier_core::adapter::model_profile::ProbeLoadOutcome`.
+  outcome: string
+}
+
 export type AppState = {
   events: EventLogEntry[]
   currentState: string
@@ -135,6 +169,12 @@ export type AppState = {
   /// `CommitDecision`. See `DiffPane.svelte` for the buttons that
   /// invoke the `submit_approval` Tauri command.
   pendingApproval: PendingApproval | null
+  /// v52 — active BYOM model. See [`CurrentModel`].
+  currentModel: CurrentModel | null
+  /// v53 — §5 Context panel rows. Replaced wholesale on each
+  /// `ContextItems` event; populated by the Runner at every turn
+  /// boundary alongside the aggregate `ContextSnapshot`.
+  contextItems: ContextItemSummary[]
 }
 
 export function initialState(): AppState {
@@ -150,6 +190,8 @@ export function initialState(): AppState {
     contextWindowTokens: DEFAULT_CONTEXT_WINDOW_TOKENS,
     scrubOffset: null,
     pendingApproval: null,
+    currentModel: null,
+    contextItems: [],
   }
 }
 
@@ -216,6 +258,28 @@ export function applyEvent(state: AppState, evt: BridgedEvent): AppState {
       // The dispatcher resolved the pending — clear it. Per-file
       // EditStaged events for the committed paths arrive separately.
       return { ...state, events, pendingApproval: null }
+    }
+    case 'ModelProfileLoaded': {
+      const p = evt.payload as {
+        model_id: string
+        base_url: string
+        strategy: string
+        outcome: string
+      }
+      const currentModel: CurrentModel = {
+        modelId: p.model_id,
+        baseUrl: p.base_url,
+        strategy: p.strategy,
+        outcome: p.outcome,
+      }
+      return { ...state, events, currentModel }
+    }
+    case 'ContextItems': {
+      // v53 — replace the panel's items wholesale. Snapshots come
+      // at every turn boundary, so a stale partial render is never
+      // preferable to the freshest snapshot.
+      const p = evt.payload as { items: ContextItemSummary[] }
+      return { ...state, events, contextItems: p.items ?? [] }
     }
     // Variants we don't fold into pane state — just the event log.
     case 'IllegalTransitionAttempted':
@@ -320,6 +384,18 @@ export function projectEvent(evt: BridgedEvent): EventLogEntry {
     case 'EditStaged': {
       const p = evt.payload as { path: string }
       return { kind: 'EditStaged', detail: p.path }
+    }
+    case 'ModelProfileLoaded': {
+      const p = evt.payload as { model_id: string; strategy: string; outcome: string }
+      return {
+        kind: 'ModelProfile',
+        detail: `${p.model_id} · strategy=${p.strategy} · ${p.outcome}`,
+      }
+    }
+    case 'ContextItems': {
+      const p = evt.payload as { items?: unknown[] }
+      const n = Array.isArray(p.items) ? p.items.length : 0
+      return { kind: 'ContextItems', detail: `${n} items` }
     }
     case 'Cancelled':
       return { kind: 'Cancelled', detail: '' }

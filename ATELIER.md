@@ -1,6 +1,6 @@
 # Atelier — project context
 
-Atelier is a **coding harness, end-to-end runnable on Phase A/B/C scope**: agent loop, BYOM adapters, verification gates, hooks, cost ledger, GUI + TUI. As of v51 the full pipeline runs against three providers (Mock, Anthropic, OpenAI-compatible — which covers LM Studio / llama-server / vLLM / sglang / Ollama / OpenAI itself), with hunk accept/reject, GUI driver mode, TUI driver mode, and probe-on-first-use model adaptation. `atelier-core` carries the §2.5 actor, §3 atomic staging + incremental diff stream, §11 sandbox profiles, §14 on-disk session + recovery log + registry, §15 hook loader + first-use approval + dispatcher + seven built-in tools, §2 typed envelope + three emission strategies + conformance tracker, §7 did-it-do-what-it-said + DoD loader, §5 typed context/memory/plan, and §1 probe-on-first-use cache. The §15 MCP-over-`rmcp` client is the remaining big-ticket Phase A item; the harness drives built-in tools end-to-end today. See `tasks/todo.md` for what's done vs. in flight; `CHANGELOG.md` for the version-by-version trail (latest: v51).
+Atelier is a **coding harness, end-to-end runnable on Phase A/B/C scope**: agent loop, BYOM adapters, verification gates, hooks, cost ledger, GUI + TUI. As of v53 the full pipeline runs against three providers (Mock, Anthropic, OpenAI-compatible — which covers LM Studio / llama-server / vLLM / sglang / Ollama / OpenAI itself), with hunk accept/reject, GUI driver mode, TUI driver mode, probe-on-first-use model adaptation, a multi-profile `.atelier/providers.toml` config, and the §5 Context panel (per-item token counts + provenance, rendered in both UIs). The GUI and TUI footers render the active model id + §2 strategy + probe outcome in the bottom-right. `atelier-core` carries the §2.5 actor, §3 atomic staging + incremental diff stream, §11 sandbox profiles, §14 on-disk session + recovery log + registry, §15 hook loader + first-use approval + dispatcher + seven built-in tools, §2 typed envelope + three emission strategies + conformance tracker, §7 did-it-do-what-it-said + DoD loader, §5 typed context/memory/plan + `ContextItemSummary` projection, §1 probe-on-first-use cache, and the v53 `ProvidersConfig` loader. The §15 MCP-over-`rmcp` client is the remaining big-ticket Phase A item; the harness drives built-in tools end-to-end today. See `tasks/todo.md` for what's done vs. in flight; `CHANGELOG.md` for the version-by-version trail (latest: v53).
 
 ## Stack
 
@@ -41,6 +41,23 @@ cargo run -p atelier-cli -- run \
 ```
 
 On first use the harness fires a short calibration probe (one tool-call test + one JSON-sentinel test) and caches the resulting `ModelProfile` to `~/.atelier/model_profiles/<hash>.json`. Override with `--no-probe` (skip; use capability defaults) or `--force-probe` (re-probe even if cached). LM Studio (`:1234`), llama-server (`:8080`), vLLM (`:8000`), and OpenAI itself (no `--base-url`, set `OPENAI_API_KEY`) all work through the same flag.
+
+To skip re-typing the flags every invocation, drop them into `<repo>/.atelier/providers.toml` (v53; renamed + reshaped from v52's `config.toml`). The binary loads it automatically:
+
+```toml
+default = "local"
+
+[providers.local]
+provider = "openai-compat"
+base_url = "http://localhost:11434/v1"
+model    = "local:qwen2.5-coder:7b"
+
+[providers.cloud]
+provider = "anthropic"
+model    = "anthropic:claude-opus-4-7"
+```
+
+Multiple named profiles; `--profile <NAME>` switches between them; `default` picks one when no flag is given. Per-field CLI flags still override individual fields of the resolved profile. Precedence (top wins): CLI > resolved profile > built-in defaults. The active model + strategy + probe outcome render in the bottom-right of the GUI/TUI footer; the v53 §5 Context panel lists per-item token counts + provenance in the same right-side column.
 
 ## Verification convention
 

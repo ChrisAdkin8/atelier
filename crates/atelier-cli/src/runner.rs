@@ -596,19 +596,32 @@ impl Runner {
 
             turns = turn + 1;
 
-            // Per-turn ContextSnapshot. The runner doesn't yet wire a
-            // full §5 ContextManager; for now we approximate `known` by
-            // round-tripping the messages through the adapter's
-            // count_tokens (which falls back to char/4 on adapters
-            // without a real token counter). `unknown` is 0 because no
-            // item carries `TokenSource::Unavailable` yet — when a
-            // real ContextManager wires in, it'll provide both.
+            // Per-turn ContextSnapshot + ContextItems (v53).
+            //
+            // The aggregate `ContextSnapshot` drives the §5 token
+            // meter; the per-item `ContextItems` stream feeds the
+            // Context panel. They go out together at the same turn
+            // boundary so the panel rows and the meter denominator
+            // can never disagree.
+            //
+            // Token attribution: the adapter only gives a *total*
+            // for the message list. We render per-item counts via a
+            // char/4 approximation tagged `TokenSource::Approx` —
+            // honest about being a rough number rather than a
+            // load-bearing exact count. When a real §5
+            // ContextManager replaces this projection (deferred), it
+            // will supply per-item counts at whatever source the
+            // adapter exposes.
             if let Ok(token_count) = self.adapter.count_tokens(&messages).await {
                 let _ = bus.send(Event::ContextSnapshot {
                     known_tokens: token_count.count,
                     unknown_tokens: 0,
                 });
             }
+            let context_items = summarise_messages(&messages);
+            let _ = bus.send(Event::ContextItems {
+                items: context_items,
+            });
 
             // 8. If the envelope or scripted response says done, exit.
             if envelope.claimed_done == Some(true) {
@@ -753,6 +766,68 @@ async fn advance(handle: &SessionHandle, _from: State, to: State) -> Result<(), 
         .map_err(|e| RunError::Session(format!("send Advance({to}): {e}")))
 }
 
+/// v53 — projection from the live conversation onto the per-item
+/// shape the §5 Context panel wants. Each `Message` becomes a
+/// [`ContextItemSummary`] with:
+///
+///   * a `kind` mirroring the message role (`system_prompt` /
+///     `user_message` / `assistant_turn` / `tool_result`),
+///   * a 1-line `label` (first 80 chars of `content`),
+///   * a `provenance` string aligning with `context::Provenance`
+///     variants where they fit (and a synthetic `assistant_turn`
+///     where they don't — the typed enum will get the variant when a
+///     real ContextManager replaces this projection),
+///   * a char/4 approximation as the token count, tagged `approx`.
+///
+/// Stable per-message `id` derived from the message index + role so
+/// successive emissions during a run keep the same id for the same
+/// turn. (The Runner doesn't yet rebuild from a session.json
+/// replay; when it does, this id scheme will need a stable source —
+/// likely the conversation's serial position.)
+fn summarise_messages(messages: &[Message]) -> Vec<atelier_core::context::ContextItemSummary> {
+    use atelier_core::context::ContextItemSummary;
+
+    fn first_line_label(s: &str) -> String {
+        let line = s.lines().next().unwrap_or("");
+        let truncated: String = line.chars().take(80).collect();
+        if truncated.chars().count() < line.chars().count() {
+            format!("{truncated}…")
+        } else {
+            truncated
+        }
+    }
+
+    fn approx_tokens(s: &str) -> u32 {
+        // Match `count_tokens` fallback heuristic — chars/4.
+        // Cap at u32::MAX defensively for absurdly long messages.
+        let count = s.chars().count() / 4;
+        u32::try_from(count).unwrap_or(u32::MAX)
+    }
+
+    messages
+        .iter()
+        .enumerate()
+        .map(|(idx, msg)| {
+            let (kind, provenance, provenance_detail) = match msg.role {
+                Role::System => ("system_prompt", "initial", None),
+                Role::User => ("user_message", "user_attached", None),
+                Role::Assistant => ("assistant_turn", "assistant_turn", None),
+                Role::Tool => ("tool_result", "tool_result", msg.tool_call_id.clone()),
+            };
+            ContextItemSummary {
+                id: format!("msg-{idx:04}-{kind}"),
+                kind: kind.to_string(),
+                label: first_line_label(&msg.content),
+                provenance: provenance.to_string(),
+                provenance_detail,
+                tokens: approx_tokens(&msg.content),
+                token_source: "approx".to_string(),
+                pinned: false,
+            }
+        })
+        .collect()
+}
+
 fn now_rfc3339() -> String {
     // PROVISIONAL — uses `time::OffsetDateTime` if we add the dep, but for
     // now a coarse second-precision via `SystemTime` keeps the cli dep-
@@ -890,5 +965,85 @@ pub fn read_prompt(path: Option<&Path>) -> io::Result<String> {
             io::Read::read_to_string(&mut io::stdin(), &mut s)?;
             Ok(s)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn msg(role: Role, content: &str) -> Message {
+        Message {
+            role,
+            content: content.into(),
+            tool_call_id: None,
+            tool_calls: Vec::new(),
+        }
+    }
+
+    fn tool_msg(content: &str, tool_call_id: &str) -> Message {
+        Message {
+            role: Role::Tool,
+            content: content.into(),
+            tool_call_id: Some(tool_call_id.into()),
+            tool_calls: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn summarise_messages_maps_each_role_to_provenance() {
+        let messages = vec![
+            msg(Role::System, "you are a coding agent"),
+            msg(Role::User, "fix the failing test"),
+            msg(Role::Assistant, "ok I'll start by reading parser.rs"),
+            tool_msg("file contents…", "tc-1"),
+        ];
+        let v = summarise_messages(&messages);
+        assert_eq!(v.len(), 4);
+
+        assert_eq!(v[0].kind, "system_prompt");
+        assert_eq!(v[0].provenance, "initial");
+
+        assert_eq!(v[1].kind, "user_message");
+        assert_eq!(v[1].provenance, "user_attached");
+
+        assert_eq!(v[2].kind, "assistant_turn");
+        assert_eq!(v[2].provenance, "assistant_turn");
+
+        assert_eq!(v[3].kind, "tool_result");
+        assert_eq!(v[3].provenance, "tool_result");
+        assert_eq!(v[3].provenance_detail.as_deref(), Some("tc-1"));
+    }
+
+    #[test]
+    fn summarise_messages_truncates_long_first_lines() {
+        let long = "x".repeat(500);
+        let v = summarise_messages(&[msg(Role::User, &long)]);
+        assert_eq!(v[0].label.chars().count(), 81); // 80 + ellipsis
+        assert!(v[0].label.ends_with('…'));
+    }
+
+    #[test]
+    fn summarise_messages_token_source_is_approx() {
+        let v = summarise_messages(&[msg(Role::User, "hello world")]);
+        assert_eq!(v[0].token_source, "approx");
+        // chars/4 floor for "hello world" (11 chars) = 2.
+        assert_eq!(v[0].tokens, 2);
+    }
+
+    #[test]
+    fn summarise_messages_assigns_stable_ids_by_index() {
+        let messages = vec![msg(Role::User, "a"), msg(Role::Assistant, "b")];
+        let v1 = summarise_messages(&messages);
+        let v2 = summarise_messages(&messages);
+        let ids1: Vec<_> = v1.iter().map(|s| &s.id).collect();
+        let ids2: Vec<_> = v2.iter().map(|s| &s.id).collect();
+        assert_eq!(ids1, ids2);
+    }
+
+    #[test]
+    fn summarise_messages_empty_input_yields_empty_output() {
+        let v = summarise_messages(&[]);
+        assert!(v.is_empty());
     }
 }

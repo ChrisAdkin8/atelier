@@ -1,5 +1,190 @@
 # Atelier Spec — Changelog
 
+## v53 — 2026-05-17
+
+**`.atelier/providers.toml` (named profiles) + §5 Context panel.** Two pieces landed together: the v52 single-provider config is reshaped into a multi-profile TOML with a `default` selector and a `--profile` CLI flag, and the GUI + TUI gain a §5 Context panel showing per-item token counts + provenance ("why is this in my agent's head?"). The §5 panel ties off one of the few remaining stated Phase C mechanical gates (`API assertions for token counts and why-here; cache-bust ledger entry on eviction`).
+
+### TOML format change — v52 `config.toml` → v53 `providers.toml`
+
+**Breaking change** against the v52-introduced format. v52 was committed only days earlier and not in the wild, so this is a clean rewrite rather than a migration.
+
+```toml
+# .atelier/providers.toml
+
+default = "local"
+
+[providers.local]
+provider = "openai-compat"
+base_url = "http://localhost:11434/v1"
+model    = "local:qwen2.5-coder:7b"
+
+[providers.cloud]
+provider = "anthropic"
+model    = "anthropic:claude-opus-4-7"
+
+[runner]
+max_turns = 32
+
+[probe]
+policy = "auto"
+```
+
+What changed:
+
+| v52 | v53 |
+|---|---|
+| `.atelier/config.toml` | `.atelier/providers.toml` |
+| Single `[provider]` table | `[providers.<name>]` map + `default` selector |
+| Field name `kind` | Field name `provider` |
+| `--no-probe`/`--force-probe` only | adds `--profile <NAME>` |
+
+Why: a real harness session often wants more than one provider on hand — local LLM for fast iteration, cloud-hosted Anthropic for hard reasoning, a vLLM cluster for production-flavoured runs. v52's single-provider shape forced editing the file (or all the CLI flags) on every switch. v53 keeps every profile in one file and switches between them with `--profile <NAME>`. The `default` field picks which profile applies when `--profile` isn't passed; per-field CLI flags (`--provider`, `--model`, `--base-url`, …) still override individual fields of the resolved profile.
+
+### New surface
+
+- **`crates/atelier-core/src/config.rs`** rewritten:
+  - `ProvidersConfig` document: `default: Option<String>`, `providers: BTreeMap<String, ProviderProfile>`, plus top-level optional `[runner]` and `[probe]` sections. `serde(deny_unknown_fields)` everywhere.
+  - `ProviderProfile` with `provider`/`model`/`base_url` fields (all optional so a half-populated profile can layer with CLI flags).
+  - `ProvidersConfig::resolve_profile(cli_profile)` — CLI > `default` > none. Returns `Result<Option<(name, &profile)>, ConfigError>` so a typo in `--profile` lists the available profiles instead of falling through silently.
+  - `validate()` enforces two cross-section invariants: `default` references an existing profile, and `base_url` requires `provider = "openai-compat"`. Each carries a path + a typed error.
+  - 19 unit tests (up from 14) cover the user's example verbatim, kebab/lowercase wire forms, discovery, malformed-file rejection, missing-default-name rejection, missing-profile rejection, base_url+wrong-provider rejection, base_url-without-provider allowed (CLI may supply later), round-trip through serde, and the three resolution paths (CLI / default / neither).
+
+- **`crates/atelier-cli/src/main.rs`** — new `--profile <NAME>` flag. `parse_cli` extended; `resolve_provider_choice` now takes a resolved `Option<&ProviderProfile>` instead of the v52 `Option<&ProviderSection>`. On every run the binary prints `atelier run: using config <path> (profile "<name>")` so the active resolution is visible.
+
+### §5 Context panel — per-row "what's in my agent's head"
+
+- **`crates/atelier-core/src/context.rs`** — new `ContextItemSummary` flat projection of `ContextItem`:
+  - `kind`: `"file_ref"` / `"inline_text"` / `"blob_ref"`.
+  - `label`: file path / first-80-chars-of-text-plus-ellipsis / sha-prefix.
+  - `provenance` + optional `provenance_detail`: the why-here trace.
+  - `tokens` + `token_source`: count and reliability label.
+  - `ContextManager::summarise()` → `Vec<ContextItemSummary>` in insertion order.
+  - 7 new tests cover each `Payload` variant's label shape, each `Provenance` variant's mapping, insertion-order preservation, and round-trip through serde.
+
+- **`crates/atelier-core/src/session.rs`** — new `Event::ContextItems { items: Vec<ContextItemSummary> }` variant. Emitted at the same turn boundary as the existing `ContextSnapshot` so the aggregate meter denominator and the per-item rows stay coherent.
+
+- **`crates/atelier-cli/src/runner.rs`** — `summarise_messages(&[Message]) -> Vec<ContextItemSummary>` helper. Maps each `Role` onto a provenance label (`System → initial`, `User → user_attached`, `Assistant → assistant_turn`, `Tool → tool_result` with the message's `tool_call_id` as `provenance_detail`). Token attribution is `chars/4` tagged `approx` — honest about being a rough number. Emitted alongside `ContextSnapshot` after each turn. 5 unit tests.
+
+- **`crates/atelier-gui/`** — new Svelte `ContextPane.svelte` component renders rows with right-aligned token counts (cyan exact / yellow approx / dim unavailable), short provenance badges (`init`/`usr`/`tool`/`mem`/`pin`/`asst`), and the item label. Empty-state placeholder before the first event. Wired into `App.svelte`'s bottom-right slot stacked under the existing aggregate `MetersPane` (CSS grid `auto / 1fr` so meters keep fixed height; context takes the flex space). `bridge_event` projects `ContextItems` through `serde_json::to_value(ContextItemSummary)` so the webview gets the wire shape verbatim — no second mapping layer. 1 new bridge test.
+
+- **`crates/atelier-tui/`** — new `render_context_pane` renders the same panel in the right column between the context gauge and the bounded event log tail. Pane title `§5 Context`; rows use the same colour palette as the GUI for cross-surface consistency. `AppState.context_items` is replaced wholesale on every `ContextItems` event (snapshots come at every turn boundary; a stale partial render is never preferable to the fresh snapshot). Constraint shape tightened to `[Length(2), Length(2), Min(2), Length(4)]` so the cost + context gauges keep their full 2-row allocation even in tight test areas. 5 new tests + project_event coverage.
+
+### Demo flow
+
+```sh
+# v53 single-file, multi-profile config:
+cat > .atelier/providers.toml <<EOF
+default = "local"
+
+[providers.local]
+provider = "openai-compat"
+base_url = "http://localhost:11434/v1"
+model    = "local:qwen2.5-coder:7b"
+
+[providers.cloud]
+provider = "anthropic"
+model    = "anthropic:claude-opus-4-7"
+EOF
+
+$ atelier run "add a hello() function"
+atelier run: using config /Users/you/proj/.atelier/providers.toml (profile "local")
+…
+# Bus emits: ModelProfileLoaded { strategy: JsonSentinel, outcome: CacheHit }
+# Bus emits: ContextItems { items: [system_prompt, user_message, assistant_turn, …] }
+
+# Flip to cloud for one run, same file:
+$ atelier run --profile cloud "now do the hard version"
+atelier run: using config /Users/you/proj/.atelier/providers.toml (profile "cloud")
+```
+
+### Verified
+
+- `cargo fmt --check` clean.
+- `cargo clippy --workspace --all-targets -- -D warnings` clean.
+- `cargo test --workspace` → **atelier-core 498** (+12 from v52: +7 ContextItemSummary, +5 resolver/discovery deltas) + **atelier-cli 19** (+5 summarise_messages) + **atelier-gui 14** (+1 bridge) + **atelier-tui 62** (+10 panel + project_event + layout) = **593 passing**.
+- `make check` — schemas + 52 artifacts + 112 rig tests + 11 dry-runs all OK.
+- `npm run check` in `crates/atelier-gui/ui/` — 95 files (+1 for `ContextPane.svelte`), 0 errors, 0 warnings.
+
+### Rig counts
+- **21 schemas / 52 artifacts / 112 tests / 11 dry-runs / 498 atelier-core unit tests + 19 atelier-cli integration tests + 14 atelier-gui unit tests + 62 atelier-tui unit tests** (atelier-core +12, atelier-cli +5, atelier-gui +1, atelier-tui +10 from v52).
+
+### §5 mechanical gate status
+- ✅ **API assertions for token counts** — `ContextItems` event ships per-item `tokens` + `token_source`, asserted in tests across all four crates.
+- ✅ **API assertions for why-here per item** — `provenance` + `provenance_detail` ship in every row; mapped from `context::Provenance` (and `summarise_messages` for the runtime path); tests assert stable labels.
+- ✅ **Cache-bust ledger entry on eviction** — landed in v44 (`ContextManager::evict` returns `CacheBustEvent`; `Ledger::cache_bust_from` writes it). Not new in v53, but the panel makes it visible.
+- ⏳ **Pin / unpin / evict with cache-bust confirm** in the UI — data layer is there (`ContextManager::{pin, unpin, evict}`); the UI buttons are deferred.
+- ⏳ **Memory panel** — separate work item.
+
+## v52 — 2026-05-17
+
+**`.atelier/config.toml` + model badge in the GUI/TUI footer.** Atelier's runtime knobs — which BYOM adapter, which model, which base URL, max turns, probe policy — now live in a small TOML file the binary picks up automatically. Per-repo override (committed) → user-scope fallback (`~/.atelier/config.toml`) → built-in defaults. CLI flags still win at the top. The GUI and TUI both render the active model id + §2 strategy + probe outcome in the bottom-right of their footer, so a glance tells you which provider you're talking to.
+
+### New surface
+
+- **`crates/atelier-core/src/config.rs`** (NEW, ~600 lines):
+  - `AtelierConfig` document with three optional sections: `[provider]` (`kind`, `model`, `base_url`), `[runner]` (`max_turns`), `[probe]` (`policy`). Every field is `Option<T>` so a one-line config (`[provider] kind = "anthropic"`) is valid and inherits defaults for the rest.
+  - `ProviderKind` enum (`Mock` / `Anthropic` / `OpenaiCompat`, kebab-case on the wire) and `ProbePolicyName` enum (`Auto` / `Skip` / `Force`, lowercase on the wire). Both derive `as_str()` for log lines + the UI status line.
+  - `AtelierConfig::load(repo_root)` walks the path list: `<repo>/.atelier/config.toml` first, then `~/.atelier/config.toml`. Missing both is `Ok(None)` (not an error); a file that exists but doesn't parse is fatal (`ConfigError::Parse` with the file path) so a typo can't silently shift the runtime to defaults.
+  - `AtelierConfig::paths_searched(repo_root)` mirrors the search list for "no config found, searched …" logging.
+  - Cross-section validation: `[provider].base_url` requires `[provider].kind = "openai-compat"`. `ConfigError::Invalid` carries the file path + a typed message.
+  - `serde(deny_unknown_fields)` on every struct so a typo'd `[provider].mod_el = "..."` is a parse error, not a silent fall-through.
+  - 14 unit tests cover shape (every field optional, kebab/lowercase wire forms, unknown-field rejection), discovery (project before user, missing-both yields None), validation (`base_url` requires `openai-compat`; `base_url` without `kind` is allowed because CLI may supply `kind` later), round-trip through serde.
+
+- **`crates/atelier-cli/src/main.rs`** — `run_run` refactored into a top-down narrative: parse argv → resolve workspace → load TOML → layer CLI > TOML > defaults → build Runner → run. New `CliArgs` struct holds raw `Option<T>` flags; new helpers `resolve_provider_choice`, `resolve_provider_kind`, `resolve_probe_policy`, `read_prompt_from_cli`. The binary prints `atelier run: using config <path>` so users can confirm which file is active. Usage text expanded with a config example block.
+
+- **`crates/atelier-gui/ui/src/lib/state.ts`** — new `CurrentModel` type + `applyEvent` arm for `ModelProfileLoaded` populating `state.currentModel`. `projectEvent` adds a `ModelProfile` event-log line.
+
+- **`crates/atelier-gui/ui/src/App.svelte`** — footer extended with a right-aligned `.model-badge` (CSS `margin-left: auto` flex idiom) rendering `model_id · strategy · outcome` with cyan id, green strategy, dim outcome. Falls back to `no model` placeholder before the first event.
+
+- **`crates/atelier-gui/src/lib.rs`** — `bridge_event` for `ModelProfileLoaded` now serialises `outcome` via `serde_json::to_value(ProbeLoadOutcome)` so the wire shape is `snake_case` (`cache_hit` / `probed` / `reprobed` / `not_cached`) directly usable in the UI. Pre-v52 used `format!("{:?}").to_lowercase()` which produced `cachehit`.
+
+- **`crates/atelier-tui/src/lib.rs`** — new `CurrentModel` struct on `AppState`. `apply` populates it from `ModelProfileLoaded`. `render_help` split into `render_help_left` + `render_help_right_model` + `model_badge_width` so the layout split between scrub keys (left, flexible) and the model badge (right, fixed-width) is one ratatui `Layout::default().direction(Horizontal).constraints([Min(0), Length(badge_width)])`. The pending-approval banner suppresses the badge so the approval prompt is the unambiguous focus.
+
+- **`crates/atelier-tui/src/lib.rs`** — new `snake_case_debug` helper inserts underscores at camel-case boundaries so the TUI's `outcome` label matches the GUI's `serde(rename_all = "snake_case")` projection byte-for-byte.
+
+### Demo flow
+
+```sh
+# One-time: pin the local LLM defaults for this repo.
+cat > .atelier/config.toml <<EOF
+[provider]
+kind     = "openai-compat"
+base_url = "http://localhost:11434/v1"
+model    = "local:qwen2.5-coder:7b"
+EOF
+
+# Now every invocation only needs a prompt:
+$ atelier run "add a hello() function"
+atelier run: using config /Users/you/proj/.atelier/config.toml
+…
+
+# GUI footer (bottom-right):
+#   local:qwen2.5-coder:7b · json_sentinel · cache_hit
+
+# TUI footer (right of the help line):
+#    q/Esc/Ctrl-C quit · [ prev · ] next · g HEAD     local:qwen2.5-coder:7b · json_sentinel · cache_hit
+```
+
+### CLI override layering (top wins)
+
+```text
+  1. CLI flags                         (per-invocation overrides)
+  2. <repo>/.atelier/config.toml       (project scope)
+  3. ~/.atelier/config.toml            (user scope)
+  4. Built-in defaults                 (mock, 32 turns, auto probe)
+```
+
+### Verified
+
+- `cargo fmt --check` clean.
+- `cargo clippy --workspace --all-targets -- -D warnings` clean.
+- `cargo test --workspace` → **atelier-core 486** (+14 from `config`) + **atelier-cli 14** + **atelier-gui 13** (+1 from the new `bridge_event` test) + **atelier-tui 52** (+6 from the model-badge tests) = **565 passing**.
+- `make check` — schemas + 52 artifacts + 112 rig tests + 11 dry-runs all OK.
+- `npm run check` in `crates/atelier-gui/ui/` — 94 files, 0 errors, 0 warnings.
+
+### Rig counts
+- **21 schemas / 52 artifacts / 112 tests / 11 dry-runs / 486 atelier-core unit tests + 14 atelier-cli integration tests + 13 atelier-gui unit tests + 52 atelier-tui unit tests** (atelier-core +14, atelier-gui +1, atelier-tui +6 from v51).
+
 ## v51 — 2026-05-17
 
 **Probe-on-first-use model adaptation (§1).** Atelier now fires a short calibration round-trip the first time it encounters a new `(model_id, base_url)` pair, observes whether the model handles native tool calls and JSON-sentinel envelopes, picks the appropriate §2 strategy, and caches the result to `~/.atelier/model_profiles/<hash>.json` so subsequent runs skip the probe. The cached profile is emitted on the bus as a new `Event::ModelProfileLoaded` so the GUI and TUI can render the active strategy badge. The Anthropic and Mock adapters skip the probe (they're well-characterised); only `openai-compat` is probed by default. CLI flags `--no-probe` and `--force-probe` override.

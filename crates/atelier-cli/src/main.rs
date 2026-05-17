@@ -13,6 +13,10 @@
 // Import the binary's view via the library name.
 use atelier_cli::runner;
 
+use atelier_core::config::{
+    LoadedConfig, ProbePolicyName, ProviderKind, ProviderProfile, ProvidersConfig,
+};
+
 use std::env;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -30,7 +34,45 @@ SUBCOMMANDS:
                                    loop until claimed_done, run DoD checks,
                                    persist the session. Phase C unblock (1).
 
+`atelier run` may read defaults from a TOML config (v53):
+
+    <repo>/.atelier/providers.toml    project scope (preferred)
+    ~/.atelier/providers.toml         user scope (fallback)
+
+If both exist, the project file wins. The file declares named profiles
+under [providers.<name>] tables; `default = \"<name>\"` picks one;
+`--profile <NAME>` on the CLI overrides the default. Per-field flags
+below still override individual fields of the resolved profile.
+
+Layering, top wins: CLI flags > resolved profile > built-in defaults
+(provider=mock, max-turns=32, probe=auto). On invocation the binary
+prints `atelier run: using config <path> [profile <NAME>]` so it is
+visible which file (and profile within it) is active.
+
+Example `.atelier/providers.toml`:
+
+    default = \"local\"
+
+    [providers.local]
+    provider = \"openai-compat\"
+    base_url = \"http://localhost:11434/v1\"
+    model    = \"local:qwen2.5-coder:7b\"
+
+    [providers.cloud]
+    provider = \"anthropic\"
+    model    = \"anthropic:claude-opus-4-7\"
+
+    [runner]
+    max_turns = 32
+
+    [probe]
+    policy = \"auto\"
+
 `atelier run` options:
+    --profile <NAME>               Select a named profile from
+                                   providers.toml (overrides `default`).
+                                   Errors if the name isn't present
+                                   in the file.
     --provider <NAME>              Adapter to use. One of:
                                      mock          (default) — no network.
                                      anthropic     — Messages API (`ANTHROPIC_API_KEY`).
@@ -130,151 +172,209 @@ fn run_init(mut args: impl Iterator<Item = String>) -> ExitCode {
     }
 }
 
-fn run_run(mut args: impl Iterator<Item = String>) -> ExitCode {
-    let mut provider = "mock".to_string();
-    let mut model: Option<String> = None;
-    let mut base_url: Option<String> = None;
-    let mut workspace: Option<PathBuf> = None;
-    let mut max_turns: Option<usize> = None;
-    let mut prompt_file: Option<PathBuf> = None;
-    let mut prompt_args: Vec<String> = Vec::new();
-    let mut no_probe = false;
-    let mut force_probe = false;
+// ---------- `atelier run` ----------
+//
+// The function is structured top-down so the data flow reads in
+// stages:
+//
+//   parse argv  →  resolve workspace  →  load TOML config  →
+//   layer CLI > TOML > defaults  →  build Runner  →  run.
+//
+// Each stage hands typed values to the next; nothing reaches the
+// Runner that hasn't been validated.
 
+/// Raw CLI flags before any defaulting or config-merging is applied.
+/// Everything is `Option<T>` so the precedence resolver can tell
+/// "user didn't say" from "user said this." `prompt_args` is the
+/// only field that's intrinsically a `Vec` because positional words
+/// concatenate; `no_probe` / `force_probe` are bare bools because a
+/// flag is either there or not.
+struct CliArgs {
+    /// `--profile <NAME>` — selects which `[providers.<name>]` table
+    /// in providers.toml is the *base* of the resolved provider.
+    /// `None` means "fall back to `default` in the file, then to
+    /// built-in defaults."
+    profile: Option<String>,
+    provider: Option<String>,
+    model: Option<String>,
+    base_url: Option<String>,
+    workspace: Option<PathBuf>,
+    max_turns: Option<usize>,
+    prompt_file: Option<PathBuf>,
+    prompt_args: Vec<String>,
+    no_probe: bool,
+    force_probe: bool,
+}
+
+impl CliArgs {
+    fn empty() -> Self {
+        Self {
+            profile: None,
+            provider: None,
+            model: None,
+            base_url: None,
+            workspace: None,
+            max_turns: None,
+            prompt_file: None,
+            prompt_args: Vec::new(),
+            no_probe: false,
+            force_probe: false,
+        }
+    }
+}
+
+/// Either a fully parsed [`CliArgs`] or an exit code (`--help`,
+/// missing-value error). The caller dispatches on the result; this
+/// keeps the parsing function flat — no early `return ExitCode` from
+/// inside the parse loop.
+enum CliParseResult {
+    Ok(CliArgs),
+    Exit(ExitCode),
+}
+
+fn parse_cli(mut args: impl Iterator<Item = String>) -> CliParseResult {
+    let mut out = CliArgs::empty();
     while let Some(a) = args.next() {
         match a.as_str() {
             "-h" | "--help" => {
                 println!("{USAGE}");
-                return ExitCode::SUCCESS;
+                return CliParseResult::Exit(ExitCode::SUCCESS);
             }
+            "--profile" => match args.next() {
+                Some(v) => out.profile = Some(v),
+                None => return missing_value("--profile", "name"),
+            },
             "--provider" => match args.next() {
-                Some(v) => provider = v,
-                None => {
-                    eprintln!("atelier run: --provider requires a value");
-                    return ExitCode::from(2);
-                }
+                Some(v) => out.provider = Some(v),
+                None => return missing_value("--provider", "value"),
             },
             "--model" => match args.next() {
-                Some(v) => model = Some(v),
-                None => {
-                    eprintln!("atelier run: --model requires a value");
-                    return ExitCode::from(2);
-                }
+                Some(v) => out.model = Some(v),
+                None => return missing_value("--model", "value"),
             },
             "--base-url" => match args.next() {
-                Some(v) => base_url = Some(v),
-                None => {
-                    eprintln!("atelier run: --base-url requires a URL");
-                    return ExitCode::from(2);
-                }
+                Some(v) => out.base_url = Some(v),
+                None => return missing_value("--base-url", "URL"),
             },
             "--workspace" => match args.next() {
-                Some(v) => workspace = Some(PathBuf::from(v)),
-                None => {
-                    eprintln!("atelier run: --workspace requires a path");
-                    return ExitCode::from(2);
-                }
+                Some(v) => out.workspace = Some(PathBuf::from(v)),
+                None => return missing_value("--workspace", "path"),
             },
             "--max-turns" => match args.next().and_then(|s| s.parse::<usize>().ok()) {
-                Some(n) => max_turns = Some(n),
-                None => {
-                    eprintln!("atelier run: --max-turns requires a positive integer");
-                    return ExitCode::from(2);
-                }
+                Some(n) => out.max_turns = Some(n),
+                None => return missing_value("--max-turns", "positive integer"),
             },
             "--prompt-file" => match args.next() {
-                Some(v) => prompt_file = Some(PathBuf::from(v)),
-                None => {
-                    eprintln!("atelier run: --prompt-file requires a path");
-                    return ExitCode::from(2);
-                }
+                Some(v) => out.prompt_file = Some(PathBuf::from(v)),
+                None => return missing_value("--prompt-file", "path"),
             },
-            "--no-probe" => no_probe = true,
-            "--force-probe" => force_probe = true,
-            // Everything else is treated as positional prompt text.
-            _ => prompt_args.push(a),
+            "--no-probe" => out.no_probe = true,
+            "--force-probe" => out.force_probe = true,
+            // Everything else is positional prompt text.
+            _ => out.prompt_args.push(a),
         }
     }
+    CliParseResult::Ok(out)
+}
 
-    if no_probe && force_probe {
+fn missing_value(flag: &str, kind: &str) -> CliParseResult {
+    eprintln!("atelier run: {flag} requires a {kind}");
+    CliParseResult::Exit(ExitCode::from(2))
+}
+
+fn run_run(args: impl Iterator<Item = String>) -> ExitCode {
+    // 1. Parse argv into a typed CliArgs.
+    let cli = match parse_cli(args) {
+        CliParseResult::Ok(c) => c,
+        CliParseResult::Exit(code) => return code,
+    };
+
+    if cli.no_probe && cli.force_probe {
         eprintln!("atelier run: --no-probe and --force-probe are mutually exclusive");
         return ExitCode::from(2);
     }
 
-    let provider_choice = match provider.as_str() {
-        "mock" => runner::ProviderChoice::Mock {
-            responses: Vec::new(),
-        },
-        "anthropic" => {
-            let model_id = model.unwrap_or_else(|| "anthropic:claude-opus-4-7".to_string());
-            if !model_id.starts_with("anthropic:") {
-                eprintln!(
-                    "atelier run: --model for --provider anthropic must be prefixed \
-                     `anthropic:` (got {model_id:?}); e.g. anthropic:claude-opus-4-7"
-                );
-                return ExitCode::from(2);
-            }
-            if base_url.is_some() {
-                eprintln!("atelier run: --base-url is only valid with --provider openai-compat");
-                return ExitCode::from(2);
-            }
-            runner::ProviderChoice::Anthropic { model_id }
+    // 2. Resolve the workspace path. Needed before config load
+    //    because `<workspace>/.atelier/providers.toml` is the
+    //    project scope.
+    let workspace = match cli
+        .workspace
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(env::current_dir)
+    {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("atelier run: cannot read current directory: {e}");
+            return ExitCode::from(1);
         }
-        "openai-compat" => {
-            let Some(model_id) = model else {
-                eprintln!(
-                    "atelier run: --provider openai-compat requires --model <ID> \
-                     (e.g. `local:llama3:8b` or `gpt-4o-mini`); the id is sent \
-                     verbatim to the server"
-                );
-                return ExitCode::from(2);
-            };
-            runner::ProviderChoice::OpenAiCompat { model_id, base_url }
-        }
-        other => {
-            eprintln!(
-                "atelier run: unknown provider {other:?}. Supported: `mock`, \
-                 `anthropic`, `openai-compat`. (`bedrock`, `vertex` land in Phase E/F.)"
-            );
+    };
+
+    // 3. Load the TOML config (best-effort; absent is OK). A
+    //    malformed file is fatal — silently ignoring it would let a
+    //    typo silently fall back to defaults, which is exactly the
+    //    surprise this layer exists to prevent.
+    let loaded = match ProvidersConfig::load(&workspace) {
+        Ok(opt) => opt,
+        Err(e) => {
+            eprintln!("atelier run: config error: {e}");
             return ExitCode::from(2);
         }
     };
+    let config = loaded
+        .as_ref()
+        .map(|l| l.config.clone())
+        .unwrap_or_default();
 
-    let workspace = match workspace {
-        Some(p) => p,
-        None => match env::current_dir() {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("atelier run: cannot read current directory: {e}");
-                return ExitCode::from(1);
-            }
-        },
-    };
-
-    let prompt = if !prompt_args.is_empty() {
-        prompt_args.join(" ")
-    } else {
-        // No positional prompt — read from --prompt-file or stdin.
-        let p = prompt_file.as_deref().filter(|p| p.to_str() != Some("-"));
-        match runner::read_prompt(p) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("atelier run: cannot read prompt: {e}");
-                return ExitCode::from(1);
-            }
+    // 4. Resolve which named profile (if any) is the *base* of the
+    //    provider settings. CLI `--profile` overrides the file's
+    //    `default`. None of either yields `None` and the CLI flags
+    //    are expected to specify everything they need directly.
+    let resolved_profile = match config.resolve_profile(cli.profile.as_deref()) {
+        Ok(p) => p.map(|(name, profile)| (name.to_string(), profile.clone())),
+        Err(e) => {
+            eprintln!("atelier run: {e}");
+            return ExitCode::from(2);
         }
     };
-
-    if prompt.trim().is_empty() {
-        eprintln!("atelier run: prompt is empty");
-        return ExitCode::from(2);
+    if let Some(LoadedConfig { path, .. }) = &loaded {
+        match &resolved_profile {
+            Some((name, _)) => println!(
+                "atelier run: using config {} (profile {name:?})",
+                path.display(),
+            ),
+            None => println!("atelier run: using config {}", path.display()),
+        }
     }
 
-    // For the mock provider with no scripted responses, the loop has
-    // nothing to do — the adapter would return NotConfigured on the first
-    // chat call. v0 binary use is the docs walkthrough; the integration
-    // tests construct `Runner` directly with `Mock { responses }` to
-    // script real turns.
+    // 5. Layer CLI > resolved profile > defaults into the runtime
+    //    values the Runner needs.
+    let provider_choice =
+        match resolve_provider_choice(&cli, resolved_profile.as_ref().map(|(_, p)| p)) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("atelier run: {e}");
+                return ExitCode::from(2);
+            }
+        };
+    let max_turns = cli
+        .max_turns
+        .or_else(|| config.runner.as_ref().and_then(|r| r.max_turns));
+    let probe_policy_override = resolve_probe_policy(&cli, &config);
+
+    // 5. Read the prompt (positional or --prompt-file or stdin).
+    let prompt = match read_prompt_from_cli(&cli) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+
+    // 6. Build the tokio runtime + Runner + run.
+    //
+    // For the mock provider with no scripted responses the loop has
+    // nothing to do — the adapter returns NotConfigured on the first
+    // chat call. v0 binary use is the docs walkthrough; the
+    // integration tests construct `Runner` directly with
+    // `Mock { responses }` to script real turns.
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -297,10 +397,8 @@ fn run_run(mut args: impl Iterator<Item = String>) -> ExitCode {
     if let Some(n) = max_turns {
         runner = runner.with_max_turns(n);
     }
-    if no_probe {
-        runner = runner.with_probe_policy(runner::ProbePolicy::Skip);
-    } else if force_probe {
-        runner = runner.with_probe_policy(runner::ProbePolicy::Force);
+    if let Some(policy) = probe_policy_override {
+        runner = runner.with_probe_policy(policy);
     }
 
     match rt.block_on(runner.run(prompt)) {
@@ -323,4 +421,141 @@ fn run_run(mut args: impl Iterator<Item = String>) -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/// Layer CLI flags on top of the resolved profile to produce the final
+/// [`runner::ProviderChoice`]. Returns a printable error string on
+/// validation failure so the caller emits one consistent
+/// `atelier run: <error>` line.
+///
+/// Precedence per field is `cli.or(profile).or(default)`. The
+/// `profile` here is the named `[providers.<name>]` table picked by
+/// either `--profile` or the file's `default`.
+fn resolve_provider_choice(
+    cli: &CliArgs,
+    profile: Option<&ProviderProfile>,
+) -> Result<runner::ProviderChoice, String> {
+    // Resolve `provider` first because the other fields depend on
+    // which adapter we're talking to.
+    let kind = resolve_provider_kind(cli.provider.as_deref(), profile)?;
+    let model = cli
+        .model
+        .clone()
+        .or_else(|| profile.and_then(|p| p.model.clone()));
+    let base_url = cli
+        .base_url
+        .clone()
+        .or_else(|| profile.and_then(|p| p.base_url.clone()));
+
+    match kind {
+        ProviderKind::Mock => {
+            if base_url.is_some() {
+                return Err("base_url is only valid with provider `openai-compat`".into());
+            }
+            Ok(runner::ProviderChoice::Mock {
+                responses: Vec::new(),
+            })
+        }
+        ProviderKind::Anthropic => {
+            let model_id = model.unwrap_or_else(|| "anthropic:claude-opus-4-7".to_string());
+            if !model_id.starts_with("anthropic:") {
+                return Err(format!(
+                    "model for provider `anthropic` must be prefixed `anthropic:` \
+                     (got {model_id:?}); e.g. anthropic:claude-opus-4-7"
+                ));
+            }
+            if base_url.is_some() {
+                return Err("base_url is only valid with provider `openai-compat`".into());
+            }
+            Ok(runner::ProviderChoice::Anthropic { model_id })
+        }
+        ProviderKind::OpenaiCompat => {
+            let Some(model_id) = model else {
+                return Err("provider `openai-compat` requires a model id \
+                     (CLI `--model <ID>` or TOML `[providers.<name>].model = \"...\"`); \
+                     e.g. `local:llama3:8b` or `openai:gpt-4o-mini`. The id is \
+                     sent verbatim to the server."
+                    .into());
+            };
+            Ok(runner::ProviderChoice::OpenAiCompat { model_id, base_url })
+        }
+    }
+}
+
+/// Resolve which `ProviderKind` to use. CLI `--provider <NAME>` wins;
+/// then the resolved profile's `provider` field; otherwise fall back
+/// to `Mock` so a fresh repo with no config still runs.
+fn resolve_provider_kind(
+    cli_provider: Option<&str>,
+    profile: Option<&ProviderProfile>,
+) -> Result<ProviderKind, String> {
+    if let Some(p) = cli_provider {
+        return parse_provider_string(p, "--provider");
+    }
+    if let Some(kind) = profile.and_then(|p| p.provider) {
+        return Ok(kind);
+    }
+    Ok(ProviderKind::Mock)
+}
+
+fn parse_provider_string(s: &str, source: &str) -> Result<ProviderKind, String> {
+    match s {
+        "mock" => Ok(ProviderKind::Mock),
+        "anthropic" => Ok(ProviderKind::Anthropic),
+        "openai-compat" => Ok(ProviderKind::OpenaiCompat),
+        other => Err(format!(
+            "{source}: unknown provider {other:?}. Supported: `mock`, `anthropic`, \
+             `openai-compat`. (`bedrock`, `vertex` land in Phase E/F.)"
+        )),
+    }
+}
+
+/// Layer CLI `--no-probe` / `--force-probe` over the TOML
+/// `[probe].policy`. Returns `Some(policy)` when the runner should
+/// override its per-provider default — `None` means "leave the
+/// Runner's built-in default in place" (which is `Skip` for Mock /
+/// Anthropic and `Auto` for OpenAI-compat).
+fn resolve_probe_policy(cli: &CliArgs, config: &ProvidersConfig) -> Option<runner::ProbePolicy> {
+    if cli.no_probe {
+        return Some(runner::ProbePolicy::Skip);
+    }
+    if cli.force_probe {
+        return Some(runner::ProbePolicy::Force);
+    }
+    config
+        .probe
+        .as_ref()
+        .and_then(|p| p.policy)
+        .map(|p| match p {
+            ProbePolicyName::Auto => runner::ProbePolicy::Auto,
+            ProbePolicyName::Skip => runner::ProbePolicy::Skip,
+            ProbePolicyName::Force => runner::ProbePolicy::Force,
+        })
+}
+
+/// Read the prompt from (in order): positional argv words,
+/// `--prompt-file`, or stdin. Rejects an empty prompt up-front so the
+/// Runner doesn't have to.
+fn read_prompt_from_cli(cli: &CliArgs) -> Result<String, ExitCode> {
+    let prompt = if !cli.prompt_args.is_empty() {
+        cli.prompt_args.join(" ")
+    } else {
+        // No positional prompt — read from --prompt-file or stdin.
+        let p = cli
+            .prompt_file
+            .as_deref()
+            .filter(|p| p.to_str() != Some("-"));
+        match runner::read_prompt(p) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("atelier run: cannot read prompt: {e}");
+                return Err(ExitCode::from(1));
+            }
+        }
+    };
+    if prompt.trim().is_empty() {
+        eprintln!("atelier run: prompt is empty");
+        return Err(ExitCode::from(2));
+    }
+    Ok(prompt)
 }

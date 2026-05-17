@@ -106,6 +106,32 @@ pub struct AppState {
     /// AppState stays pure render-state; the handle lives in the loop
     /// frame.
     pub pending_approval: Option<PendingApproval>,
+    /// v52 — active BYOM model, populated by `ModelProfileLoaded`.
+    /// Rendered on the right-hand side of the footer so the user
+    /// always knows which model + strategy the run is using.
+    /// `None` until the Runner emits its one-shot `ModelProfileLoaded`
+    /// event at session start.
+    pub current_model: Option<CurrentModel>,
+    /// v53 — per-item §5 context snapshot, rebuilt whole-cloth on
+    /// every `Event::ContextItems`. The Context pane renders these
+    /// rows; the aggregate `context_tokens` pair still drives the
+    /// meter denominator above it.
+    pub context_items: Vec<atelier_core::context::ContextItemSummary>,
+}
+
+/// Snapshot of the active model + strategy. Mirror of the GUI's
+/// `CurrentModel` shape in `crates/atelier-gui/ui/src/lib/state.ts` so
+/// the two surfaces stay byte-for-byte equivalent on the bus.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CurrentModel {
+    /// `<provider>:<model>` form (e.g. `local:qwen2.5-coder:7b`).
+    pub model_id: String,
+    /// Endpoint URL; empty for adapters that don't speak HTTP.
+    pub base_url: String,
+    /// `native_tool` / `json_sentinel` / `regex_prose`.
+    pub strategy: &'static str,
+    /// `cache_hit` / `probed` / `reprobed` / `not_cached`.
+    pub outcome: String,
 }
 
 /// Currently-pending hunk approval, mirror of
@@ -209,6 +235,22 @@ impl ConversationRole {
 /// entries today). The TUI's running total ignores `None` rather than
 /// treating it as zero so the meter isn't artificially deflated by
 /// no-cost bookkeeping rows.
+/// Convert a Debug-formatted enum variant (`"CacheHit"`,
+/// `"NotCached"`) into the snake_case wire form the rest of the
+/// system uses (`"cache_hit"`, `"not_cached"`). Used so the TUI's
+/// footer matches the GUI's `serde(rename_all = "snake_case")`
+/// projection byte-for-byte.
+fn snake_case_debug(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 4);
+    for (i, ch) in s.chars().enumerate() {
+        if ch.is_ascii_uppercase() && i > 0 {
+            out.push('_');
+        }
+        out.push(ch.to_ascii_lowercase());
+    }
+    out
+}
+
 fn ledger_entry_cost(entry: &LedgerEntry) -> Option<f64> {
     match entry {
         LedgerEntry::ModelCall { cost_usd, .. } | LedgerEntry::ToolCall { cost_usd, .. } => {
@@ -299,8 +341,34 @@ impl AppState {
                 // files arrive separately and populate `recent_edits`.
                 self.pending_approval = None;
             }
-            SessionEvent::ModelProfileLoaded { .. }
-            | SessionEvent::IllegalTransitionAttempted { .. }
+            SessionEvent::ModelProfileLoaded {
+                model_id,
+                base_url,
+                strategy,
+                outcome,
+            } => {
+                // v52 — record the active model so the footer can
+                // render it. Outcome is Debug-then-lowercased to
+                // mirror the GUI's snake_case label (`cache_hit` etc.
+                // — `format!("{outcome:?}")` returns `CacheHit`; we
+                // convert in two steps so the wire shape matches the
+                // GUI exactly: insert an underscore at each lower-to-
+                // upper boundary, then lowercase the whole thing).
+                self.current_model = Some(CurrentModel {
+                    model_id: model_id.clone(),
+                    base_url: base_url.clone(),
+                    strategy: strategy.as_str(),
+                    outcome: snake_case_debug(&format!("{outcome:?}")),
+                });
+            }
+            SessionEvent::ContextItems { items } => {
+                // v53 — replace the in-memory snapshot wholesale.
+                // Items arrive at every turn boundary, so a stale
+                // partial render is never preferable to the fresh
+                // snapshot.
+                self.context_items = items.clone();
+            }
+            SessionEvent::IllegalTransitionAttempted { .. }
             | SessionEvent::Cancelled
             | SessionEvent::Shutdown => {}
         }
@@ -468,6 +536,10 @@ pub fn project_event(evt: &SessionEvent) -> EventLine {
                 format!("{outcome:?}").to_lowercase()
             ),
         },
+        SessionEvent::ContextItems { items } => EventLine {
+            kind: "ContextItems",
+            detail: format!("{} items", items.len()),
+        },
         SessionEvent::Shutdown => EventLine {
             kind: "Shutdown",
             detail: String::new(),
@@ -525,18 +597,30 @@ pub fn render(state: &AppState, area: Rect, buf: &mut Buffer) {
         .split(body[1]);
     render_diff(state, bottom[0], buf);
 
-    // Right column splits between the two meters + a tail of the event log.
+    // Right column splits between the two aggregate meters, the
+    // v53 §5 Context panel (flex height — this is where the per-row
+    // "what's in my agent's head" detail lives), and a bounded tail
+    // of the event log so developer-facing transitions stay visible
+    // without crowding out the user-facing context pane.
+    //
+    // Constraint shape is chosen so the two gauges keep their full
+    // 2-row allocation even when the host terminal is tight: fixed
+    // Lengths total 8 rows; the §5 panel takes whatever's left
+    // (with a soft floor of 2 rows so the empty-state line is
+    // visible).
     let right = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(2), // cost gauge
-            Constraint::Length(2), // context gauge
-            Constraint::Min(1),    // tail of event log
+            Constraint::Length(2), // context gauge (aggregate)
+            Constraint::Min(2),    // §5 context items (per-row, flex)
+            Constraint::Length(4), // bounded event log tail
         ])
         .split(bottom[1]);
     render_cost_meter(state, right[0], buf);
     render_context_meter(state, right[1], buf);
-    render_event_log(state, right[2], buf);
+    render_context_pane(state, right[2], buf);
+    render_event_log(state, right[3], buf);
 
     render_help(state, vertical[2], buf);
 }
@@ -899,6 +983,88 @@ fn render_context_meter(state: &AppState, area: Rect, buf: &mut Buffer) {
     Widget::render(gauge, area, buf);
 }
 
+/// v53 — §5 Context panel. Renders one row per `ContextItemSummary`
+/// in insertion order with three pieces of information per row:
+///
+///   * **token count** (right-aligned in fixed-width column), with a
+///     colour cue for the source (`exact` cyan / `approx` yellow /
+///     `unavailable` dim) so the user knows how much to trust the
+///     number;
+///   * **provenance badge** (`init` / `usr` / `tool` / `mem` / `pin`)
+///     — short labels for the why-here trace;
+///   * **label** (file path or truncated text).
+///
+/// Empty state shows a single dim line ("no context items yet")
+/// rather than a blank pane — the user always wants to know whether
+/// the pane is alive but empty or actually broken.
+fn render_context_pane(state: &AppState, area: Rect, buf: &mut Buffer) {
+    let block = Block::default().borders(Borders::TOP).title(" §5 Context ");
+
+    if state.context_items.is_empty() {
+        let p = Paragraph::new(Line::from(Span::styled(
+            "no context items yet",
+            Style::default().fg(Color::DarkGray),
+        )))
+        .block(block);
+        Widget::render(p, area, buf);
+        return;
+    }
+
+    let rows: Vec<ListItem> = state
+        .context_items
+        .iter()
+        .map(|item| {
+            let tokens_label = format_tokens_for_pane(item.tokens);
+            let tokens_style = match item.token_source.as_str() {
+                "exact" => Style::default().fg(Color::Cyan),
+                "approx" => Style::default().fg(Color::Yellow),
+                _ => Style::default().fg(Color::DarkGray),
+            };
+            let badge = provenance_badge(&item.provenance);
+            let badge_style = provenance_badge_style(&item.provenance);
+            let pin = if item.pinned { "📌 " } else { "   " };
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("{tokens_label} "), tokens_style),
+                Span::styled(format!("{badge} "), badge_style),
+                Span::raw(pin.to_string()),
+                Span::raw(item.label.clone()),
+            ]))
+        })
+        .collect();
+    Widget::render(List::new(rows).block(block), area, buf);
+}
+
+/// Right-pad token count into a 5-wide column so the badges line up.
+fn format_tokens_for_pane(n: u32) -> String {
+    format!("{n:>5}")
+}
+
+/// Short provenance label that fits in a narrow column. Stable
+/// labels so the §5 mechanical gate can assert on them.
+fn provenance_badge(provenance: &str) -> &'static str {
+    match provenance {
+        "initial" => "init",
+        "user_attached" => "usr ",
+        "tool_result" => "tool",
+        "memory_promoted" => "mem ",
+        "pinned_by_user" => "pin ",
+        "assistant_turn" => "asst",
+        _ => "????",
+    }
+}
+
+fn provenance_badge_style(provenance: &str) -> Style {
+    match provenance {
+        "initial" => Style::default().fg(Color::DarkGray),
+        "user_attached" => Style::default().fg(Color::Green),
+        "tool_result" => Style::default().fg(Color::Magenta),
+        "memory_promoted" => Style::default().fg(Color::Blue),
+        "pinned_by_user" => Style::default().fg(Color::Yellow),
+        "assistant_turn" => Style::default().fg(Color::White),
+        _ => Style::default().fg(Color::Red),
+    }
+}
+
 fn render_event_log(state: &AppState, area: Rect, buf: &mut Buffer) {
     // Newest first, tail to the available rows.
     let visible: Vec<ListItem> = state
@@ -929,7 +1095,9 @@ fn render_event_log(state: &AppState, area: Rect, buf: &mut Buffer) {
 
 fn render_help(state: &AppState, area: Rect, buf: &mut Buffer) {
     // Pending state takes precedence in the footer: the user needs to
-    // see the approval keys when a decision is required.
+    // see the approval keys when a decision is required. The model
+    // badge is suppressed during pending so the approval message is
+    // unambiguous.
     if state.pending_approval.is_some() {
         Widget::render(
             Paragraph::new(" APPROVAL REQUIRED · y accept all · n reject all · q quit ").style(
@@ -942,19 +1110,87 @@ fn render_help(state: &AppState, area: Rect, buf: &mut Buffer) {
         );
         return;
     }
+
+    let left = render_help_left(state);
+    match state.current_model.as_ref() {
+        // No model badge yet — let the help text fill the line.
+        None => Widget::render(
+            Paragraph::new(left).style(Style::default().fg(Color::DarkGray)),
+            area,
+            buf,
+        ),
+        // Split: left flexible, right fixed-width. The badge's column
+        // count is derived from the underlying strings so the layout
+        // matches what `render_help_right_model` is about to render.
+        Some(model) => {
+            let right_width = model_badge_width(model);
+            let chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Min(0), Constraint::Length(right_width)])
+                .split(area);
+            Widget::render(
+                Paragraph::new(left).style(Style::default().fg(Color::DarkGray)),
+                chunks[0],
+                buf,
+            );
+            Widget::render(render_help_right_model(model), chunks[1], buf);
+        }
+    }
+}
+
+/// Build the left-side help text — scrubber keys + optional pinned-
+/// scroll hint. Always present; never empty.
+fn render_help_left(state: &AppState) -> String {
     let scrub_note = if state.scrub_offset.is_some() {
         "  [pinned: g returns to HEAD]"
     } else {
         ""
     };
-    Widget::render(
-        Paragraph::new(format!(
-            " q/Esc/Ctrl-C quit · [ prev · ] next · g HEAD{scrub_note}"
-        ))
-        .style(Style::default().fg(Color::DarkGray)),
-        area,
-        buf,
-    );
+    format!(" q/Esc/Ctrl-C quit · [ prev · ] next · g HEAD{scrub_note}")
+}
+
+/// Build the right-side model badge as a styled
+/// [`ratatui::widgets::Paragraph`]. Always returns a paragraph (the
+/// caller already established that `state.current_model` is `Some`).
+/// Mirrors the GUI's bottom-right model widget — same field order,
+/// same separator, same colour family (cyan id · green strategy ·
+/// dim outcome).
+fn render_help_right_model(model: &CurrentModel) -> Paragraph<'static> {
+    // Trailing space so the badge doesn't hit the terminal edge.
+    let line = Line::from(vec![
+        Span::styled(
+            model.model_id.clone(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" · ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            model.strategy.to_string(),
+            Style::default().fg(Color::Green),
+        ),
+        Span::styled(" · ", Style::default().fg(Color::DarkGray)),
+        Span::styled(model.outcome.clone(), Style::default().fg(Color::DarkGray)),
+        Span::raw(" "),
+    ]);
+    Paragraph::new(line)
+}
+
+/// Visual column count of the model badge — the sum of each
+/// segment's display width plus the three `" · "` separators and the
+/// trailing space. Kept in lockstep with [`render_help_right_model`]
+/// so the layout split matches what gets rendered. The fields are
+/// ASCII-only in practice (model ids, strategy labels, outcome
+/// labels), so `chars().count()` is the right column measure;
+/// `unicode-width` would be the heavier-weight upgrade if a future
+/// model id grew non-ASCII characters.
+fn model_badge_width(model: &CurrentModel) -> u16 {
+    let id = model.model_id.chars().count();
+    let strategy = model.strategy.chars().count();
+    let outcome = model.outcome.chars().count();
+    // Three " · " separators (3 cols each) + leading 0 + trailing 1.
+    let total = id + strategy + outcome + (3 * 3) + 1;
+    total.try_into().unwrap_or(u16::MAX)
 }
 
 /// Outcome of a single keypress, dispatched by [`run`]'s event loop.
@@ -1517,6 +1753,202 @@ mod tests {
         let area = Rect::new(0, 0, 100, 24);
         let rendered = render_to_string(&s, area);
         assert!(rendered.contains("quit"), "got:\n{rendered}");
+    }
+
+    // ---------- v52: model badge in the footer ----------
+
+    fn fixture_model() -> CurrentModel {
+        CurrentModel {
+            model_id: "local:qwen2.5-coder:7b".into(),
+            base_url: "http://localhost:11434/v1".into(),
+            strategy: "json_sentinel",
+            outcome: "cache_hit".into(),
+        }
+    }
+
+    #[test]
+    fn snake_case_debug_handles_camel_case() {
+        assert_eq!(snake_case_debug("CacheHit"), "cache_hit");
+        assert_eq!(snake_case_debug("NotCached"), "not_cached");
+        assert_eq!(snake_case_debug("Probed"), "probed");
+        // Leading uppercase doesn't get a leading underscore.
+        assert_eq!(snake_case_debug("A"), "a");
+    }
+
+    #[test]
+    fn apply_model_profile_loaded_populates_current_model() {
+        use atelier_core::adapter::model_profile::ProbeLoadOutcome;
+        use atelier_core::protocol_strategy::Strategy;
+
+        let mut s = AppState::new();
+        s.apply(&SessionEvent::ModelProfileLoaded {
+            model_id: "local:qwen2.5-coder:7b".into(),
+            base_url: "http://localhost:11434/v1".into(),
+            strategy: Strategy::JsonSentinel,
+            outcome: ProbeLoadOutcome::CacheHit,
+        });
+        let m = s.current_model.expect("current_model populated");
+        assert_eq!(m.model_id, "local:qwen2.5-coder:7b");
+        assert_eq!(m.base_url, "http://localhost:11434/v1");
+        assert_eq!(m.strategy, "json_sentinel");
+        assert_eq!(m.outcome, "cache_hit");
+    }
+
+    #[test]
+    fn footer_shows_model_id_after_model_profile_loaded() {
+        let mut s = AppState::new();
+        s.current_model = Some(fixture_model());
+        let area = Rect::new(0, 0, 120, 24);
+        let rendered = render_to_string(&s, area);
+        // Footer line is the last row; check the model badge is present.
+        assert!(
+            rendered.contains("local:qwen2.5-coder:7b"),
+            "got:\n{rendered}"
+        );
+        assert!(rendered.contains("json_sentinel"), "got:\n{rendered}");
+        assert!(rendered.contains("cache_hit"), "got:\n{rendered}");
+    }
+
+    #[test]
+    fn footer_omits_model_badge_when_no_model_loaded_yet() {
+        let s = AppState::new();
+        let area = Rect::new(0, 0, 120, 24);
+        let rendered = render_to_string(&s, area);
+        // Neither label nor a `no model` placeholder — pre-event the
+        // footer is just the help line.
+        assert!(!rendered.contains("cache_hit"), "got:\n{rendered}");
+        assert!(!rendered.contains("json_sentinel"), "got:\n{rendered}");
+    }
+
+    #[test]
+    fn footer_suppresses_model_badge_during_pending_approval() {
+        let mut s = AppState::new();
+        s.current_model = Some(fixture_model());
+        // Inject a pending-approval so render_help takes the
+        // approval branch.
+        s.pending_approval = Some(PendingApproval {
+            commit_id: uuid::Uuid::nil(),
+            files: vec![],
+        });
+        let area = Rect::new(0, 0, 120, 24);
+        let rendered = render_to_string(&s, area);
+        assert!(rendered.contains("APPROVAL REQUIRED"), "got:\n{rendered}");
+        // Model badge must be hidden so the approval prompt is the
+        // unambiguous focus.
+        assert!(!rendered.contains("qwen2.5-coder"), "got:\n{rendered}");
+    }
+
+    // ---------- v53: §5 Context pane ----------
+
+    fn ctx_item(
+        id: &str,
+        kind: &str,
+        label: &str,
+        provenance: &str,
+        tokens: u32,
+        token_source: &str,
+    ) -> atelier_core::context::ContextItemSummary {
+        atelier_core::context::ContextItemSummary {
+            id: id.into(),
+            kind: kind.into(),
+            label: label.into(),
+            provenance: provenance.into(),
+            provenance_detail: None,
+            tokens,
+            token_source: token_source.into(),
+            pinned: false,
+        }
+    }
+
+    #[test]
+    fn apply_context_items_replaces_snapshot_wholesale() {
+        let mut s = AppState::new();
+        s.apply(&SessionEvent::ContextItems {
+            items: vec![
+                ctx_item("a", "file_ref", "src/a.rs", "user_attached", 10, "exact"),
+                ctx_item("b", "file_ref", "src/b.rs", "user_attached", 20, "exact"),
+            ],
+        });
+        assert_eq!(s.context_items.len(), 2);
+        // Second snapshot replaces, doesn't append.
+        s.apply(&SessionEvent::ContextItems {
+            items: vec![ctx_item(
+                "c",
+                "file_ref",
+                "src/c.rs",
+                "tool_result",
+                5,
+                "approx",
+            )],
+        });
+        assert_eq!(s.context_items.len(), 1);
+        assert_eq!(s.context_items[0].label, "src/c.rs");
+    }
+
+    #[test]
+    fn render_context_pane_shows_empty_placeholder_with_no_items() {
+        let s = AppState::new();
+        let area = Rect::new(0, 0, 120, 30);
+        let rendered = render_to_string(&s, area);
+        assert!(
+            rendered.contains("no context items yet"),
+            "got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn render_context_pane_lists_items_with_provenance_badges() {
+        let mut s = AppState::new();
+        s.context_items = vec![
+            ctx_item("a", "file_ref", "src/a.rs", "user_attached", 10, "exact"),
+            ctx_item("b", "file_ref", "src/b.rs", "tool_result", 5, "approx"),
+        ];
+        let area = Rect::new(0, 0, 120, 30);
+        let rendered = render_to_string(&s, area);
+        assert!(rendered.contains("src/a.rs"), "got:\n{rendered}");
+        assert!(rendered.contains("src/b.rs"), "got:\n{rendered}");
+        // Badges (column-aligned shortcuts).
+        assert!(rendered.contains("usr"), "got:\n{rendered}");
+        assert!(rendered.contains("tool"), "got:\n{rendered}");
+    }
+
+    #[test]
+    fn provenance_badge_labels_are_stable() {
+        // Spec §5 mechanical-gate-friendly: stable strings.
+        assert_eq!(provenance_badge("initial"), "init");
+        assert_eq!(provenance_badge("user_attached"), "usr ");
+        assert_eq!(provenance_badge("tool_result"), "tool");
+        assert_eq!(provenance_badge("memory_promoted"), "mem ");
+        assert_eq!(provenance_badge("pinned_by_user"), "pin ");
+        assert_eq!(provenance_badge("assistant_turn"), "asst");
+        assert_eq!(provenance_badge("garbage"), "????");
+    }
+
+    #[test]
+    fn project_event_for_context_items_includes_count() {
+        let line = project_event(&SessionEvent::ContextItems {
+            items: vec![
+                ctx_item("a", "file_ref", "x", "initial", 1, "exact"),
+                ctx_item("b", "file_ref", "y", "initial", 1, "exact"),
+                ctx_item("c", "file_ref", "z", "initial", 1, "exact"),
+            ],
+        });
+        assert_eq!(line.kind, "ContextItems");
+        assert!(line.detail.contains("3"));
+    }
+
+    #[test]
+    fn model_badge_width_matches_visible_chars() {
+        let m = fixture_model();
+        // "local:qwen2.5-coder:7b" (22) + " · " (3) + "json_sentinel"
+        // (13) + " · " (3) + "cache_hit" (9) + " · " (3) + trailing
+        // " " (1) = 54. Note: there are three separators total.
+        let expected = m.model_id.len()
+            + m.strategy.len()
+            + m.outcome.len()
+            + (3 * 3) // three " · "
+            + 1; // trailing space
+        assert_eq!(model_badge_width(&m) as usize, expected);
     }
 
     #[test]

@@ -23,7 +23,11 @@ Not in TUI (GUI-only): drag-and-drop, Mermaid/D2 inline rendering, browser previ
 
 Panes wired: conversation, textual live diff (Hunks::Lines `@@` headers + `+`/`-`/`Created`/`Deleted`/`Binary`/`Same` badges), plan canvas tree, cost meter, context meter (Gauge with `+N unknown` for `TokenSource::Unavailable` items), scrubber keys `[` / `]` / `g`. `Event::ModelProfileLoaded` (v51) prints a one-line "ModelProfile · strategy=… · …" event in the log so the active §2 strategy is visible at-a-glance.
 
-`cargo test -p atelier-tui` → 46 unit tests against the pure `render` + `apply` + `handle_key` + `project_event` surface, plus the v48 approval-key tests.
+**v52 — model badge in the footer.** The right side of the help line renders `model_id · strategy · outcome` (cyan bold id, green strategy, dim outcome) for the lifetime of the run. Pre-event the footer is just the scrub-key help line; during an outstanding hunk approval the badge is suppressed so the yellow `APPROVAL REQUIRED` banner is the unambiguous focus. The split is one ratatui `Layout::default().direction(Horizontal).constraints([Min(0), Length(badge_width)])`; `model_badge_width()` computes the column count from the underlying strings so the layout matches what gets rendered.
+
+**v53 — §5 Context panel in the right column.** Between the aggregate context gauge and the bounded event-log tail, `render_context_pane` renders one row per `ContextItemSummary` from `Event::ContextItems`: right-aligned token count (cyan exact / yellow approx / dim unavailable), short provenance badge (`init`/`usr`/`tool`/`mem`/`pin`/`asst`), pin glyph, label. Empty-state placeholder before the first event. Constraint shape `[Length(2), Length(2), Min(2), Length(4)]` keeps the gauges' 2-row allocation intact even when the terminal is tight; the §5 panel takes whatever remains.
+
+`cargo test -p atelier-tui` → 62 unit tests (v53: +10) against the pure `render` + `apply` + `handle_key` + `project_event` + model-badge + §5-panel surface, plus the v48 approval-key tests.
 
 What's not here yet: file tree (needs `OnDiskSession.files` snapshot the actor doesn't surface), `g <n>` step-index prefix (needs §4 time-travel step count to clamp against).
 
@@ -32,7 +36,7 @@ What's not here yet: file tree (needs `OnDiskSession.files` snapshot the actor d
 ```sh
 cargo run -p atelier-tui -- "rename my-script"   # driver mode
 cargo run -p atelier-tui                          # viewer mode
-cargo test -p atelier-tui                         # 46 unit tests
+cargo test -p atelier-tui                         # 62 unit tests (v53)
 ```
 
 ## Architecture

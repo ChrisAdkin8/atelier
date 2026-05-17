@@ -27,6 +27,7 @@
   import DiffPane from './lib/components/DiffPane.svelte'
   import PlanPane from './lib/components/PlanPane.svelte'
   import MetersPane from './lib/components/MetersPane.svelte'
+  import ContextPane from './lib/components/ContextPane.svelte'
   import Composer from './lib/components/Composer.svelte'
 
   // NOTE (v49): named `app` rather than `state` because svelte-check
@@ -115,24 +116,54 @@
       />
     </div>
     <div class="pane-slot meters-slot">
-      <MetersPane
-        totalCostUsd={app.totalCostUsd}
-        knownTokens={app.contextTokens.known}
-        unknownTokens={app.contextTokens.unknown}
-        contextWindowTokens={app.contextWindowTokens}
-      />
+      <!-- v53: the bottom-right slot stacks the aggregate Meters
+           (cost + context-window gauge) above the per-item Context
+           panel. The Meters pane stays fixed-height; the Context
+           pane fills the remaining vertical space because per-item
+           rows are what scales as the agent's context grows. -->
+      <div class="meters-stack">
+        <MetersPane
+          totalCostUsd={app.totalCostUsd}
+          knownTokens={app.contextTokens.known}
+          unknownTokens={app.contextTokens.unknown}
+          contextWindowTokens={app.contextWindowTokens}
+        />
+        <ContextPane items={app.contextItems} />
+      </div>
     </div>
   </main>
 
   <Composer busy={composerBusy} />
 
   <footer class="help">
+    <!-- Left side: scrub keys. -->
     <span>[ prev</span>
     <span>] next</span>
     <span>g HEAD</span>
     {#if app.scrubOffset != null}
       <span class="hint">[pinned: g returns to HEAD]</span>
     {/if}
+
+    <!-- v52 — active BYOM model on the right side. Empty until the
+         Runner emits its one-shot `ModelProfileLoaded` event at session
+         start; populated thereafter for the lifetime of the run. -->
+    <span class="model-badge" aria-label="active model">
+      {#if app.currentModel}
+        <span class="model-id" title={app.currentModel.baseUrl}>
+          {app.currentModel.modelId}
+        </span>
+        <span class="model-sep">·</span>
+        <span class="model-strategy" title="§2 emission strategy">
+          {app.currentModel.strategy}
+        </span>
+        <span class="model-sep">·</span>
+        <span class="model-outcome" title="probe outcome">
+          {app.currentModel.outcome}
+        </span>
+      {:else}
+        <span class="model-pending">no model</span>
+      {/if}
+    </span>
   </footer>
 </div>
 
@@ -177,6 +208,19 @@
     grid-row: 2;
     grid-column: 2;
   }
+  /* v53 — Meters stays fixed-height (its content is two gauges);
+     Context takes the remaining vertical space because the row
+     count grows with the agent's working set. */
+  .meters-stack {
+    display: grid;
+    grid-template-rows: auto 1fr;
+    gap: var(--gap-pane, 0.5rem);
+    width: 100%;
+    min-height: 0;
+  }
+  .meters-stack > :global(:first-child) {
+    flex: none;
+  }
   .help {
     display: flex;
     gap: 1rem;
@@ -190,5 +234,33 @@
   }
   .help .hint {
     color: var(--accent-yellow);
+  }
+  /* v52 — push the model badge to the right edge of the footer.
+     `margin-left: auto` is the canonical flexbox idiom for "all
+     siblings hug the left; this one hugs the right." */
+  .help .model-badge {
+    margin-left: auto;
+    display: inline-flex;
+    align-items: baseline;
+    gap: 0.35rem;
+    color: var(--fg-default, var(--fg-dim));
+  }
+  .help .model-id {
+    color: var(--accent-cyan, #6cc);
+    font-weight: 500;
+  }
+  .help .model-strategy {
+    color: var(--accent-green, #9c9);
+  }
+  .help .model-outcome {
+    color: var(--fg-dim);
+  }
+  .help .model-sep {
+    color: var(--fg-dim);
+    opacity: 0.6;
+  }
+  .help .model-pending {
+    color: var(--fg-dim);
+    font-style: italic;
   }
 </style>

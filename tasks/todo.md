@@ -8,7 +8,7 @@ Pre-implementation of the harness itself. The supporting test rig is fully wired
 - 52/52 artifacts validate against schemas
 - 112/112 rig self-tests pass
 - 11/11 canonical fixtures pass dry-run
-- 472/472 `atelier-core` Rust unit tests (v51: +34 from `adapter/model_profile.rs` — cache I/O round-trip, pure `decide_strategy`, probe driver against MockAdapter, `ProfileStore::load_or_probe` cache-hit / cache-miss / force-reprobe / stale-schema / ephemeral / fatal-error paths)
+- 498/498 `atelier-core` Rust unit tests (v53: +12 from `config.rs` reshape + `context.rs` ContextItemSummary)
 - Reference machine spec populated (M1 Pro / 32 GB / macOS 26.4.1)
 - CI runs `make check` on push/PR (`.github/workflows/check.yml`); separate `rust` job runs `cargo fmt`, `cargo clippy -D warnings`, `cargo test -p atelier-core` on Ubuntu + macOS with the pinned 1.85.0 toolchain
 - Cross-schema `$ref` resolves via the shared registry in `tests/_schema_helpers.py` (session → envelope, subagent-type → routing, tool manifest → `_implementation.v1.json`)
@@ -292,13 +292,13 @@ Steps (1) + (2) close §3's 10-file-rename gate and §5's context-panel-API + ca
 - [ ] UX target: refactor without conversation pane open
 
 ### §5 Visible context / memory / plan
-- [ ] Context-panel API (token counts + why-here trace per item)
-- [ ] Pin / unpin / evict with cache-bust confirm
+- [x] Context-panel API (token counts + why-here trace per item) — v53. `ContextItemSummary` + `ContextManager::summarise()` ride on the bus as `Event::ContextItems`; rendered by both UIs (Svelte `ContextPane.svelte`, TUI `render_context_pane`) with token counts colour-cued by source and short provenance badges. Runner builds the per-message projection via `summarise_messages`.
+- [~] Pin / unpin / evict with cache-bust confirm — partial. Data layer landed v44 (`ContextManager::{pin, unpin, evict}` + `CacheBustEvent` → ledger); the §5 panel renders the `pinned` flag with a glyph; UI buttons for the round-trip are deferred.
 - [ ] Memory panel: editable cards + last-used + one-click promote
 - [ ] Plan canvas (editable tree; reorder, constraints, manual mark-done)
 - [ ] Non-destructive compaction; expansion gated with cost disclosure
 - [ ] Mental-model panel — off by default, cost-disclosed on enable
-- [ ] **Mechanical gate:** API assertions for token counts and why-here; cache-bust ledger entry on eviction
+- [x] **Mechanical gate:** API assertions for token counts and why-here; cache-bust ledger entry on eviction — v53. `Event::ContextItems` ships per-item `tokens` + `token_source` + `provenance` (+ optional detail) across all four crates with tests asserting stable labels; the `CacheBustEvent` → `Ledger::cache_bust_from` path landed in v44 (`LedgerEntry::CacheBust`).
 - [ ] UX target: "find what agent knows about file X" median <5 s
 
 ---

@@ -111,6 +111,106 @@ pub enum Payload {
     },
 }
 
+/// v53 — flat projection of a [`ContextItem`] for the §5 Context
+/// panel. Built by [`ContextManager::summarise`]; broadcast on the
+/// bus via `Event::ContextItems`; consumed by the GUI + TUI.
+///
+/// The shape is intentionally string-typed (kind / provenance /
+/// token_source as `String`) so the JSON projection in
+/// `atelier-gui/src/lib.rs::bridge_event` can ship straight through
+/// to the webview without a second mapping layer. The `_detail`
+/// field carries the variant-specific payload (tool_call_id, card_id,
+/// note) for provenances that have one; `None` otherwise.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextItemSummary {
+    /// UUID of the item, as a string. Lets the UI correlate
+    /// successive snapshots — same id across re-emits = same item.
+    pub id: String,
+    /// Payload kind label: `"file_ref"`, `"inline_text"`, `"blob_ref"`.
+    pub kind: String,
+    /// Short human-readable label. File path for `FileRef`, a
+    /// truncated first line for `InlineText`, a `sha256:abcd…` prefix
+    /// for `BlobRef`.
+    pub label: String,
+    /// Provenance label: `"initial"`, `"user_attached"`,
+    /// `"tool_result"`, `"memory_promoted"`, `"pinned_by_user"`.
+    pub provenance: String,
+    /// Optional provenance detail — tool-call id, memory-card id,
+    /// or the user-supplied note. `None` for `Initial`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance_detail: Option<String>,
+    /// Token count this item contributes to the context window.
+    pub tokens: u32,
+    /// Source of the count: `"exact"` / `"approx"` / `"unavailable"`.
+    pub token_source: String,
+    /// `true` iff the user has explicitly pinned this item.
+    pub pinned: bool,
+}
+
+impl ContextItemSummary {
+    /// Build a summary from a `ContextItem`. Caps the inline-text
+    /// label at 80 characters so long pastes don't dominate the
+    /// pane; the full payload remains on the actor side.
+    pub fn from_item(item: &ContextItem) -> Self {
+        let (kind, label) = match &item.payload {
+            Payload::FileRef { path, line_range } => {
+                let label = match line_range {
+                    Some((s, e)) => format!("{path}:{s}-{e}"),
+                    None => path.clone(),
+                };
+                ("file_ref".to_string(), label)
+            }
+            Payload::InlineText { text } => {
+                let first_line = text.lines().next().unwrap_or("");
+                let truncated: String = first_line.chars().take(80).collect();
+                let label = if truncated.chars().count() < first_line.chars().count() {
+                    format!("{truncated}…")
+                } else {
+                    truncated
+                };
+                ("inline_text".to_string(), label)
+            }
+            Payload::BlobRef {
+                sha256_hex,
+                mime_type,
+            } => {
+                let prefix: String = sha256_hex.chars().take(8).collect();
+                let label = match mime_type {
+                    Some(m) => format!("sha256:{prefix}… ({m})"),
+                    None => format!("sha256:{prefix}…"),
+                };
+                ("blob_ref".to_string(), label)
+            }
+        };
+        let (provenance, provenance_detail) = match &item.provenance {
+            Provenance::Initial => ("initial".to_string(), None),
+            Provenance::UserAttached { note } => ("user_attached".to_string(), note.clone()),
+            Provenance::ToolResult { tool_call_id } => {
+                ("tool_result".to_string(), Some(tool_call_id.clone()))
+            }
+            Provenance::MemoryPromoted { card_id } => {
+                ("memory_promoted".to_string(), Some(card_id.clone()))
+            }
+            Provenance::PinnedByUser { note } => ("pinned_by_user".to_string(), note.clone()),
+        };
+        let token_source = match item.tokens.source {
+            TokenSource::Exact => "exact".to_string(),
+            TokenSource::Approx => "approx".to_string(),
+            TokenSource::Unavailable => "unavailable".to_string(),
+        };
+        Self {
+            id: item.id.0.to_string(),
+            kind,
+            label,
+            provenance,
+            provenance_detail,
+            tokens: item.tokens.count,
+            token_source,
+            pinned: item.pinned,
+        }
+    }
+}
+
 /// A single context item. Round-trips through serde so it can ride along in
 /// future versions of `schemas/session/v1.json` (the schema's `context`
 /// field is reserved for this).
@@ -283,6 +383,23 @@ impl ContextManager {
             items_with_unknown_tokens: unknown,
             item_count: self.items.len(),
         }
+    }
+
+    /// v53 — projection for the §5 Context panel bus event. Each
+    /// item materialises into a [`ContextItemSummary`] with a short
+    /// human label, a token count + source, and a why-here trace
+    /// (provenance + optional detail). Insertion order preserved so
+    /// the panel renders chronologically.
+    ///
+    /// Distinct from [`token_snapshot`](Self::token_snapshot): that
+    /// gives the aggregate meter denominator; this gives the per-row
+    /// data the panel actually shows. The two are emitted at the
+    /// same turn boundary so the meter and the rows stay coherent.
+    pub fn summarise(&self) -> Vec<ContextItemSummary> {
+        self.items
+            .values()
+            .map(ContextItemSummary::from_item)
+            .collect()
     }
 
     fn with_mut<F: FnOnce(&mut ContextItem)>(
@@ -547,6 +664,132 @@ mod tests {
             let back: Provenance = serde_json::from_str(&json).unwrap();
             assert_eq!(back, prov);
         }
+    }
+
+    // ---------- v53: ContextItemSummary + summarise() ----------
+
+    #[test]
+    fn summary_file_ref_uses_path_as_label() {
+        let i = item(
+            Payload::FileRef {
+                path: "src/lib.rs".into(),
+                line_range: None,
+            },
+            42,
+            TokenSource::Exact,
+            Provenance::UserAttached { note: None },
+        );
+        let s = ContextItemSummary::from_item(&i);
+        assert_eq!(s.kind, "file_ref");
+        assert_eq!(s.label, "src/lib.rs");
+        assert_eq!(s.provenance, "user_attached");
+        assert!(s.provenance_detail.is_none());
+        assert_eq!(s.tokens, 42);
+        assert_eq!(s.token_source, "exact");
+    }
+
+    #[test]
+    fn summary_file_ref_with_line_range_includes_it_in_label() {
+        let i = item(
+            Payload::FileRef {
+                path: "src/lib.rs".into(),
+                line_range: Some((10, 20)),
+            },
+            42,
+            TokenSource::Exact,
+            Provenance::Initial,
+        );
+        let s = ContextItemSummary::from_item(&i);
+        assert_eq!(s.label, "src/lib.rs:10-20");
+        assert_eq!(s.provenance, "initial");
+    }
+
+    #[test]
+    fn summary_inline_text_truncates_long_first_line() {
+        let long = "x".repeat(200);
+        let i = item(
+            Payload::InlineText { text: long },
+            10,
+            TokenSource::Approx,
+            Provenance::ToolResult {
+                tool_call_id: "tc-1".into(),
+            },
+        );
+        let s = ContextItemSummary::from_item(&i);
+        assert_eq!(s.kind, "inline_text");
+        // 80 chars + ellipsis.
+        assert_eq!(s.label.chars().count(), 81);
+        assert!(s.label.ends_with('…'));
+        assert_eq!(s.provenance, "tool_result");
+        assert_eq!(s.provenance_detail.as_deref(), Some("tc-1"));
+    }
+
+    #[test]
+    fn summary_inline_text_short_does_not_truncate() {
+        let i = item(
+            Payload::InlineText {
+                text: "hello world".into(),
+            },
+            1,
+            TokenSource::Approx,
+            Provenance::PinnedByUser {
+                note: Some("important".into()),
+            },
+        );
+        let s = ContextItemSummary::from_item(&i);
+        assert_eq!(s.label, "hello world");
+        assert_eq!(s.provenance, "pinned_by_user");
+        assert_eq!(s.provenance_detail.as_deref(), Some("important"));
+    }
+
+    #[test]
+    fn summary_blob_ref_uses_sha_prefix() {
+        let i = item(
+            Payload::BlobRef {
+                sha256_hex: "deadbeef1234".into(),
+                mime_type: Some("application/json".into()),
+            },
+            5,
+            TokenSource::Unavailable,
+            Provenance::MemoryPromoted {
+                card_id: "card-1".into(),
+            },
+        );
+        let s = ContextItemSummary::from_item(&i);
+        assert_eq!(s.kind, "blob_ref");
+        assert!(s.label.starts_with("sha256:deadbeef"));
+        assert!(s.label.contains("application/json"));
+        assert_eq!(s.token_source, "unavailable");
+        assert_eq!(s.provenance, "memory_promoted");
+        assert_eq!(s.provenance_detail.as_deref(), Some("card-1"));
+    }
+
+    #[test]
+    fn summarise_preserves_insertion_order() {
+        let mut m = ContextManager::new();
+        m.add(file_item("a.rs", 1));
+        m.add(file_item("b.rs", 2));
+        m.add(file_item("c.rs", 3));
+        let v = m.summarise();
+        let labels: Vec<&str> = v.iter().map(|s| s.label.as_str()).collect();
+        assert_eq!(labels, vec!["a.rs", "b.rs", "c.rs"]);
+    }
+
+    #[test]
+    fn summary_round_trips_through_serde() {
+        let i = item(
+            Payload::FileRef {
+                path: "x".into(),
+                line_range: None,
+            },
+            7,
+            TokenSource::Exact,
+            Provenance::Initial,
+        );
+        let s = ContextItemSummary::from_item(&i);
+        let json = serde_json::to_string(&s).unwrap();
+        let back: ContextItemSummary = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, s);
     }
 
     #[test]

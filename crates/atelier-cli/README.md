@@ -39,6 +39,22 @@ Planned (spec §11 credential storage; not yet implemented):
 
 The first time the Runner sees a `(model_id, base_url)` pair under an `openai-compat` provider, it fires two short calibration calls — one tests native tool use, one tests the JSON-sentinel envelope — and caches the resulting `ModelProfile` to `~/.atelier/model_profiles/<sha256-hex>.json`. Cache hit on subsequent runs is free. `Mock` and `Anthropic` are well-characterised and skip the probe by default. CLI overrides: `--no-probe` (skip; use capability defaults) and `--force-probe` (re-probe even if cached). Implementation: [`crates/atelier-core/src/adapter/model_profile.rs`](../atelier-core/src/adapter/model_profile.rs).
 
+## Config file (v53)
+
+CLI flags layer on top of an optional `.atelier/providers.toml` that can declare multiple named profiles. Precedence, top wins:
+
+```text
+  1. CLI flags                                    (per-invocation)
+  2. Resolved profile (from providers.toml)       (named, persisted)
+  3. Built-in defaults                            (mock, 32 turns, auto probe)
+```
+
+The "resolved profile" is whichever `[providers.<name>]` table matches `--profile <NAME>` from the CLI, or the file's top-level `default = "<name>"` field. Per-field flags (`--provider`, `--model`, `--base-url`, `--max-turns`, `--no-probe`/`--force-probe`) still override individual fields of the resolved profile.
+
+The binary prints `atelier run: using config <path> (profile "<name>")` on every run so you can confirm what's active. A malformed file is fatal (exit 2 with the path + parse-error message) — silently ignoring it would let a typo slip the runtime back to defaults. Schema, discovery rules, and validation live in [`crates/atelier-core/src/config.rs`](../atelier-core/src/config.rs); the top-level [README §5](../../README.md#5-configure-with-atelierproviderstoml--v53) walks through the format and worked examples.
+
+In `main.rs` the layering is implemented as a flat top-down narrative — `parse_cli` → resolve workspace → `ProvidersConfig::load` → `resolve_profile` → `resolve_provider_choice` / `resolve_probe_policy` → build `Runner`. Each stage hands typed values to the next; nothing reaches the Runner that hasn't been validated.
+
 ## Build
 
 ```sh

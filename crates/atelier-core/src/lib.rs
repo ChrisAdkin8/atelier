@@ -9,6 +9,7 @@
 //!   §15  Extensibility — MCP-first tool transport
 
 pub mod adapter;
+pub mod config;
 pub mod context;
 pub mod diff;
 pub mod dispatcher;

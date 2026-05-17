@@ -13,6 +13,8 @@ What's wired:
 - **Driver mode**: the `start_demo_run` Tauri command builds a `Runner` with `ApprovalPolicy::AwaitApproval` and a scripted `MockAdapter`, runs it end-to-end against a per-run UUID workspace under `$TMP/atelier-gui-{pid}/{run_uuid}`, and pumps events back to the webview via `EventSink::Callback`.
 - **Hunk accept/reject** (v46 contract + v47 GUI driver wiring): DiffPane renders a pending banner with per-file checkboxes and accept/reject buttons; `submit_approval` Tauri command routes the accept set through the live `SessionDispatcher::submit_approval`.
 - **Defensive plumbing** (v49 audit fixes): concurrent-run guard via `Arc<AtomicBool>`, 64 KB prompt cap, per-run workspace cleanup via `RunCleanup` drop guard, `listenerReady` gate so a fast user can't lose the first run's events, prototype-pollution mitigation via `Object.create(null)` in the diff pane's accept set, `submit_approval` errors surfaced inline.
+- **Model badge** (v52): footer's bottom-right renders `model_id · strategy · outcome` (cyan id, green strategy, dim outcome) for the lifetime of the run. Populated when the Runner emits its one-shot `ModelProfileLoaded` at session start. `App.svelte` uses the canonical `margin-left: auto` flexbox idiom to push the badge to the right edge of the existing footer.
+- **§5 Context panel** (v53): bottom-right slot stacks `MetersPane` (fixed) above the new `ContextPane.svelte` (flex). Renders one row per `ContextItemSummary` from `Event::ContextItems` — right-aligned token count (colour-cued: cyan exact / yellow approx / dim unavailable), short provenance badge (`init`/`usr`/`tool`/`mem`/`pin`/`asst`), and the item's label with a tooltip carrying the full provenance trace. Empty-state placeholder before the first `ContextItems` event.
 
 What's intentionally *not* here yet:
 
@@ -34,7 +36,7 @@ cd crates/atelier-gui && cargo tauri dev              # spins up Vite + Rust she
 For tests without the webview:
 
 ```sh
-cargo test -p atelier-gui              # 12 unit tests on bridge_event
+cargo test -p atelier-gui              # 14 unit tests on bridge_event (v53)
 npm --prefix crates/atelier-gui/ui run check   # svelte-check + tsc
 npm --prefix crates/atelier-gui/ui run build   # production frontend build
 ```
