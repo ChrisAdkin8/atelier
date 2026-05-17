@@ -12,6 +12,10 @@
   <a href="CONTRIBUTING.md"><b>Contributing</b></a>
 </p>
 
+<p align="center">
+  <img src="crates/atelier-gui/icons/icon.png" width="120" alt="atelier app icon — lowercase 'a' in Iowan Old Style on a dark rounded square">
+</p>
+
 # Atelier
 
 [![check](https://github.com/ChrisAdkin8/atelier/actions/workflows/check.yml/badge.svg)](https://github.com/ChrisAdkin8/atelier/actions/workflows/check.yml)
