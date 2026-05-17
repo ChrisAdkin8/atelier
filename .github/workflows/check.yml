@@ -65,6 +65,26 @@ jobs:
           toolchain: "1.85.0"
           components: rustfmt, clippy
 
+      # Tauri 2 (atelier-gui) pulls glib-sys / webkit2gtk-4.1-sys via build.rs;
+      # those need GTK + WebKit system libraries that ubuntu-latest doesn't
+      # ship. Package set tracks Tauri's official Linux prerequisites; bump
+      # webkit2gtk-4.1-dev → 4.2 when the runner moves past 24.04. macOS uses
+      # the system WebKit framework so this step is Linux-only.
+      - name: Install Tauri Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev
+
       # Cache key includes rust-toolchain.toml so a channel bump invalidates the
       # cache. Without it, an old toolchain's target/ artefacts get reused.
       - name: Cache cargo
