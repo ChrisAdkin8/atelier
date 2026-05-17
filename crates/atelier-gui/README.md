@@ -15,6 +15,7 @@ What's wired:
 - **Defensive plumbing** (v49 audit fixes): concurrent-run guard via `Arc<AtomicBool>`, 64 KB prompt cap, per-run workspace cleanup via `RunCleanup` drop guard, `listenerReady` gate so a fast user can't lose the first run's events, prototype-pollution mitigation via `Object.create(null)` in the diff pane's accept set, `submit_approval` errors surfaced inline.
 - **Model badge** (v52): footer's bottom-right renders `model_id · strategy · outcome` (cyan id, green strategy, dim outcome) for the lifetime of the run. Populated when the Runner emits its one-shot `ModelProfileLoaded` at session start. `App.svelte` uses the canonical `margin-left: auto` flexbox idiom to push the badge to the right edge of the existing footer.
 - **§5 Context panel** (v53): bottom-right slot stacks `MetersPane` (fixed) above the new `ContextPane.svelte` (flex). Renders one row per `ContextItemSummary` from `Event::ContextItems` — right-aligned token count (colour-cued: cyan exact / yellow approx / dim unavailable), short provenance badge (`init`/`usr`/`tool`/`mem`/`pin`/`asst`), and the item's label with a tooltip carrying the full provenance trace. Empty-state placeholder before the first `ContextItems` event.
+- **§5 Memory panel** (v54): top-right slot stacks `PlanPane` (fit-content) above the new `MemoryPane.svelte` (flex). Renders one row per `MemoryCardSummary` from `Event::MemoryCards` — pin glyph + bold title + compact `YYYY-MM-DD HH:MM` last-used badge, plus a two-line clamped body preview. Tooltip carries id + full timestamps. Empty-state placeholder until a card source populates the store (Runner ships an empty snapshot today).
 
 What's intentionally *not* here yet:
 
@@ -36,7 +37,7 @@ cd crates/atelier-gui && cargo tauri dev              # spins up Vite + Rust she
 For tests without the webview:
 
 ```sh
-cargo test -p atelier-gui              # 14 unit tests on bridge_event (v53)
+cargo test -p atelier-gui              # 15 unit tests on bridge_event (v54)
 npm --prefix crates/atelier-gui/ui run check   # svelte-check + tsc
 npm --prefix crates/atelier-gui/ui run build   # production frontend build
 ```

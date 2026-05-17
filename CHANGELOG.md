@@ -1,5 +1,83 @@
 # Atelier Spec — Changelog
 
+## v54 — 2026-05-17
+
+**§5 Memory panel.** Companion to v53's Context panel: cards on the bus, rendered in the top-right column of both UIs above what the agent is about to do (Plan) — Memory is what the agent knows long-term, Plan is what it's about to act on. The `MemoryStore` data layer was already in `atelier-core` since v44; v54 adds the bus projection (`MemoryCardSummary` + `Event::MemoryCards`), wires the Runner to publish a snapshot per turn boundary, and lands matching Svelte + ratatui panels. The Runner ships an empty card list today (no card source is wired yet — no add-card tool, no session-replay loader); the event surface is in place so any future card source is purely additive.
+
+Plus a small README cleanup: §6 "Running against a local LLM" merged into the **Quick start** (which already showed the openai-compat one-liner) so users hit the local-LLM walkthrough at the top of the file instead of after the deeper configuration material.
+
+### New surface
+
+- **`crates/atelier-core/src/memory.rs`** — `MemoryCardSummary` flat projection of `MemoryCard`:
+  - `title` = first non-empty line of `content` (markdown convention).
+  - `body_preview` = remaining text, capped at `MEMORY_BODY_PREVIEW_CHARS = 200` with a trailing ellipsis when truncated.
+  - `created_at`, `last_used`, `pinned` carried through verbatim.
+  - `MemoryStore::summarise()` materialises the per-card list in insertion order.
+  - 8 new tests cover title extraction (incl. leading-blank-line skip), preview truncation at the cap, empty/single-line edge cases, pinned + timestamp pass-through, insertion-order preservation, and serde round-trip.
+
+- **`crates/atelier-core/src/session.rs`** — new `Event::MemoryCards { cards: Vec<MemoryCardSummary> }` variant. Emitted at the same turn boundary as `ContextItems` so the two §5 panels (context = per-turn, memory = durable) update coherently.
+
+- **`crates/atelier-cli/src/runner.rs`** — per-run `MemoryStore::new()` (empty for now); `Event::MemoryCards { cards: memory_store.summarise() }` broadcast alongside `Event::ContextItems` after each turn. The empty snapshot is intentional — surfaces the "no memory cards yet" placeholder so the panel is visibly idle rather than indistinguishable from a broken render.
+
+- **`crates/atelier-gui/`** — new Svelte `MemoryPane.svelte`:
+  - One row per card: optional pin glyph (📌), title (bold), compact `YYYY-MM-DD HH:MM` "last used" badge on the right, two-line body preview clamped via `line-clamp: 2` (with `-webkit-line-clamp` for browser compatibility).
+  - Tooltip carries full id + created/last-used timestamps so the panel surface stays compact.
+  - Pinned rows get a subtle yellow accent — mirrors ContextPane.
+  - Wired into `App.svelte`'s top-right slot stacked under `PlanPane` via a `plan-stack` CSS grid (`auto / 1fr` so Plan keeps fit-content height and Memory takes the flex space).
+  - `bridge_event` projection passes `MemoryCardSummary` through `serde_json::to_value` (snake_case wire shape, directly renderable). 1 new bridge test.
+  - `state.ts`: `MemoryCardSummary` type, `applyEvent` reducer arm (wholesale-replace policy mirroring `ContextItems`), `initialState.memoryCards: []`.
+
+- **`crates/atelier-tui/`** — new `render_memory_pane`:
+  - Top-right column split vertically 50/50 between Plan (top) and Memory (bottom) — mirrors the GUI's stack and keeps both §5 surfaces in the highest-visibility column.
+  - Per row: pin glyph, title (bold + white when pinned), compact `YYYY-MM-DD HH:MM` last-used timestamp. Body preview deliberately omitted — the TUI row budget is tighter than the GUI's, and title + last-used are the high-value scanning fields.
+  - `short_timestamp(iso)` helper trims ISO 8601 to date + hh:mm; tolerates non-ISO input by passing it through verbatim so a malformed timestamp is visible rather than dropped.
+  - `AppState.memory_cards` field; `apply` arm with wholesale-replace; `project_event` arm yields `"MemoryCards N cards"` event-log line. 3 new tests.
+
+### README cleanup
+
+- **`README.md`** — §6 "Running against a local LLM" merged into **Quick start** as a subsection. The walkthrough (Ollama install + `--provider openai-compat --base-url …` invocation + other-servers table + probe-on-first-use note) now lives at the top of the file. §5 (Configure with providers.toml) stays where it is as the deeper configuration reference; the Quick start subsection links to it.
+
+### Demo flow
+
+```sh
+$ atelier run "<prompt>"
+…
+# Bus emits, per turn:
+#   ContextSnapshot { known_tokens, unknown_tokens }       (aggregate meter)
+#   ContextItems { items: [system_prompt, user_message, …] }  (per-row Context panel)
+#   MemoryCards { cards: [] }                              (per-row Memory panel — empty until a source wires in)
+
+# GUI top-right column:
+#   ┌─ Plan ──────┐
+#   │ • step 1    │   plan canvas tree (existing v44)
+#   │ • step 2    │
+#   ├─ §5 Memory ─┤
+#   │ no memory   │   empty state until a card source is wired
+#   │   cards yet │
+#   └─────────────┘
+
+# TUI top-right column has the same split via Layout::default()
+# .direction(Vertical).constraints([Percentage(50), Percentage(50)]).
+```
+
+### Verified
+
+- `cargo fmt --check` clean.
+- `cargo clippy --workspace --all-targets -- -D warnings` clean.
+- `cargo test --workspace` → **atelier-core 506** (+8 from `memory::MemoryCardSummary`) + **atelier-cli 19** + **atelier-gui 15** (+1 bridge) + **atelier-tui 65** (+3 panel) = **605 passing**.
+- `make check` — schemas + 52 artifacts + 112 rig tests + 11 dry-runs all OK.
+- `npm run check` in `crates/atelier-gui/ui/` — 96 files (+1 `MemoryPane.svelte`), 0 errors, 0 warnings.
+- `cargo doc --workspace --no-deps` emits 0 warnings.
+
+### §5 mechanical gate status (post-v54)
+- ✅ Context-panel API (v53)
+- ✅ Mechanical gate: API assertions for token counts + why-here (v53) + cache-bust ledger entry on eviction (v44)
+- ⏳ Pin / unpin / evict UI round-trip — data layer + render done; UI buttons + dispatcher round-trip deferred
+- ✅ **Memory panel: editable cards + last-used + one-click promote** (v54 — view path; the "editable" + "one-click promote" UI round-trips land with the pin/unpin UI work)
+- ⏳ Plan canvas editing
+- ⏳ Non-destructive compaction; expansion gated with cost disclosure
+- ⏳ Mental-model panel
+
 ## v53 — 2026-05-17
 
 **`.atelier/providers.toml` (named profiles) + §5 Context panel.** Two pieces landed together: the v52 single-provider config is reshaped into a multi-profile TOML with a `default` selector and a `--profile` CLI flag, and the GUI + TUI gain a §5 Context panel showing per-item token counts + provenance ("why is this in my agent's head?"). The §5 panel ties off one of the few remaining stated Phase C mechanical gates (`API assertions for token counts and why-here; cache-bust ledger entry on eviction`).

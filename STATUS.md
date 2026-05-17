@@ -27,6 +27,7 @@ The Phase A foundation, Phase B protocol/verification subset, and Phase C worksp
 - §1 probe-on-first-use (v51) — `crates/atelier-core/src/adapter/model_profile.rs`. Caches per-model strategy observations to `~/.atelier/model_profiles/<hash>.json`; `Event::ModelProfileLoaded` surfaces to UIs; `ProfileStore::load_or_probe` is the entry point.
 - **`.atelier/providers.toml` loader (v53)** — `crates/atelier-core/src/config.rs`. Multi-profile TOML at `<repo>/.atelier/providers.toml` (project) then `~/.atelier/providers.toml` (user); `default = "<name>"` + `[providers.<name>]` tables; `--profile <NAME>` switches between them; CLI flags still win field-by-field. GUI + TUI footers render the active model id + §2 strategy + probe outcome in the bottom-right.
 - **§5 Context panel (v53)** — `crates/atelier-core/src/context.rs::ContextItemSummary` + `ContextManager::summarise()` + `Event::ContextItems`; rendered by both UIs (Svelte `ContextPane.svelte`, TUI `render_context_pane`) as per-row token counts + provenance badges. Closes the stated §5 mechanical gate ("API assertions for token counts and why-here; cache-bust ledger entry on eviction").
+- **§5 Memory panel (v54)** — `crates/atelier-core/src/memory.rs::MemoryCardSummary` + `MemoryStore::summarise()` + `Event::MemoryCards`; rendered by both UIs (Svelte `MemoryPane.svelte`, TUI `render_memory_pane`) above their respective Plan panes. Empty until a card source wires in; event surface in place so future cards-from-tool / cards-from-replay are purely additive.
 
 **CLI + drivers**
 - `atelier init` — bootstraps `.atelier/{sessions,tools,hooks}/` + seeded `ATELIER.md` + `.gitignore` append. Idempotent.
@@ -43,10 +44,10 @@ The Phase A foundation, Phase B protocol/verification subset, and Phase C worksp
 | Canonical workload fixtures | 11 (10 Py + 1 TS) | [`tests/workload/canonical/`](tests/workload/canonical/) |
 | Validated artifacts | 52 | [`tests/`](tests/) |
 | Rig self-tests | 112 | [`tests/`](tests/) |
-| `atelier-core` Rust unit tests | 498 | [`crates/atelier-core/src/`](crates/atelier-core/src/) |
+| `atelier-core` Rust unit tests | 506 | [`crates/atelier-core/src/`](crates/atelier-core/src/) |
 | `atelier-cli` integration tests | 19 | [`crates/atelier-cli/tests/`](crates/atelier-cli/tests/) |
-| `atelier-gui` unit tests | 14 | [`crates/atelier-gui/src/lib.rs`](crates/atelier-gui/src/lib.rs) |
-| `atelier-tui` unit tests | 62 | [`crates/atelier-tui/src/lib.rs`](crates/atelier-tui/src/lib.rs) |
+| `atelier-gui` unit tests | 15 | [`crates/atelier-gui/src/lib.rs`](crates/atelier-gui/src/lib.rs) |
+| `atelier-tui` unit tests | 65 | [`crates/atelier-tui/src/lib.rs`](crates/atelier-tui/src/lib.rs) |
 | Phased build plan | see file | [`tasks/todo.md`](tasks/todo.md) |
 
 `make check` runs schema meta-validation → artifact validation → rig self-tests → workload dry-run. All currently green; CI runs the same pipeline on every push/PR alongside `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace`.

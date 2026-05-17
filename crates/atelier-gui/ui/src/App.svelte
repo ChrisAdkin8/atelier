@@ -28,6 +28,7 @@
   import PlanPane from './lib/components/PlanPane.svelte'
   import MetersPane from './lib/components/MetersPane.svelte'
   import ContextPane from './lib/components/ContextPane.svelte'
+  import MemoryPane from './lib/components/MemoryPane.svelte'
   import Composer from './lib/components/Composer.svelte'
 
   // NOTE (v49): named `app` rather than `state` because svelte-check
@@ -107,7 +108,15 @@
       <ConversationPane conversation={app.conversation} />
     </div>
     <div class="pane-slot plan-slot">
-      <PlanPane planSteps={app.planSteps} />
+      <!-- v54: the top-right slot stacks the Plan canvas above
+           the Memory panel. Plan reflects what the agent is about
+           to do; Memory reflects what it remembers long-term. The
+           two are upstream of every other §5 surface so they
+           share the highest-visibility column. -->
+      <div class="plan-stack">
+        <PlanPane planSteps={app.planSteps} />
+        <MemoryPane cards={app.memoryCards} />
+      </div>
     </div>
     <div class="pane-slot diff-slot">
       <DiffPane
@@ -220,6 +229,16 @@
   }
   .meters-stack > :global(:first-child) {
     flex: none;
+  }
+  /* v54 — Plan stays at the top (typically 4-8 short rows, so a
+     soft `auto` height suits it); Memory takes the remaining
+     vertical space because card counts can grow. */
+  .plan-stack {
+    display: grid;
+    grid-template-rows: auto 1fr;
+    gap: var(--gap-pane, 0.5rem);
+    width: 100%;
+    min-height: 0;
   }
   .help {
     display: flex;

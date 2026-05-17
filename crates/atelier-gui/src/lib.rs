@@ -449,6 +449,13 @@ pub fn bridge_event(evt: &SessionEvent) -> BridgedEvent {
                 "items": serde_json::to_value(items).unwrap_or(Value::Null),
             }),
         },
+        SessionEvent::MemoryCards { cards } => BridgedEvent {
+            kind: "MemoryCards",
+            payload: json!({
+                // `MemoryCardSummary` derives Serialize verbatim.
+                "cards": serde_json::to_value(cards).unwrap_or(Value::Null),
+            }),
+        },
         SessionEvent::Shutdown => BridgedEvent {
             kind: "Shutdown",
             payload: Value::Null,
@@ -601,6 +608,30 @@ mod tests {
         assert_eq!(b.payload["committed"][0], "a.rs");
         assert_eq!(b.payload["committed"][1], "b.rs");
         assert_eq!(b.payload["dropped"][0], "c.rs");
+    }
+
+    #[test]
+    fn bridge_memory_cards_passes_cards_through_verbatim() {
+        use atelier_core::memory::MemoryCardSummary;
+
+        let cards = vec![MemoryCardSummary {
+            id: "mem-1".into(),
+            title: "user prefers tabs".into(),
+            body_preview: "chose this in turn 2".into(),
+            created_at: "2026-05-17T10:00:00Z".into(),
+            last_used: "2026-05-17T12:00:00Z".into(),
+            pinned: true,
+        }];
+        let b = bridge_event(&SessionEvent::MemoryCards {
+            cards: cards.clone(),
+        });
+        assert_eq!(b.kind, "MemoryCards");
+        let wire = b.payload["cards"].as_array().expect("cards array");
+        assert_eq!(wire.len(), 1);
+        assert_eq!(wire[0]["id"], "mem-1");
+        assert_eq!(wire[0]["title"], "user prefers tabs");
+        assert_eq!(wire[0]["pinned"], true);
+        assert_eq!(wire[0]["body_preview"], "chose this in turn 2");
     }
 
     #[test]

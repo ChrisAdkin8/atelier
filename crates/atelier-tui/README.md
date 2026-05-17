@@ -27,7 +27,9 @@ Panes wired: conversation, textual live diff (Hunks::Lines `@@` headers + `+`/`-
 
 **v53 — §5 Context panel in the right column.** Between the aggregate context gauge and the bounded event-log tail, `render_context_pane` renders one row per `ContextItemSummary` from `Event::ContextItems`: right-aligned token count (cyan exact / yellow approx / dim unavailable), short provenance badge (`init`/`usr`/`tool`/`mem`/`pin`/`asst`), pin glyph, label. Empty-state placeholder before the first event. Constraint shape `[Length(2), Length(2), Min(2), Length(4)]` keeps the gauges' 2-row allocation intact even when the terminal is tight; the §5 panel takes whatever remains.
 
-`cargo test -p atelier-tui` → 62 unit tests (v53: +10) against the pure `render` + `apply` + `handle_key` + `project_event` + model-badge + §5-panel surface, plus the v48 approval-key tests.
+**v54 — §5 Memory panel in the top-right column.** Top-right column split vertically 50/50 between Plan (top) and Memory (bottom) — mirrors the GUI's stack. `render_memory_pane` shows one row per `MemoryCardSummary`: pin glyph + bold title (white when pinned) + compact `YYYY-MM-DD HH:MM` last-used timestamp. Body preview deliberately omitted (the GUI has more row budget; the TUI prioritises title + last-used). Empty-state placeholder until a card source populates the store.
+
+`cargo test -p atelier-tui` → 65 unit tests (v54: +3) against the pure `render` + `apply` + `handle_key` + `project_event` + model-badge + §5 Context + §5 Memory surface, plus the v48 approval-key tests.
 
 What's not here yet: file tree (needs `OnDiskSession.files` snapshot the actor doesn't surface), `g <n>` step-index prefix (needs §4 time-travel step count to clamp against).
 
@@ -36,7 +38,7 @@ What's not here yet: file tree (needs `OnDiskSession.files` snapshot the actor d
 ```sh
 cargo run -p atelier-tui -- "rename my-script"   # driver mode
 cargo run -p atelier-tui                          # viewer mode
-cargo test -p atelier-tui                         # 62 unit tests (v53)
+cargo test -p atelier-tui                         # 65 unit tests (v54)
 ```
 
 ## Architecture

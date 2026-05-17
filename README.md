@@ -56,9 +56,42 @@ atelier run --provider openai-compat \
     --model local:qwen2.5-coder:7b "<prompt>"
 ```
 
-Re-typing the flags gets old; pin them as a named profile in `.atelier/providers.toml` (see [§5 below](#5-configure-with-atelierproviderstoml--v53)). The Tauri GUI (`cargo tauri dev` from `crates/atelier-gui/`) and the ratatui TUI (`cargo run -p atelier-tui -- "<prompt>"`) drive the same loop with a live multi-pane workspace.
+### Running against a local LLM
 
-For the deeper "what's happening under the hood" walkthrough, read on through **Configure and run** below. For first-time build prerequisites (rustup, pinned toolchain), see [Build](#build).
+Quickest path on macOS / Linux is Ollama:
+
+```sh
+brew install ollama && brew services start ollama   # macOS; or `ollama serve` in a terminal
+ollama pull qwen2.5-coder:7b                        # ~4.7 GB; fits comfortably on an M1 Pro
+atelier run --provider openai-compat \
+    --base-url http://localhost:11434/v1 \
+    --model local:qwen2.5-coder:7b "<prompt>"
+```
+
+Other servers, same `--provider openai-compat` switch — only `--base-url` changes: LM Studio (`http://localhost:1234/v1`), llama-server (`http://localhost:8080/v1`), vLLM / sglang (`http://localhost:8000/v1`), OpenAI itself (omit `--base-url`; set `OPENAI_API_KEY`).
+
+On first use the harness fires a short calibration probe (one native tool-call test + one JSON-sentinel envelope test) and writes a `ModelProfile` to `~/.atelier/model_profiles/<hash>.json`. Subsequent runs against the same `(model, base_url)` pair use the cached profile. The §1 conformance tracker still degrades at runtime if the live model misbehaves — the cached profile is the *initial* strategy hint, not a contract.
+
+### Skip the re-typing
+
+Pin the flags as a named profile in `.atelier/providers.toml` (see [§5 below](#5-configure-with-atelierproviderstoml--v53) for the full format and override-precedence rules):
+
+```toml
+default = "local"
+
+[providers.local]
+provider = "openai-compat"
+base_url = "http://localhost:11434/v1"
+model    = "local:qwen2.5-coder:7b"
+```
+
+Now `atelier run "<prompt>"` is enough. Add a `[providers.cloud]` entry pointing at Anthropic and you can flip between them with `atelier run --profile cloud "…"`.
+
+### Multi-pane workspace
+
+The Tauri GUI (`cargo tauri dev` from `crates/atelier-gui/`) and the ratatui TUI (`cargo run -p atelier-tui -- "<prompt>"`) drive the same loop with a live multi-pane workspace (conversation, diff with hunk accept/reject, plan canvas, cost + context meters, §5 Context panel, footer with active model badge).
+
+For the deeper "what's happening under the hood" walkthrough, read on through **Configure and run** below. For first-time build prerequisites (rustup, pinned toolchain), see [Build](#build); piece-by-piece state of the build is in [`STATUS.md`](STATUS.md#phase-a--piece-by-piece-tracker).
 
 ---
 
@@ -333,34 +366,6 @@ atelier run: config error: config at /Users/you/proj/.atelier/providers.toml
 is invalid: [providers.cloud].base_url is only valid when [providers.cloud].provider = "openai-compat"
 (got provider = "anthropic")
 ```
-
-### 6. Running against a local LLM
-
-The `atelier run` invocation is in [Quick start](#quick-start); the local-LLM-specific setup is below. Quickest path on macOS / Linux:
-
-```sh
-brew install ollama && brew services start ollama   # macOS; or `ollama serve` in a terminal
-ollama pull qwen2.5-coder:7b                        # ~4.7 GB; fits comfortably on an M1 Pro
-```
-
-To make this the default for the project so future invocations only need a prompt, drop the same values into `<repo>/.atelier/providers.toml` as a named profile (see [§5](#5-configure-with-atelierproviderstoml--v53)):
-
-```toml
-default = "local"
-
-[providers.local]
-provider = "openai-compat"
-base_url = "http://localhost:11434/v1"
-model    = "local:qwen2.5-coder:7b"
-```
-
-Now `atelier run "<prompt>"` is enough — the `local` profile is picked up via `default`. Add a `[providers.cloud]` entry pointing at Anthropic and you can flip between them with `atelier run --profile cloud "…"`.
-
-On first use the harness fires a short calibration probe (one native tool-call test + one JSON-sentinel envelope test) and writes a `ModelProfile` to `~/.atelier/model_profiles/<hash>.json`. Subsequent runs against the same `(model, base_url)` pair use the cached profile. The §1 conformance tracker still degrades at runtime if the live model misbehaves — the cached profile is the *initial* strategy hint, not a contract.
-
-Other servers, same `--provider openai-compat` switch: LM Studio (`http://localhost:1234/v1`), llama-server (`http://localhost:8080/v1`), vLLM / sglang (`http://localhost:8000/v1`), OpenAI itself (omit `--base-url`; set `OPENAI_API_KEY`).
-
-Piece-by-piece state of the build — what's landed, what's planned, where each piece lives in the tree — is in [`STATUS.md`](STATUS.md#phase-a--piece-by-piece-tracker).
 
 ---
 

@@ -131,6 +131,20 @@ export type ContextItemSummary = {
   pinned: boolean
 }
 
+/// v54 — one row in the §5 Memory panel. Mirror of
+/// `atelier_core::memory::MemoryCardSummary`; bridged across
+/// `atelier://event` as the payload of the `MemoryCards` event.
+export type MemoryCardSummary = {
+  id: string
+  title: string
+  body_preview: string
+  /// RFC 3339.
+  created_at: string
+  /// RFC 3339.
+  last_used: string
+  pinned: boolean
+}
+
 /// v52 — the active BYOM model, populated by `ModelProfileLoaded`.
 /// Rendered in the footer (`App.svelte`) on the right-hand side so the
 /// user always knows which model + strategy the run is using.
@@ -175,6 +189,11 @@ export type AppState = {
   /// `ContextItems` event; populated by the Runner at every turn
   /// boundary alongside the aggregate `ContextSnapshot`.
   contextItems: ContextItemSummary[]
+  /// v54 — §5 Memory panel rows. Replaced wholesale on each
+  /// `MemoryCards` event; populated by the Runner alongside
+  /// `ContextItems`. Distinct from context items: cards are
+  /// durable across sessions; context items are per-turn.
+  memoryCards: MemoryCardSummary[]
 }
 
 export function initialState(): AppState {
@@ -192,6 +211,7 @@ export function initialState(): AppState {
     pendingApproval: null,
     currentModel: null,
     contextItems: [],
+    memoryCards: [],
   }
 }
 
@@ -280,6 +300,11 @@ export function applyEvent(state: AppState, evt: BridgedEvent): AppState {
       // preferable to the freshest snapshot.
       const p = evt.payload as { items: ContextItemSummary[] }
       return { ...state, events, contextItems: p.items ?? [] }
+    }
+    case 'MemoryCards': {
+      // v54 — same wholesale-replace policy as ContextItems.
+      const p = evt.payload as { cards: MemoryCardSummary[] }
+      return { ...state, events, memoryCards: p.cards ?? [] }
     }
     // Variants we don't fold into pane state — just the event log.
     case 'IllegalTransitionAttempted':
@@ -396,6 +421,11 @@ export function projectEvent(evt: BridgedEvent): EventLogEntry {
       const p = evt.payload as { items?: unknown[] }
       const n = Array.isArray(p.items) ? p.items.length : 0
       return { kind: 'ContextItems', detail: `${n} items` }
+    }
+    case 'MemoryCards': {
+      const p = evt.payload as { cards?: unknown[] }
+      const n = Array.isArray(p.cards) ? p.cards.length : 0
+      return { kind: 'MemoryCards', detail: `${n} cards` }
     }
     case 'Cancelled':
       return { kind: 'Cancelled', detail: '' }

@@ -164,6 +164,23 @@ impl MemoryStore {
         self.items.is_empty()
     }
 
+    /// v54 — projection for the §5 Memory panel bus event. Each
+    /// card materialises into a [`MemoryCardSummary`] with a short
+    /// title (first line of `content`), a truncated body preview,
+    /// and the lifecycle fields the panel renders (`created_at`,
+    /// `last_used`, `pinned`).
+    ///
+    /// Distinct from [`Self::to_vec`]: that gives the full cards
+    /// for on-disk round-trip; this gives the UI-friendly
+    /// projection for the per-row panel. Insertion order preserved
+    /// so the panel renders chronologically.
+    pub fn summarise(&self) -> Vec<MemoryCardSummary> {
+        self.items
+            .values()
+            .map(MemoryCardSummary::from_card)
+            .collect()
+    }
+
     fn with_mut<F: FnOnce(&mut MemoryCard)>(&mut self, id: &str, f: F) -> Result<(), MemoryError> {
         let order = *self
             .by_id
@@ -181,6 +198,83 @@ impl MemoryStore {
 pub struct PromoteOutput {
     pub relative_path: String,
     pub bytes: Vec<u8>,
+}
+
+/// v54 — flat projection of a [`MemoryCard`] for the §5 Memory
+/// panel. Built by [`MemoryStore::summarise`]; broadcast on the
+/// bus via `Event::MemoryCards`; consumed by the GUI + TUI.
+///
+/// The shape mirrors [`crate::context::ContextItemSummary`] in
+/// spirit: string-typed and self-describing so the wire format is
+/// directly renderable. Title + body preview are derived from
+/// `content`: the first line is the title (markdown convention),
+/// the remainder (capped at 200 chars) is the preview.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryCardSummary {
+    /// Card id, opaque to the panel — used as a stable React-style
+    /// key for diffed re-renders.
+    pub id: String,
+    /// First non-empty line of `content`. Empty string when the
+    /// card has no content at all (degenerate case; the schema
+    /// allows it but the panel renders a placeholder).
+    pub title: String,
+    /// Remainder of `content` after the title, capped at
+    /// [`MEMORY_BODY_PREVIEW_CHARS`] characters with a trailing
+    /// ellipsis when truncated. Lets the panel show a one-glance
+    /// hint of the card body without expanding the whole thing.
+    pub body_preview: String,
+    /// RFC 3339, from [`MemoryCard::created_at`].
+    pub created_at: String,
+    /// RFC 3339, from [`MemoryCard::last_used`]. Lets the panel
+    /// sort or badge least-recently-used cards.
+    pub last_used: String,
+    /// `true` iff [`MemoryCard::pinned`].
+    pub pinned: bool,
+}
+
+/// Cap on [`MemoryCardSummary::body_preview`] before truncation —
+/// 200 chars is enough for one or two short paragraphs to be
+/// visible without dominating the panel.
+pub const MEMORY_BODY_PREVIEW_CHARS: usize = 200;
+
+impl MemoryCardSummary {
+    /// Build a summary from a `MemoryCard`. Splits `content` into a
+    /// title (first non-empty line) and a preview (remaining text,
+    /// capped at [`MEMORY_BODY_PREVIEW_CHARS`]).
+    pub fn from_card(card: &MemoryCard) -> Self {
+        let (title, body_preview) = split_title_and_preview(&card.content);
+        Self {
+            id: card.id.clone(),
+            title,
+            body_preview,
+            created_at: card.created_at.clone(),
+            last_used: card.last_used.clone(),
+            pinned: card.pinned,
+        }
+    }
+}
+
+/// Pure helper for [`MemoryCardSummary::from_card`]. Walks
+/// `content` once: first non-empty trimmed line becomes the title;
+/// remaining text (with leading whitespace stripped) is the body,
+/// truncated at the configured cap with a trailing ellipsis.
+fn split_title_and_preview(content: &str) -> (String, String) {
+    let mut lines = content.lines();
+    let title = lines
+        .by_ref()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("")
+        .to_string();
+    let remaining: String = lines.collect::<Vec<_>>().join("\n");
+    let remaining = remaining.trim_start().to_string();
+    let preview = if remaining.chars().count() > MEMORY_BODY_PREVIEW_CHARS {
+        let truncated: String = remaining.chars().take(MEMORY_BODY_PREVIEW_CHARS).collect();
+        format!("{truncated}…")
+    } else {
+        remaining
+    };
+    (title, preview)
 }
 
 /// Conservative filename derivation — keep ASCII-alphanumeric / `-` / `_`,
@@ -381,6 +475,100 @@ mod tests {
     fn rejects_unknown_fields_at_card_level() {
         let raw = r#"{"id":"x","content":"x","created_at":"x","last_used":"x","extra":1}"#;
         assert!(serde_json::from_str::<MemoryCard>(raw).is_err());
+    }
+
+    // ---------- v54: MemoryCardSummary + summarise() ----------
+
+    fn fixture_card(id: &str, content: &str) -> MemoryCard {
+        MemoryCard {
+            id: id.into(),
+            content: content.into(),
+            created_at: "2026-05-17T10:00:00Z".into(),
+            last_used: "2026-05-17T12:00:00Z".into(),
+            pinned: false,
+        }
+    }
+
+    #[test]
+    fn summary_title_is_first_non_empty_line() {
+        let c = fixture_card(
+            "mem-1",
+            "User prefers tabs over spaces.\n\nDetails: chose this in turn 2.",
+        );
+        let s = MemoryCardSummary::from_card(&c);
+        assert_eq!(s.id, "mem-1");
+        assert_eq!(s.title, "User prefers tabs over spaces.");
+        assert_eq!(s.body_preview, "Details: chose this in turn 2.");
+    }
+
+    #[test]
+    fn summary_skips_leading_blank_lines_for_title() {
+        let c = fixture_card("mem-1", "\n   \nFirst real line\nsecond line");
+        let s = MemoryCardSummary::from_card(&c);
+        assert_eq!(s.title, "First real line");
+        assert_eq!(s.body_preview, "second line");
+    }
+
+    #[test]
+    fn summary_empty_content_yields_empty_title_and_preview() {
+        let c = fixture_card("mem-1", "");
+        let s = MemoryCardSummary::from_card(&c);
+        assert_eq!(s.title, "");
+        assert_eq!(s.body_preview, "");
+    }
+
+    #[test]
+    fn summary_single_line_has_empty_preview() {
+        let c = fixture_card("mem-1", "just one line, no body");
+        let s = MemoryCardSummary::from_card(&c);
+        assert_eq!(s.title, "just one line, no body");
+        assert_eq!(s.body_preview, "");
+    }
+
+    #[test]
+    fn summary_body_preview_truncates_with_ellipsis_past_cap() {
+        let body = "x".repeat(MEMORY_BODY_PREVIEW_CHARS + 50);
+        let content = format!("title line\n{body}");
+        let c = fixture_card("mem-1", &content);
+        let s = MemoryCardSummary::from_card(&c);
+        assert_eq!(s.title, "title line");
+        // Cap chars + ellipsis.
+        assert_eq!(
+            s.body_preview.chars().count(),
+            MEMORY_BODY_PREVIEW_CHARS + 1
+        );
+        assert!(s.body_preview.ends_with('…'));
+    }
+
+    #[test]
+    fn summary_carries_pinned_and_timestamps() {
+        let mut c = fixture_card("mem-1", "title\nbody");
+        c.pinned = true;
+        c.last_used = "2026-05-17T13:00:00Z".into();
+        let s = MemoryCardSummary::from_card(&c);
+        assert!(s.pinned);
+        assert_eq!(s.last_used, "2026-05-17T13:00:00Z");
+        assert_eq!(s.created_at, "2026-05-17T10:00:00Z");
+    }
+
+    #[test]
+    fn summarise_preserves_insertion_order() {
+        let mut m = MemoryStore::new();
+        m.add(fixture_card("a", "first")).unwrap();
+        m.add(fixture_card("b", "second")).unwrap();
+        m.add(fixture_card("c", "third")).unwrap();
+        let v = m.summarise();
+        let ids: Vec<&str> = v.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn summary_round_trips_through_serde() {
+        let c = fixture_card("mem-1", "title\nbody");
+        let s = MemoryCardSummary::from_card(&c);
+        let json = serde_json::to_string(&s).unwrap();
+        let back: MemoryCardSummary = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, s);
     }
 
     #[test]

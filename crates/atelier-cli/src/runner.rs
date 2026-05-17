@@ -25,6 +25,7 @@ use atelier_core::{
     dod::DodConfig,
     hooks::HookSet,
     ledger::Ledger,
+    memory::MemoryStore,
     persistence::OnDiskSession,
     plan::PlanCanvas,
     protocol::Envelope,
@@ -470,6 +471,12 @@ impl Runner {
         // 5. Turn loop.
         let session_id = session_handle.id();
         let mut messages: Vec<Message> = vec![Message::text(Role::User, prompt.clone())];
+        // v54 — per-run MemoryStore. Today empty: no card source is
+        // wired (no add-card tool, no session-replay loader). The
+        // Memory panel renders the empty-state until a future
+        // change populates the store; the event surface is in
+        // place so that future change is purely additive.
+        let memory_store = MemoryStore::new();
         // Broadcast the initial user prompt so the conversation pane
         // catches up before the first turn. Best-effort send (no
         // subscribers is fine — see SessionDispatcher::dispatch).
@@ -621,6 +628,19 @@ impl Runner {
             let context_items = summarise_messages(&messages);
             let _ = bus.send(Event::ContextItems {
                 items: context_items,
+            });
+
+            // v54 — §5 Memory panel snapshot. The Runner doesn't
+            // yet wire a MemoryStore source (no card-add tool, no
+            // promote-from-context UI round-trip), so today this
+            // ships an empty snapshot — but the event surface is
+            // in place so the panel renders an "empty memory"
+            // placeholder rather than nothing at all, and any
+            // future card-source (a tool that calls
+            // `MemoryStore::add`, a session-replay loader, etc.)
+            // plugs in by populating the store + re-emitting.
+            let _ = bus.send(Event::MemoryCards {
+                cards: memory_store.summarise(),
             });
 
             // 8. If the envelope or scripted response says done, exit.

@@ -6,7 +6,7 @@ Spec references: §1, §2, §2.5, §3, §4, §7, §11, §14, §15.
 
 ## Current state
 
-The crate is **end-to-end runnable** for Phase A/B/C scope: three BYOM adapters live (Mock, Anthropic, OpenAI-compatible — the third covers LM Studio, llama-server, vLLM, sglang, Ollama, OpenAI itself), seven built-in tools route through the §15 dispatcher with §11 sandbox enforcement, hunk accept/reject lives end-to-end via `SessionDispatcher::submit_approval`, v51 adds probe-on-first-use model adaptation, v52 added a TOML config loader, and v53 reshapes that loader into `.atelier/providers.toml` with named profiles + adds the §5 Context panel data layer (`ContextItemSummary` + `ContextManager::summarise()` + `Event::ContextItems`). **498 unit tests, all green** (v53: +12 from `config` + `context`). The only big Phase A item still outstanding is the §15 MCP client (gated on the `rmcp` spike outcome) — the built-in tool dispatcher is the same surface a future MCP client will share, so all hook / ledger / verification wiring is in place.
+The crate is **end-to-end runnable** for Phase A/B/C scope: three BYOM adapters live (Mock, Anthropic, OpenAI-compatible — the third covers LM Studio, llama-server, vLLM, sglang, Ollama, OpenAI itself), seven built-in tools route through the §15 dispatcher with §11 sandbox enforcement, hunk accept/reject lives end-to-end via `SessionDispatcher::submit_approval`, v51 adds probe-on-first-use model adaptation, v53 reshapes the TOML config into multi-profile `.atelier/providers.toml` + adds the §5 Context panel data layer, and v54 adds the §5 Memory panel data layer (`MemoryCardSummary` + `MemoryStore::summarise()` + `Event::MemoryCards`). **506 unit tests, all green** (v54: +8 from `memory`). The only big Phase A item still outstanding is the §15 MCP client (gated on the `rmcp` spike outcome) — the built-in tool dispatcher is the same surface a future MCP client will share, so all hook / ledger / verification wiring is in place.
 
 | Module | Spec | What it gives you |
 |---|---|---|
@@ -39,7 +39,7 @@ The crate is **end-to-end runnable** for Phase A/B/C scope: three BYOM adapters 
 
 ```
 cargo build -p atelier-core
-cargo test  -p atelier-core   # 498 tests (v53)
+cargo test  -p atelier-core   # 506 tests (v54)
 ```
 
 ## `rmcp` dependency wiring

@@ -173,6 +173,21 @@ pub enum Event {
         items: Vec<crate::context::ContextItemSummary>,
     },
 
+    /// v54 — per-card snapshot of the §5 memory subsystem for the
+    /// Memory panel ("what does the agent know about me long-term?").
+    /// Emitted at the same turn boundary as [`Event::ContextItems`] so
+    /// "context" (current-turn-only) and "memory" (durable) render
+    /// coherently. Cards appear in insertion order; the stable `id`
+    /// per card lets UIs animate adds/promotions/evictions.
+    ///
+    /// Distinct from `ContextItems` in semantics: context items live
+    /// for one prompt-cache lifetime and contribute to the token
+    /// meter; memory cards survive across sessions and are surfaced
+    /// to the model only when explicitly promoted into context.
+    MemoryCards {
+        cards: Vec<crate::memory::MemoryCardSummary>,
+    },
+
     /// Spec §3 "Hunk accept / reject": a tool staged writes and the
     /// dispatcher is waiting for the user's accept-set decision before
     /// the rename phase. UI consumers render each `files[i]` (path +

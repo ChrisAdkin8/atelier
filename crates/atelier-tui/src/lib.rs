@@ -117,6 +117,11 @@ pub struct AppState {
     /// rows; the aggregate `context_tokens` pair still drives the
     /// meter denominator above it.
     pub context_items: Vec<atelier_core::context::ContextItemSummary>,
+    /// v54 — per-card §5 memory snapshot, rebuilt whole-cloth on
+    /// every `Event::MemoryCards`. The Memory pane renders these
+    /// rows; cards are durable across sessions and distinct from
+    /// the per-turn context items above.
+    pub memory_cards: Vec<atelier_core::memory::MemoryCardSummary>,
 }
 
 /// Snapshot of the active model + strategy. Mirror of the GUI's
@@ -368,6 +373,12 @@ impl AppState {
                 // snapshot.
                 self.context_items = items.clone();
             }
+            SessionEvent::MemoryCards { cards } => {
+                // v54 — same wholesale-replace policy as
+                // ContextItems. Cards arrive at every turn so the
+                // panel never displays stale state.
+                self.memory_cards = cards.clone();
+            }
             SessionEvent::IllegalTransitionAttempted { .. }
             | SessionEvent::Cancelled
             | SessionEvent::Shutdown => {}
@@ -540,6 +551,10 @@ pub fn project_event(evt: &SessionEvent) -> EventLine {
             kind: "ContextItems",
             detail: format!("{} items", items.len()),
         },
+        SessionEvent::MemoryCards { cards } => EventLine {
+            kind: "MemoryCards",
+            detail: format!("{} cards", cards.len()),
+        },
         SessionEvent::Shutdown => EventLine {
             kind: "Shutdown",
             detail: String::new(),
@@ -582,13 +597,23 @@ pub fn render(state: &AppState, area: Rect, buf: &mut Buffer) {
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(vertical[1]);
 
-    // Top row: conversation | plan
+    // Top row: conversation | (plan + memory stack).
+    // v54 — Plan reflects what the agent is about to do; Memory
+    // reflects what it remembers long-term. Both belong in the
+    // highest-visibility right column and don't compete with the
+    // diff / context detail below.
     let top = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
         .split(body[0]);
     render_conversation(state, top[0], buf);
-    render_plan(state, top[1], buf);
+
+    let top_right = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(top[1]);
+    render_plan(state, top_right[0], buf);
+    render_memory_pane(state, top_right[1], buf);
 
     // Bottom row: diff | (meters + event log)
     let bottom = Layout::default()
@@ -1062,6 +1087,72 @@ fn provenance_badge_style(provenance: &str) -> Style {
         "pinned_by_user" => Style::default().fg(Color::Yellow),
         "assistant_turn" => Style::default().fg(Color::White),
         _ => Style::default().fg(Color::Red),
+    }
+}
+
+/// v54 — §5 Memory panel. One row per `MemoryCardSummary` in
+/// insertion order. Each row shows:
+///
+///   * a pin glyph when [`MemoryCardSummary::pinned`];
+///   * the title (first non-empty line of the card body);
+///   * the last-used timestamp, right-aligned and condensed to
+///     `YYYY-MM-DD HH:MM` for column-fit.
+///
+/// Empty state renders a single dim line so the pane is visibly
+/// idle rather than indistinguishable from a broken render. The
+/// preview body intentionally doesn't render here — the TUI's row
+/// budget is much tighter than the GUI's, and the title +
+/// last-used badge are the high-value fields for scanning.
+fn render_memory_pane(state: &AppState, area: Rect, buf: &mut Buffer) {
+    let block = Block::default().borders(Borders::TOP).title(" §5 Memory ");
+
+    if state.memory_cards.is_empty() {
+        let p = Paragraph::new(Line::from(Span::styled(
+            "no memory cards yet",
+            Style::default().fg(Color::DarkGray),
+        )))
+        .block(block);
+        Widget::render(p, area, buf);
+        return;
+    }
+
+    let rows: Vec<ListItem> = state
+        .memory_cards
+        .iter()
+        .map(|card| {
+            let pin = if card.pinned { "📌 " } else { "   " };
+            let title_style = if card.pinned {
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            let when = short_timestamp(&card.last_used);
+            ListItem::new(Line::from(vec![
+                Span::raw(pin.to_string()),
+                Span::styled(card.title.clone(), title_style),
+                Span::raw("  "),
+                Span::styled(when, Style::default().fg(Color::DarkGray)),
+            ]))
+        })
+        .collect();
+    Widget::render(List::new(rows).block(block), area, buf);
+}
+
+/// Compact form of an RFC 3339 timestamp for narrow columns —
+/// `"2026-05-17T12:34:56Z"` → `"2026-05-17 12:34"`. Returns the
+/// input unchanged when it doesn't look like ISO 8601 so a
+/// malformed timestamp is visibly malformed rather than silently
+/// dropped.
+fn short_timestamp(iso: &str) -> String {
+    // Pattern: 10 chars date + 'T' + 5 chars hh:mm. Anything else
+    // (empty, garbled, future timezone offsets) round-trips
+    // verbatim — the panel surface is informational, not parsed.
+    if iso.len() >= 16 && iso.as_bytes().get(10) == Some(&b'T') {
+        format!("{} {}", &iso[..10], &iso[11..16])
+    } else {
+        iso.to_string()
     }
 }
 
@@ -1935,6 +2026,65 @@ mod tests {
         });
         assert_eq!(line.kind, "ContextItems");
         assert!(line.detail.contains("3"));
+    }
+
+    // ---------- v54: §5 Memory pane ----------
+
+    fn mem_card(
+        id: &str,
+        title: &str,
+        last_used: &str,
+        pinned: bool,
+    ) -> atelier_core::memory::MemoryCardSummary {
+        atelier_core::memory::MemoryCardSummary {
+            id: id.into(),
+            title: title.into(),
+            body_preview: "body".into(),
+            created_at: "2026-05-17T10:00:00Z".into(),
+            last_used: last_used.into(),
+            pinned,
+        }
+    }
+
+    #[test]
+    fn apply_memory_cards_replaces_snapshot_wholesale() {
+        let mut s = AppState::new();
+        s.apply(&SessionEvent::MemoryCards {
+            cards: vec![
+                mem_card("a", "first", "2026-05-17T12:00:00Z", false),
+                mem_card("b", "second", "2026-05-17T12:30:00Z", true),
+            ],
+        });
+        assert_eq!(s.memory_cards.len(), 2);
+        s.apply(&SessionEvent::MemoryCards {
+            cards: vec![mem_card("c", "third", "2026-05-17T13:00:00Z", false)],
+        });
+        assert_eq!(s.memory_cards.len(), 1);
+        assert_eq!(s.memory_cards[0].title, "third");
+    }
+
+    #[test]
+    fn render_memory_pane_empty_state_visible() {
+        let s = AppState::new();
+        let area = Rect::new(0, 0, 120, 30);
+        let rendered = render_to_string(&s, area);
+        assert!(rendered.contains("no memory cards yet"), "got:\n{rendered}");
+    }
+
+    #[test]
+    fn render_memory_pane_shows_title_and_timestamp() {
+        let mut s = AppState::new();
+        s.memory_cards = vec![mem_card(
+            "mem-1",
+            "user prefers tabs",
+            "2026-05-17T12:34:56Z",
+            false,
+        )];
+        let area = Rect::new(0, 0, 120, 30);
+        let rendered = render_to_string(&s, area);
+        assert!(rendered.contains("user prefers tabs"), "got:\n{rendered}");
+        // Compact form: "2026-05-17 12:34"
+        assert!(rendered.contains("2026-05-17 12:34"), "got:\n{rendered}");
     }
 
     #[test]
