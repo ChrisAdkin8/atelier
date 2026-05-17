@@ -1,19 +1,16 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- atelier app icon — capital A in the banner wordmark style (Iowan Old Style
-     Roman, served by macOS as IowanOldStyle-Roman).
-     Colors and fonts mirror assets/banner-loop.svg.
+<!-- atelier app icon — capital A in the macOS system UI font (SF Pro Regular,
+     `.SFNS-Regular`). Matches the font GitHub renders the README in on macOS.
 
-     The 'A' is a baked glyph path rather than an SVG <text> element. At icon
-     sizes (font-size ≈ 660) rsvg/Pango auto-selects Iowan Old Style Titling
-     (the display variant with thin verticals and slab feet), which diverges
-     visibly from the banner wordmark — the banner renders at font-size 36, well
-     below the optical-size threshold, so it gets Roman. Baking the Roman glyph
-     outline at design time via Core Text removes the font-selection ambiguity:
+     The 'A' is a baked glyph path rather than an SVG <text> element: rsvg/Pango
+     can't access the protected system font directly, and at icon sizes any
+     fallback selection produces a visibly different glyph. Baking the SF Pro
+     outline at design time via Core Text removes the font-selection step;
      rsvg now rasterises a pre-resolved path.
 
-     Path generated via assets/glyph-to-path.swift; the centering transform
-     puts the path's bbox centre on canvas (512, 512). Re-extract the path
-     after a macOS font update by re-running build-icon.sh. -->
+     Path generated via assets/glyph-to-path.swift; the centring transform puts
+     the path's bbox centre on canvas (512, 512). Regenerate after a macOS font
+     update by re-running the helper with arguments "system A 660". -->
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024"
      role="img" aria-label="atelier — A monogram">
   <title>atelier</title>
@@ -25,12 +22,12 @@
        side. -->
   <rect x="100" y="100" width="824" height="824" rx="185" ry="185" fill="#0e1116"/>
 
-  <!-- Baked 'A' glyph from IowanOldStyle-Roman at font-size 660.
+  <!-- Baked 'A' glyph from .SFNS-Regular at font-size 660.
        scale(1 -1) flips Core Text's Y-up coordinates to SVG's Y-down;
-       translate(287.07 741.94) centres the glyph's bbox on canvas (512, 512).
-       Numbers from assets/glyph-to-path.swift output (bbox center
-       cx=224.93, cy=229.94 → 512-224.93=287.07, 512-(-229.94)=741.94). -->
-  <g transform="translate(287.07 741.94) scale(1 -1)" fill="#f0ead6">
-    <path d="M224.94140625 399.287109375 L151.142578125 206.572265625 Q157.265625 206.572265625 168.8671875 206.25 Q205.283203125 205.283203125 218.49609375 205.283203125 Q234.609375 205.283203125 276.826171875 206.25 Q286.171875 206.572265625 291.005859375 206.572265625 Z M210.439453125 459.873046875 L265.869140625 459.873046875 Q307.763671875 331.93359375 345.3076171875 226.23046875 Q382.8515625 120.52734375 404.443359375 67.353515625 Q417.333984375 36.73828125 426.6796875 29.6484375 Q436.025390625 22.55859375 453.427734375 22.55859375 L459.873046875 22.55859375 L459.873046875 0.0 Q434.736328125 1.2890625 413.9501953125 1.93359375 Q393.1640625 2.578125 378.984375 2.578125 Q360.9375 2.578125 339.345703125 1.93359375 Q317.75390625 1.2890625 293.583984375 0.0 L293.583984375 22.55859375 L299.70703125 22.55859375 Q322.587890625 22.55859375 330.966796875 27.8759765625 Q339.345703125 33.193359375 339.345703125 47.373046875 Q339.345703125 52.529296875 338.056640625 58.8134765625 Q336.767578125 65.09765625 333.8671875 73.798828125 L302.28515625 172.412109375 Q290.0390625 172.412109375 268.76953125 172.734375 Q230.09765625 173.701171875 219.140625 173.701171875 Q197.2265625 173.701171875 177.7294921875 173.5400390625 Q158.232421875 173.37890625 137.28515625 172.734375 Q114.404296875 115.048828125 106.025390625 88.623046875 Q97.646484375 62.197265625 97.646484375 50.91796875 Q97.646484375 35.126953125 106.025390625 28.8427734375 Q114.404296875 22.55859375 135.99609375 22.55859375 L144.697265625 22.55859375 L144.697265625 0.0 Q121.171875 1.2890625 100.7080078125 1.93359375 Q80.244140625 2.578125 64.130859375 2.578125 Q51.240234375 2.578125 31.904296875 1.93359375 Q12.568359375 1.2890625 -9.990234375 0.0 L-9.990234375 22.236328125 Q12.890625 22.880859375 26.2646484375 31.4208984375 Q39.638671875 39.9609375 49.62890625 59.94140625 Q67.67578125 97.646484375 113.5986328125 210.9228515625 Q159.521484375 324.19921875 210.439453125 459.873046875 Z"/>
+       translate(302.36 744.51) centres the glyph's bbox on canvas (512, 512).
+       Numbers from assets/glyph-to-path.swift output (bbox center cx=209.64,
+       cy=232.51 → 512-209.64=302.36, 512-(-232.51)=744.51). -->
+  <g transform="translate(302.36 744.51) scale(1 -1)" fill="#f0ead6">
+    <path d="M8.056640625 0.0 L181.11328125 465.029296875 L223.974609375 465.029296875 L223.974609375 395.419921875 L209.150390625 395.419921875 L68.96484375 0.0 Z M87.333984375 133.095703125 L106.669921875 182.40234375 L312.919921875 182.40234375 L332.255859375 133.095703125 Z M350.302734375 0.0 L210.439453125 395.419921875 L210.439453125 465.029296875 L238.4765625 465.029296875 L411.2109375 0.0 Z"/>
   </g>
 </svg>

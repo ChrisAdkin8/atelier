@@ -3,17 +3,26 @@ import CoreGraphics
 import Foundation
 
 // Output the SVG path data for a single glyph rendered in a specific font.
-// Usage: swift glyph-to-path.swift <PostScript-font-name> <character> <font-size>
+// Usage: swift glyph-to-path.swift <PostScript-font-name|system> <character> <font-size>
+//
+// Pass "system" as the first argument to extract from the macOS system UI font
+// (SF Pro on modern releases). Core Text refuses direct PostScript lookups for
+// system fonts and would silently fall back to Times New Roman.
 
 guard CommandLine.arguments.count == 4,
       let fontSize = Double(CommandLine.arguments[3]) else {
-    FileHandle.standardError.write("usage: glyph-to-path.swift <font-ps-name> <char> <font-size>\n".data(using: .utf8)!)
+    FileHandle.standardError.write("usage: glyph-to-path.swift <font-ps-name|system> <char> <font-size>\n".data(using: .utf8)!)
     exit(2)
 }
 let fontName = CommandLine.arguments[1]
 let ch = CommandLine.arguments[2]
 
-let font = CTFontCreateWithName(fontName as CFString, CGFloat(fontSize), nil)
+let font: CTFont
+if fontName == "system" {
+    font = CTFontCreateUIFontForLanguage(.system, CGFloat(fontSize), nil)!
+} else {
+    font = CTFontCreateWithName(fontName as CFString, CGFloat(fontSize), nil)
+}
 let actualName = CTFontCopyPostScriptName(font) as String
 FileHandle.standardError.write("resolved font: \(actualName)\n".data(using: .utf8)!)
 
