@@ -994,3 +994,171 @@ async fn v56_envelope_claimed_changes_surfaces_as_bus_event() {
     }
     assert!(saw, "no ClaimedChanges event observed on the bus");
 }
+
+// ---------- v60.5 §5 non-destructive compaction ----------
+
+#[tokio::test]
+async fn v60_5_compact_context_items_round_trips_through_dispatcher() {
+    use atelier_cli::compaction;
+    use atelier_cli::compaction_blob;
+    use atelier_core::ledger::LedgerEntry;
+    use runner::AdapterHandle;
+
+    let workspace = tempfile::TempDir::new().unwrap();
+    // Two queued responses: the first carries the envelope-done so
+    // the runner exits after one turn; the second is a plain-text
+    // "summary" the orchestrator's adapter.chat() will consume.
+    let responses = vec![
+        MockResponse {
+            assistant_text: "ok".into(),
+            tool_calls: vec![mock_envelope_tool_call(&envelope_done())],
+        },
+        MockResponse {
+            assistant_text: "Summary of items 1 and 2 (stubbed).".into(),
+            tool_calls: vec![],
+        },
+    ];
+    let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let dispatcher_handle = DispatcherHandle::new();
+    let adapter_handle = AdapterHandle::new();
+    let runner = Runner::new(
+        workspace.path().to_path_buf(),
+        ProviderChoice::Mock { responses },
+        EventSink::Capture(events.clone()),
+    )
+    .expect("mock runner construction is infallible")
+    .with_dispatcher_handle(dispatcher_handle.clone())
+    .with_adapter_handle(adapter_handle.clone())
+    .with_max_turns(2);
+
+    let runner_task = tokio::spawn(async move { runner.run("seed prompt".into()).await });
+
+    // Wait until both handles populate AND we observe a ContextItems
+    // snapshot with at least two non-pinned items (the user prompt +
+    // the assistant turn, both produced by the Runner's per-turn
+    // context manager).
+    let mut target_ids: Vec<String> = Vec::new();
+    wait_until(
+        || {
+            if dispatcher_handle.get().is_none() || adapter_handle.get().is_none() {
+                return false;
+            }
+            let snap = events.lock().clone();
+            for ev in snap {
+                if let Event::ContextItems { items } = ev {
+                    let non_pinned: Vec<_> = items
+                        .iter()
+                        .filter(|i| !i.pinned)
+                        .map(|i| i.id.clone())
+                        .collect();
+                    if non_pinned.len() >= 2 {
+                        target_ids = non_pinned.into_iter().take(2).collect();
+                        return true;
+                    }
+                }
+            }
+            false
+        },
+        std::time::Duration::from_secs(10),
+        "ContextItems with >= 2 non-pinned items + handles populated",
+    )
+    .await;
+    assert_eq!(target_ids.len(), 2);
+
+    // The pre-queued second MockResponse above carries the summary
+    // text; the orchestrator's `adapter.chat()` will consume it
+    // when we run the compaction below.
+    let adapter = adapter_handle.get().unwrap();
+    let sd = dispatcher_handle.get().unwrap();
+    let before = events.lock().len();
+
+    // Run the compaction directly through the orchestrator (same code
+    // path the GUI Tauri command + TUI Mutation::Compact delegate to).
+    let sid = uuid::Uuid::new_v4().to_string();
+    let now = "2026-05-17T11:00:00Z";
+    let result = compaction::compact(
+        adapter.as_ref(),
+        sd.as_ref(),
+        workspace.path(),
+        &sid,
+        target_ids.clone(),
+        now,
+    )
+    .await
+    .expect("orchestrator must succeed");
+    assert!(result.summary_card_id.starts_with("mem-"));
+    assert!(result.expansion_blob_path.contains(&sid));
+
+    // Assert: among the events emitted AFTER `before`, we observe (in
+    // order) a `LedgerAppended(ModelCall)`, a `LedgerAppended(Compaction)`,
+    // a `ContextItems` snapshot lacking the compacted ids, a
+    // `MemoryCards` snapshot containing the new summary, and a
+    // `CompactionExecuted` event.
+    let mut saw_model_call = false;
+    let mut saw_compaction_entry = false;
+    let mut saw_context_items_post = false;
+    let mut saw_memory_cards_post = false;
+    let mut saw_compaction_executed = false;
+    wait_until(
+        || {
+            let snap = events.lock().clone();
+            saw_model_call = false;
+            saw_compaction_entry = false;
+            saw_context_items_post = false;
+            saw_memory_cards_post = false;
+            saw_compaction_executed = false;
+            for ev in snap.into_iter().skip(before) {
+                match ev {
+                    Event::LedgerAppended { entry } => match entry {
+                        LedgerEntry::ModelCall { .. } => {
+                            saw_model_call = true;
+                        }
+                        LedgerEntry::Compaction { replaced_items, .. } => {
+                            if replaced_items == target_ids {
+                                saw_compaction_entry = true;
+                            }
+                        }
+                        _ => {}
+                    },
+                    Event::ContextItems { items } => {
+                        if saw_compaction_entry && !items.iter().any(|i| target_ids.contains(&i.id))
+                        {
+                            saw_context_items_post = true;
+                        }
+                    }
+                    Event::MemoryCards { cards } => {
+                        if saw_compaction_entry
+                            && cards.iter().any(|c| c.id == result.summary_card_id)
+                        {
+                            saw_memory_cards_post = true;
+                        }
+                    }
+                    Event::CompactionExecuted {
+                        summary_card_id, ..
+                    } => {
+                        if summary_card_id == result.summary_card_id {
+                            saw_compaction_executed = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            saw_model_call
+                && saw_compaction_entry
+                && saw_context_items_post
+                && saw_memory_cards_post
+                && saw_compaction_executed
+        },
+        std::time::Duration::from_secs(10),
+        "full event sequence for v60.5 compaction",
+    )
+    .await;
+
+    // Blob on disk must round-trip back to the originals (by id).
+    let blob = compaction_blob::read(workspace.path(), &result.expansion_blob_path)
+        .expect("blob must be readable");
+    let blob_ids: Vec<String> = blob.items.iter().map(|i| i.id.to_string()).collect();
+    assert_eq!(blob_ids, target_ids);
+
+    let _ = runner_task.await;
+}

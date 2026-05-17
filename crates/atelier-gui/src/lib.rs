@@ -55,6 +55,11 @@ pub struct BridgedEvent {
 /// still active. Cleared by the spawned task's `Drop`-style cleanup.
 pub struct SessionState {
     pub dispatcher_handle: DispatcherHandle,
+    /// v60.5 — companion slot for the active `Adapter`. Populated by
+    /// `start_demo_run` alongside `dispatcher_handle`; cleared by the
+    /// runner's `AdapterHandleGuard` on every exit path. Read by
+    /// `compact_context_items` to issue the §5 summary call.
+    pub adapter_handle: atelier_cli::AdapterHandle,
     pub run_in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// v58 (M-sec-2 regression fix) — own the per-process tempdir
     /// handle so RAII removes the directory on app shutdown. The
@@ -107,6 +112,7 @@ pub fn run() {
 
             app.manage(SessionState {
                 dispatcher_handle: DispatcherHandle::new(),
+                adapter_handle: atelier_cli::AdapterHandle::new(),
                 run_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 workspace_tempdir,
             });
@@ -128,6 +134,8 @@ pub fn run() {
             mark_plan_step_status,
             add_plan_step_constraint,
             reorder_plan_steps,
+            // v60.5 §5 non-destructive compaction.
+            compact_context_items,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -426,6 +434,72 @@ fn reorder_plan_steps(
     sd.reorder_plan_steps(ordering).map_err(|e| e.to_string())
 }
 
+/// v60.5 — wire shape returned by the Compact toast in the §5 Context
+/// pane. Carries enough to populate "Compacted N items, freed ~Mk
+/// tokens; summary card mem-…" without a follow-up query.
+#[derive(Serialize, Debug)]
+pub struct CompactionResult {
+    pub tokens_freed: u32,
+    pub summary_card_id: String,
+    pub expansion_blob_path: String,
+    pub summary_tokens_in: u32,
+    pub summary_tokens_out: u32,
+}
+
+/// v60.5 — cap on the number of items a single compaction call may
+/// touch. Matches the `MAX_PLAN_STEPS` discipline on the v55 mutators:
+/// a hostile or buggy webview shouldn't be able to push a 1M-id list
+/// through the IPC boundary.
+const MAX_COMPACTION_IDS: usize = 256;
+
+fn require_adapter(
+    state: &tauri::State<'_, SessionState>,
+) -> Result<std::sync::Arc<dyn atelier_core::adapter::Adapter>, String> {
+    state
+        .adapter_handle
+        .get()
+        .ok_or_else(|| "no active adapter (start a run first)".to_string())
+}
+
+#[tauri::command]
+async fn compact_context_items(
+    state: tauri::State<'_, SessionState>,
+    ids: Vec<String>,
+) -> Result<CompactionResult, String> {
+    if ids.len() > MAX_COMPACTION_IDS {
+        return Err(format!(
+            "compact_context_items: too many ids: {} (max {MAX_COMPACTION_IDS})",
+            ids.len()
+        ));
+    }
+    let sd = require_dispatcher(&state)?;
+    let adapter = require_adapter(&state)?;
+    let workspace = state.workspace_root().to_path_buf();
+    // v49 per-run workspace lives under the per-process root; for v60.5
+    // we use the process-wide root as the session id since the GUI
+    // demo run doesn't expose its run_id externally. Real session-id
+    // routing lands once the GUI grows a session picker.
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let now = now_rfc3339();
+    atelier_cli::compaction::compact(
+        adapter.as_ref(),
+        sd.as_ref(),
+        &workspace,
+        &session_id,
+        ids,
+        &now,
+    )
+    .await
+    .map(|r| CompactionResult {
+        tokens_freed: r.freed_tokens,
+        summary_card_id: r.summary_card_id,
+        expansion_blob_path: r.expansion_blob_path,
+        summary_tokens_in: r.summary_tokens_in,
+        summary_tokens_out: r.summary_tokens_out,
+    })
+    .map_err(|e| e.to_string())
+}
+
 /// Start a mock-scripted run with `AwaitApproval` policy. v47 demo
 /// driver: the GUI builds a `Runner` that emits a `write_file` tool
 /// call against the ephemeral workspace, the dispatcher hits the
@@ -492,6 +566,7 @@ fn start_demo_run(
     }
 
     let handle = state.dispatcher_handle.clone();
+    let adapter_handle = state.adapter_handle.clone();
     let run_in_flight = state.run_in_flight.clone();
 
     // Build a scripted single-turn run:
@@ -555,6 +630,7 @@ fn start_demo_run(
     let runner = runner
         .with_approval_policy(ApprovalPolicy::AwaitApproval)
         .with_dispatcher_handle(handle)
+        .with_adapter_handle(adapter_handle)
         .with_max_turns(4);
 
     // The spawned task owns the per-run workspace + the in-flight
@@ -741,6 +817,15 @@ pub fn bridge_event(evt: &SessionEvent) -> BridgedEvent {
                 .collect::<Vec<_>>(),
         }),
         SessionEvent::Shutdown => Value::Null,
+        SessionEvent::CompactionExecuted {
+            freed_tokens,
+            replaced_item_count,
+            summary_card_id,
+        } => json!({
+            "freed_tokens": freed_tokens,
+            "replaced_item_count": replaced_item_count,
+            "summary_card_id": summary_card_id,
+        }),
     };
     BridgedEvent { kind, payload }
 }
@@ -903,6 +988,7 @@ mod tests {
             created_at: "2026-05-17T10:00:00Z".into(),
             last_used: "2026-05-17T12:00:00Z".into(),
             pinned: true,
+            compacted_from: None,
         }];
         let b = bridge_event(&SessionEvent::MemoryCards {
             cards: cards.clone(),
@@ -1034,5 +1120,38 @@ mod tests {
         // Outcome is serialised through serde's snake_case rename,
         // which is what the footer renders directly.
         assert_eq!(b.payload["outcome"], "cache_hit");
+    }
+
+    // ---------- v60.5: compaction wiring ----------
+
+    #[test]
+    fn bridge_compaction_executed_carries_freed_tokens_and_card_id() {
+        let b = bridge_event(&SessionEvent::CompactionExecuted {
+            freed_tokens: 12_345,
+            replaced_item_count: 7,
+            summary_card_id: "mem-abc".into(),
+        });
+        assert_eq!(b.kind, "CompactionExecuted");
+        assert_eq!(b.payload["freed_tokens"], 12_345);
+        assert_eq!(b.payload["replaced_item_count"], 7);
+        assert_eq!(b.payload["summary_card_id"], "mem-abc");
+    }
+
+    #[test]
+    fn bridge_memory_cards_passes_compacted_from_when_set() {
+        use atelier_core::memory::MemoryCardSummary;
+
+        let cards = vec![MemoryCardSummary {
+            id: "mem-c".into(),
+            title: "summary of …".into(),
+            body_preview: "compacted from 7 items".into(),
+            created_at: "2026-05-17T11:00:00Z".into(),
+            last_used: "2026-05-17T11:00:00Z".into(),
+            pinned: true,
+            compacted_from: Some(7),
+        }];
+        let b = bridge_event(&SessionEvent::MemoryCards { cards });
+        let wire = b.payload["cards"].as_array().expect("cards array");
+        assert_eq!(wire[0]["compacted_from"], 7);
     }
 }

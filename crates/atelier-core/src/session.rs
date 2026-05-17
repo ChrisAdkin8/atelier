@@ -265,6 +265,20 @@ pub enum Event {
         outcome: crate::adapter::model_profile::ProbeLoadOutcome,
     },
 
+    /// v60.5 — terminal marker for a successful §5 non-destructive
+    /// compaction. Emitted by `SessionDispatcher::compact_context_items`
+    /// after the preceding `LedgerAppended` (the `Compaction` entry),
+    /// `ContextItems` (snapshot without the replaced items), and
+    /// `MemoryCards` (snapshot with the new pinned summary) events
+    /// land. UIs use it as the "clear my multi-select state and show
+    /// the toast" signal — the snapshot events have already
+    /// converged the panels by the time it arrives.
+    CompactionExecuted {
+        freed_tokens: u32,
+        replaced_item_count: usize,
+        summary_card_id: String,
+    },
+
     /// The actor is shutting down. No further events will be emitted.
     Shutdown,
 }
@@ -294,6 +308,7 @@ impl Event {
             Self::StagingPendingApproval { .. } => "StagingPendingApproval",
             Self::CommitDecision { .. } => "CommitDecision",
             Self::ModelProfileLoaded { .. } => "ModelProfileLoaded",
+            Self::CompactionExecuted { .. } => "CompactionExecuted",
             Self::Shutdown => "Shutdown",
         }
     }
@@ -517,6 +532,16 @@ mod tests {
         assert_eq!(MessageRole::User.wire_label(), "user");
         assert_eq!(MessageRole::Assistant.wire_label(), "assistant");
         assert_eq!(MessageRole::Tool.wire_label(), "tool");
+    }
+
+    #[test]
+    fn compaction_executed_event_carries_expected_kind() {
+        let ev = Event::CompactionExecuted {
+            freed_tokens: 100,
+            replaced_item_count: 3,
+            summary_card_id: "mem-c".into(),
+        };
+        assert_eq!(ev.kind(), "CompactionExecuted");
     }
 
     /// Hook impl that counts invocations — lets tests assert that hooks fired

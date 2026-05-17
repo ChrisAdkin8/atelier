@@ -69,6 +69,28 @@ pub enum LedgerEntry {
         /// `ContextOverflowError -> <chosen action>`, etc.).
         note: String,
     },
+    /// v60.5 — non-destructive context compaction (§5). A `Compaction`
+    /// entry is paired in the ledger with a preceding `ModelCall` for the
+    /// summary generation; the `Compaction` itself carries no cost (the
+    /// summary call did), only the bookkeeping needed to reverse the
+    /// operation in v60.6 Expand.
+    Compaction {
+        timestamp: String,
+        /// Sum of `tokens` across every replaced context item, as
+        /// reported by [`crate::context::CacheBustEvent::tokens_freed`].
+        freed_tokens: u32,
+        /// Context-item ids that were evicted and replaced by the
+        /// summary card.
+        replaced_items: Vec<String>,
+        /// Id of the `MemoryCard` that took the replaced items' place.
+        /// Always pinned by construction.
+        summary_card_id: String,
+        /// Repo-relative path to the JSON blob (under
+        /// `.atelier/sessions/<sid>/compactions/`) that v60.6 Expand
+        /// reads to replay the originals. Mirrors the value stored in
+        /// the summary card's [`crate::memory::CompactionSource`].
+        expansion_blob_path: String,
+    },
 }
 
 impl LedgerEntry {
@@ -76,7 +98,8 @@ impl LedgerEntry {
         match self {
             Self::ModelCall { timestamp, .. }
             | Self::ToolCall { timestamp, .. }
-            | Self::CacheBust { timestamp, .. } => timestamp,
+            | Self::CacheBust { timestamp, .. }
+            | Self::Compaction { timestamp, .. } => timestamp,
         }
     }
 
@@ -85,13 +108,14 @@ impl LedgerEntry {
             Self::ModelCall { .. } => Kind::ModelCall,
             Self::ToolCall { .. } => Kind::ToolCall,
             Self::CacheBust { .. } => Kind::CacheBust,
+            Self::Compaction { .. } => Kind::Compaction,
         }
     }
 
     pub fn cost_usd(&self) -> Option<f64> {
         match self {
             Self::ModelCall { cost_usd, .. } | Self::ToolCall { cost_usd, .. } => *cost_usd,
-            Self::CacheBust { .. } => None,
+            Self::CacheBust { .. } | Self::Compaction { .. } => None,
         }
     }
 
@@ -146,6 +170,7 @@ pub enum Kind {
     ModelCall,
     ToolCall,
     CacheBust,
+    Compaction,
 }
 
 /// Append-only typed cost ledger. **Share via `Arc<Ledger>`, not by
@@ -217,14 +242,21 @@ impl Ledger {
             .sum()
     }
 
-    /// Count of entries with no declared `cost_usd` (excluding `CacheBust`,
-    /// which never has one). Lets the §3 cost meter render
-    /// "$1.23 + N unknown" rather than understating the bill.
+    /// Count of entries with no declared `cost_usd` (excluding `CacheBust`
+    /// and `Compaction`, which by design never carry their own cost — the
+    /// paired `ModelCall` next to a `Compaction` records the summary
+    /// generation cost). Lets the §3 cost meter render "$1.23 + N unknown"
+    /// rather than understating the bill.
     pub fn entries_without_cost(&self) -> usize {
         self.entries
             .read()
             .iter()
-            .filter(|e| !matches!(e, LedgerEntry::CacheBust { .. }))
+            .filter(|e| {
+                !matches!(
+                    e,
+                    LedgerEntry::CacheBust { .. } | LedgerEntry::Compaction { .. }
+                )
+            })
             .filter(|e| e.cost_usd().is_none())
             .count()
     }
@@ -286,6 +318,7 @@ mod tests {
             ("model_call", Kind::ModelCall),
             ("tool_call", Kind::ToolCall),
             ("cache_bust", Kind::CacheBust),
+            ("compaction", Kind::Compaction),
         ] {
             assert_eq!(serde_json::to_string(&k).unwrap(), format!("\"{lit}\""));
         }
@@ -486,5 +519,60 @@ mod tests {
     #[test]
     fn default_local_rate_matches_spec_value() {
         assert!((DEFAULT_LOCAL_RATE_USD_PER_SEC - 0.000_28).abs() < 1e-9);
+    }
+
+    // ---------- v60.5: Compaction variant ----------
+
+    fn compaction(ts: &str) -> LedgerEntry {
+        LedgerEntry::Compaction {
+            timestamp: ts.into(),
+            freed_tokens: 240,
+            replaced_items: vec!["ctx-a".into(), "ctx-b".into()],
+            summary_card_id: "mem-c".into(),
+            expansion_blob_path:
+                ".atelier/sessions/00000000-0000-0000-0000-000000000000/compactions/comp-1.json"
+                    .into(),
+        }
+    }
+
+    #[test]
+    fn compaction_serializes_to_schema_shape() {
+        let entry = compaction("2026-05-17T10:00:00Z");
+        let json: serde_json::Value = serde_json::to_value(&entry).unwrap();
+        assert_eq!(json["kind"], "compaction");
+        assert_eq!(json["freed_tokens"], 240);
+        assert_eq!(json["replaced_items"][0], "ctx-a");
+        assert_eq!(json["summary_card_id"], "mem-c");
+        assert!(json["expansion_blob_path"]
+            .as_str()
+            .unwrap()
+            .ends_with("comp-1.json"));
+    }
+
+    #[test]
+    fn compaction_round_trips_through_serde() {
+        let entry = compaction("2026-05-17T10:00:00Z");
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: LedgerEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, entry);
+    }
+
+    #[test]
+    fn compaction_entry_kind_and_no_cost() {
+        let entry = compaction("t");
+        assert_eq!(entry.kind(), Kind::Compaction);
+        assert_eq!(entry.cost_usd(), None);
+        assert_eq!(entry.timestamp(), "t");
+    }
+
+    #[test]
+    fn entries_without_cost_excludes_compaction() {
+        // Compaction never carries its own cost — only the paired
+        // ModelCall does — so it should not inflate the
+        // "$X + N unknown" badge on the cost meter.
+        let l = Ledger::new();
+        l.append(compaction("t1"));
+        l.append(model_call("t2", 5, 5, None));
+        assert_eq!(l.entries_without_cost(), 1);
     }
 }

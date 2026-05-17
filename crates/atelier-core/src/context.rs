@@ -398,6 +398,68 @@ impl ContextManager {
         })
     }
 
+    /// v60.5 — atomic batch evict for §5 non-destructive compaction.
+    ///
+    /// Behaviour:
+    ///
+    /// * Pass 1 verifies every id is present and unpinned. If any id is
+    ///   missing or pinned, returns `Err(...)` with the offending id and
+    ///   leaves state unchanged.
+    /// * Pass 2 evicts in input order, returning the `CacheBustEvent`s
+    ///   in the same order. Each event mirrors `evict`'s output so the
+    ///   caller can ledger them individually if needed.
+    /// * Empty input is an idempotent `Ok(vec![])` — callers don't have
+    ///   to special-case the "user selected nothing" branch.
+    ///
+    /// Distinct from looping `evict` in two ways:
+    ///
+    /// 1. **Atomicity**: a pinned item in the middle of the list would
+    ///    otherwise stop the loop with N − k items already gone.
+    /// 2. **Duplicate detection**: a duplicated id in the input is
+    ///    caught at Pass 1 (the second copy hits `NotFound` after the
+    ///    first eviction).
+    pub fn evict_batch(
+        &mut self,
+        ids: &[ContextItemId],
+        evicted_at: impl Into<String>,
+    ) -> Result<Vec<CacheBustEvent>, ContextError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Pass 1: validate every id exists and is unpinned. Also rejects
+        // duplicates because the second copy still has to survive Pass 1
+        // before Pass 2 runs.
+        let mut seen = std::collections::BTreeSet::new();
+        for id in ids {
+            if !seen.insert(*id) {
+                return Err(ContextError::NotFound(*id));
+            }
+            let order = self
+                .by_id
+                .get(id)
+                .copied()
+                .ok_or(ContextError::NotFound(*id))?;
+            if self.items.get(&order).is_some_and(|i| i.pinned) {
+                return Err(ContextError::EvictPinned(*id));
+            }
+        }
+        // Pass 2: evict in input order, share the same evicted_at across
+        // every event so they all carry the same timestamp.
+        let evicted_at: String = evicted_at.into();
+        let mut events = Vec::with_capacity(ids.len());
+        for id in ids {
+            let order = self.by_id.remove(id).expect("Pass 1 guarantees presence");
+            let item = self.items.remove(&order).expect("by_id and items in sync");
+            events.push(CacheBustEvent {
+                item_id: *id,
+                tokens_freed: item.tokens.count,
+                provenance: item.provenance,
+                evicted_at: evicted_at.clone(),
+            });
+        }
+        Ok(events)
+    }
+
     /// Lookup by id.
     pub fn get(&self, id: ContextItemId) -> Option<&ContextItem> {
         self.by_id.get(&id).and_then(|o| self.items.get(o))
@@ -943,5 +1005,78 @@ mod tests {
             serde_json::to_string(&TokenSource::Unavailable).unwrap(),
             "\"unavailable\""
         );
+    }
+
+    // ---------- v60.5: evict_batch ----------
+
+    #[test]
+    fn evict_batch_evicts_in_input_order_and_returns_events() {
+        let mut m = ContextManager::new();
+        let a = m.add(file_item("a.rs", 10));
+        let b = m.add(file_item("b.rs", 20));
+        let c = m.add(file_item("c.rs", 30));
+
+        let evs = m
+            .evict_batch(&[c, a], "2026-05-17T11:00:00Z")
+            .expect("must succeed");
+        assert_eq!(evs.len(), 2);
+        assert_eq!(evs[0].item_id, c);
+        assert_eq!(evs[0].tokens_freed, 30);
+        assert_eq!(evs[1].item_id, a);
+        assert_eq!(evs[1].tokens_freed, 10);
+        assert_eq!(evs[0].evicted_at, "2026-05-17T11:00:00Z");
+
+        // Remaining state: only b survives.
+        assert_eq!(m.len(), 1);
+        assert!(m.get(b).is_some());
+    }
+
+    #[test]
+    fn evict_batch_pin_check_is_all_or_nothing() {
+        let mut m = ContextManager::new();
+        let a = m.add(file_item("a.rs", 10));
+        let b = m.add(file_item("b.rs", 20));
+        let c = m.add(file_item("c.rs", 30));
+        m.pin(b).unwrap();
+
+        let err = m.evict_batch(&[a, b, c], "t").unwrap_err();
+        assert_eq!(err, ContextError::EvictPinned(b));
+        // Crucially: nothing was evicted because Pass 1 rejected.
+        assert_eq!(m.len(), 3);
+        assert!(m.get(a).is_some());
+        assert!(m.get(c).is_some());
+    }
+
+    #[test]
+    fn evict_batch_unknown_id_rejects_and_leaves_state_unchanged() {
+        let mut m = ContextManager::new();
+        let a = m.add(file_item("a.rs", 10));
+        let ghost = ContextItemId::new();
+
+        let err = m.evict_batch(&[a, ghost], "t").unwrap_err();
+        assert_eq!(err, ContextError::NotFound(ghost));
+        assert_eq!(m.len(), 1);
+        assert!(m.get(a).is_some());
+    }
+
+    #[test]
+    fn evict_batch_empty_is_noop() {
+        let mut m = ContextManager::new();
+        let a = m.add(file_item("a.rs", 10));
+        let evs = m.evict_batch(&[], "t").unwrap();
+        assert!(evs.is_empty());
+        assert_eq!(m.len(), 1);
+        assert!(m.get(a).is_some());
+    }
+
+    #[test]
+    fn evict_batch_rejects_duplicate_ids() {
+        let mut m = ContextManager::new();
+        let a = m.add(file_item("a.rs", 10));
+        let err = m.evict_batch(&[a, a], "t").unwrap_err();
+        // The second occurrence triggers NotFound (Pass-1 dup guard).
+        assert_eq!(err, ContextError::NotFound(a));
+        // Nothing was evicted because Pass 1 rejected.
+        assert_eq!(m.len(), 1);
     }
 }

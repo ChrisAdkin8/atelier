@@ -162,6 +162,34 @@ impl DispatcherHandle {
     }
 }
 
+/// v60.5 — shared slot the runner publishes its active adapter into so
+/// external callers (the GUI's `compact_context_items` Tauri command,
+/// the TUI's `Mutation::Compact` arm) can issue the §5 compaction
+/// summary call without re-implementing the per-provider construction
+/// logic. Same pattern as [`DispatcherHandle`]: `get()` is cheap and
+/// returns an `Arc` clone; the runner clears the slot via
+/// `AdapterHandleGuard` so a torn-down run can't leak an
+/// `Arc<dyn Adapter>` to a future caller.
+#[derive(Clone, Default)]
+pub struct AdapterHandle {
+    inner: Arc<parking_lot::Mutex<Option<Arc<dyn Adapter>>>>,
+}
+
+impl AdapterHandle {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn get(&self) -> Option<Arc<dyn Adapter>> {
+        self.inner.lock().clone()
+    }
+    fn set(&self, a: Arc<dyn Adapter>) {
+        *self.inner.lock() = Some(a);
+    }
+    fn clear(&self) {
+        *self.inner.lock() = None;
+    }
+}
+
 /// Drop-guard that clears the caller's `DispatcherHandle` slot when
 /// `Runner::run` exits via any path: success, `?`-propagated error,
 /// or panic. Without this, an early-return between `handle.set(...)`
@@ -173,6 +201,21 @@ struct DispatcherHandleGuard<'a> {
 }
 
 impl Drop for DispatcherHandleGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle {
+            handle.clear();
+        }
+    }
+}
+
+/// v60.5 — companion to [`DispatcherHandleGuard`] for the new
+/// [`AdapterHandle`]. Same lifecycle: clear on every exit path so a
+/// crashing run can't strand an `Arc<dyn Adapter>` in the slot.
+struct AdapterHandleGuard<'a> {
+    handle: Option<&'a AdapterHandle>,
+}
+
+impl Drop for AdapterHandleGuard<'_> {
     fn drop(&mut self) {
         if let Some(handle) = self.handle {
             handle.clear();
@@ -220,6 +263,11 @@ pub struct Runner {
     /// SessionDispatcher is constructed. Lets the GUI thread a
     /// `submit_approval` Tauri command to the live dispatcher.
     dispatcher_handle: Option<DispatcherHandle>,
+    /// v60.5 — companion slot for the adapter. Populated as soon as
+    /// the run starts; cleared via [`AdapterHandleGuard`] on every exit
+    /// path. Both drivers (GUI + TUI) use this to surface
+    /// `compact_context_items` without re-constructing the adapter.
+    adapter_handle: Option<AdapterHandle>,
     /// v51 — probe policy chosen at construction time. The CLI
     /// flips this for `--no-probe` / `--force-probe`.
     probe_policy: ProbePolicy,
@@ -292,6 +340,7 @@ impl Runner {
             max_turns: 32,
             approval_policy: atelier_core::dispatcher::ApprovalPolicy::AutoApproveAll,
             dispatcher_handle: None,
+            adapter_handle: None,
             probe_policy,
             probe_base_url,
         })
@@ -319,6 +368,14 @@ impl Runner {
     /// motivating use case.
     pub fn with_dispatcher_handle(mut self, handle: DispatcherHandle) -> Self {
         self.dispatcher_handle = Some(handle);
+        self
+    }
+
+    /// v60.5 — register a slot the runner publishes its active adapter
+    /// into. Enables `atelier_cli::compaction::compact` to be invoked
+    /// from a UI thread without re-constructing the adapter.
+    pub fn with_adapter_handle(mut self, handle: AdapterHandle) -> Self {
+        self.adapter_handle = Some(handle);
         self
     }
 
@@ -394,6 +451,17 @@ impl Runner {
         }
         let _handle_guard = DispatcherHandleGuard {
             handle: self.dispatcher_handle.as_ref(),
+        };
+        // v60.5 — companion publication of the active adapter so the
+        // UI's `compact_context_items` command (and the TUI's
+        // `Mutation::Compact` arm) can issue the §5 summary call
+        // without re-constructing the adapter. Same guard discipline
+        // as the dispatcher slot.
+        if let Some(handle) = &self.adapter_handle {
+            handle.set(self.adapter.clone());
+        }
+        let _adapter_handle_guard = AdapterHandleGuard {
+            handle: self.adapter_handle.as_ref(),
         };
 
         // 4. Drain events into the sink. tokio task; exits when the

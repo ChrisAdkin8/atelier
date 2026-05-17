@@ -36,6 +36,10 @@ thiserror = { workspace = true }
 # `~/.atelier/memory/`. Promoted from dev-deps so the GUI / TUI
 # drivers (which depend on atelier-cli) can both reach it.
 tempfile = { workspace = true }
+# v60.5 — `compaction_blob` serialises `CompactionBlob { items: Vec<ContextItem>, ... }`
+# (serde) and mints `comp-<uuid>` blob ids (uuid).
+serde = { workspace = true, features = ["derive"] }
+uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]
 assert_cmd = { workspace = true }

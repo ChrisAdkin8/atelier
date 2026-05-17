@@ -36,6 +36,77 @@
   let toast: string | null = $state(null)
   let toastError: boolean = $state(false)
 
+  // v60.5 — §5 non-destructive compaction. Multi-select uses a
+  // checkbox column on the leftmost edge; the "Compact N selected"
+  // button surfaces in the pane header once selection.size >= 2.
+  // Pinned items can't be selected (the dispatcher would refuse
+  // them anyway, but we hide the affordance).
+  let selectedIds: Set<string> = $state(new Set())
+  let compactConfirmOpen: boolean = $state(false)
+  let compactInFlight: boolean = $state(false)
+
+  // Re-derive on each item-list change so removed ids drop out of
+  // the selection.
+  $effect(() => {
+    const live = new Set(items.map((i) => i.id))
+    const filtered = new Set<string>()
+    for (const id of selectedIds) {
+      if (live.has(id)) filtered.add(id)
+    }
+    if (filtered.size !== selectedIds.size) {
+      selectedIds = filtered
+    }
+  })
+
+  function toggleSelected(id: string, pinned: boolean) {
+    if (pinned) return
+    const next = new Set(selectedIds)
+    if (next.has(id)) next.delete(id)
+    else next.add(id)
+    selectedIds = next
+  }
+
+  function tokensToCompact(): number {
+    let total = 0
+    for (const item of items) {
+      if (selectedIds.has(item.id)) total += item.tokens
+    }
+    return total
+  }
+
+  function askCompact() {
+    if (selectedIds.size < 2) return
+    compactConfirmOpen = true
+  }
+
+  function cancelCompact() {
+    compactConfirmOpen = false
+  }
+
+  async function confirmCompact() {
+    if (selectedIds.size < 2 || compactInFlight) return
+    compactInFlight = true
+    const ids = [...selectedIds]
+    try {
+      const r = await invoke<{
+        tokens_freed: number
+        summary_card_id: string
+        summary_tokens_in: number
+        summary_tokens_out: number
+      }>('compact_context_items', { ids })
+      showToast(
+        `compacted ${ids.length} items — freed ${r.tokens_freed} tokens; summary ${r.summary_card_id} (${r.summary_tokens_in}→${r.summary_tokens_out} tokens)`,
+        false,
+      )
+      selectedIds = new Set()
+    } catch (e) {
+      showToast(String(e), true)
+    } finally {
+      compactConfirmOpen = false
+      compactInFlight = false
+    }
+  }
+
   async function pin(id: string) {
     try {
       await invoke<null>('pin_context_item', { id })
@@ -113,7 +184,39 @@
 </script>
 
 <section class="pane context-pane">
-  <header class="pane-title">§5 Context</header>
+  <header class="pane-title">
+    <span>§5 Context</span>
+    {#if selectedIds.size >= 2}
+      <button
+        class="compact-action"
+        onclick={askCompact}
+        disabled={compactInFlight}
+        title="compact selected"
+        aria-label="compact {selectedIds.size} selected items"
+      >
+        compact {selectedIds.size} selected
+      </button>
+    {/if}
+  </header>
+
+  {#if compactConfirmOpen}
+    <div class="compact-confirm">
+      <span>
+        compact {selectedIds.size} items — frees ~{tokensToCompact()} tokens.
+        summary added as pinned memory card; reversible in v60.6.
+      </span>
+      <span class="confirm-actions">
+        <button
+          class="confirm"
+          onclick={confirmCompact}
+          disabled={compactInFlight}
+        >
+          confirm
+        </button>
+        <button class="cancel" onclick={cancelCompact}>cancel</button>
+      </span>
+    </div>
+  {/if}
 
   {#if items.length === 0}
     <p class="empty">no context items yet</p>
@@ -123,8 +226,18 @@
         <li
           class="row"
           class:row-pinned={item.pinned}
+          class:row-selected={selectedIds.has(item.id)}
           title={tooltipFor(item)}
         >
+          <span class="select">
+            <input
+              type="checkbox"
+              checked={selectedIds.has(item.id)}
+              disabled={item.pinned}
+              aria-label="select {item.label}"
+              onchange={() => toggleSelected(item.id, item.pinned)}
+            />
+          </span>
           <span class="tokens token-source-{item.token_source}">
             {item.tokens}
           </span>
@@ -201,6 +314,39 @@
     font-size: 0.75rem;
     color: var(--fg-dim);
     letter-spacing: 0.05em;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+  }
+  .compact-action {
+    background: rgba(255, 200, 0, 0.08);
+    border: 1px solid rgba(255, 200, 0, 0.4);
+    border-radius: 3px;
+    color: #ec9;
+    cursor: pointer;
+    font-family: inherit;
+    font-size: 0.7rem;
+    padding: 0.1rem 0.45rem;
+    letter-spacing: 0.02em;
+  }
+  .compact-action:hover:not(:disabled) {
+    background: rgba(255, 200, 0, 0.16);
+  }
+  .compact-action:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+  .compact-confirm {
+    background: rgba(255, 200, 0, 0.06);
+    border-bottom: 1px solid rgba(255, 200, 0, 0.3);
+    padding: 0.3rem 0.6rem;
+    font-size: 0.72rem;
+    color: var(--fg-default, #ddd);
+    display: flex;
+    justify-content: space-between;
+    gap: 0.5rem;
+    flex-wrap: wrap;
   }
   .empty {
     margin: 0;
@@ -219,14 +365,29 @@
   }
   .row {
     display: grid;
-    grid-template-columns: 4ch 5ch auto 1fr auto;
-    grid-template-areas: 'tokens badge pin label actions' '. . . confirm confirm';
+    grid-template-columns: 2ch 4ch 5ch auto 1fr auto;
+    grid-template-areas: 'select tokens badge pin label actions' '. . . . confirm confirm';
     gap: 0.45rem;
     align-items: baseline;
     padding: 0.15rem 0.6rem;
     font-family: var(--font-mono);
     font-size: 0.78rem;
     line-height: 1.3;
+  }
+  .select {
+    grid-area: select;
+  }
+  .select input[type='checkbox'] {
+    margin: 0;
+    cursor: pointer;
+  }
+  .select input[type='checkbox']:disabled {
+    cursor: not-allowed;
+    opacity: 0.4;
+  }
+  .row-selected {
+    /* Light orange tint to mirror the compact-action button. */
+    background: rgba(255, 200, 0, 0.07);
   }
   .actions {
     grid-area: actions;

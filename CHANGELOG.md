@@ -1,5 +1,51 @@
 # Atelier Spec — Changelog
 
+## v60.5 — 2026-05-17 (§5 non-destructive context compaction, compact-only)
+
+Closes the §5 spec promise *non-destructive compaction with cost disclosure* on the compact side; v60.6 lands the matching Expand affordance against the frozen blob format. Compact-only ships a complete contract — the originals are written to disk, ledgered, and pointed at from the summary card — so v60.6 is a UI flip rather than a new wire shape.
+
+User-visible:
+
+- **GUI Context pane**: every row gains a checkbox column (disabled on pinned rows); a "Compact N selected" button surfaces in the pane header once ≥2 items are selected; clicking it opens an inline confirm dialog showing the projected `frees ~Nk tokens`, with a one-line note that the operation is reversible in v60.6. Confirm fires the new `compact_context_items` Tauri command.
+- **TUI Context pane**: `space` toggles the focused row's id in a multi-select set (no-op on pinned); `C` (shift-c) opens a `CompactConfirm` modal that renders the same cost disclosure in the help footer; `y` confirms, `n` / `Esc` cancels. A new `[*]` / `[ ]` / `[-]` glyph in the leftmost column shows per-row state.
+- **Memory pane** (GUI + TUI): compaction-generated cards carry a small "compacted from N items" hint via the new `MemoryCardSummary.compacted_from` projection.
+
+Data layer (atelier-core):
+
+- New `LedgerEntry::Compaction { freed_tokens, replaced_items, summary_card_id, expansion_blob_path }` variant + matching `Kind::Compaction` discriminator + the schema bump in `schemas/session/v1.json` (`kind` enum widened; per-kind `allOf` adds `Compaction` requireds). Compaction entries never carry their own `cost_usd` — the immediately preceding `ModelCall` records the summary-generation cost.
+- New `Event::CompactionExecuted { freed_tokens, replaced_item_count, summary_card_id }` event. Emitted by the dispatcher mutator after `LedgerAppended(Compaction)` → `ContextItems` → `MemoryCards` have already converged the panels; UIs use it as the "clear my multi-select / show the toast" signal.
+- New `MemoryCard.compacted_from: Option<CompactionSource>` field (and `CompactionSource { item_ids, expansion_blob_path, compacted_at }` struct) that links the summary card back to the originals + the on-disk blob v60.6 Expand will read. Optional; existing bundled session fixtures round-trip unchanged.
+- New `MemoryCardSummary.compacted_from: Option<u32>` projection (item count only) so the bus payload stays small.
+- New `ContextManager::evict_batch(&[ContextItemId], evicted_at)` — atomic Pass-1 pin/missing check, Pass-2 evict. Rejects duplicate ids at Pass 1 (the second copy hits the dup guard).
+
+Dispatcher / orchestration:
+
+- `SessionDispatcher::compact_context_items(ids, summary_text, expansion_blob_path, now) -> Result<CompactionOutput, CompactionError>` is the new sync mutator. Validates the summary via the shared `text_safety::validate_user_text`, atomically evicts via `evict_batch`, mints a pinned summary `MemoryCard` carrying the `CompactionSource` link, appends `LedgerEntry::Compaction`, and emits the bus events in a fixed order.
+- `SessionDispatcher::snapshot_context_items(&[String]) -> Result<Vec<ContextItem>, ContextError>` — non-mutating clone for the orchestrator to feed `compaction_blob::write` *before* the eviction. Same id-validation as the other dispatcher mutators (`parse_context_item_id`).
+- `SessionDispatcher::append_ledger_entry(entry)` — append + broadcast convenience, lets the orchestrator record the summary `ModelCall` without holding its own `Arc<Ledger>` clone.
+- New `atelier_cli::compaction::compact(adapter, dispatcher, workspace_root, session_id, ids, now)` orchestrator. Composes the five steps (snapshot → adapter chat → blob write → ledger ModelCall → dispatcher mutator) into one async free function the GUI Tauri command and the TUI `submit_compact` helper both delegate to. Fixed summary system prompt; 16 KiB cap on the response; `MockAdapter::queue_text_response`-friendly so tests pre-seed the summary.
+- New `atelier_cli::compaction_blob` module. `write(workspace_root, session_id, compacted_at, items)` persists a `CompactionBlob { version: 1, blob_id, compacted_at, items }` envelope under `<workspace>/.atelier/sessions/<session_id>/compactions/<comp-uuid>.json` via `NamedTempFile::persist`; symmetric `read(workspace_root, relative_path)` for v60.6. Mirrors `memory_promote`'s hardening discipline (canonical containment, session-id hygiene, 4 MiB cap).
+- New `atelier_cli::AdapterHandle` — companion to `DispatcherHandle`, with the same `set` / `clear` / Drop-guard lifecycle. Lets the GUI Tauri command + TUI mutation arm reach the live adapter without re-constructing the per-provider adapter.
+
+Tests landed (~44 new):
+
+- 6 in `atelier-core/memory.rs`: serde round-trip with/without `compacted_from`, `CompactionSource` round-trip, `MemoryCardSummary` projection.
+- 5 in `atelier-core/context.rs`: `evict_batch` happy path, pin-blocks-all-or-nothing, unknown-id-error, empty-noop, duplicate-id rejection.
+- 5 in `atelier-core/ledger.rs`: wire-label test extended with `compaction`, `LedgerEntry::Compaction` serde + cost, `entries_without_cost` excludes Compaction.
+- 1 in `atelier-core/session.rs`: `Event::CompactionExecuted.kind()` pinning.
+- 9 in `atelier-core/dispatcher.rs`: full `compact_context_items` coverage (happy path, empty, pinned-atomic, unknown-id, malformed-id, Trojan-Source, frontmatter-rejection, snapshot ordering, snapshot-unknown).
+- 8 in `atelier-cli/compaction_blob.rs`: round-trip, oversize, path-traversal, non-`.atelier/sessions/` prefix, non-`.json`, parent-dir creation, invalid-session-id, relative-workspace.
+- 4 in `atelier-cli/compaction.rs`: happy path (ModelCall + Compaction ledger order), empty-ids skips adapter, oversize-summary rejection, dispatcher-error doesn't leak state.
+- 2 in `atelier-gui/lib.rs`: bridge `CompactionExecuted` and `MemoryCards.compacted_from` projection.
+- 6 in `atelier-tui/lib.rs`: `space`-toggle (unpinned + pinned), `Shift-C` gating on ≥2 selected, `CompactConfirm` modal `y`/`n`, `apply(CompactionExecuted)` clears selection, `apply(ContextItems)` drops stale selected ids.
+- 1 integration test in `atelier-cli/tests/run_integration.rs`: scripted MockAdapter; asserts the full event sequence + the on-disk blob round-trips back to the original `ContextItem`s.
+
+Workspace test count: **711 → 755**. `make check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all -- --check`, `npm run check` all green.
+
+Deferred to v60.6:
+
+- Expand: `MemoryPane.svelte` button + `SessionDispatcher::expand_memory_card` mutator + `compaction_blob::read` consumer + the cache-rewarm cost disclosure on the expand confirm.
+
 ## v57–v60 — 2026-05-17 (four-round audit / fix sweep)
 
 Four consecutive deep-scan / fix rounds against the v56 codebase. Each round produced a synthesised audit report (bugs / smells / security in parallel) and closed every non-LOW finding in the next round. Trajectory:

@@ -136,6 +136,15 @@ pub struct AppState {
     pub selected_context: usize,
     pub selected_memory: usize,
     pub selected_plan: usize,
+    /// v60.5 — multi-select for §5 non-destructive compaction. Set
+    /// of `ContextItemSummary.id` strings the user has marked with
+    /// `space`. Separate from `selected_context` (the cursor index)
+    /// so the user can navigate without losing the selection. Pinned
+    /// rows can't be added (the dispatcher would refuse them
+    /// anyway, but the UI hides the affordance). Cleared on
+    /// `Event::CompactionExecuted` so a successful compaction
+    /// resets the selection without the user having to.
+    pub selected_context_set: std::collections::HashSet<String>,
     /// v55 — modal input state. `Normal` is the default; the
     /// modals are entered via per-pane keys (`a` for add, `c` for
     /// constraint) and exited via Enter (submit) / Esc (cancel).
@@ -199,6 +208,11 @@ pub enum InputMode {
     /// Evict-confirm modal — `y` confirms, anything else cancels.
     /// `id` is the stringified `ContextItemId` to evict.
     EvictConfirm { id: String },
+    /// v60.5 — compact-confirm modal. `y` confirms; anything else
+    /// cancels. Carries the `ids` to compact and the projected
+    /// `tokens_freed` so the modal can render the cost disclosure
+    /// without re-summing.
+    CompactConfirm { ids: Vec<String>, tokens_freed: u32 },
 }
 
 /// Snapshot of the active model + strategy. Mirror of the GUI's
@@ -331,7 +345,9 @@ fn ledger_entry_cost(entry: &LedgerEntry) -> Option<f64> {
         // CacheBust entries carry no cost field (the eviction itself
         // doesn't cost money; the future re-introduction of the evicted
         // tokens does, and lands as a ModelCall).
-        LedgerEntry::CacheBust { .. } => None,
+        // v60.5 Compaction entries similarly don't carry their own
+        // cost — the paired ModelCall right before them does.
+        LedgerEntry::CacheBust { .. } | LedgerEntry::Compaction { .. } => None,
     }
 }
 
@@ -443,6 +459,15 @@ impl AppState {
                 // partial render is never preferable to the fresh
                 // snapshot.
                 self.context_items = items.clone();
+                // v60.5 — drop any selected-id that no longer
+                // corresponds to a live item. This covers the case
+                // where an item the user pre-selected was evicted via
+                // a different path (e.g. another driver or an
+                // automated compaction).
+                let live: std::collections::HashSet<&str> =
+                    items.iter().map(|i| i.id.as_str()).collect();
+                self.selected_context_set
+                    .retain(|id| live.contains(id.as_str()));
             }
             SessionEvent::MemoryCards { cards } => {
                 // v54 — same wholesale-replace policy as
@@ -458,6 +483,13 @@ impl AppState {
                     .iter()
                     .map(|c| (c.path.clone(), c.summary.clone()))
                     .collect();
+            }
+            SessionEvent::CompactionExecuted { .. } => {
+                // v60.5 — a successful compaction has already converged
+                // the `ContextItems` + `MemoryCards` snapshots; we just
+                // clear the multi-select so the user isn't carrying a
+                // stale selection into the next interaction.
+                self.selected_context_set.clear();
             }
             SessionEvent::IllegalTransitionAttempted { .. }
             | SessionEvent::Cancelled
@@ -636,6 +668,14 @@ pub fn project_event(evt: &SessionEvent) -> EventLine {
             LedgerEntry::ModelCall { .. } => "model_call".to_string(),
             LedgerEntry::ToolCall { tool_name, .. } => format!("tool_call:{tool_name}"),
             LedgerEntry::CacheBust { .. } => "cache_bust".to_string(),
+            LedgerEntry::Compaction {
+                freed_tokens,
+                replaced_items,
+                ..
+            } => format!(
+                "compaction:{} items, {freed_tokens} tokens",
+                replaced_items.len()
+            ),
         },
         SessionEvent::ContextSnapshot {
             known_tokens,
@@ -668,6 +708,13 @@ pub fn project_event(evt: &SessionEvent) -> EventLine {
         SessionEvent::ClaimedChanges { changes } => {
             format!("{} file rationale(s)", changes.len())
         }
+        SessionEvent::CompactionExecuted {
+            freed_tokens,
+            replaced_item_count,
+            summary_card_id,
+        } => format!(
+            "compacted {replaced_item_count} items → freed {freed_tokens} tokens → {summary_card_id}"
+        ),
         SessionEvent::Shutdown => String::new(),
     };
     EventLine { kind, detail }
@@ -1149,7 +1196,17 @@ fn render_context_meter(state: &AppState, area: Rect, buf: &mut Buffer) {
 /// rather than a blank pane — the user always wants to know whether
 /// the pane is alive but empty or actually broken.
 fn render_context_pane(state: &AppState, area: Rect, buf: &mut Buffer) {
-    let block = Block::default().borders(Borders::TOP).title(" §5 Context ");
+    // v60.5 — title shows the multi-select counter so the user knows
+    // how many items will be compacted on `C`.
+    let title = if state.selected_context_set.is_empty() {
+        " §5 Context ".to_string()
+    } else {
+        format!(
+            " §5 Context [{} selected — C to compact] ",
+            state.selected_context_set.len()
+        )
+    };
+    let block = Block::default().borders(Borders::TOP).title(title);
 
     if state.context_items.is_empty() {
         let p = Paragraph::new(Line::from(Span::styled(
@@ -1174,7 +1231,17 @@ fn render_context_pane(state: &AppState, area: Rect, buf: &mut Buffer) {
             let badge = provenance_badge(&item.provenance);
             let badge_style = provenance_badge_style(&item.provenance);
             let pin = if item.pinned { "📌 " } else { "   " };
+            // v60.5 — leading 3-cell select glyph: `[*]` selected,
+            // `[ ]` selectable, `[-]` pinned (un-selectable).
+            let select_glyph = if item.pinned {
+                "[-] "
+            } else if state.selected_context_set.contains(&item.id) {
+                "[*] "
+            } else {
+                "[ ] "
+            };
             ListItem::new(Line::from(vec![
+                Span::raw(select_glyph.to_string()),
                 Span::styled(format!("{tokens_label} "), tokens_style),
                 Span::styled(format!("{badge} "), badge_style),
                 Span::raw(pin.to_string()),
@@ -1328,6 +1395,37 @@ fn render_help(state: &AppState, area: Rect, buf: &mut Buffer) {
         return;
     }
 
+    // v60.5 — open modals also take precedence so the user sees the
+    // confirmation prompt instead of the regular help line.
+    if let InputMode::CompactConfirm { ids, tokens_freed } = &state.input_mode {
+        Widget::render(
+            Paragraph::new(format!(
+                " COMPACT {} items · frees ~{tokens_freed} tokens · y confirm · n / Esc cancel ",
+                ids.len()
+            ))
+            .style(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            area,
+            buf,
+        );
+        return;
+    }
+    if let InputMode::EvictConfirm { .. } = &state.input_mode {
+        Widget::render(
+            Paragraph::new(" EVICT context item · y confirm · n / Esc cancel ").style(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            area,
+            buf,
+        );
+        return;
+    }
+
     let left = render_help_left(state);
     match state.current_model.as_ref() {
         // No model badge yet — let the help text fill the line.
@@ -1443,6 +1541,24 @@ pub enum InputOutcome {
     EvictAsk(String),
     /// In `EvictConfirm` mode: `y` confirms the evict.
     EvictConfirmYes(String),
+    /// v60.5 — toggle the focused context row's id in the multi-select
+    /// set. Carries `pinned` so the run loop can no-op on pinned items
+    /// without re-fetching state.
+    ToggleContextSelected {
+        id: String,
+        pinned: bool,
+    },
+    /// v60.5 — `C` in the Context pane: ask the run loop to open the
+    /// compact-confirm modal for the current `selected_context_set`.
+    /// The run loop computes `tokens_freed` (sum of `tokens` across the
+    /// selected items) and transitions to `InputMode::CompactConfirm`.
+    CompactAsk,
+    /// v60.5 — in `CompactConfirm` mode: `y` confirms. Carries the ids
+    /// + `tokens_freed` so the run loop doesn't have to inspect state.
+    CompactConfirmYes {
+        ids: Vec<String>,
+        tokens_freed: u32,
+    },
     /// In any modal: Esc / `q` cancels back to Normal.
     ModalCancel,
     /// Memory pane: `d` deletes selected card.
@@ -1504,6 +1620,18 @@ pub fn handle_key(key: KeyEvent, state: &AppState) -> InputOutcome {
                 _ => InputOutcome::Continue,
             };
         }
+        InputMode::CompactConfirm { ids, tokens_freed } => {
+            return match (key.code, key.modifiers) {
+                (KeyCode::Char('y'), _) => InputOutcome::CompactConfirmYes {
+                    ids: ids.clone(),
+                    tokens_freed: *tokens_freed,
+                },
+                (KeyCode::Esc, _) | (KeyCode::Char('n'), _) | (KeyCode::Char('q'), _) => {
+                    InputOutcome::ModalCancel
+                }
+                _ => InputOutcome::Continue,
+            };
+        }
         InputMode::TextInput { .. } => {
             return match (key.code, key.modifiers) {
                 (KeyCode::Esc, _) => InputOutcome::ModalCancel,
@@ -1544,6 +1672,19 @@ pub fn handle_key(key: KeyEvent, state: &AppState) -> InputOutcome {
     // Pane-scoped mutator keys.
     match state.focused_pane {
         FocusedPane::Context => {
+            // v60.5 — `C` (shift+c) opens the compact-confirm modal,
+            // gated on `selected_context_set.len() >= 2`. This runs
+            // BEFORE the per-row affordances because `C` doesn't need
+            // a focused row — it operates on the multi-select set.
+            // Note: lowercase `c` is reserved (the global Ctrl-c is
+            // quit, and the Plan pane uses bare `c` for add-constraint),
+            // so we key off the uppercase form here.
+            if matches!(key.code, KeyCode::Char('C')) {
+                if state.selected_context_set.len() >= 2 {
+                    return InputOutcome::CompactAsk;
+                }
+                return InputOutcome::Continue;
+            }
             let Some(item) = state.context_items.get(state.selected_context) else {
                 return InputOutcome::Continue;
             };
@@ -1551,6 +1692,12 @@ pub fn handle_key(key: KeyEvent, state: &AppState) -> InputOutcome {
                 (KeyCode::Char('p'), _) => InputOutcome::PinContext(item.id.clone()),
                 (KeyCode::Char('u'), _) => InputOutcome::UnpinContext(item.id.clone()),
                 (KeyCode::Char('e'), _) => InputOutcome::EvictAsk(item.id.clone()),
+                // v60.5 — `space` toggles selection on the focused row
+                // (no-op if pinned).
+                (KeyCode::Char(' '), _) => InputOutcome::ToggleContextSelected {
+                    id: item.id.clone(),
+                    pinned: item.pinned,
+                },
                 _ => InputOutcome::Continue,
             }
         }
@@ -1660,6 +1807,10 @@ async fn run_async(prompt: Option<String>) -> io::Result<()> {
     // mode; the y/n key handler reads it to call submit_approval.
     let mut state = AppState::new();
     let dispatcher_handle: Option<atelier_cli::runner::DispatcherHandle>;
+    // v60.5 — companion handle for §5 non-destructive compaction.
+    // `None` in viewer mode (no adapter to call); otherwise mirrors
+    // `dispatcher_handle`'s lifetime via the same `AdapterHandleGuard`.
+    let adapter_handle: Option<atelier_cli::runner::AdapterHandle>;
     let _run_task: Option<tokio::task::JoinHandle<()>>;
     let _viewer_session: Option<atelier_core::SessionHandle>;
 
@@ -1667,8 +1818,9 @@ async fn run_async(prompt: Option<String>) -> io::Result<()> {
         Some(p) => {
             // Driver mode: build the Runner, wire EventSink::Callback
             // to the mpsc, spawn the run.
-            let (handle, task) = spawn_driver_run(p, event_tx.clone())?;
+            let (handle, adapter_h, task) = spawn_driver_run(p, event_tx.clone())?;
             dispatcher_handle = Some(handle);
+            adapter_handle = Some(adapter_h);
             _run_task = Some(task);
             _viewer_session = None;
         }
@@ -1699,6 +1851,7 @@ async fn run_async(prompt: Option<String>) -> io::Result<()> {
                 }
             });
             dispatcher_handle = None;
+            adapter_handle = None;
             _run_task = None;
             _viewer_session = Some(session_handle);
         }
@@ -1778,6 +1931,35 @@ async fn run_async(prompt: Option<String>) -> io::Result<()> {
                             InputOutcome::EvictConfirmYes(id) => {
                                 state.input_mode = InputMode::Normal;
                                 submit_mutation(&dispatcher_handle, Mutation::Evict(id));
+                            }
+                            InputOutcome::ToggleContextSelected { id, pinned } => {
+                                if !pinned && !state.selected_context_set.insert(id.clone()) {
+                                    state.selected_context_set.remove(&id);
+                                }
+                            }
+                            InputOutcome::CompactAsk => {
+                                if state.selected_context_set.len() >= 2 {
+                                    let ids: Vec<String> = state
+                                        .context_items
+                                        .iter()
+                                        .filter(|i| state.selected_context_set.contains(&i.id))
+                                        .map(|i| i.id.clone())
+                                        .collect();
+                                    let tokens_freed = state
+                                        .context_items
+                                        .iter()
+                                        .filter(|i| state.selected_context_set.contains(&i.id))
+                                        .map(|i| i.tokens)
+                                        .sum::<u32>();
+                                    state.input_mode = InputMode::CompactConfirm {
+                                        ids,
+                                        tokens_freed,
+                                    };
+                                }
+                            }
+                            InputOutcome::CompactConfirmYes { ids, tokens_freed: _ } => {
+                                state.input_mode = InputMode::Normal;
+                                submit_compact(&dispatcher_handle, &adapter_handle, ids);
                             }
                             InputOutcome::ModalCancel => {
                                 state.input_mode = InputMode::Normal;
@@ -1878,9 +2060,12 @@ fn spawn_driver_run(
     event_tx: tokio::sync::mpsc::UnboundedSender<SessionEvent>,
 ) -> io::Result<(
     atelier_cli::runner::DispatcherHandle,
+    atelier_cli::runner::AdapterHandle,
     tokio::task::JoinHandle<()>,
 )> {
-    use atelier_cli::runner::{DispatcherHandle, EventSink, MockResponse, ProviderChoice, Runner};
+    use atelier_cli::runner::{
+        AdapterHandle, DispatcherHandle, EventSink, MockResponse, ProviderChoice, Runner,
+    };
     use atelier_core::adapter::ToolCallRequest;
     use atelier_core::dispatcher::ApprovalPolicy;
     use atelier_core::protocol::Envelope;
@@ -1933,6 +2118,7 @@ fn spawn_driver_run(
     }];
 
     let handle = DispatcherHandle::new();
+    let adapter_handle = AdapterHandle::new();
     let cb = std::sync::Arc::new(move |evt: &SessionEvent| {
         let _ = event_tx.send(evt.clone());
     });
@@ -1944,6 +2130,7 @@ fn spawn_driver_run(
     .map_err(|e| io::Error::other(format!("runner build failed: {e}")))?
     .with_approval_policy(ApprovalPolicy::AwaitApproval)
     .with_dispatcher_handle(handle.clone())
+    .with_adapter_handle(adapter_handle.clone())
     .with_max_turns(4);
 
     let task = tokio::spawn(async move {
@@ -1951,7 +2138,7 @@ fn spawn_driver_run(
             tracing::warn!(error = %e, "TUI demo run failed");
         }
     });
-    Ok((handle, task))
+    Ok((handle, adapter_handle, task))
 }
 
 /// Pick the first whitespace-delimited word from `s`, sanitised to
@@ -2075,6 +2262,59 @@ fn submit_mutation(handle: &Option<atelier_cli::runner::DispatcherHandle>, m: Mu
     if let Err(e) = result {
         tracing::warn!(error = %e, "submit_mutation: dispatcher rejected the request");
     }
+}
+
+/// v60.5 — fire a §5 non-destructive compaction. Distinct from
+/// `submit_mutation` because:
+///
+/// 1. The orchestrator (`atelier_cli::compaction::compact`) is
+///    async (it calls into the adapter), so we spawn a task
+///    instead of running synchronously.
+/// 2. It needs both the dispatcher and the adapter handles; the
+///    latter isn't on `submit_mutation`'s signature.
+///
+/// No-op (with a `tracing::warn`) in viewer mode or when either
+/// handle is empty.
+fn submit_compact(
+    dispatcher_handle: &Option<atelier_cli::runner::DispatcherHandle>,
+    adapter_handle: &Option<atelier_cli::runner::AdapterHandle>,
+    ids: Vec<String>,
+) {
+    let (Some(dh), Some(ah)) = (dispatcher_handle, adapter_handle) else {
+        tracing::warn!("submit_compact: no active run");
+        return;
+    };
+    let Some(sd) = dh.get() else {
+        tracing::warn!("submit_compact: dispatcher handle empty");
+        return;
+    };
+    let Some(adapter) = ah.get() else {
+        tracing::warn!("submit_compact: adapter handle empty");
+        return;
+    };
+    let now = atelier_core::time::now_rfc3339();
+    // The TUI driver run doesn't currently surface its per-run
+    // workspace_root or session_id externally, so we mint a fresh
+    // session UUID per compaction call and write the blob under
+    // `std::env::temp_dir()`. Once the TUI grows a real session
+    // picker (Phase D §4 time-travel) these will come from the
+    // active session.
+    let workspace = std::env::temp_dir();
+    let session_id = uuid::Uuid::new_v4().to_string();
+    tokio::spawn(async move {
+        let result = atelier_cli::compaction::compact(
+            adapter.as_ref(),
+            sd.as_ref(),
+            &workspace,
+            &session_id,
+            ids,
+            &now,
+        )
+        .await;
+        if let Err(e) = result {
+            tracing::warn!(error = %e, "submit_compact: orchestration failed");
+        }
+    });
 }
 
 // v57 (H6 fix): the TUI's `now_rfc3339_for_tui` + `tui_days_to_ymd`
@@ -2482,6 +2722,7 @@ mod tests {
             created_at: "2026-05-17T10:00:00Z".into(),
             last_used: last_used.into(),
             pinned,
+            compacted_from: None,
         }
     }
 
@@ -3226,6 +3467,7 @@ mod tests {
                 created_at: "2026-05-17T10:00:00Z".into(),
                 last_used: "2026-05-17T10:00:00Z".into(),
                 pinned: false,
+                compacted_from: None,
             })
             .collect();
     }
@@ -3417,5 +3659,127 @@ mod tests {
             handle_key(key(KeyCode::Esc, KeyModifiers::empty()), &s),
             InputOutcome::ModalCancel
         );
+    }
+
+    // ---------- v60.5: §5 non-destructive compaction ----------
+
+    #[test]
+    fn context_pane_space_toggles_selection_for_unpinned_row() {
+        let mut s = AppState::new();
+        s.focused_pane = FocusedPane::Context;
+        seed_context(&mut s, &["id-a", "id-b"]);
+        s.selected_context = 1;
+        assert_eq!(
+            handle_key(key(KeyCode::Char(' '), KeyModifiers::empty()), &s),
+            InputOutcome::ToggleContextSelected {
+                id: "id-b".to_string(),
+                pinned: false,
+            }
+        );
+    }
+
+    #[test]
+    fn context_pane_space_marks_pinned_row_as_pinned() {
+        // The run loop's match arm no-ops when `pinned == true`; we just
+        // confirm `handle_key` reports the flag accurately.
+        let mut s = AppState::new();
+        s.focused_pane = FocusedPane::Context;
+        seed_context(&mut s, &["id-a"]);
+        s.context_items[0].pinned = true;
+        assert_eq!(
+            handle_key(key(KeyCode::Char(' '), KeyModifiers::empty()), &s),
+            InputOutcome::ToggleContextSelected {
+                id: "id-a".to_string(),
+                pinned: true,
+            }
+        );
+    }
+
+    #[test]
+    fn context_pane_shift_c_emits_compact_ask_only_with_two_plus_selected() {
+        let mut s = AppState::new();
+        s.focused_pane = FocusedPane::Context;
+        seed_context(&mut s, &["id-a", "id-b", "id-c"]);
+
+        // With zero selected -> no-op.
+        assert_eq!(
+            handle_key(key(KeyCode::Char('C'), KeyModifiers::SHIFT), &s),
+            InputOutcome::Continue
+        );
+
+        // With one selected -> still no-op.
+        s.selected_context_set.insert("id-a".to_string());
+        assert_eq!(
+            handle_key(key(KeyCode::Char('C'), KeyModifiers::SHIFT), &s),
+            InputOutcome::Continue
+        );
+
+        // With two selected -> CompactAsk.
+        s.selected_context_set.insert("id-b".to_string());
+        assert_eq!(
+            handle_key(key(KeyCode::Char('C'), KeyModifiers::SHIFT), &s),
+            InputOutcome::CompactAsk
+        );
+    }
+
+    #[test]
+    fn compact_confirm_mode_consumes_y_and_n() {
+        let mut s = AppState::new();
+        s.input_mode = InputMode::CompactConfirm {
+            ids: vec!["id-a".into(), "id-b".into()],
+            tokens_freed: 250,
+        };
+        match handle_key(key(KeyCode::Char('y'), KeyModifiers::empty()), &s) {
+            InputOutcome::CompactConfirmYes { ids, tokens_freed } => {
+                assert_eq!(ids, vec!["id-a".to_string(), "id-b".to_string()]);
+                assert_eq!(tokens_freed, 250);
+            }
+            other => panic!("expected CompactConfirmYes, got {other:?}"),
+        }
+        assert_eq!(
+            handle_key(key(KeyCode::Char('n'), KeyModifiers::empty()), &s),
+            InputOutcome::ModalCancel
+        );
+        assert_eq!(
+            handle_key(key(KeyCode::Esc, KeyModifiers::empty()), &s),
+            InputOutcome::ModalCancel
+        );
+    }
+
+    #[test]
+    fn apply_compaction_executed_clears_selection() {
+        let mut s = AppState::new();
+        s.selected_context_set.insert("id-a".into());
+        s.selected_context_set.insert("id-b".into());
+        assert_eq!(s.selected_context_set.len(), 2);
+        s.apply(&SessionEvent::CompactionExecuted {
+            freed_tokens: 100,
+            replaced_item_count: 2,
+            summary_card_id: "mem-x".into(),
+        });
+        assert!(s.selected_context_set.is_empty());
+    }
+
+    #[test]
+    fn apply_context_items_drops_stale_selected_ids() {
+        // If the next snapshot doesn't contain an id we had selected
+        // (e.g. evicted via another path), drop it from the selection.
+        let mut s = AppState::new();
+        s.selected_context_set.insert("id-a".into());
+        s.selected_context_set.insert("id-b".into());
+        s.apply(&SessionEvent::ContextItems {
+            items: vec![CtxSum {
+                id: "id-a".into(),
+                kind: "inline_text".into(),
+                label: "x".into(),
+                provenance: "user_attached".into(),
+                provenance_detail: None,
+                tokens: 5,
+                token_source: "approx".into(),
+                pinned: false,
+            }],
+        });
+        assert!(s.selected_context_set.contains("id-a"));
+        assert!(!s.selected_context_set.contains("id-b"));
     }
 }

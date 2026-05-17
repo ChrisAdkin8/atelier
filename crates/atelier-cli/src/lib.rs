@@ -34,9 +34,22 @@ pub mod runner;
 /// module-level doc for the failure modes it closes.
 pub mod memory_promote;
 
+/// v60.5 — hardened reader/writer for §5 compaction blobs. Mirrors
+/// `memory_promote`'s discipline (canonical-root containment, atomic
+/// `NamedTempFile::persist`, per-call size cap) for the
+/// `.atelier/sessions/<sid>/compactions/<id>.json` payload that
+/// v60.6 Expand will replay.
+pub mod compaction_blob;
+
+/// v60.5 — §5 non-destructive compaction orchestration. Composes the
+/// adapter summary call + blob write + dispatcher mutator into a
+/// single async free function the GUI Tauri command and TUI
+/// `Mutation::Compact` arm both delegate to.
+pub mod compaction;
+
 pub use runner::{
-    DispatcherHandle, EventSink, MockResponse, ProbePolicy, ProviderChoice, RunError, RunReport,
-    Runner,
+    AdapterHandle, DispatcherHandle, EventSink, MockResponse, ProbePolicy, ProviderChoice,
+    RunError, RunReport, Runner,
 };
 
 // v50: re-export ApprovalPolicy from atelier-core so a downstream

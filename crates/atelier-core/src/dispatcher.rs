@@ -215,6 +215,43 @@ pub enum RegisterError {
     DuplicateName(String),
 }
 
+/// v60.5 — error returned by `SessionDispatcher::compact_context_items`.
+///
+/// Compaction crosses the §5 Context and Memory subsystems, so a single
+/// domain-specific error type wouldn't carry the right shape; this enum
+/// keeps the underlying `ContextError` / `MemoryError` reachable for
+/// callers that want to render a specific message and provides the
+/// dispatcher-level cases on top.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum CompactionError {
+    #[error("compact_context_items: refusing to compact an empty selection")]
+    Empty,
+
+    #[error("compact_context_items: summary text rejected: {0}")]
+    InvalidSummary(String),
+
+    #[error("compact_context_items: context: {0}")]
+    Context(#[from] crate::context::ContextError),
+
+    #[error("compact_context_items: memory: {0}")]
+    Memory(#[from] crate::memory::MemoryError),
+}
+
+/// v60.5 — value returned by a successful
+/// `SessionDispatcher::compact_context_items` call. The caller (typically
+/// the `atelier_cli::compaction` orchestrator) uses these fields to
+/// build the UI-side toast ("compacted 7 items, freed ~12.3k tokens").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactionOutput {
+    /// `mem-<uuid>` of the freshly-created summary card. Always pinned
+    /// by construction; carries a `CompactionSource` linking back to
+    /// the replaced items + the expansion blob.
+    pub summary_card_id: String,
+    /// Sum of `tokens` across the evicted items (as reported by
+    /// `CacheBustEvent::tokens_freed`).
+    pub freed_tokens: u32,
+}
+
 /// Spec §3 hunk accept/reject contract.
 ///
 /// Called by [`Dispatcher::dispatch`] between staging and commit when a
@@ -997,6 +1034,7 @@ impl SessionDispatcher {
             created_at: now.to_string(),
             last_used: now.to_string(),
             pinned: false,
+            compacted_from: None,
         };
         self.memory_store.lock().add(card)?;
         self.emit_memory_cards();
@@ -1080,6 +1118,132 @@ impl SessionDispatcher {
         self.plan_canvas.lock().reorder(new_order)?;
         self.emit_plan_snapshot();
         Ok(())
+    }
+
+    /// v60.5 — append a single ledger entry and broadcast the matching
+    /// `LedgerAppended` event. Public so callers outside the dispatcher
+    /// (`atelier_cli::compaction`, which records the `ModelCall` for the
+    /// summary generation) can ledger without holding their own
+    /// `Arc<Ledger>` + `broadcast::Sender` clones. The dispatcher's
+    /// internal call sites continue to inline `ledger.append + send`
+    /// where they need other side effects in the same atomic step.
+    pub fn append_ledger_entry(&self, entry: crate::ledger::LedgerEntry) {
+        self.ledger.append(entry.clone());
+        let _ = self.events.send(Event::LedgerAppended { entry });
+    }
+
+    /// v60.5 — snapshot a subset of `ContextManager` items without
+    /// evicting them. Used by the `atelier_cli::compaction` orchestrator
+    /// to serialise the items into the expansion blob *before* calling
+    /// [`Self::compact_context_items`] (which then atomically evicts
+    /// them). Returns clones (so the caller is free to drop the lock)
+    /// in input order.
+    pub fn snapshot_context_items(
+        &self,
+        ids: &[String],
+    ) -> Result<Vec<crate::context::ContextItem>, crate::context::ContextError> {
+        let parsed: Vec<_> = ids
+            .iter()
+            .map(|s| parse_context_item_id(s))
+            .collect::<Result<_, _>>()?;
+        let mgr = self.context_manager.lock();
+        let mut out = Vec::with_capacity(parsed.len());
+        for id in parsed {
+            let item = mgr
+                .get(id)
+                .ok_or(crate::context::ContextError::NotFound(id))?
+                .clone();
+            out.push(item);
+        }
+        Ok(out)
+    }
+
+    /// v60.5 — atomic §5 non-destructive compaction. Replaces the
+    /// `ids` items in `ContextManager` with one pinned summary
+    /// `MemoryCard`, ledgers the operation as a `Compaction` entry, and
+    /// emits the snapshot stream so subscribed UIs converge.
+    ///
+    /// The caller is responsible for:
+    ///   1. Generating `summary_text` (typically via `adapter.chat()`).
+    ///   2. Snapshotting the items via [`Self::snapshot_context_items`]
+    ///      and writing them to disk via
+    ///      `atelier_cli::compaction_blob::write` *before* this call.
+    ///   3. Passing the resulting `expansion_blob_path` here so the
+    ///      summary card's `compacted_from` link points at the
+    ///      already-written blob (v60.6 Expand reads it back).
+    ///
+    /// Event broadcast order (matters for UI convergence):
+    ///   * `LedgerAppended` with the `Compaction` entry
+    ///   * `ContextItems` snapshot (with the replaced items gone)
+    ///   * `MemoryCards` snapshot (with the new pinned summary)
+    ///   * `CompactionExecuted` (terminal signal for UIs to clear
+    ///     their multi-select / toast state)
+    pub fn compact_context_items(
+        &self,
+        ids: Vec<String>,
+        summary_text: String,
+        expansion_blob_path: String,
+        now: &str,
+    ) -> Result<CompactionOutput, CompactionError> {
+        if ids.is_empty() {
+            return Err(CompactionError::Empty);
+        }
+
+        // Pre-mutation validation. Same predicates as the memory-card
+        // add path so a summary that fails here would have failed there
+        // (and a future `promote_to_global` of the summary card stays
+        // safe).
+        crate::text_safety::validate_user_text(&summary_text, /* check_frontmatter */ true)
+            .map_err(CompactionError::InvalidSummary)?;
+
+        let parsed_ids: Vec<_> = ids
+            .iter()
+            .map(|s| parse_context_item_id(s))
+            .collect::<Result<_, _>>()?;
+
+        // Evict atomically (pin/missing checks land in Pass 1).
+        let cache_bust_events = self.context_manager.lock().evict_batch(&parsed_ids, now)?;
+        let freed_tokens: u32 = cache_bust_events.iter().map(|e| e.tokens_freed).sum();
+
+        // Mint the summary card. Always pinned — the compaction is
+        // pointless if the user can drop the replacement.
+        let summary_card_id = format!("mem-{}", uuid::Uuid::new_v4());
+        let card = crate::memory::MemoryCard {
+            id: summary_card_id.clone(),
+            content: summary_text,
+            created_at: now.to_string(),
+            last_used: now.to_string(),
+            pinned: true,
+            compacted_from: Some(crate::memory::CompactionSource {
+                item_ids: ids.clone(),
+                expansion_blob_path: expansion_blob_path.clone(),
+                compacted_at: now.to_string(),
+            }),
+        };
+        self.memory_store.lock().add(card)?;
+
+        // Ledger entry + event broadcast.
+        let entry = crate::ledger::LedgerEntry::Compaction {
+            timestamp: now.to_string(),
+            freed_tokens,
+            replaced_items: ids,
+            summary_card_id: summary_card_id.clone(),
+            expansion_blob_path,
+        };
+        self.ledger.append(entry.clone());
+        let _ = self.events.send(Event::LedgerAppended { entry });
+        self.emit_context_items();
+        self.emit_memory_cards();
+        let _ = self.events.send(Event::CompactionExecuted {
+            freed_tokens,
+            replaced_item_count: cache_bust_events.len(),
+            summary_card_id: summary_card_id.clone(),
+        });
+
+        Ok(CompactionOutput {
+            summary_card_id,
+            freed_tokens,
+        })
     }
 
     /// Dispatch one tool call and perform the side effects. Returns the
@@ -2713,5 +2877,224 @@ mod tests {
             Event::PlanSnapshot { steps } => assert!(steps.is_empty()),
             other => panic!("expected PlanSnapshot, got {other:?}"),
         }
+    }
+
+    // ---------- v60.5: compact_context_items ----------
+
+    #[tokio::test]
+    async fn compact_context_items_evicts_creates_summary_card_and_ledgers() {
+        let (sd, cm, ms, _pc, ledger, mut rx) = build_v55_dispatcher();
+        let a = seed_context_item(&cm, 100);
+        let b = seed_context_item(&cm, 150);
+        let _kept = seed_context_item(&cm, 50);
+
+        let out = sd
+            .compact_context_items(
+                vec![a.to_string(), b.to_string()],
+                "Summary: a + b discussed module X.".into(),
+                ".atelier/sessions/sid/compactions/comp-test.json".into(),
+                "2026-05-17T11:00:00Z",
+            )
+            .expect("compact must succeed");
+        assert_eq!(out.freed_tokens, 250);
+        assert!(out.summary_card_id.starts_with("mem-"));
+
+        // Context state: only the kept item remains.
+        assert_eq!(cm.lock().len(), 1);
+
+        // Memory state: one pinned card with the compacted_from link.
+        let cards = ms.lock().to_vec();
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].id, out.summary_card_id);
+        assert!(cards[0].pinned);
+        let cs = cards[0].compacted_from.as_ref().expect("compacted_from");
+        assert_eq!(cs.item_ids, vec![a.to_string(), b.to_string()]);
+        assert_eq!(
+            cs.expansion_blob_path,
+            ".atelier/sessions/sid/compactions/comp-test.json"
+        );
+        assert_eq!(cs.compacted_at, "2026-05-17T11:00:00Z");
+
+        // Ledger has a single Compaction entry.
+        let entries = ledger.to_vec();
+        assert_eq!(entries.len(), 1);
+        match &entries[0] {
+            LedgerEntry::Compaction {
+                freed_tokens,
+                replaced_items,
+                summary_card_id,
+                ..
+            } => {
+                assert_eq!(*freed_tokens, 250);
+                assert_eq!(replaced_items.len(), 2);
+                assert_eq!(summary_card_id, &out.summary_card_id);
+            }
+            other => panic!("expected Compaction, got {other:?}"),
+        }
+
+        // Event broadcast order: LedgerAppended → ContextItems → MemoryCards → CompactionExecuted.
+        match next_event(&mut rx).await {
+            Event::LedgerAppended { entry } => {
+                assert!(matches!(entry, LedgerEntry::Compaction { .. }))
+            }
+            other => panic!("expected LedgerAppended, got {other:?}"),
+        }
+        match next_event(&mut rx).await {
+            Event::ContextItems { items } => assert_eq!(items.len(), 1),
+            other => panic!("expected ContextItems, got {other:?}"),
+        }
+        match next_event(&mut rx).await {
+            Event::MemoryCards { cards } => assert_eq!(cards.len(), 1),
+            other => panic!("expected MemoryCards, got {other:?}"),
+        }
+        match next_event(&mut rx).await {
+            Event::CompactionExecuted {
+                freed_tokens,
+                replaced_item_count,
+                summary_card_id,
+            } => {
+                assert_eq!(freed_tokens, 250);
+                assert_eq!(replaced_item_count, 2);
+                assert_eq!(summary_card_id, out.summary_card_id);
+            }
+            other => panic!("expected CompactionExecuted, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn compact_context_items_empty_selection_returns_error() {
+        let (sd, _cm, _ms, _pc, ledger, _rx) = build_v55_dispatcher();
+        let err = sd
+            .compact_context_items(vec![], "summary".into(), "blob.json".into(), "t")
+            .unwrap_err();
+        assert_eq!(err, CompactionError::Empty);
+        assert_eq!(ledger.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn compact_context_items_rejects_pinned_item_atomically() {
+        let (sd, cm, ms, _pc, ledger, _rx) = build_v55_dispatcher();
+        let a = seed_context_item(&cm, 100);
+        let b = seed_context_item(&cm, 50);
+        cm.lock().pin(b).unwrap();
+
+        let err = sd
+            .compact_context_items(
+                vec![a.to_string(), b.to_string()],
+                "summary".into(),
+                "blob.json".into(),
+                "t",
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            CompactionError::Context(crate::context::ContextError::EvictPinned(_))
+        ));
+        // Atomicity: a is still in the store (Pass-1 of evict_batch refused).
+        assert_eq!(cm.lock().len(), 2);
+        assert_eq!(ms.lock().to_vec().len(), 0);
+        assert_eq!(ledger.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn compact_context_items_rejects_unknown_item() {
+        let (sd, cm, _ms, _pc, _ledger, _rx) = build_v55_dispatcher();
+        let _a = seed_context_item(&cm, 10);
+        let ghost = uuid::Uuid::new_v4().to_string();
+
+        let err = sd
+            .compact_context_items(
+                vec![ghost.clone()],
+                "summary".into(),
+                "blob.json".into(),
+                "t",
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            CompactionError::Context(crate::context::ContextError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn compact_context_items_rejects_malformed_id() {
+        let (sd, cm, _ms, _pc, _ledger, _rx) = build_v55_dispatcher();
+        let _a = seed_context_item(&cm, 10);
+
+        let err = sd
+            .compact_context_items(
+                vec!["not-a-uuid".into()],
+                "summary".into(),
+                "blob.json".into(),
+                "t",
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            CompactionError::Context(crate::context::ContextError::Malformed(s)) if s == "not-a-uuid"
+        ));
+    }
+
+    #[tokio::test]
+    async fn compact_context_items_rejects_summary_with_trojan_source() {
+        let (sd, cm, ms, _pc, ledger, _rx) = build_v55_dispatcher();
+        let a = seed_context_item(&cm, 10);
+
+        let err = sd
+            .compact_context_items(
+                vec![a.to_string()],
+                "harmless looking\u{202E}reversed".into(),
+                "blob.json".into(),
+                "t",
+            )
+            .unwrap_err();
+        assert!(matches!(err, CompactionError::InvalidSummary(_)));
+        // No state change.
+        assert_eq!(cm.lock().len(), 1);
+        assert_eq!(ms.lock().to_vec().len(), 0);
+        assert_eq!(ledger.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn compact_context_items_rejects_summary_with_frontmatter_delimiter() {
+        let (sd, cm, _ms, _pc, _ledger, _rx) = build_v55_dispatcher();
+        let a = seed_context_item(&cm, 10);
+
+        let err = sd
+            .compact_context_items(
+                vec![a.to_string()],
+                "alpha\n---\nforged frontmatter".into(),
+                "blob.json".into(),
+                "t",
+            )
+            .unwrap_err();
+        assert!(matches!(err, CompactionError::InvalidSummary(_)));
+    }
+
+    #[tokio::test]
+    async fn snapshot_context_items_returns_clones_in_input_order() {
+        let (sd, cm, _ms, _pc, _ledger, _rx) = build_v55_dispatcher();
+        let a = seed_context_item(&cm, 1);
+        let b = seed_context_item(&cm, 2);
+        let c = seed_context_item(&cm, 3);
+
+        // Request out of insertion order; result should follow the input.
+        let items = sd
+            .snapshot_context_items(&[c.to_string(), a.to_string(), b.to_string()])
+            .expect("snapshot must succeed");
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].id, c);
+        assert_eq!(items[1].id, a);
+        assert_eq!(items[2].id, b);
+        // Items still in the manager (not evicted).
+        assert_eq!(cm.lock().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn snapshot_context_items_rejects_unknown_id() {
+        let (sd, _cm, _ms, _pc, _ledger, _rx) = build_v55_dispatcher();
+        let ghost = uuid::Uuid::new_v4().to_string();
+        let err = sd.snapshot_context_items(&[ghost]).unwrap_err();
+        assert!(matches!(err, crate::context::ContextError::NotFound(_)));
     }
 }
