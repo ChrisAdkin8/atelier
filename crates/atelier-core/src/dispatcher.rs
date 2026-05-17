@@ -252,6 +252,56 @@ pub struct CompactionOutput {
     pub freed_tokens: u32,
 }
 
+/// v60.6 — error returned by `SessionDispatcher::expand_memory_card`.
+/// Wraps the layered failures so the caller (the `atelier_cli::expansion`
+/// orchestrator) can render a precise message.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ExpansionError {
+    #[error("expand_memory_card: memory card {0:?} not found")]
+    CardNotFound(String),
+
+    #[error("expand_memory_card: card {0:?} is not a compaction summary (missing compacted_from)")]
+    NotACompactionCard(String),
+
+    #[error(
+        "expand_memory_card: blob items do not match the card's compacted_from.item_ids \
+         (expected {expected} ids, got {got})"
+    )]
+    ItemMismatch { expected: usize, got: usize },
+
+    #[error(
+        "expand_memory_card: blob item id {got:?} at position {position} does not match \
+         compacted_from.item_ids[{position}] = {expected:?}"
+    )]
+    ItemIdMismatch {
+        position: usize,
+        expected: String,
+        got: String,
+    },
+
+    #[error("expand_memory_card: context: {0}")]
+    Context(#[from] crate::context::ContextError),
+
+    #[error("expand_memory_card: memory: {0}")]
+    Memory(#[from] crate::memory::MemoryError),
+}
+
+/// v60.6 — value returned by a successful
+/// `SessionDispatcher::expand_memory_card` call. Drives the UI toast
+/// ("restored 5 items, paid ~240 cache tokens"). Mirror of
+/// [`CompactionOutput`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpansionOutput {
+    /// Number of `ContextItem`s restored to the manager.
+    pub restored_item_count: usize,
+    /// Id of the summary `MemoryCard` that was dropped.
+    pub summary_card_id: String,
+    /// Prompt-cache rewarm cost the user paid (sum of `tokens.count`
+    /// across the restored items). Matches the `cache_rewarm_tokens`
+    /// stored in the now-gone `CompactionSource`.
+    pub cache_rewarm_tokens: u32,
+}
+
 /// Spec §3 hunk accept/reject contract.
 ///
 /// Called by [`Dispatcher::dispatch`] between staging and commit when a
@@ -1218,6 +1268,7 @@ impl SessionDispatcher {
                 item_ids: ids.clone(),
                 expansion_blob_path: expansion_blob_path.clone(),
                 compacted_at: now.to_string(),
+                cache_rewarm_tokens: freed_tokens,
             }),
         };
         self.memory_store.lock().add(card)?;
@@ -1243,6 +1294,124 @@ impl SessionDispatcher {
         Ok(CompactionOutput {
             summary_card_id,
             freed_tokens,
+        })
+    }
+
+    /// v60.6 — read-only snapshot of a single memory card by id. Used
+    /// by `atelier_cli::expansion::expand` to read the
+    /// `compacted_from` link (and its `expansion_blob_path`) before
+    /// reading the blob; symmetric to [`Self::snapshot_context_items`].
+    /// Returns `None` when the card isn't in the store.
+    pub fn snapshot_memory_card(&self, id: &str) -> Option<crate::memory::MemoryCard> {
+        self.memory_store.lock().get(id).cloned()
+    }
+
+    /// v60.6 — atomic §5 Expand. Symmetric counterpart to
+    /// [`Self::compact_context_items`]. Removes a compaction-summary
+    /// `MemoryCard`, re-inserts the original `ContextItem`s into the
+    /// `ContextManager`, ledgers the operation as an `Expansion`
+    /// entry, and emits the snapshot stream so subscribed UIs
+    /// converge.
+    ///
+    /// The caller is responsible for:
+    ///
+    ///   1. Reading the on-disk blob via
+    ///      `atelier_cli::compaction_blob::read` (path comes from the
+    ///      card's `compacted_from.expansion_blob_path`).
+    ///   2. Passing the blob items in — this method validates them
+    ///      against the card's `compacted_from.item_ids` (count + ids
+    ///      in order) before mutating anything.
+    ///
+    /// Failure modes (all atomic — state stays unchanged on `Err`):
+    ///
+    ///   * `CardNotFound` if the card isn't in `MemoryStore`.
+    ///   * `NotACompactionCard` if the card has no `compacted_from`.
+    ///   * `ItemMismatch` / `ItemIdMismatch` if `items` doesn't
+    ///     match the card's recorded ids (defends against a
+    ///     blob/card desync — e.g., the blob was rewritten by hand).
+    ///   * `Context(AlreadyPresent)` if any restored id collides
+    ///     with an item already in the manager (e.g., the user
+    ///     pinned a memory card after compaction and is trying to
+    ///     re-expand on top of another compaction's tail).
+    ///
+    /// Event broadcast order (matches Compaction's discipline):
+    ///   * `LedgerAppended` with the `Expansion` entry
+    ///   * `ContextItems` snapshot (with the restored items present)
+    ///   * `MemoryCards` snapshot (with the summary card gone)
+    ///   * `ExpansionExecuted` (terminal signal for UIs)
+    pub fn expand_memory_card(
+        &self,
+        card_id: String,
+        items: Vec<crate::context::ContextItem>,
+        now: &str,
+    ) -> Result<ExpansionOutput, ExpansionError> {
+        // ---- Pre-flight: snapshot card + validate it carries compacted_from. ----
+        let card = self
+            .memory_store
+            .lock()
+            .get(&card_id)
+            .cloned()
+            .ok_or_else(|| ExpansionError::CardNotFound(card_id.clone()))?;
+        let compacted_from = card
+            .compacted_from
+            .as_ref()
+            .ok_or_else(|| ExpansionError::NotACompactionCard(card_id.clone()))?;
+
+        // ---- Validate items match the card's recorded ids. ----
+        if items.len() != compacted_from.item_ids.len() {
+            return Err(ExpansionError::ItemMismatch {
+                expected: compacted_from.item_ids.len(),
+                got: items.len(),
+            });
+        }
+        for (position, (expected_id, item)) in
+            compacted_from.item_ids.iter().zip(items.iter()).enumerate()
+        {
+            if item.id.to_string() != *expected_id {
+                return Err(ExpansionError::ItemIdMismatch {
+                    position,
+                    expected: expected_id.clone(),
+                    got: item.id.to_string(),
+                });
+            }
+        }
+
+        // Pre-compute the rewarm cost from the items we're about to
+        // restore; this is the ledger entry's authoritative value.
+        // Equal to the card's stored `cache_rewarm_tokens` for any
+        // v60.6+ compaction; for v60.5-era compactions (where the
+        // stored field defaulted to 0) we still report the real cost.
+        let cache_rewarm_tokens: u32 = items.iter().map(|i| i.tokens.count).sum();
+        let restored_item_ids: Vec<String> = items.iter().map(|i| i.id.to_string()).collect();
+        let restored_item_count = items.len();
+
+        // ---- Pass-1 atomic restore: refuse on any id collision. ----
+        self.context_manager.lock().add_batch(items)?;
+
+        // ---- Drop the summary card from MemoryStore. ----
+        self.memory_store.lock().evict(&card_id)?;
+
+        // ---- Ledger entry + event broadcast. ----
+        let entry = crate::ledger::LedgerEntry::Expansion {
+            timestamp: now.to_string(),
+            restored_item_ids,
+            summary_card_id: card_id.clone(),
+            cache_rewarm_tokens,
+        };
+        self.ledger.append(entry.clone());
+        let _ = self.events.send(Event::LedgerAppended { entry });
+        self.emit_context_items();
+        self.emit_memory_cards();
+        let _ = self.events.send(Event::ExpansionExecuted {
+            restored_item_count,
+            summary_card_id: card_id.clone(),
+            cache_rewarm_tokens,
+        });
+
+        Ok(ExpansionOutput {
+            restored_item_count,
+            summary_card_id: card_id,
+            cache_rewarm_tokens,
         })
     }
 
@@ -3096,5 +3265,213 @@ mod tests {
         let ghost = uuid::Uuid::new_v4().to_string();
         let err = sd.snapshot_context_items(&[ghost]).unwrap_err();
         assert!(matches!(err, crate::context::ContextError::NotFound(_)));
+    }
+
+    // ---------- v60.6: expand_memory_card + snapshot_memory_card ----------
+
+    /// Drive a compaction end-to-end through the dispatcher and return
+    /// (a) the resulting summary `card_id`, (b) the items that were
+    /// evicted (so the test can simulate "read the blob" by passing
+    /// them straight back in). Keeps the v60.6 tests focused on the
+    /// expansion path rather than re-asserting the compaction shape.
+    fn compact_and_capture(
+        sd: &SessionDispatcher,
+        cm: &Arc<parking_lot::Mutex<crate::context::ContextManager>>,
+        tokens: &[u32],
+    ) -> (String, Vec<crate::context::ContextItem>) {
+        let ids: Vec<crate::context::ContextItemId> =
+            tokens.iter().map(|t| seed_context_item(cm, *t)).collect();
+        let id_strings: Vec<String> = ids.iter().map(|i| i.to_string()).collect();
+        // Snapshot BEFORE compaction so we have the items to pass back
+        // into `expand_memory_card` (the orchestrator would normally
+        // read these from the on-disk blob).
+        let items = sd.snapshot_context_items(&id_strings).expect("snapshot");
+        let out = sd
+            .compact_context_items(
+                id_strings,
+                "summary line".into(),
+                ".atelier/sessions/sid/compactions/comp-test.json".into(),
+                "2026-05-17T11:00:00Z",
+            )
+            .expect("compact must succeed");
+        (out.summary_card_id, items)
+    }
+
+    #[tokio::test]
+    async fn snapshot_memory_card_returns_cloned_card() {
+        let (sd, cm, _ms, _pc, _ledger, _rx) = build_v55_dispatcher();
+        let (card_id, _items) = compact_and_capture(&sd, &cm, &[10, 20]);
+        let card = sd.snapshot_memory_card(&card_id).expect("must be present");
+        assert_eq!(card.id, card_id);
+        assert!(card.pinned);
+        assert!(card.compacted_from.is_some());
+        let cs = card.compacted_from.unwrap();
+        assert_eq!(cs.item_ids.len(), 2);
+        assert_eq!(cs.cache_rewarm_tokens, 30);
+    }
+
+    #[tokio::test]
+    async fn snapshot_memory_card_returns_none_for_missing_id() {
+        let (sd, _cm, _ms, _pc, _ledger, _rx) = build_v55_dispatcher();
+        assert!(sd.snapshot_memory_card("mem-nope").is_none());
+    }
+
+    #[tokio::test]
+    async fn expand_memory_card_restores_items_drops_card_and_ledgers() {
+        let (sd, cm, ms, _pc, ledger, mut rx) = build_v55_dispatcher();
+        let (card_id, items) = compact_and_capture(&sd, &cm, &[10, 20]);
+        // Drain the compaction-side events so the expansion events
+        // arrive at the head of the receiver.
+        while rx.try_recv().is_ok() {}
+        assert_eq!(cm.lock().len(), 0, "items must be gone post-compaction");
+        assert_eq!(ms.lock().len(), 1, "summary card must be present");
+
+        let out = sd
+            .expand_memory_card(card_id.clone(), items, "2026-05-17T12:00:00Z")
+            .expect("expand must succeed");
+        assert_eq!(out.restored_item_count, 2);
+        assert_eq!(out.cache_rewarm_tokens, 30);
+        assert_eq!(out.summary_card_id, card_id);
+
+        // Context state: items are back.
+        assert_eq!(cm.lock().len(), 2);
+        // Memory state: summary card gone.
+        assert_eq!(ms.lock().len(), 0);
+
+        // Ledger: ModelCall(none here) + Compaction (from earlier) + Expansion.
+        let entries = ledger.to_vec();
+        let expansion = entries
+            .iter()
+            .rev()
+            .find(|e| matches!(e, LedgerEntry::Expansion { .. }))
+            .expect("must have one Expansion entry");
+        match expansion {
+            LedgerEntry::Expansion {
+                cache_rewarm_tokens,
+                summary_card_id,
+                restored_item_ids,
+                ..
+            } => {
+                assert_eq!(*cache_rewarm_tokens, 30);
+                assert_eq!(summary_card_id, &card_id);
+                assert_eq!(restored_item_ids.len(), 2);
+            }
+            _ => unreachable!(),
+        }
+
+        // Event order: LedgerAppended(Expansion) → ContextItems → MemoryCards → ExpansionExecuted.
+        match next_event(&mut rx).await {
+            Event::LedgerAppended { entry } => {
+                assert!(matches!(entry, LedgerEntry::Expansion { .. }))
+            }
+            other => panic!("expected LedgerAppended, got {other:?}"),
+        }
+        match next_event(&mut rx).await {
+            Event::ContextItems { items } => assert_eq!(items.len(), 2),
+            other => panic!("expected ContextItems, got {other:?}"),
+        }
+        match next_event(&mut rx).await {
+            Event::MemoryCards { cards } => assert!(cards.is_empty()),
+            other => panic!("expected MemoryCards, got {other:?}"),
+        }
+        match next_event(&mut rx).await {
+            Event::ExpansionExecuted {
+                restored_item_count,
+                summary_card_id,
+                cache_rewarm_tokens,
+            } => {
+                assert_eq!(restored_item_count, 2);
+                assert_eq!(summary_card_id, card_id);
+                assert_eq!(cache_rewarm_tokens, 30);
+            }
+            other => panic!("expected ExpansionExecuted, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn expand_memory_card_unknown_card_returns_error() {
+        let (sd, _cm, _ms, _pc, ledger, _rx) = build_v55_dispatcher();
+        let err = sd
+            .expand_memory_card("mem-nope".into(), vec![], "t")
+            .unwrap_err();
+        assert!(matches!(err, ExpansionError::CardNotFound(_)));
+        assert_eq!(ledger.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn expand_memory_card_non_compaction_card_returns_error() {
+        let (sd, _cm, _ms, _pc, ledger, _rx) = build_v55_dispatcher();
+        let plain_id = sd
+            .add_memory_card("ordinary card".into(), "2026-05-17T10:00:00Z")
+            .unwrap();
+        let err = sd.expand_memory_card(plain_id, vec![], "t").unwrap_err();
+        assert!(matches!(err, ExpansionError::NotACompactionCard(_)));
+        // No expansion ledger entry written.
+        let n_expansions = ledger
+            .to_vec()
+            .iter()
+            .filter(|e| matches!(e, LedgerEntry::Expansion { .. }))
+            .count();
+        assert_eq!(n_expansions, 0);
+    }
+
+    #[tokio::test]
+    async fn expand_memory_card_item_count_mismatch_rejects_atomically() {
+        let (sd, cm, ms, _pc, ledger, _rx) = build_v55_dispatcher();
+        let (card_id, mut items) = compact_and_capture(&sd, &cm, &[10, 20]);
+        items.pop(); // 2 ids on the card, only 1 item supplied
+
+        let err = sd.expand_memory_card(card_id, items, "t").unwrap_err();
+        assert!(matches!(
+            err,
+            ExpansionError::ItemMismatch {
+                expected: 2,
+                got: 1
+            }
+        ));
+        // Atomicity: card still present, no Expansion entry written.
+        assert_eq!(ms.lock().len(), 1);
+        assert_eq!(cm.lock().len(), 0);
+        let n_expansions = ledger
+            .to_vec()
+            .iter()
+            .filter(|e| matches!(e, LedgerEntry::Expansion { .. }))
+            .count();
+        assert_eq!(n_expansions, 0);
+    }
+
+    #[tokio::test]
+    async fn expand_memory_card_item_id_mismatch_rejects_atomically() {
+        let (sd, cm, _ms, _pc, _ledger, _rx) = build_v55_dispatcher();
+        let (card_id, items) = compact_and_capture(&sd, &cm, &[10, 20]);
+        // Swap the two items' positions — count matches, ids don't.
+        let swapped = vec![items[1].clone(), items[0].clone()];
+        let err = sd.expand_memory_card(card_id, swapped, "t").unwrap_err();
+        assert!(matches!(
+            err,
+            ExpansionError::ItemIdMismatch { position: 0, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn expand_memory_card_id_collision_rolls_back_via_add_batch() {
+        // If the user has somehow re-introduced an item with the same id
+        // since compaction (e.g., via an alternate restore path),
+        // expansion must refuse to overwrite it.
+        let (sd, cm, ms, _pc, _ledger, _rx) = build_v55_dispatcher();
+        let (card_id, items) = compact_and_capture(&sd, &cm, &[10, 20]);
+        // Pre-insert one of the items back into the manager — re-using
+        // its original id — before calling expand. add_batch's Pass 1
+        // must reject the whole batch.
+        cm.lock().add(items[0].clone());
+        assert_eq!(cm.lock().len(), 1);
+
+        let err = sd.expand_memory_card(card_id, items, "t").unwrap_err();
+        assert!(matches!(
+            err,
+            ExpansionError::Context(crate::context::ContextError::AlreadyPresent(_))
+        ));
+        // Card still present (atomicity).
+        assert_eq!(ms.lock().len(), 1);
     }
 }

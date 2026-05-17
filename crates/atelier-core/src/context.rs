@@ -311,6 +311,17 @@ pub enum ContextError {
     /// input at the API boundary.
     #[error("malformed context item id {0:?}")]
     Malformed(String),
+
+    /// v60.6 — `add_batch` refuses to insert an item whose id is
+    /// already present in the manager (or appears twice in the same
+    /// input batch). The first-write-wins / silently-overwrite
+    /// semantics of the underlying `BTreeMap` would otherwise turn a
+    /// duplicate id into a lost item; this error makes the collision
+    /// visible to the caller (the §5 Expand path, which surfaces it
+    /// as "this card was already expanded, or its ids collide with
+    /// items added since").
+    #[error("context item {0} is already present")]
+    AlreadyPresent(ContextItemId),
 }
 
 /// Insertion-ordered context store. Items render in the §5 panel in the
@@ -458,6 +469,57 @@ impl ContextManager {
             });
         }
         Ok(events)
+    }
+
+    /// v60.6 — atomic batch insert for §5 Expand. Mirror of
+    /// [`Self::evict_batch`]'s discipline:
+    ///
+    /// * Pass 1 verifies that every item's id is fresh (not already in
+    ///   the manager) and that no two items in the input share an id.
+    ///   If any check fails, returns `Err(...)` with the offending id
+    ///   and leaves state unchanged.
+    /// * Pass 2 inserts each item in input order, mirroring
+    ///   [`Self::add`]'s `next_order`-incrementing behaviour so the
+    ///   restored items appear at the tail of the manager (rather than
+    ///   reclaiming their original insertion slots, which would
+    ///   reshuffle the §5 panel relative to anything added since the
+    ///   compaction).
+    /// * Empty input is `Ok(())` — callers don't have to special-case
+    ///   the "nothing to restore" branch.
+    ///
+    /// Used by `SessionDispatcher::expand_memory_card` to replay the
+    /// blob's items back into context atomically: if even one id
+    /// collides with a currently-present item, the whole expansion is
+    /// refused (the caller surfaces the error to the user — typically
+    /// "this card was already expanded, or another card with the same
+    /// item ids was restored").
+    pub fn add_batch(&mut self, items: Vec<ContextItem>) -> Result<(), ContextError> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        // Pass 1: validate. A duplicate within the input batch trips
+        // the same error as a collision with existing state — the
+        // second occurrence of an id would (in Pass 2) overwrite the
+        // first via `by_id.insert`, which is precisely the bug
+        // `add_batch`'s atomicity is designed to prevent.
+        let mut seen = std::collections::BTreeSet::new();
+        for item in &items {
+            if !seen.insert(item.id) {
+                return Err(ContextError::AlreadyPresent(item.id));
+            }
+            if self.by_id.contains_key(&item.id) {
+                return Err(ContextError::AlreadyPresent(item.id));
+            }
+        }
+        // Pass 2: insert in input order.
+        for item in items {
+            let id = item.id;
+            let order = self.next_order;
+            self.next_order += 1;
+            self.by_id.insert(id, order);
+            self.items.insert(order, item);
+        }
+        Ok(())
     }
 
     /// Lookup by id.
@@ -1078,5 +1140,105 @@ mod tests {
         assert_eq!(err, ContextError::NotFound(a));
         // Nothing was evicted because Pass 1 rejected.
         assert_eq!(m.len(), 1);
+    }
+
+    // ---------- v60.6: add_batch ----------
+
+    #[test]
+    fn add_batch_inserts_in_input_order_and_appends_at_tail() {
+        let mut m = ContextManager::new();
+        // Pre-existing item — restored items must appear AFTER it.
+        let pre = m.add(file_item("pre.rs", 5));
+        let restored = vec![file_item("a.rs", 10), file_item("b.rs", 20)];
+        let ids: Vec<_> = restored.iter().map(|i| i.id).collect();
+        m.add_batch(restored).expect("must succeed");
+        assert_eq!(m.len(), 3);
+
+        let order: Vec<String> = m
+            .iter()
+            .map(|i| match &i.payload {
+                Payload::FileRef { path, .. } => path.clone(),
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(order, vec!["pre.rs", "a.rs", "b.rs"]);
+        // Lookup by id still works.
+        for id in ids {
+            assert!(m.get(id).is_some());
+        }
+        // Pre-existing item still present.
+        assert!(m.get(pre).is_some());
+    }
+
+    #[test]
+    fn add_batch_rejects_collision_with_existing_item_atomically() {
+        let mut m = ContextManager::new();
+        let a = m.add(file_item("a.rs", 10));
+        // Build an input that includes a fresh item AND a collision.
+        let fresh = file_item("fresh.rs", 99);
+        let fresh_id = fresh.id;
+        let colliding = ContextItem {
+            id: a, // same id as the existing item
+            payload: Payload::FileRef {
+                path: "colliding.rs".into(),
+                line_range: None,
+            },
+            tokens: TokenCount {
+                count: 1,
+                source: TokenSource::Exact,
+            },
+            provenance: Provenance::UserAttached { note: None },
+            pinned: false,
+            added_at: "2026-05-17T11:00:00Z".into(),
+            last_used: "2026-05-17T11:00:00Z".into(),
+        };
+        let err = m.add_batch(vec![fresh, colliding]).unwrap_err();
+        assert_eq!(err, ContextError::AlreadyPresent(a));
+        // Nothing was inserted — `fresh` must NOT survive Pass-1 rejection.
+        assert_eq!(m.len(), 1);
+        assert!(m.get(fresh_id).is_none());
+    }
+
+    #[test]
+    fn add_batch_rejects_duplicate_within_input() {
+        let mut m = ContextManager::new();
+        let item_a = file_item("a.rs", 10);
+        let item_a_clone = item_a.clone();
+        let id_a = item_a.id;
+        let err = m.add_batch(vec![item_a, item_a_clone]).unwrap_err();
+        assert_eq!(err, ContextError::AlreadyPresent(id_a));
+        assert_eq!(m.len(), 0);
+    }
+
+    #[test]
+    fn add_batch_empty_is_noop() {
+        let mut m = ContextManager::new();
+        let a = m.add(file_item("a.rs", 10));
+        m.add_batch(vec![]).unwrap();
+        assert_eq!(m.len(), 1);
+        assert!(m.get(a).is_some());
+    }
+
+    #[test]
+    fn add_batch_preserves_original_token_and_provenance() {
+        let mut m = ContextManager::new();
+        let item = item(
+            Payload::InlineText {
+                text: "summarised content".into(),
+            },
+            128,
+            TokenSource::Exact,
+            Provenance::ToolResult {
+                tool_call_id: "tc-1".into(),
+            },
+        );
+        let id = item.id;
+        m.add_batch(vec![item]).unwrap();
+        let got = m.get(id).unwrap();
+        assert_eq!(got.tokens.count, 128);
+        assert!(matches!(
+            got.provenance,
+            Provenance::ToolResult { ref tool_call_id } if tool_call_id == "tc-1"
+        ));
     }
 }

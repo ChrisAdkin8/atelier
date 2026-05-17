@@ -279,6 +279,20 @@ pub enum Event {
         summary_card_id: String,
     },
 
+    /// v60.6 — terminal marker for a successful §5 Expand (symmetric to
+    /// [`Self::CompactionExecuted`]). Emitted by
+    /// `SessionDispatcher::expand_memory_card` after the preceding
+    /// `LedgerAppended(Expansion)`, `ContextItems` (snapshot with the
+    /// originals back in place), and `MemoryCards` (snapshot with the
+    /// summary card gone) events land. UIs use it as the "show the
+    /// 'restored N items' toast" signal; the snapshot events have
+    /// already converged the panels by the time it arrives.
+    ExpansionExecuted {
+        restored_item_count: usize,
+        summary_card_id: String,
+        cache_rewarm_tokens: u32,
+    },
+
     /// The actor is shutting down. No further events will be emitted.
     Shutdown,
 }
@@ -309,6 +323,7 @@ impl Event {
             Self::CommitDecision { .. } => "CommitDecision",
             Self::ModelProfileLoaded { .. } => "ModelProfileLoaded",
             Self::CompactionExecuted { .. } => "CompactionExecuted",
+            Self::ExpansionExecuted { .. } => "ExpansionExecuted",
             Self::Shutdown => "Shutdown",
         }
     }
@@ -542,6 +557,16 @@ mod tests {
             summary_card_id: "mem-c".into(),
         };
         assert_eq!(ev.kind(), "CompactionExecuted");
+    }
+
+    #[test]
+    fn expansion_executed_event_carries_expected_kind() {
+        let ev = Event::ExpansionExecuted {
+            restored_item_count: 3,
+            summary_card_id: "mem-c".into(),
+            cache_rewarm_tokens: 240,
+        };
+        assert_eq!(ev.kind(), "ExpansionExecuted");
     }
 
     /// Hook impl that counts invocations — lets tests assert that hooks fired

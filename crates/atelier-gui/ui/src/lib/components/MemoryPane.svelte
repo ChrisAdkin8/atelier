@@ -35,6 +35,12 @@
   let toast: string | null = $state(null)
   let toastError: boolean = $state(false)
 
+  // v60.6 — Expand confirm state. Open at most one row at a time;
+  // confirm triggers `expand_memory_card`, which on success removes
+  // the card via the next `MemoryCards` snapshot.
+  let expandConfirmFor: string | null = $state(null)
+  let expandInFlight: boolean = $state(false)
+
   async function add() {
     const content = draft.trim()
     if (!content) return
@@ -63,6 +69,35 @@
       showToast(`promoted → ${r.path} (${r.bytes} bytes)`, false)
     } catch (e) {
       showToast(String(e), true)
+    }
+  }
+
+  function askExpand(id: string) {
+    expandConfirmFor = id
+  }
+
+  function cancelExpand() {
+    expandConfirmFor = null
+  }
+
+  async function confirmExpand(id: string) {
+    if (expandInFlight) return
+    expandInFlight = true
+    try {
+      const r = await invoke<{
+        restored_item_count: number
+        summary_card_id: string
+        cache_rewarm_tokens: number
+      }>('expand_memory_card', { id })
+      showToast(
+        `restored ${r.restored_item_count} items · ~${r.cache_rewarm_tokens} cache tokens re-warmed`,
+        false,
+      )
+    } catch (e) {
+      showToast(String(e), true)
+    } finally {
+      expandInFlight = false
+      expandConfirmFor = null
     }
   }
 
@@ -123,6 +158,17 @@
             <span class="title">{card.title || '(untitled)'}</span>
             <span class="when">{shortTimestamp(card.last_used)}</span>
             <span class="row-actions">
+              {#if card.compacted_from}
+                <button
+                  class="action expand"
+                  onclick={() => askExpand(card.id)}
+                  disabled={expandInFlight && expandConfirmFor !== card.id}
+                  title="expand: restore the {card.compacted_from} original context items from disk"
+                  aria-label="expand {card.id}"
+                >
+                  ⤴ expand
+                </button>
+              {/if}
               <button
                 class="action"
                 onclick={() => void promote(card.id)}
@@ -141,6 +187,39 @@
               </button>
             </span>
           </div>
+          {#if card.compacted_from}
+            <p class="compaction-badge">
+              compacted from {card.compacted_from} item{card.compacted_from === 1
+                ? ''
+                : 's'}{card.cache_rewarm_tokens != null
+                ? ` · ~${card.cache_rewarm_tokens} tokens to re-warm`
+                : ''}
+            </p>
+          {/if}
+          {#if expandConfirmFor === card.id && card.compacted_from}
+            <div class="expand-confirm" role="dialog" aria-label="confirm expand">
+              <span class="expand-msg">
+                Restore {card.compacted_from} items · pays ~{card.cache_rewarm_tokens ?? '?'}
+                cache tokens to re-warm the prompt
+              </span>
+              <span class="expand-buttons">
+                <button
+                  class="action danger"
+                  disabled={expandInFlight}
+                  onclick={() => void confirmExpand(card.id)}
+                >
+                  {expandInFlight ? 'expanding…' : 'expand'}
+                </button>
+                <button
+                  class="action"
+                  disabled={expandInFlight}
+                  onclick={cancelExpand}
+                >
+                  cancel
+                </button>
+              </span>
+            </div>
+          {/if}
           {#if card.body_preview}
             <p class="preview">{card.body_preview}</p>
           {/if}
@@ -312,5 +391,37 @@
     -webkit-line-clamp: 2;
     -webkit-box-orient: vertical;
     overflow: hidden;
+  }
+  /* v60.6 — Expand affordance + cost-disclosure badge. */
+  .action.expand:hover:not(:disabled) {
+    color: #9cf;
+    border-color: #467;
+  }
+  .compaction-badge {
+    margin: 0.2rem 0 0 0;
+    color: var(--fg-dim);
+    font-size: 0.7rem;
+    font-style: italic;
+    opacity: 0.85;
+  }
+  .expand-confirm {
+    margin: 0.3rem 0 0 0;
+    padding: 0.25rem 0.4rem;
+    border: 1px solid #467;
+    border-radius: 3px;
+    background: rgba(120, 180, 220, 0.05);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    align-items: center;
+    font-size: 0.72rem;
+  }
+  .expand-msg {
+    color: var(--fg-default, #ddd);
+    flex: 1;
+  }
+  .expand-buttons {
+    display: inline-flex;
+    gap: 0.3rem;
   }
 </style>

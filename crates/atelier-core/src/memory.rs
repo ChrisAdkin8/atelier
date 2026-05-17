@@ -67,6 +67,15 @@ pub struct CompactionSource {
     /// `MemoryCard::created_at` (which mirrors this for compaction-
     /// generated cards but stays divergent for hand-authored cards).
     pub compacted_at: String,
+    /// v60.6 — sum of `tokens.count` across the replaced items at the
+    /// moment of compaction. Equal to `Compaction::freed_tokens` and to
+    /// the prompt-cache rewarm cost the user pays if they Expand later.
+    /// Optional on the wire (`#[serde(default)]`) so v60.5-era sessions
+    /// — written before this field existed — round-trip as 0. New
+    /// compactions always populate it; the Expand confirm dialog uses
+    /// it to surface the cache-rewarm cost without re-reading the blob.
+    #[serde(default)]
+    pub cache_rewarm_tokens: u32,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -291,6 +300,14 @@ pub struct MemoryCardSummary {
     /// the typed struct for non-compaction cards.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compacted_from: Option<u32>,
+    /// v60.6 — `Some(N)` when this card was produced by a §5
+    /// compaction; `N` is the prompt-cache rewarm cost the user will
+    /// pay if they Expand (sum of `tokens.count` across the replaced
+    /// items at compaction time). Lets the Memory pane render the
+    /// cost in the Expand confirm dialog without re-reading the
+    /// on-disk blob. Absent for non-compaction cards.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_rewarm_tokens: Option<u32>,
 }
 
 /// Cap on [`MemoryCardSummary::body_preview`] before truncation —
@@ -315,6 +332,10 @@ impl MemoryCardSummary {
                 .compacted_from
                 .as_ref()
                 .map(|cs| cs.item_ids.len() as u32),
+            cache_rewarm_tokens: card
+                .compacted_from
+                .as_ref()
+                .map(|cs| cs.cache_rewarm_tokens),
         }
     }
 }
@@ -662,6 +683,7 @@ mod tests {
                 ".atelier/sessions/00000000-0000-0000-0000-000000000000/compactions/comp-abc.json"
                     .into(),
             compacted_at: "2026-05-17T13:00:00Z".into(),
+            cache_rewarm_tokens: 240,
         }
     }
 
@@ -714,5 +736,47 @@ mod tests {
         assert!(plain_summary.compacted_from.is_none());
         let plain_json = serde_json::to_value(&plain_summary).unwrap();
         assert!(plain_json.get("compacted_from").is_none());
+    }
+
+    // ---------- v60.6: cache_rewarm_tokens projection + back-compat ----------
+
+    #[test]
+    fn compaction_source_cache_rewarm_tokens_round_trips() {
+        let src = compaction_source_fixture();
+        assert_eq!(src.cache_rewarm_tokens, 240);
+        let json = serde_json::to_string(&src).unwrap();
+        assert!(json.contains("\"cache_rewarm_tokens\":240"));
+        let back: CompactionSource = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, src);
+    }
+
+    #[test]
+    fn compaction_source_without_cache_rewarm_tokens_is_backwards_compat() {
+        // v60.5-era serialisation: the field wasn't written. Make sure
+        // the v60.6 deserialiser still accepts the older shape and
+        // defaults the missing field to 0.
+        let raw = r#"{
+            "item_ids": ["a", "b"],
+            "expansion_blob_path": ".atelier/sessions/abc/compactions/comp-1.json",
+            "compacted_at": "2026-05-17T13:00:00Z"
+        }"#;
+        let src: CompactionSource = serde_json::from_str(raw).unwrap();
+        assert_eq!(src.cache_rewarm_tokens, 0);
+        assert_eq!(src.item_ids.len(), 2);
+    }
+
+    #[test]
+    fn memory_card_summary_projects_cache_rewarm_tokens() {
+        let mut c = fixture_card("mem-1", "title");
+        c.compacted_from = Some(compaction_source_fixture());
+        let s = MemoryCardSummary::from_card(&c);
+        assert_eq!(s.cache_rewarm_tokens, Some(240));
+
+        // Non-compaction card has neither projection.
+        let plain = fixture_card("mem-2", "title");
+        let plain_summary = MemoryCardSummary::from_card(&plain);
+        assert!(plain_summary.cache_rewarm_tokens.is_none());
+        let json = serde_json::to_value(&plain_summary).unwrap();
+        assert!(json.get("cache_rewarm_tokens").is_none());
     }
 }

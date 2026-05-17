@@ -213,6 +213,15 @@ pub enum InputMode {
     /// `tokens_freed` so the modal can render the cost disclosure
     /// without re-summing.
     CompactConfirm { ids: Vec<String>, tokens_freed: u32 },
+    /// v60.6 — expand-confirm modal. `y` confirms; anything else
+    /// cancels. Carries the card id and the cache-rewarm cost
+    /// surfaced from the card's `cache_rewarm_tokens` projection so
+    /// the modal renders the disclosure without re-reading the blob.
+    ExpandConfirm {
+        card_id: String,
+        item_count: u32,
+        cache_rewarm_tokens: u32,
+    },
 }
 
 /// Snapshot of the active model + strategy. Mirror of the GUI's
@@ -347,7 +356,11 @@ fn ledger_entry_cost(entry: &LedgerEntry) -> Option<f64> {
         // tokens does, and lands as a ModelCall).
         // v60.5 Compaction entries similarly don't carry their own
         // cost — the paired ModelCall right before them does.
-        LedgerEntry::CacheBust { .. } | LedgerEntry::Compaction { .. } => None,
+        // v60.6 Expansion: cache_rewarm_tokens is a prompt-cache
+        // disclosure, not a `$` line, so it stays out of the cost meter.
+        LedgerEntry::CacheBust { .. }
+        | LedgerEntry::Compaction { .. }
+        | LedgerEntry::Expansion { .. } => None,
     }
 }
 
@@ -490,6 +503,14 @@ impl AppState {
                 // clear the multi-select so the user isn't carrying a
                 // stale selection into the next interaction.
                 self.selected_context_set.clear();
+            }
+            SessionEvent::ExpansionExecuted { .. } => {
+                // v60.6 — terminal marker; the `ContextItems` +
+                // `MemoryCards` snapshots have already converged. No
+                // local UI state to clear (the Expand confirm modal
+                // closes itself in `submit_expand`'s post-spawn path
+                // via the same InputMode::Normal transition the run
+                // loop applies on ExpandConfirmYes).
             }
             SessionEvent::IllegalTransitionAttempted { .. }
             | SessionEvent::Cancelled
@@ -676,6 +697,14 @@ pub fn project_event(evt: &SessionEvent) -> EventLine {
                 "compaction:{} items, {freed_tokens} tokens",
                 replaced_items.len()
             ),
+            LedgerEntry::Expansion {
+                restored_item_ids,
+                cache_rewarm_tokens,
+                ..
+            } => format!(
+                "expansion:{} items, {cache_rewarm_tokens} tokens",
+                restored_item_ids.len()
+            ),
         },
         SessionEvent::ContextSnapshot {
             known_tokens,
@@ -714,6 +743,13 @@ pub fn project_event(evt: &SessionEvent) -> EventLine {
             summary_card_id,
         } => format!(
             "compacted {replaced_item_count} items → freed {freed_tokens} tokens → {summary_card_id}"
+        ),
+        SessionEvent::ExpansionExecuted {
+            restored_item_count,
+            summary_card_id,
+            cache_rewarm_tokens,
+        } => format!(
+            "restored {restored_item_count} items ← {summary_card_id} (paid ~{cache_rewarm_tokens} cache tokens)"
         ),
         SessionEvent::Shutdown => String::new(),
     };
@@ -1322,12 +1358,28 @@ fn render_memory_pane(state: &AppState, area: Rect, buf: &mut Buffer) {
                 Style::default().fg(Color::White)
             };
             let when = short_timestamp(&card.last_used);
-            ListItem::new(Line::from(vec![
+            let mut spans = vec![
                 Span::raw(pin.to_string()),
                 Span::styled(card.title.clone(), title_style),
                 Span::raw("  "),
                 Span::styled(when, Style::default().fg(Color::DarkGray)),
-            ]))
+            ];
+            // v60.6 — Compaction-flavoured cards get a "[×N, T tokens]"
+            // suffix so the user can see which rows are Expand-eligible
+            // at a glance. Falls back to `"?"` for the token count if
+            // cache_rewarm_tokens isn't populated (v60.5-era cards).
+            if let Some(count) = card.compacted_from {
+                let tokens = card
+                    .cache_rewarm_tokens
+                    .map(|t| t.to_string())
+                    .unwrap_or_else(|| "?".to_string());
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled(
+                    format!("[×{count}, {tokens} tk]"),
+                    Style::default().fg(Color::Cyan),
+                ));
+            }
+            ListItem::new(Line::from(spans))
         })
         .collect();
     Widget::render(List::new(rows).block(block), area, buf);
@@ -1406,6 +1458,27 @@ fn render_help(state: &AppState, area: Rect, buf: &mut Buffer) {
             .style(
                 Style::default()
                     .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            area,
+            buf,
+        );
+        return;
+    }
+    // v60.6 — symmetric counterpart to CompactConfirm.
+    if let InputMode::ExpandConfirm {
+        item_count,
+        cache_rewarm_tokens,
+        ..
+    } = &state.input_mode
+    {
+        Widget::render(
+            Paragraph::new(format!(
+                " EXPAND {item_count} items · pays ~{cache_rewarm_tokens} cache tokens · y confirm · n / Esc cancel "
+            ))
+            .style(
+                Style::default()
+                    .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ),
             area,
@@ -1559,6 +1632,20 @@ pub enum InputOutcome {
         ids: Vec<String>,
         tokens_freed: u32,
     },
+    /// v60.6 — Memory pane: `x` (eXpand) on a compaction-flavoured
+    /// card. Carries the card id + the cost disclosure so the run
+    /// loop can transition to `ExpandConfirm` without re-fetching state.
+    ExpandAsk {
+        card_id: String,
+        item_count: u32,
+        cache_rewarm_tokens: u32,
+    },
+    /// v60.6 — in `ExpandConfirm` mode: `y` confirms. Carries the
+    /// card id; the orchestrator re-reads the blob (we don't trust
+    /// the modal's snapshot for the actual restoration).
+    ExpandConfirmYes {
+        card_id: String,
+    },
     /// In any modal: Esc / `q` cancels back to Normal.
     ModalCancel,
     /// Memory pane: `d` deletes selected card.
@@ -1625,6 +1712,17 @@ pub fn handle_key(key: KeyEvent, state: &AppState) -> InputOutcome {
                 (KeyCode::Char('y'), _) => InputOutcome::CompactConfirmYes {
                     ids: ids.clone(),
                     tokens_freed: *tokens_freed,
+                },
+                (KeyCode::Esc, _) | (KeyCode::Char('n'), _) | (KeyCode::Char('q'), _) => {
+                    InputOutcome::ModalCancel
+                }
+                _ => InputOutcome::Continue,
+            };
+        }
+        InputMode::ExpandConfirm { card_id, .. } => {
+            return match (key.code, key.modifiers) {
+                (KeyCode::Char('y'), _) => InputOutcome::ExpandConfirmYes {
+                    card_id: card_id.clone(),
                 },
                 (KeyCode::Esc, _) | (KeyCode::Char('n'), _) | (KeyCode::Char('q'), _) => {
                     InputOutcome::ModalCancel
@@ -1714,6 +1812,29 @@ pub fn handle_key(key: KeyEvent, state: &AppState) -> InputOutcome {
                     return InputOutcome::Continue;
                 };
                 InputOutcome::PromoteMemory(card.id.clone())
+            }
+            // v60.6 — `x` opens the expand-confirm modal, but only
+            // on rows whose card was produced by a §5 compaction
+            // (the `compacted_from` projection is `Some`). On any
+            // other card the keystroke is inert.
+            (KeyCode::Char('x'), _) => {
+                let Some(card) = state.memory_cards.get(state.selected_memory) else {
+                    return InputOutcome::Continue;
+                };
+                let Some(count) = card.compacted_from else {
+                    return InputOutcome::Continue;
+                };
+                // `cache_rewarm_tokens` is `Some(_)` for every
+                // v60.6+ compaction. v60.5-era cards may carry
+                // `None`; we default the disclosure to 0 in that
+                // case (the orchestrator will still surface the
+                // real cost in the post-expand toast).
+                let cache_rewarm_tokens = card.cache_rewarm_tokens.unwrap_or(0);
+                InputOutcome::ExpandAsk {
+                    card_id: card.id.clone(),
+                    item_count: count,
+                    cache_rewarm_tokens,
+                }
             }
             _ => InputOutcome::Continue,
         },
@@ -1960,6 +2081,21 @@ async fn run_async(prompt: Option<String>) -> io::Result<()> {
                             InputOutcome::CompactConfirmYes { ids, tokens_freed: _ } => {
                                 state.input_mode = InputMode::Normal;
                                 submit_compact(&dispatcher_handle, &adapter_handle, ids);
+                            }
+                            InputOutcome::ExpandAsk {
+                                card_id,
+                                item_count,
+                                cache_rewarm_tokens,
+                            } => {
+                                state.input_mode = InputMode::ExpandConfirm {
+                                    card_id,
+                                    item_count,
+                                    cache_rewarm_tokens,
+                                };
+                            }
+                            InputOutcome::ExpandConfirmYes { card_id } => {
+                                state.input_mode = InputMode::Normal;
+                                submit_expand(&dispatcher_handle, card_id);
                             }
                             InputOutcome::ModalCancel => {
                                 state.input_mode = InputMode::Normal;
@@ -2313,6 +2449,38 @@ fn submit_compact(
         .await;
         if let Err(e) = result {
             tracing::warn!(error = %e, "submit_compact: orchestration failed");
+        }
+    });
+}
+
+/// v60.6 — fire a §5 Expand. Symmetric counterpart to
+/// [`submit_compact`]; doesn't need the adapter handle (no model
+/// call in the loop), so the function signature is one parameter
+/// shorter.
+///
+/// The blob is resolved against `std::env::temp_dir()` — same
+/// shortcut [`submit_compact`] takes, since the TUI driver run
+/// doesn't externally expose its `workspace_root`. The compaction
+/// path also wrote under this same root, so reads and writes
+/// pair correctly for the demo run.
+fn submit_expand(
+    dispatcher_handle: &Option<atelier_cli::runner::DispatcherHandle>,
+    card_id: String,
+) {
+    let Some(dh) = dispatcher_handle else {
+        tracing::warn!("submit_expand: no active run");
+        return;
+    };
+    let Some(sd) = dh.get() else {
+        tracing::warn!("submit_expand: dispatcher handle empty");
+        return;
+    };
+    let now = atelier_core::time::now_rfc3339();
+    let workspace = std::env::temp_dir();
+    tokio::spawn(async move {
+        let result = atelier_cli::expansion::expand(sd.as_ref(), &workspace, card_id, &now).await;
+        if let Err(e) = result {
+            tracing::warn!(error = %e, "submit_expand: orchestration failed");
         }
     });
 }
@@ -2723,6 +2891,29 @@ mod tests {
             last_used: last_used.into(),
             pinned,
             compacted_from: None,
+            cache_rewarm_tokens: None,
+        }
+    }
+
+    /// v60.6 — compaction-flavoured memory card. Mirrors `mem_card` but
+    /// populates the `compacted_from` + `cache_rewarm_tokens`
+    /// projections so render + expand-keybind tests can exercise the
+    /// Expand-eligible row path.
+    fn mem_compacted_card(
+        id: &str,
+        title: &str,
+        count: u32,
+        rewarm_tokens: u32,
+    ) -> atelier_core::memory::MemoryCardSummary {
+        atelier_core::memory::MemoryCardSummary {
+            id: id.into(),
+            title: title.into(),
+            body_preview: "summary line".into(),
+            created_at: "2026-05-17T11:00:00Z".into(),
+            last_used: "2026-05-17T11:00:00Z".into(),
+            pinned: true,
+            compacted_from: Some(count),
+            cache_rewarm_tokens: Some(rewarm_tokens),
         }
     }
 
@@ -3468,6 +3659,7 @@ mod tests {
                 last_used: "2026-05-17T10:00:00Z".into(),
                 pinned: false,
                 compacted_from: None,
+                cache_rewarm_tokens: None,
             })
             .collect();
     }
@@ -3781,5 +3973,118 @@ mod tests {
         });
         assert!(s.selected_context_set.contains("id-a"));
         assert!(!s.selected_context_set.contains("id-b"));
+    }
+
+    // ---------- v60.6: §5 Expand ----------
+
+    #[test]
+    fn memory_pane_x_on_compacted_card_opens_expand_modal() {
+        let mut s = AppState::new();
+        s.focused_pane = FocusedPane::Memory;
+        s.memory_cards = vec![mem_compacted_card("mem-c", "summary", 5, 240)];
+        s.selected_memory = 0;
+        match handle_key(key(KeyCode::Char('x'), KeyModifiers::empty()), &s) {
+            InputOutcome::ExpandAsk {
+                card_id,
+                item_count,
+                cache_rewarm_tokens,
+            } => {
+                assert_eq!(card_id, "mem-c");
+                assert_eq!(item_count, 5);
+                assert_eq!(cache_rewarm_tokens, 240);
+            }
+            other => panic!("expected ExpandAsk, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn memory_pane_x_on_plain_card_is_inert() {
+        let mut s = AppState::new();
+        s.focused_pane = FocusedPane::Memory;
+        s.memory_cards = vec![mem_card("mem-a", "ordinary", "2026-05-17T10:00:00Z", false)];
+        s.selected_memory = 0;
+        assert_eq!(
+            handle_key(key(KeyCode::Char('x'), KeyModifiers::empty()), &s),
+            InputOutcome::Continue
+        );
+    }
+
+    #[test]
+    fn expand_confirm_y_yields_expand_confirm_yes() {
+        let s = AppState {
+            input_mode: InputMode::ExpandConfirm {
+                card_id: "mem-c".into(),
+                item_count: 3,
+                cache_rewarm_tokens: 150,
+            },
+            ..AppState::new()
+        };
+        match handle_key(key(KeyCode::Char('y'), KeyModifiers::empty()), &s) {
+            InputOutcome::ExpandConfirmYes { card_id } => {
+                assert_eq!(card_id, "mem-c");
+            }
+            other => panic!("expected ExpandConfirmYes, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn expand_confirm_cancel_keys_yield_modal_cancel() {
+        let s = AppState {
+            input_mode: InputMode::ExpandConfirm {
+                card_id: "mem-c".into(),
+                item_count: 3,
+                cache_rewarm_tokens: 150,
+            },
+            ..AppState::new()
+        };
+        for k in [KeyCode::Char('n'), KeyCode::Esc, KeyCode::Char('q')] {
+            assert_eq!(
+                handle_key(key(k, KeyModifiers::empty()), &s),
+                InputOutcome::ModalCancel
+            );
+        }
+    }
+
+    #[test]
+    fn render_memory_pane_renders_compaction_badge() {
+        let mut s = AppState::new();
+        s.memory_cards = vec![mem_compacted_card("mem-c", "summary", 5, 240)];
+        // Render the memory pane directly into a wide buffer so the
+        // badge has room — the full `render` layout splits the
+        // screen into four panes and the badge would otherwise wrap
+        // out of view in narrow areas.
+        let area = Rect::new(0, 0, 100, 5);
+        let mut buf = Buffer::empty(area);
+        render_memory_pane(&s, area, &mut buf);
+        let rendered = buffer_to_string(&buf, area);
+        assert!(
+            rendered.contains("[×5, 240 tk]"),
+            "missing badge in:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn render_help_footer_renders_expand_confirm_banner() {
+        let s = AppState {
+            input_mode: InputMode::ExpandConfirm {
+                card_id: "mem-c".into(),
+                item_count: 4,
+                cache_rewarm_tokens: 320,
+            },
+            ..AppState::new()
+        };
+        // Render the help/footer band directly. The full screen
+        // layout dedicates only a 1-row strip to it, which is too
+        // narrow to substring-match our banner text in a
+        // multi-pane render_to_string snapshot.
+        let area = Rect::new(0, 0, 100, 1);
+        let mut buf = Buffer::empty(area);
+        render_help(&s, area, &mut buf);
+        let rendered = buffer_to_string(&buf, area);
+        assert!(
+            rendered.contains("EXPAND 4 items"),
+            "missing banner in:\n{rendered}"
+        );
+        assert!(rendered.contains("~320 cache tokens"));
     }
 }

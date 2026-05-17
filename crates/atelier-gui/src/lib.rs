@@ -136,6 +136,8 @@ pub fn run() {
             reorder_plan_steps,
             // v60.5 §5 non-destructive compaction.
             compact_context_items,
+            // v60.6 §5 Expand.
+            expand_memory_card,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -500,6 +502,34 @@ async fn compact_context_items(
     .map_err(|e| e.to_string())
 }
 
+/// v60.6 — wire shape returned by the Expand toast in the §5 Memory
+/// pane. Carries enough to render "Restored N items; ~M cache tokens
+/// re-warmed" without a follow-up query.
+#[derive(Serialize, Debug)]
+pub struct ExpansionResult {
+    pub restored_item_count: usize,
+    pub summary_card_id: String,
+    pub cache_rewarm_tokens: u32,
+}
+
+#[tauri::command]
+async fn expand_memory_card(
+    state: tauri::State<'_, SessionState>,
+    id: String,
+) -> Result<ExpansionResult, String> {
+    let sd = require_dispatcher(&state)?;
+    let workspace = state.workspace_root().to_path_buf();
+    let now = now_rfc3339();
+    atelier_cli::expansion::expand(sd.as_ref(), &workspace, id, &now)
+        .await
+        .map(|r| ExpansionResult {
+            restored_item_count: r.restored_item_count,
+            summary_card_id: r.summary_card_id,
+            cache_rewarm_tokens: r.cache_rewarm_tokens,
+        })
+        .map_err(|e| e.to_string())
+}
+
 /// Start a mock-scripted run with `AwaitApproval` policy. v47 demo
 /// driver: the GUI builds a `Runner` that emits a `write_file` tool
 /// call against the ephemeral workspace, the dispatcher hits the
@@ -826,6 +856,15 @@ pub fn bridge_event(evt: &SessionEvent) -> BridgedEvent {
             "replaced_item_count": replaced_item_count,
             "summary_card_id": summary_card_id,
         }),
+        SessionEvent::ExpansionExecuted {
+            restored_item_count,
+            summary_card_id,
+            cache_rewarm_tokens,
+        } => json!({
+            "restored_item_count": restored_item_count,
+            "summary_card_id": summary_card_id,
+            "cache_rewarm_tokens": cache_rewarm_tokens,
+        }),
     };
     BridgedEvent { kind, payload }
 }
@@ -989,6 +1028,7 @@ mod tests {
             last_used: "2026-05-17T12:00:00Z".into(),
             pinned: true,
             compacted_from: None,
+            cache_rewarm_tokens: None,
         }];
         let b = bridge_event(&SessionEvent::MemoryCards {
             cards: cards.clone(),
@@ -1149,9 +1189,26 @@ mod tests {
             last_used: "2026-05-17T11:00:00Z".into(),
             pinned: true,
             compacted_from: Some(7),
+            cache_rewarm_tokens: Some(1234),
         }];
         let b = bridge_event(&SessionEvent::MemoryCards { cards });
         let wire = b.payload["cards"].as_array().expect("cards array");
         assert_eq!(wire[0]["compacted_from"], 7);
+        assert_eq!(wire[0]["cache_rewarm_tokens"], 1234);
+    }
+
+    // ---------- v60.6: Expand wiring ----------
+
+    #[test]
+    fn bridge_expansion_executed_carries_count_card_and_cost() {
+        let b = bridge_event(&SessionEvent::ExpansionExecuted {
+            restored_item_count: 5,
+            summary_card_id: "mem-abc".into(),
+            cache_rewarm_tokens: 240,
+        });
+        assert_eq!(b.kind, "ExpansionExecuted");
+        assert_eq!(b.payload["restored_item_count"], 5);
+        assert_eq!(b.payload["summary_card_id"], "mem-abc");
+        assert_eq!(b.payload["cache_rewarm_tokens"], 240);
     }
 }

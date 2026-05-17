@@ -18,6 +18,16 @@
   let toast: string | null = $state(null)
   let toastError: boolean = $state(false)
 
+  // v60.6 — HTML5 drag-and-drop reorder. Replaces the v55 up/down
+  // arrow buttons; the dispatcher mutator (`reorder_plan_steps`) is
+  // unchanged. Drag state is in-component (not persisted) and
+  // cleared on drop/dragend; the dispatcher re-emits the matching
+  // `PlanSnapshot` on success so the visual reorder happens
+  // wholesale on the next event tick rather than being applied
+  // optimistically in this component.
+  let dragSourceIdx: number | null = $state(null)
+  let dragOverIdx: number | null = $state(null)
+
   function glyph(status: PlanStatus): string {
     switch (status) {
       case 'pending':
@@ -108,18 +118,58 @@
     }
   }
 
-  async function moveUp(idx: number) {
-    if (idx <= 0) return
-    const ids = planSteps.map((s) => s.id)
-    ;[ids[idx - 1], ids[idx]] = [ids[idx], ids[idx - 1]]
-    await reorder(ids)
+  /// Pure helper extracted so the reorder math is unit-testable
+  /// without spinning up Tauri. Returns a fresh array where the
+  /// element originally at `from` lands at `to`. If `from === to` (or
+  /// the indices are out of range), returns a shallow copy unchanged.
+  export function reorderArray<T>(arr: T[], from: number, to: number): T[] {
+    if (from < 0 || from >= arr.length || to < 0 || to >= arr.length || from === to) {
+      return arr.slice()
+    }
+    const next = arr.slice()
+    const [moved] = next.splice(from, 1)
+    next.splice(to, 0, moved)
+    return next
   }
 
-  async function moveDown(idx: number) {
-    if (idx >= planSteps.length - 1) return
+  function onDragStart(idx: number, ev: DragEvent) {
+    dragSourceIdx = idx
+    if (ev.dataTransfer) {
+      ev.dataTransfer.effectAllowed = 'move'
+      // Some browsers refuse to start a drag without setData payload.
+      ev.dataTransfer.setData('text/plain', String(idx))
+    }
+  }
+
+  function onDragOver(idx: number, ev: DragEvent) {
+    if (dragSourceIdx === null) return
+    ev.preventDefault()
+    if (ev.dataTransfer) {
+      ev.dataTransfer.dropEffect = 'move'
+    }
+    dragOverIdx = idx
+  }
+
+  function onDragLeave(idx: number) {
+    if (dragOverIdx === idx) {
+      dragOverIdx = null
+    }
+  }
+
+  function onDragEnd() {
+    dragSourceIdx = null
+    dragOverIdx = null
+  }
+
+  async function onDrop(idx: number, ev: DragEvent) {
+    ev.preventDefault()
+    const from = dragSourceIdx
+    dragSourceIdx = null
+    dragOverIdx = null
+    if (from === null || from === idx) return
     const ids = planSteps.map((s) => s.id)
-    ;[ids[idx], ids[idx + 1]] = [ids[idx + 1], ids[idx]]
-    await reorder(ids)
+    const reordered = reorderArray(ids, from, idx)
+    await reorder(reordered)
   }
 
   async function reorder(ordering: string[]) {
@@ -162,8 +212,24 @@
     {:else}
       <ul class="steps">
         {#each planSteps as step, idx (step.id)}
-          <li>
+          <li
+            class="step-item"
+            class:dragging={dragSourceIdx === idx}
+            class:drag-target={dragOverIdx === idx && dragSourceIdx !== idx}
+            draggable="true"
+            ondragstart={(e) => onDragStart(idx, e)}
+            ondragover={(e) => onDragOver(idx, e)}
+            ondragleave={() => onDragLeave(idx)}
+            ondrop={(e) => void onDrop(idx, e)}
+            ondragend={onDragEnd}
+            aria-label="plan step {idx + 1} of {planSteps.length}"
+          >
             <div class="step-row">
+              <span
+                class="drag-handle"
+                title="drag to reorder"
+                aria-hidden="true"
+              >⋮⋮</span>
               <button
                 class="glyph-btn {step.status}"
                 onclick={() => void cycleStatus(step)}
@@ -179,20 +245,6 @@
                 {step.text}
               </span>
               <span class="step-actions">
-                <button
-                  class="action"
-                  onclick={() => void moveUp(idx)}
-                  disabled={idx === 0}
-                  title="move up"
-                  aria-label="move {step.text} up"
-                >↑</button>
-                <button
-                  class="action"
-                  onclick={() => void moveDown(idx)}
-                  disabled={idx === planSteps.length - 1}
-                  title="move down"
-                  aria-label="move {step.text} down"
-                >↓</button>
                 <button
                   class="action"
                   onclick={() => openConstraint(step.id)}
@@ -434,5 +486,35 @@
   }
   .constraints li {
     padding: 0.05rem 0;
+  }
+  /* v60.6 — drag-and-drop reorder affordances. */
+  .step-item {
+    cursor: default;
+  }
+  .step-item.dragging {
+    opacity: 0.4;
+  }
+  .step-item.drag-target {
+    /* Top border highlights the drop slot — the moved item lands
+       at this row's index, displacing the row downward. */
+    border-top: 2px solid var(--fg-accent, #6cf);
+    margin-top: -2px;
+  }
+  .drag-handle {
+    color: var(--fg-dim);
+    font-size: 0.85rem;
+    cursor: grab;
+    user-select: none;
+    flex: 0 0 1rem;
+    line-height: 1;
+    padding: 0 0.2rem 0 0;
+    opacity: 0.4;
+    transition: opacity 0.1s;
+  }
+  .step-item:hover .drag-handle {
+    opacity: 1;
+  }
+  .step-item.dragging .drag-handle {
+    cursor: grabbing;
   }
 </style>

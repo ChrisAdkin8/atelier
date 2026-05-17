@@ -37,7 +37,7 @@
         "additionalProperties": false,
         "properties": {
           "timestamp": {"type": "string", "format": "date-time"},
-          "kind": {"enum": ["model_call", "cache_bust", "tool_call", "compaction"]},
+          "kind": {"enum": ["model_call", "cache_bust", "tool_call", "compaction", "expansion"]},
           "model_id": {"type": "string"},
           "prompt_tokens": {"type": "integer", "minimum": 0},
           "completion_tokens": {"type": "integer", "minimum": 0},
@@ -49,8 +49,10 @@
           "note": {"type": "string"},
           "freed_tokens": {"type": "integer", "minimum": 0, "description": "Sum of tokens freed across the items replaced by this compaction. Required for kind=compaction."},
           "replaced_items": {"type": "array", "items": {"type": "string"}, "description": "Context-item ids whose contents were summarised and evicted. Required for kind=compaction."},
-          "summary_card_id": {"type": "string", "description": "Id of the MemoryCard that took the replaced items' place. Required for kind=compaction."},
-          "expansion_blob_path": {"type": "string", "description": "Repo-relative path to the JSON blob under .atelier/sessions/<sid>/compactions/ that v60.6 Expand will read to restore the originals. Required for kind=compaction."}
+          "summary_card_id": {"type": "string", "description": "Id of the MemoryCard that took the replaced items' place. Required for kind=compaction. For kind=expansion, the id of the summary card that was just replaced by the restored originals."},
+          "expansion_blob_path": {"type": "string", "description": "Repo-relative path to the JSON blob under .atelier/sessions/<sid>/compactions/ that v60.6 Expand will read to restore the originals. Required for kind=compaction."},
+          "restored_item_ids": {"type": "array", "items": {"type": "string"}, "description": "Context-item ids that were restored from the blob. Required for kind=expansion."},
+          "cache_rewarm_tokens": {"type": "integer", "minimum": 0, "description": "Sum of tokens across the restored items — the cache-rewarm cost the user paid by re-introducing this prefix material into the prompt. Required for kind=expansion."}
         },
         "allOf": [
           {
@@ -68,6 +70,10 @@
           {
             "if": {"properties": {"kind": {"const": "compaction"}}, "required": ["kind"]},
             "then": {"required": ["freed_tokens", "replaced_items", "summary_card_id", "expansion_blob_path"]}
+          },
+          {
+            "if": {"properties": {"kind": {"const": "expansion"}}, "required": ["kind"]},
+            "then": {"required": ["restored_item_ids", "summary_card_id", "cache_rewarm_tokens"]}
           }
         ]
       }
@@ -156,7 +162,8 @@
             "properties": {
               "item_ids": {"type": "array", "items": {"type": "string"}},
               "expansion_blob_path": {"type": "string"},
-              "compacted_at": {"type": "string", "format": "date-time"}
+              "compacted_at": {"type": "string", "format": "date-time"},
+              "cache_rewarm_tokens": {"type": "integer", "minimum": 0, "description": "v60.6 — cache-rewarm cost (sum of `tokens.count` across the items replaced by this card). Set at compaction time so the Expand confirm dialog can surface the cost without reading the blob. Optional for sessions written before v60.6."}
             }
           }
         }

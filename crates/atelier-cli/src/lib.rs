@@ -47,6 +47,11 @@ pub mod compaction_blob;
 /// `Mutation::Compact` arm both delegate to.
 pub mod compaction;
 
+/// v60.6 — §5 Expand orchestration. Symmetric counterpart to
+/// [`compaction`]: reads the on-disk blob produced by a v60.5+
+/// compaction and replays the originals back into context.
+pub mod expansion;
+
 pub use runner::{
     AdapterHandle, DispatcherHandle, EventSink, MockResponse, ProbePolicy, ProviderChoice,
     RunError, RunReport, Runner,

@@ -91,6 +91,28 @@ pub enum LedgerEntry {
         /// the summary card's [`crate::memory::CompactionSource`].
         expansion_blob_path: String,
     },
+    /// v60.6 — symmetric counterpart to [`Self::Compaction`]. Recorded
+    /// when the user invokes Expand on a compaction-generated
+    /// `MemoryCard`: the summary card is dropped and the original
+    /// context items are restored from the blob. Carries no cost of its
+    /// own — `cache_rewarm_tokens` is the *prompt-cache* cost the user
+    /// agreed to in the confirm dialog (the restored prefix material has
+    /// to be re-cached on the next turn), distinct from the `cost_usd`
+    /// the ledger sums across `ModelCall`/`ToolCall` entries.
+    Expansion {
+        timestamp: String,
+        /// Context-item ids that were restored from the blob (in
+        /// insertion order). Mirror of the corresponding
+        /// `Compaction::replaced_items`.
+        restored_item_ids: Vec<String>,
+        /// Id of the `MemoryCard` that was just replaced. Lets a
+        /// future audit cross-reference the matching `Compaction`
+        /// entry's `summary_card_id`.
+        summary_card_id: String,
+        /// Sum of `tokens.count` across the restored items — the
+        /// prompt-cache rewarm cost the user paid.
+        cache_rewarm_tokens: u32,
+    },
 }
 
 impl LedgerEntry {
@@ -99,7 +121,8 @@ impl LedgerEntry {
             Self::ModelCall { timestamp, .. }
             | Self::ToolCall { timestamp, .. }
             | Self::CacheBust { timestamp, .. }
-            | Self::Compaction { timestamp, .. } => timestamp,
+            | Self::Compaction { timestamp, .. }
+            | Self::Expansion { timestamp, .. } => timestamp,
         }
     }
 
@@ -109,13 +132,14 @@ impl LedgerEntry {
             Self::ToolCall { .. } => Kind::ToolCall,
             Self::CacheBust { .. } => Kind::CacheBust,
             Self::Compaction { .. } => Kind::Compaction,
+            Self::Expansion { .. } => Kind::Expansion,
         }
     }
 
     pub fn cost_usd(&self) -> Option<f64> {
         match self {
             Self::ModelCall { cost_usd, .. } | Self::ToolCall { cost_usd, .. } => *cost_usd,
-            Self::CacheBust { .. } | Self::Compaction { .. } => None,
+            Self::CacheBust { .. } | Self::Compaction { .. } | Self::Expansion { .. } => None,
         }
     }
 
@@ -171,6 +195,7 @@ pub enum Kind {
     ToolCall,
     CacheBust,
     Compaction,
+    Expansion,
 }
 
 /// Append-only typed cost ledger. **Share via `Arc<Ledger>`, not by
@@ -242,11 +267,13 @@ impl Ledger {
             .sum()
     }
 
-    /// Count of entries with no declared `cost_usd` (excluding `CacheBust`
-    /// and `Compaction`, which by design never carry their own cost — the
-    /// paired `ModelCall` next to a `Compaction` records the summary
-    /// generation cost). Lets the §3 cost meter render "$1.23 + N unknown"
-    /// rather than understating the bill.
+    /// Count of entries with no declared `cost_usd` (excluding `CacheBust`,
+    /// `Compaction`, and `Expansion`, which by design never carry their
+    /// own cost — the paired `ModelCall` next to a `Compaction` records
+    /// the summary generation cost, and `Expansion` is a pure state
+    /// rewind whose disclosed `cache_rewarm_tokens` is a prompt-cache
+    /// quantity, not a `$` line). Lets the §3 cost meter render
+    /// "$1.23 + N unknown" rather than understating the bill.
     pub fn entries_without_cost(&self) -> usize {
         self.entries
             .read()
@@ -254,7 +281,9 @@ impl Ledger {
             .filter(|e| {
                 !matches!(
                     e,
-                    LedgerEntry::CacheBust { .. } | LedgerEntry::Compaction { .. }
+                    LedgerEntry::CacheBust { .. }
+                        | LedgerEntry::Compaction { .. }
+                        | LedgerEntry::Expansion { .. }
                 )
             })
             .filter(|e| e.cost_usd().is_none())
@@ -319,6 +348,7 @@ mod tests {
             ("tool_call", Kind::ToolCall),
             ("cache_bust", Kind::CacheBust),
             ("compaction", Kind::Compaction),
+            ("expansion", Kind::Expansion),
         ] {
             assert_eq!(serde_json::to_string(&k).unwrap(), format!("\"{lit}\""));
         }
@@ -572,6 +602,53 @@ mod tests {
         // "$X + N unknown" badge on the cost meter.
         let l = Ledger::new();
         l.append(compaction("t1"));
+        l.append(model_call("t2", 5, 5, None));
+        assert_eq!(l.entries_without_cost(), 1);
+    }
+
+    // ---------- v60.6: Expansion variant ----------
+
+    fn expansion(ts: &str) -> LedgerEntry {
+        LedgerEntry::Expansion {
+            timestamp: ts.into(),
+            restored_item_ids: vec!["ctx-a".into(), "ctx-b".into()],
+            summary_card_id: "mem-c".into(),
+            cache_rewarm_tokens: 240,
+        }
+    }
+
+    #[test]
+    fn expansion_serializes_to_schema_shape() {
+        let entry = expansion("2026-05-17T13:00:00Z");
+        let json: serde_json::Value = serde_json::to_value(&entry).unwrap();
+        assert_eq!(json["kind"], "expansion");
+        assert_eq!(json["cache_rewarm_tokens"], 240);
+        assert_eq!(json["restored_item_ids"][0], "ctx-a");
+        assert_eq!(json["summary_card_id"], "mem-c");
+    }
+
+    #[test]
+    fn expansion_round_trips_through_serde() {
+        let entry = expansion("2026-05-17T13:00:00Z");
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: LedgerEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, entry);
+    }
+
+    #[test]
+    fn expansion_entry_kind_and_no_cost() {
+        let entry = expansion("t");
+        assert_eq!(entry.kind(), Kind::Expansion);
+        assert_eq!(entry.cost_usd(), None);
+        assert_eq!(entry.timestamp(), "t");
+    }
+
+    #[test]
+    fn entries_without_cost_excludes_expansion() {
+        // Same reasoning as Compaction: cache-rewarm cost is a
+        // prompt-cache disclosure, not a `$` charge.
+        let l = Ledger::new();
+        l.append(expansion("t1"));
         l.append(model_call("t2", 5, 5, None));
         assert_eq!(l.entries_without_cost(), 1);
     }

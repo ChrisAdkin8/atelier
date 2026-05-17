@@ -1162,3 +1162,181 @@ async fn v60_5_compact_context_items_round_trips_through_dispatcher() {
 
     let _ = runner_task.await;
 }
+
+// ---------- v60.6 §5 Expand ----------
+
+#[tokio::test]
+async fn v60_6_expand_memory_card_round_trips_through_dispatcher() {
+    use atelier_cli::compaction;
+    use atelier_cli::expansion;
+    use atelier_core::ledger::LedgerEntry;
+    use runner::AdapterHandle;
+
+    let workspace = tempfile::TempDir::new().unwrap();
+    let responses = vec![
+        MockResponse {
+            assistant_text: "ok".into(),
+            tool_calls: vec![mock_envelope_tool_call(&envelope_done())],
+        },
+        MockResponse {
+            assistant_text: "Summary of items 1 and 2 (stubbed).".into(),
+            tool_calls: vec![],
+        },
+    ];
+    let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let dispatcher_handle = DispatcherHandle::new();
+    let adapter_handle = AdapterHandle::new();
+    let runner = Runner::new(
+        workspace.path().to_path_buf(),
+        ProviderChoice::Mock { responses },
+        EventSink::Capture(events.clone()),
+    )
+    .expect("mock runner construction is infallible")
+    .with_dispatcher_handle(dispatcher_handle.clone())
+    .with_adapter_handle(adapter_handle.clone())
+    .with_max_turns(2);
+
+    let runner_task = tokio::spawn(async move { runner.run("seed prompt".into()).await });
+
+    // Wait for handles + a ContextItems snapshot with ≥ 2 non-pinned
+    // items (same pre-flight as the v60.5 test).
+    let mut target_ids: Vec<String> = Vec::new();
+    wait_until(
+        || {
+            if dispatcher_handle.get().is_none() || adapter_handle.get().is_none() {
+                return false;
+            }
+            let snap = events.lock().clone();
+            for ev in snap {
+                if let Event::ContextItems { items } = ev {
+                    let non_pinned: Vec<_> = items
+                        .iter()
+                        .filter(|i| !i.pinned)
+                        .map(|i| i.id.clone())
+                        .collect();
+                    if non_pinned.len() >= 2 {
+                        target_ids = non_pinned.into_iter().take(2).collect();
+                        return true;
+                    }
+                }
+            }
+            false
+        },
+        std::time::Duration::from_secs(10),
+        "ContextItems with >= 2 non-pinned items + handles populated",
+    )
+    .await;
+    assert_eq!(target_ids.len(), 2);
+
+    let adapter = adapter_handle.get().unwrap();
+    let sd = dispatcher_handle.get().unwrap();
+
+    // Capture token totals BEFORE compaction so we can assert the
+    // expansion cost matches.
+    let pre_compact_items = sd
+        .snapshot_context_items(&target_ids)
+        .expect("snapshot pre-compact must succeed");
+    let expected_cache_rewarm_tokens: u32 = pre_compact_items.iter().map(|i| i.tokens.count).sum();
+
+    // ---- Step A: compact two items. ----
+    let sid = uuid::Uuid::new_v4().to_string();
+    let compact_result = compaction::compact(
+        adapter.as_ref(),
+        sd.as_ref(),
+        workspace.path(),
+        &sid,
+        target_ids.clone(),
+        "2026-05-17T11:00:00Z",
+    )
+    .await
+    .expect("compaction must succeed");
+    assert_eq!(compact_result.freed_tokens, expected_cache_rewarm_tokens);
+
+    let before_expand = events.lock().len();
+
+    // ---- Step B: expand the resulting summary card. ----
+    let expand_result = expansion::expand(
+        sd.as_ref(),
+        workspace.path(),
+        compact_result.summary_card_id.clone(),
+        "2026-05-17T12:00:00Z",
+    )
+    .await
+    .expect("expand must succeed");
+    assert_eq!(expand_result.restored_item_count, 2);
+    assert_eq!(
+        expand_result.cache_rewarm_tokens,
+        expected_cache_rewarm_tokens
+    );
+    assert_eq!(
+        expand_result.summary_card_id,
+        compact_result.summary_card_id
+    );
+
+    // ---- Step C: assert the post-expand event sequence. ----
+    let mut saw_expansion_entry = false;
+    let mut saw_context_items_post = false;
+    let mut saw_memory_cards_post = false;
+    let mut saw_expansion_executed = false;
+    wait_until(
+        || {
+            let snap = events.lock().clone();
+            saw_expansion_entry = false;
+            saw_context_items_post = false;
+            saw_memory_cards_post = false;
+            saw_expansion_executed = false;
+            for ev in snap.into_iter().skip(before_expand) {
+                match ev {
+                    Event::LedgerAppended {
+                        entry:
+                            LedgerEntry::Expansion {
+                                restored_item_ids,
+                                summary_card_id,
+                                ..
+                            },
+                    } => {
+                        if restored_item_ids == target_ids
+                            && summary_card_id == compact_result.summary_card_id
+                        {
+                            saw_expansion_entry = true;
+                        }
+                    }
+                    Event::LedgerAppended { .. } => {}
+                    Event::ContextItems { items } => {
+                        if saw_expansion_entry
+                            && target_ids
+                                .iter()
+                                .all(|id| items.iter().any(|i| i.id == *id))
+                        {
+                            saw_context_items_post = true;
+                        }
+                    }
+                    Event::MemoryCards { cards } => {
+                        if saw_expansion_entry
+                            && cards.iter().all(|c| c.id != compact_result.summary_card_id)
+                        {
+                            saw_memory_cards_post = true;
+                        }
+                    }
+                    Event::ExpansionExecuted {
+                        summary_card_id, ..
+                    } => {
+                        if summary_card_id == compact_result.summary_card_id {
+                            saw_expansion_executed = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            saw_expansion_entry
+                && saw_context_items_post
+                && saw_memory_cards_post
+                && saw_expansion_executed
+        },
+        std::time::Duration::from_secs(10),
+        "full event sequence for v60.6 expansion",
+    )
+    .await;
+
+    let _ = runner_task.await;
+}

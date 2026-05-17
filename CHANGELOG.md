@@ -1,5 +1,51 @@
 # Atelier Spec — Changelog
 
+## v60.6 — 2026-05-17 (§5 Expand + drag-and-drop plan reorder)
+
+Closes two Phase C rows in a single release:
+
+1. The §5 **Expand** affordance, the symmetric counterpart to v60.5's compact-only landing. Restores the originals from the on-disk blob, drops the summary card, ledgers the operation, and surfaces the cache-rewarm cost before the user confirms. No schema migration — the v60.5 blob format (`compaction_blob v1`) is the contract.
+2. The §3 GUI **drag-and-drop** plan reorder (Phase C `[ ]` row). Replaces the up/down arrow buttons in `PlanPane.svelte` with HTML5 drag-and-drop against the existing `reorder_plan_steps` Tauri mutator. TUI keeps its existing keyboard-driven reorder (no terminal drag).
+
+User-visible:
+
+- **GUI Memory pane**: compaction-generated cards gain a *"compacted from N items · ~T tokens to re-warm"* badge under the title; the row gains an `⤴ expand` button (only when `compacted_from` is set); clicking opens an inline confirm dialog that quotes the exact cache-rewarm cost. Confirm fires the new `expand_memory_card` Tauri command; the toast reads "restored N items · ~T cache tokens re-warmed".
+- **TUI Memory pane**: every compaction-flavoured row carries a cyan `[×N, T tk]` suffix so the user can scan for Expand-eligible cards at a glance. `x` (eXpand) on a selected compaction card opens an `EXPAND N items · pays ~T cache tokens` cyan banner; `y` confirms, `n` / `Esc` cancels.
+- **GUI Plan pane**: each step gains a `⋮⋮` drag handle on the left; rows are `draggable="true"` with HTML5 `dragstart`/`dragover`/`drop` handlers. Drop target shows a top-border accent indicator; the visual reorder is wholesale-applied on the next `PlanSnapshot` event (no optimistic update). The v55 up/down arrow buttons are removed.
+
+Data layer (atelier-core):
+
+- New `LedgerEntry::Expansion { restored_item_ids, summary_card_id, cache_rewarm_tokens }` variant + matching `Kind::Expansion` discriminator + schema bump in `schemas/session/v1.json` (`kind` enum widened, per-kind `allOf` adds `Expansion` requireds). Like `Compaction`, never carries its own `cost_usd` — `cache_rewarm_tokens` is a prompt-cache disclosure, not a `$` line.
+- New `Event::ExpansionExecuted { restored_item_count, summary_card_id, cache_rewarm_tokens }` event. Emitted by the dispatcher mutator after `LedgerAppended(Expansion)` → `ContextItems` → `MemoryCards` snapshots converge; UIs use it as the terminal "show the toast" signal.
+- New `CompactionSource.cache_rewarm_tokens: u32` field (optional via `serde(default)` so v60.5-era sessions round-trip as 0). The compaction path now records the freed-tokens sum here so v60.6 Expand can surface the cost without re-reading the blob.
+- New `MemoryCardSummary.cache_rewarm_tokens: Option<u32>` projection — set iff `compacted_from` is set, so the bus payload still stays small.
+- New `ContextManager::add_batch(items)` — atomic Pass-1 collision check (against both existing state and within-batch duplicates), Pass-2 insert in order. Rejects via the new `ContextError::AlreadyPresent` variant so a buggy double-expand can't silently overwrite a live item.
+
+Dispatcher / orchestration:
+
+- `SessionDispatcher::expand_memory_card(card_id, items, now) -> Result<ExpansionOutput, ExpansionError>` — the new sync mutator. Validates the card exists + has `compacted_from`, validates the items match the recorded ids (count + ids in order), atomically restores via `add_batch`, drops the summary card, appends `LedgerEntry::Expansion`, and emits the bus events in a fixed order.
+- `SessionDispatcher::snapshot_memory_card(card_id) -> Option<MemoryCard>` — non-mutating clone for the orchestrator to extract the `compacted_from` link + blob path before calling the mutator.
+- New `atelier_cli::expansion::expand(dispatcher, workspace_root, card_id, now)` orchestrator. Composes the three steps (snapshot card → blob read → dispatcher mutator) into one `async` free function the GUI Tauri command + TUI `submit_expand` helper both delegate to. Refuses to act on a blob with the wrong version (`COMPACTION_BLOB_VERSION` mismatch).
+
+Tests landed (~33 new):
+
+- 5 in `atelier-core/ledger.rs`: `Kind::Expansion` wire label, `Expansion` serde + cost + timestamp helpers, `entries_without_cost` excludes Expansion.
+- 1 in `atelier-core/session.rs`: `Event::ExpansionExecuted.kind()` pinning.
+- 3 in `atelier-core/memory.rs`: `CompactionSource.cache_rewarm_tokens` round-trip, v60.5-era backwards-compat default, `MemoryCardSummary` projection.
+- 5 in `atelier-core/context.rs`: `add_batch` happy path with insertion-tail, collision-with-existing rejects atomically, duplicate-within-input rejection, empty-noop, preserves provenance.
+- 7 in `atelier-core/dispatcher.rs`: snapshot returns clone / returns None for missing, `expand_memory_card` happy path with full event sequence, unknown card, non-compaction card, item-count mismatch atomic, item-id mismatch atomic, id-collision rolls back via `add_batch`.
+- 4 in `atelier-cli/expansion.rs`: happy path round-trip, unknown-card, plain-card, missing-blob.
+- 1 in `atelier-gui/lib.rs`: bridge `ExpansionExecuted`.
+- 6 in `atelier-tui/lib.rs`: `x`-keybind opens modal only on compacted cards (with inert on plain), `ExpandConfirm` `y`/`n`/Esc, badge rendering, `EXPAND` banner rendering.
+- 1 integration test in `atelier-cli/tests/run_integration.rs`: scripted MockAdapter; compact then expand the same items; asserts the full event sequence + the items return with their original ids/tokens/provenance.
+
+Workspace test count: **755 → 788**. `make check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all -- --check`, `npm run check` all green.
+
+Drag-and-drop:
+
+- `PlanPane.svelte` exports a pure `reorderArray<T>(arr, from, to)` helper for the splice math (separable from Svelte for future Vitest coverage).
+- `<li>` rows are `draggable="true"`; `ondragstart` captures source idx; `ondragover` calls `preventDefault()` to enable drop; `ondrop` calls `reorderArray` and invokes `reorder_plan_steps`. The dispatcher's existing `PlanSnapshot` re-emit drives the visual reorder.
+
 ## v60.5 — 2026-05-17 (§5 non-destructive context compaction, compact-only)
 
 Closes the §5 spec promise *non-destructive compaction with cost disclosure* on the compact side; v60.6 lands the matching Expand affordance against the frozen blob format. Compact-only ships a complete contract — the originals are written to disk, ledgered, and pointed at from the summary card — so v60.6 is a UI flip rather than a new wire shape.
