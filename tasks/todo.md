@@ -8,7 +8,7 @@ Pre-implementation of the harness itself. The supporting test rig is fully wired
 - 52/52 artifacts validate against schemas
 - 112/112 rig self-tests pass
 - 11/11 canonical fixtures pass dry-run
-- 506/506 `atelier-core` Rust unit tests (v54: +8 from `memory::MemoryCardSummary` projection)
+- 788/788 workspace Rust tests at v60.6 (630 atelier-core unit + 24 atelier-cli unit + 26 atelier-cli integration + 24 atelier-gui + 84 atelier-tui). Trail: v54 506 → v60.5 755 → v60.6 788; per-version test counts live in `CHANGELOG.md`
 - Reference machine spec populated (M1 Pro / 32 GB / macOS 26.4.1)
 - CI runs `make check` on push/PR (`.github/workflows/check.yml`); separate `rust` job runs `cargo fmt`, `cargo clippy -D warnings`, `cargo test -p atelier-core` on Ubuntu + macOS with the pinned 1.85.0 toolchain
 - Cross-schema `$ref` resolves via the shared registry in `tests/_schema_helpers.py` (session → envelope, subagent-type → routing, tool manifest → `_implementation.v1.json`)
