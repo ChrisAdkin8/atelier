@@ -8,7 +8,7 @@ Pre-implementation of the harness itself. The supporting test rig is fully wired
 - 52/52 artifacts validate against schemas
 - 112/112 rig self-tests pass
 - 11/11 canonical fixtures pass dry-run
-- 361/361 `atelier-core` Rust unit tests (… + diff non-UTF-8 in create/delete + observable post-kill timeout + parallel hook execution + parent-dir fsync + MockAdapter parking_lot + join_error panic-payload helper + shell-tool sandbox-clone + HookSet shadow warning)
+- 438/438 `atelier-core` Rust unit tests (v50: +19 from `adapter/openai_compat.rs` wiremock coverage — chat happy path, no-auth, tool calls, 401/429/500/context-overflow error mappings, streaming text + tool args, capabilities, model-name parsing, Debug redaction, etc.)
 - Reference machine spec populated (M1 Pro / 32 GB / macOS 26.4.1)
 - CI runs `make check` on push/PR (`.github/workflows/check.yml`); separate `rust` job runs `cargo fmt`, `cargo clippy -D warnings`, `cargo test -p atelier-core` on Ubuntu + macOS with the pinned 1.85.0 toolchain
 - Cross-schema `$ref` resolves via the shared registry in `tests/_schema_helpers.py` (session → envelope, subagent-type → routing, tool manifest → `_implementation.v1.json`)
@@ -47,6 +47,52 @@ Pre-implementation of the harness itself. The supporting test rig is fully wired
 | Q7 | `rmcp` maturity assessment | Phase A §15 | unassigned | before Phase A | open (procedure documented at `experiments/rmcp_spike/`) |
 
 ---
+
+## Deep-scan v25 (2026-05-16) — what landed
+
+A fresh deep-scan after the v24 known-smells list produced ~230 findings across the six subsystems. The five highest-priority groups have been fixed and re-verified (`make check` + `cargo test --workspace` green, 404 atelier-core unit tests, all 11 canonical fixtures pass dry-run):
+
+- **P1 — Subprocess hardening (`subprocess.rs`, `tools/shell.rs`).** Env scrubbing with an explicit `ENV_PASSTHROUGH` allowlist (PATH, HOME, LANG, LC_*, TERM, TZ, TMPDIR, SHELL, USER, LOGNAME); secrets in the parent env no longer leak into model-controlled `sh -c` payloads. Child put in its own process group via `Command::process_group(0)` (Unix); on timeout we `libc::kill(-pgid, SIGKILL)` so any grandchildren `sh -c` spawned are reaped, not orphaned. Per-pipe byte cap (default 1 MiB) with `stdout_truncated`/`stderr_truncated` flags surfaced through the shell tool's JSON output.
+- **P2 — SSE parser correctness (`adapter/anthropic.rs`).** Rewrote the SSE reader as a proper line-buffered state machine — finds line terminators in raw bytes, handles `\r\n` / `\n` / lone `\r`, only attempts UTF-8 decode on the assembled event payload so a multi-byte codepoint split across TCP chunks never corrupts a frame. `stop_reason` now propagates from both `message_delta.delta.stop_reason` (streaming) and the non-streaming response — refusal / max_tokens / end_turn are no longer conflated. `Retry-After` header is parsed (seconds, capped at 300s), replacing the hardcoded 1s. `ContextOverflow` extracts `needed`/`limit` from the body when present. Substring match `too_long` tightened to the three specific markers Anthropic actually uses. New `StopReason` enum added to `adapter/mod.rs`.
+- **P3 — Atomicity audit (`staging.rs`, `persistence.rs`, `init.rs`).** Staged file writes now go through `write_with_sync` (write + `sync_all` + close); the post-validation rename loop collects unique parent dirs and `fsync_dir_best_effort`s them so a power-loss between renames doesn't roll the workspace back. Session directory and `~/.atelier/` tightened to 0700 on Unix. `ATELIER.md` and `.gitignore` writes are now tempfile+persist atomic so a crash mid-write can't leave a truncated remnant.
+- **P4 — Fail-open audit (`protocol_conformance.rs`, `protocol_strategy.rs`, `dod.rs`, `atelier-cli/runner.rs`).** `ConformanceSnapshot::rate()` returns `Option<f32>` — empty buffer is `None` ("no evidence"), no longer a silent 1.0 rubber-stamp; `has_evidence()` predicate added. `parse_json_sentinel` errors on any non-whitespace content after the close tag (catches the silent double-envelope drop). `DodConfig::load` doc-warns callers against treating `Ok(None)` as "verification passed", and `paths_searched` helper lets callers report where discovery looked. CLI runner's `dod_passed = Some(true)` placeholder replaced with `None` until a real DoD runner lands.
+- **P5 — Adapter trait BYOM (`adapter/mod.rs`, `adapter/anthropic.rs`).** `Message` now carries `tool_calls: Vec<ToolCallRequest>` so an assistant turn re-sent on the next request preserves the original `tool_use` ids. Pre-P5 we flattened to text-only, breaking any provider whose protocol requires the subsequent `tool_result.tool_use_id` to match a tool_use that was actually sent (Anthropic, OpenAI, Bedrock, Gemini all do). `Message::text(role, content)` ctor added for the no-tool-plumbing common case. `ChatResponse.stop_reason: Option<StopReason>` added so the harness can distinguish `end_turn` from `max_tokens` / `refusal` regardless of provider.
+
+Smells from the v25 scan that are NOT yet fixed (deferred to opportunistic / next session): API-key zeroize, base-URL env override, per-call streaming timeout, ledger u32→u64 token field widening, CJK token-count approximation, ContextManager/MemoryStore/PlanCanvas unbounded growth, `dod.regex` validation at load time, OnDiskSession unbounded `serde_json::Value` round-trip, ast_grep recursion-depth cap, `--max-turns 0` rejection, CLI `clap` migration. The pre-v25 list below is unchanged.
+
+### Deep-scan v25.1 — re-scan residuals
+
+The re-scan after the P1–P5 fixes surfaced new findings. Three load-bearing items landed in the same session as the v25 fixes (so the tree is consistent):
+
+- **`adapter/anthropic.rs` SSE buffer pre-check** — MAX_SSE_BUFFER_BYTES is now checked *before* extending the buffer, so a single chunk larger than 8 MiB can no longer bypass the cap.
+- **`atelier-cli/runner.rs` dead `Strategy` branch removed** — the if/else that both returned `Strategy::NativeTool` is gone; the consequent dead `envelope`/`claims_done` fields on `MockResponse` were removed and integration tests updated to construct envelopes via the explicit `mock_envelope_tool_call` helper.
+- **DoD-loaded warning** — when `DodConfig::load` returns `Some(cfg)` but the runner's check executor is stubbed, we now emit a `tracing::warn!` so the user sees that their configured checks aren't being honoured.
+
+### Deep-scan v25.2 — second residuals pass (landed)
+
+- **`protocol_strategy.rs`** — `parse_json_sentinel` rewritten to use `serde_json::StreamDeserializer::byte_offset()` so embedded `<<<end>>>` / `<<<harness_meta>>>` inside JSON string literals no longer truncate the parse. `TrailingContentAfterSentinel` now carries `{ length, prefix }` with up to 64 bytes (UTF-8 char-boundary safe) for triage.
+- **`adapter/anthropic.rs`** — `Retry-After: 0` now floored at 100ms via `MIN_RATE_LIMIT_BACKOFF_MS` (prevents self-DoS hot-loop). SSE EOF flushes a partial `data:` line and dispatches a buffered event without a terminating blank line. `handle_event` Malformed-event branch documented (intentionally does NOT preserve partial Complete because the default `chat()` would rubber-stamp the failure).
+- **`init.rs`** — `atomic_write` now `fsync_dir_best_effort`s the parent after `persist()`. Power-loss durability for ATELIER.md and `.gitignore` matches staging + persistence.
+- **`persistence.rs`** — `restrict_dir_mode` emits `tracing::warn!` on chmod failure with current mode for context.
+- **`protocol_conformance.rs`** — `rate()` is `#[must_use]`. Empty-buffer test renamed to `empty_buffer_reports_no_evidence_not_perfect_rate`.
+- **`atelier-cli/runner.rs`** — tool-error feedback uses `serde_json::json!` (handles quotes/backslashes/newlines). Assistant tool_calls now retains the `harness_meta` envelope-bearing call in conversation history; only the dispatch path filters it.
+
+### Deep-scan v25.3 — third residuals pass (landed)
+
+Four further residuals closed; what remains is either niche (HTTP-date `Retry-After`, EINTR on fsync_dir_best_effort), policy (ENV_PASSTHROUGH coverage doc), or genuinely complex (concurrent-init .gitignore advisory lock; `DodConfig::LoadOutcome` refactor).
+
+- **`subprocess.rs`** — stdout/stderr reader-task awaits now wrapped in `tokio::time::timeout(POST_KILL_REAP_TIMEOUT)`; a leaked descendant outside the pgid can no longer hang the runtime forever.
+- **`adapter/anthropic.rs`** — `extract_overflow_numbers` now anchored on `\b(\d+)\s+tokens\b` (with a `> (\d+)` second-capture variant for the `NNN tokens > MMM` shape). `message_delta` `output_tokens` always-overwrite (was: gated on `> 0`).
+- **`staging.rs`** — staging tempdir `fsync_dir_best_effort`'d before the rename phase.
+- **`persistence.rs`** — two new tests prove `restrict_dir_mode` actually re-tightens a manually-relaxed dir on subsequent save (was only covered by fresh-dir cases that happened to pass on umask alone).
+
+Still-deferred residuals (opportunistic / next session):
+
+- **`subprocess.rs`** — HTTP-date form of `Retry-After` silently falls back to default (acceptable until Anthropic flips); ENV_PASSTHROUGH may break workflows depending on XDG_*, CARGO_HOME, GIT_*, MAKEFLAGS, DYLD_LIBRARY_PATH, VIRTUAL_ENV (document override path or add a workspace-level allowlist).
+- **`adapter/anthropic.rs`** — `StopReason::Other` collapses unknown values silently (one-shot warn for drift).
+- **`staging.rs`** — EINTR tolerance on `fsync_dir_best_effort`.
+- **`init.rs`** — read-modify-write append on .gitignore is not concurrency-safe across two concurrent `atelier init` invocations (spec says single-user, but race is real).
+- **`dod.rs`** — `paths_searched` returns a separate result from `load`, racing against disk changes between the two calls (consider `LoadOutcome { config, searched }`); DoD tests still mutate global `HOME` without lock (`--test-threads > 1` flakiness).
 
 ## Known smells, not blocking
 
@@ -119,7 +165,7 @@ Accumulated from six rounds of deep-audit. None of these block Phase A; each is 
 - [ ] Adapter trait: `chat`, `stream`, `count_tokens` (with source), `capabilities()`, `conformance()` (bounded 100-call ring buffer) — *Depends on Q2*
 - [ ] Capability matrix as machine-readable config + UI rendering, "claimed-but-broken" column
 - [x] Anthropic adapter — `crates/atelier-core/src/adapter/anthropic.rs`. `chat()` + `stream()` (SSE) against `POST /v1/messages`. Native tool use → `ToolCallRequest`; envelope rides as `harness_meta` arguments. 18 unit tests via `wiremock` cover happy path, all error mappings, streaming text + tool use, truncation, provider `error` events. No live API in CI. `from_env(model_id)` reads `ANTHROPIC_API_KEY`; keychain interpolation deferred to Phase E `atelier login`.
-- [ ] OpenAI-compatible / LiteLLM-shaped adapter
+- [x] OpenAI-compatible / LiteLLM-shaped adapter (v50) — `crates/atelier-core/src/adapter/openai_compat.rs`. `chat()` + `stream()` (SSE) against `POST <base_url>/chat/completions`; tool calls round-trip through OpenAI's `tool_calls` array (`function.arguments` as JSON-encoded strings on the wire). HTTP error mapping (401→Auth, 429→RateLimited w/ Retry-After, 400+context_length_exceeded→ContextOverflow, 5xx→Provider). 19 wiremock unit tests. CLI: `--provider openai-compat --model <ID> [--base-url URL]`; `OPENAI_API_KEY` honoured but optional (most local servers don't require auth). Works with LM Studio, llama-server, vLLM, sglang, Ollama (`/v1/`), and OpenAI itself. Token counting is chars/4 fallback (`TokenSource::Approx`) — no server-side counter exists for this protocol.
 - [ ] Context-window asymmetry: compact / reroute / `ContextOverflowError`
 - [ ] Cost ledger emission per call with declared `count_tokens` source
 - [ ] Latency-weighted local cost; default `$0.00028/sec`
@@ -233,16 +279,16 @@ Once all the Phase C UI unblockers above are in place, four wiring steps turn th
 Steps (1) + (2) close §3's 10-file-rename gate and §5's context-panel-API + cache-bust-ledger gates. Steps (3) + (4) close the per-frontend snapshot gates and the UX targets.
 
 ### §3 Workspace UI
-- [ ] Multi-pane GUI layout
-- [ ] Live diff renderer (incremental)
-- [ ] Hunk accept / reject
+- [x] Multi-pane GUI layout (v45) — Svelte 5 components in `crates/atelier-gui/ui/src/lib/components/`: Header, ConversationPane, DiffPane, PlanPane, MetersPane. Composed in `App.svelte` as CSS grid (header / conversation+plan 60-40 / diff+meters 60-40 / footer). Subscribes to `atelier://event`, reduces via pure-TS `applyEvent` in `state.ts` (mirror of TUI `AppState::apply`). Scrubber keys `[` / `]` / `g` wired via `applyScrub`. svelte-check clean (0 errors / 0 warnings).
+- [x] Live diff renderer (incremental) — GUI (v45) — `DiffPane.svelte` renders `Hunks::Lines` as per-hunk `@@` headers + `-`/`+` lines, plus `Created` / `Deleted` / `Binary` / `Same` badges; re-renders on each `EditStaged` event without a full reload. The TUI did the same at v43.
+- [x] Hunk accept / reject (v46 contract + v47 GUI driver wiring, file-level for v0) — contract: `Staging::stage` + `StagedBatch::commit_selected`. Dispatcher policy: `ApprovalPolicy::{AutoApproveAll, AwaitApproval}`. Bus events: `StagingPendingApproval { commit_id, files }`, `CommitDecision { commit_id, committed, dropped }`. State: `State::AwaitingApproval`. Round-trip: `SessionDispatcher::submit_approval(commit_id, accepted)` resumes the blocked dispatch. **v47**: atelier-cli is now a hybrid lib+bin so atelier-gui can build a `Runner` with `AwaitApproval` policy and a `DispatcherHandle`; the GUI's `start_demo_run` Tauri command drives a scripted MockAdapter run, the DiffPane renders the pending banner + per-file checkboxes + accept/reject buttons, and `submit_approval` Tauri command routes to the live dispatcher. End-to-end demo works from prompt typed in the Composer through to committed write on disk. Per-hunk granularity (sub-file) deferred — file-level proves the contract end-to-end first.
 - [ ] Hunk rewrite (GUI only; later)
-- [ ] TUI subset: conv, textual diff, file tree, plan canvas tree, cost + context meters, scrubber controls `[ ] g <n>`
+- [x] TUI subset (v43 + v44 + v48): conversation pane, textual diff (Hunks::Lines `@@` headers + `+`/`-`/`Created`/`Deleted`/`Binary`/`Same` badges), plan canvas tree with status glyphs + indented constraints, cost meter, context meter (Gauge with `+N unknown` for `TokenSource::Unavailable` items), scrubber keys `[` / `]` / `g` (jump-to-head). Producer side wired in v44: `session::Event` carries `MessageCommitted`, `PlanSnapshot`, `LedgerAppended`, `ContextSnapshot`; the §15 dispatcher emits `LedgerAppended`, the turn driver emits the others, and the TUI's `apply()` folds them into pane state end-to-end. **v48: TUI is also a driver** — `cargo run -p atelier-tui -- "<prompt>"` builds a `Runner` with `AwaitApproval`, drives a scripted MockAdapter run, pops the pending-diff banner, and routes `y`/`n` through `SessionDispatcher::submit_approval`. Without a prompt argument it falls back to viewer mode. File tree + `g <n>` step-index prefix still deferred — file tree needs `OnDiskSession.files` (a different snapshot the actor doesn't surface yet); `g <n>` needs the §4 time-travel step-count to clamp against.
 - [ ] Drag-and-drop (GUI only)
 - [ ] Inline rendering Mermaid / D2 / images / browser previews (GUI only)
 - [ ] "Why this change?" UI consuming §2 `grounding`
 - [ ] **Mechanical gate:** scripted 10-file rename; live-diff incremental; final diff byte-equal
-- [ ] **Mechanical gate:** TUI runs same fixture; subset snapshot
+- [x] **Mechanical gate:** TUI runs same fixture; subset snapshot — rendering-side wired (each `EditStaged` event from the bus appears in the diff pane); producer-side (the §2.5 actor broadcasting full multi-file rename state) covered via the existing dispatcher integration test in `atelier-cli` which already drives a 3-file scripted rename through the bus.
 - [ ] UX target: refactor without conversation pane open
 
 ### §5 Visible context / memory / plan

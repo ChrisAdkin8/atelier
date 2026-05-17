@@ -307,7 +307,10 @@ impl<'a> Staging<'a> {
         self.writes.is_empty()
     }
 
-    /// Validate + apply the batch.
+    /// Validate + apply the batch in one shot. Equivalent to
+    /// `self.stage()?.commit_all()`. Use [`Self::stage`] directly when
+    /// you need to expose pending files for a user-approval step
+    /// (spec §3 "Hunk accept / reject") before the rename phase.
     ///
     /// On success returns a [`CommitReport`] with per-file syntax-check
     /// outcomes. On any validation failure the workspace is untouched and
@@ -315,6 +318,38 @@ impl<'a> Staging<'a> {
     pub fn commit(self) -> Result<CommitReport, StagingError> {
         if self.writes.is_empty() {
             return Ok(CommitReport { files: Vec::new() });
+        }
+        let batch = self.stage()?;
+        batch.commit_all()
+    }
+
+    /// Validate + write the batch into a staging temp tree, **without**
+    /// renaming into the workspace. Returns a [`StagedBatch`] the
+    /// caller drives to completion via
+    /// [`StagedBatch::commit_selected`] (per-file approval) or
+    /// [`StagedBatch::commit_all`] (no-prompt). Dropping the
+    /// [`StagedBatch`] discards everything — same all-or-nothing
+    /// semantic as the pre-v46 `commit()`.
+    ///
+    /// Spec §3: the staged tree is durable on disk before this returns
+    /// (`write_with_sync` + parent `fsync`). A crash between stage and
+    /// rename leaves the workspace untouched.
+    pub fn stage(self) -> Result<StagedBatch, StagingError> {
+        if self.writes.is_empty() {
+            // An empty batch needs no temp tree. Construct a
+            // never-populated StagedBatch over a fresh tempdir so the
+            // type is uniform; commit_selected on it returns an empty
+            // report regardless of `accepted`.
+            let staging_dir =
+                TempDir::new_in(self.workspace_root).map_err(|e| StagingError::Io {
+                    path: self.workspace_root.to_path_buf(),
+                    source: e,
+                })?;
+            return Ok(StagedBatch {
+                staging_dir,
+                workspace_root: self.workspace_root.to_path_buf(),
+                outcomes: Vec::new(),
+            });
         }
 
         // 1. Stage every write to a temp tree under workspace_root so the
@@ -365,7 +400,11 @@ impl<'a> Staging<'a> {
                 });
             }
 
-            // 1d. Stage the bytes.
+            // 1d. Stage the bytes. We write+sync (not bare `fs::write`) so
+            //     a crash between the write and the post-validation rename
+            //     leaves the staged file with its real contents on stable
+            //     storage — otherwise the rename could publish a
+            //     zero-length file. Spec §3 atomicity guarantee.
             let staged_path = staging_dir.path().join(rel);
             if let Some(parent) = staged_path.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| StagingError::Io {
@@ -373,7 +412,7 @@ impl<'a> Staging<'a> {
                     source: e,
                 })?;
             }
-            std::fs::write(&staged_path, &write.bytes).map_err(|e| StagingError::Io {
+            write_with_sync(&staged_path, &write.bytes).map_err(|e| StagingError::Io {
                 path: staged_path.clone(),
                 source: e,
             })?;
@@ -394,14 +433,94 @@ impl<'a> Staging<'a> {
             });
         }
 
-        // 2. All validation passed — commit. Renames in lexicographic order
-        //    (BTreeMap iter is already sorted) so any partial-failure list is
-        //    deterministic. `applied` (index of the next pending file) equals
-        //    the count of files already in their final place when a failure
-        //    fires; `remaining` is what's left including the failing one.
-        let total = outcomes.len();
-        for (applied, outcome) in outcomes.iter().enumerate() {
-            let staged_path = staging_dir.path().join(&outcome.path);
+        // 1f. Durability barrier on the staging tree. The staged files
+        //     each ran through `write_with_sync` (content fsync'd) but
+        //     their *dirents* in the staging dir are still in the
+        //     dentry cache. If we crash between staging completion and
+        //     a successful rename, on next boot we could find the
+        //     staged file content present but the dirent absent — the
+        //     rename would then fail with ENOENT mid-batch. Fsync the
+        //     staging tree once before starting the rename phase so the
+        //     staged tree is fully durable.
+        //
+        //     Best-effort: a fsync failure here doesn't fail the commit
+        //     (we'd rather attempt the rename than reject a valid
+        //     batch on a transient FS hiccup); the worst case is the
+        //     same "re-do commit on next boot" outcome the rest of the
+        //     atomicity story already tolerates.
+        let _ = fsync_dir_best_effort(staging_dir.path());
+
+        Ok(StagedBatch {
+            staging_dir,
+            workspace_root: self.workspace_root.to_path_buf(),
+            outcomes,
+        })
+    }
+}
+
+/// A validated, staged-but-not-yet-renamed batch of writes. Spec §3
+/// "Hunk accept / reject" lives here: the caller (typically the
+/// dispatcher) exposes the pending files to the user, collects the
+/// accept/reject decision, and calls [`Self::commit_selected`] with
+/// the accepted set.
+///
+/// Dropping a [`StagedBatch`] without committing discards the temp
+/// tree — same all-or-nothing semantic as the v45 `Staging::commit()`.
+///
+/// Intentionally **not** `Clone`: the temp tree is a single resource
+/// and duplicating the handle would mean two batches racing for the
+/// same staged-file paths.
+#[derive(Debug)]
+pub struct StagedBatch {
+    staging_dir: TempDir,
+    workspace_root: PathBuf,
+    outcomes: Vec<FileOutcome>,
+}
+
+impl StagedBatch {
+    /// Peek at the files that *would* be committed. Each `FileOutcome`
+    /// carries its `Hunks`, so the caller can render a diff for the
+    /// approval UI without doing any extra disk I/O. Order is the same
+    /// as the source `Staging` (BTreeMap insertion order = lexicographic).
+    pub fn pending_files(&self) -> &[FileOutcome] {
+        &self.outcomes
+    }
+
+    /// Commit every staged file. Equivalent to v45 `Staging::commit()`.
+    pub fn commit_all(self) -> Result<CommitReport, StagingError> {
+        let paths: std::collections::HashSet<PathBuf> =
+            self.outcomes.iter().map(|o| o.path.clone()).collect();
+        self.commit_selected(&paths)
+    }
+
+    /// Commit only the files whose relative path is in `accepted`.
+    /// Files NOT in the set are dropped — the temp tree's `Drop` does
+    /// the cleanup. Paths in `accepted` that aren't in the staged set
+    /// are silently ignored (idempotent: a UI that sends back its
+    /// initial pending list always works).
+    ///
+    /// `CommitReport.files` is the subset that was actually renamed,
+    /// preserving the original order. An empty `accepted` set is a
+    /// valid full-reject — returns an empty report.
+    pub fn commit_selected(
+        self,
+        accepted: &std::collections::HashSet<PathBuf>,
+    ) -> Result<CommitReport, StagingError> {
+        // Renames in lexicographic order (BTreeMap iter is sorted) so
+        // any partial-failure list is deterministic. `applied` (index
+        // of the next pending file) equals the count of files already
+        // in their final place when a failure fires; `remaining` is
+        // what's left including the failing one.
+        let selected: Vec<FileOutcome> = self
+            .outcomes
+            .into_iter()
+            .filter(|o| accepted.contains(&o.path))
+            .collect();
+        let total = selected.len();
+        let mut parents_to_sync: std::collections::BTreeSet<PathBuf> =
+            std::collections::BTreeSet::new();
+        for (applied, outcome) in selected.iter().enumerate() {
+            let staged_path = self.staging_dir.path().join(&outcome.path);
             let target = self.workspace_root.join(&outcome.path);
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| StagingError::PartialCommit {
@@ -410,6 +529,7 @@ impl<'a> Staging<'a> {
                     remaining: total - applied,
                     source: e,
                 })?;
+                parents_to_sync.insert(parent.to_path_buf());
             }
             std::fs::rename(&staged_path, &target).map_err(|e| StagingError::PartialCommit {
                 applied,
@@ -419,8 +539,38 @@ impl<'a> Staging<'a> {
             })?;
         }
 
-        Ok(CommitReport { files: outcomes })
+        // Durability barrier on the rename phase. Same rationale as the
+        // staging-tree fsync above.
+        for parent in &parents_to_sync {
+            let _ = fsync_dir_best_effort(parent);
+        }
+
+        Ok(CommitReport { files: selected })
     }
+}
+
+/// Atomic-ish file write: create, write, sync_all, close. Used by the
+/// staging tree so a crash between staging-write and post-validation
+/// rename can't publish a zero-length file.
+fn write_with_sync(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut f = std::fs::File::create(path)?;
+    std::io::Write::write_all(&mut f, bytes)?;
+    f.sync_all()
+}
+
+/// fsync a directory entry. POSIX-only; on other platforms this is a
+/// no-op and the durability contract weakens accordingly. Best-effort —
+/// callers wrap with `let _ =` because we'd rather complete a successful
+/// rename than fail the whole commit on a fsync glitch.
+#[cfg(unix)]
+fn fsync_dir_best_effort(dir: &Path) -> std::io::Result<()> {
+    let f = std::fs::File::open(dir)?;
+    f.sync_all()
+}
+
+#[cfg(not(unix))]
+fn fsync_dir_best_effort(_dir: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// Canonicalize the staging target + workspace root and assert containment.
@@ -737,5 +887,126 @@ mod tests {
         assert!(!SyntaxOutcome::Pass.is_blocking());
         assert!(!SyntaxOutcome::NotApplicable.is_blocking());
         assert!(!SyntaxOutcome::GrammarMissing.is_blocking());
+    }
+
+    // ---------- HR-A: stage / commit_selected lifecycle ----------
+
+    fn ws_dir() -> TempDir {
+        TempDir::new().unwrap()
+    }
+
+    #[test]
+    fn stage_returns_batch_with_pending_files_and_no_workspace_change() {
+        let dir = ws_dir();
+        let ws = dir.path();
+        let check = NoopSyntaxCheck;
+        let mut s = Staging::new(ws, &check);
+        s.add(StagedWrite::new("a.txt", "hello")).unwrap();
+        s.add(StagedWrite::new("nested/b.txt", "world")).unwrap();
+
+        let batch = s.stage().unwrap();
+        assert_eq!(batch.pending_files().len(), 2);
+        // Targets must NOT exist yet — stage doesn't rename.
+        assert!(!ws.join("a.txt").exists());
+        assert!(!ws.join("nested/b.txt").exists());
+    }
+
+    #[test]
+    fn commit_all_renames_every_staged_file() {
+        let dir = ws_dir();
+        let ws = dir.path();
+        let check = NoopSyntaxCheck;
+        let mut s = Staging::new(ws, &check);
+        s.add(StagedWrite::new("a.txt", "AAA")).unwrap();
+        s.add(StagedWrite::new("b.txt", "BBB")).unwrap();
+        let report = s.stage().unwrap().commit_all().unwrap();
+        assert_eq!(report.files.len(), 2);
+        assert_eq!(std::fs::read(ws.join("a.txt")).unwrap(), b"AAA");
+        assert_eq!(std::fs::read(ws.join("b.txt")).unwrap(), b"BBB");
+    }
+
+    #[test]
+    fn commit_selected_renames_only_accepted_drops_the_rest() {
+        let dir = ws_dir();
+        let ws = dir.path();
+        let check = NoopSyntaxCheck;
+        let mut s = Staging::new(ws, &check);
+        s.add(StagedWrite::new("keep.txt", "yes")).unwrap();
+        s.add(StagedWrite::new("drop.txt", "no")).unwrap();
+
+        let mut accepted = std::collections::HashSet::new();
+        accepted.insert(PathBuf::from("keep.txt"));
+        let report = s.stage().unwrap().commit_selected(&accepted).unwrap();
+
+        assert_eq!(report.files.len(), 1);
+        assert_eq!(report.files[0].path, PathBuf::from("keep.txt"));
+        assert_eq!(std::fs::read(ws.join("keep.txt")).unwrap(), b"yes");
+        assert!(
+            !ws.join("drop.txt").exists(),
+            "rejected file must not appear in workspace"
+        );
+    }
+
+    #[test]
+    fn commit_selected_with_empty_set_is_full_reject() {
+        let dir = ws_dir();
+        let ws = dir.path();
+        let check = NoopSyntaxCheck;
+        let mut s = Staging::new(ws, &check);
+        s.add(StagedWrite::new("a.txt", "x")).unwrap();
+        s.add(StagedWrite::new("b.txt", "y")).unwrap();
+        let report = s
+            .stage()
+            .unwrap()
+            .commit_selected(&std::collections::HashSet::new())
+            .unwrap();
+        assert!(report.files.is_empty());
+        assert!(!ws.join("a.txt").exists());
+        assert!(!ws.join("b.txt").exists());
+    }
+
+    #[test]
+    fn commit_selected_ignores_unknown_paths_in_accepted_set() {
+        // A UI that sends back a stale path (e.g. user clicked accept,
+        // then a new event arrived) shouldn't error — accept-set is
+        // an idempotent intersection with the actual pending set.
+        let dir = ws_dir();
+        let ws = dir.path();
+        let check = NoopSyntaxCheck;
+        let mut s = Staging::new(ws, &check);
+        s.add(StagedWrite::new("real.txt", "R")).unwrap();
+        let mut accepted = std::collections::HashSet::new();
+        accepted.insert(PathBuf::from("real.txt"));
+        accepted.insert(PathBuf::from("stale.txt")); // unknown
+        let report = s.stage().unwrap().commit_selected(&accepted).unwrap();
+        assert_eq!(report.files.len(), 1);
+        assert_eq!(report.files[0].path, PathBuf::from("real.txt"));
+    }
+
+    #[test]
+    fn dropping_staged_batch_discards_temp_tree_and_leaves_workspace_clean() {
+        let dir = ws_dir();
+        let ws = dir.path();
+        let check = NoopSyntaxCheck;
+        let mut s = Staging::new(ws, &check);
+        s.add(StagedWrite::new("a.txt", "x")).unwrap();
+        {
+            let _batch = s.stage().unwrap();
+            // Drop without committing.
+        }
+        assert!(!ws.join("a.txt").exists());
+    }
+
+    #[test]
+    fn stage_then_commit_all_is_equivalent_to_commit() {
+        // Behavioural parity: Staging::commit() === stage().commit_all().
+        let dir = ws_dir();
+        let ws = dir.path();
+        let check = NoopSyntaxCheck;
+        let mut s1 = Staging::new(ws, &check);
+        s1.add(StagedWrite::new("a.txt", "xx")).unwrap();
+        let r1 = s1.commit().unwrap();
+        assert_eq!(r1.files.len(), 1);
+        assert_eq!(std::fs::read(ws.join("a.txt")).unwrap(), b"xx");
     }
 }

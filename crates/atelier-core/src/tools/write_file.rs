@@ -100,21 +100,31 @@ impl Tool for WriteFile {
                     stderr: format!("staging add failed: {e}"),
                 })?;
 
-            let report = staging.commit().map_err(|e| ToolError::ExecutionFailed {
+            // v46: stage instead of commit. The dispatcher's
+            // ApprovalPolicy decides whether to auto-commit
+            // (current behaviour, the default) or to emit
+            // StagingPendingApproval and wait for the user's accept
+            // set (spec §3 hunk accept/reject).
+            let batch = staging.stage().map_err(|e| ToolError::ExecutionFailed {
                 tool: NAME.into(),
                 exit_code: -1,
-                stderr: format!("staging commit failed: {e}"),
+                stderr: format!("staging stage failed: {e}"),
             })?;
+            let bytes_written = batch
+                .pending_files()
+                .first()
+                .map(|f| match &f.hunks {
+                    crate::diff::Hunks::Created { new_byte_len, .. } => *new_byte_len,
+                    _ => 0,
+                })
+                .unwrap_or(0);
 
             Ok(ToolResult {
                 output: serde_json::json!({
                     "path": parsed.path,
-                    "bytes_written": report.files.first().map(|f| match &f.hunks {
-                        crate::diff::Hunks::Created { new_byte_len, .. } => *new_byte_len,
-                        _ => 0,
-                    }).unwrap_or(0),
+                    "bytes_written": bytes_written,
                 }),
-                staged_writes: Some(report),
+                staged_writes: Some(batch),
             })
         })
         .await
@@ -146,8 +156,11 @@ mod tests {
             )
             .await
             .unwrap();
+        // v46: WriteFile stages but does NOT commit — the dispatcher's
+        // ApprovalPolicy gates the rename. Without going through the
+        // dispatcher this test commits the batch directly.
         assert!(r.staged_writes.is_some(), "should produce staged writes");
-        let report = r.staged_writes.unwrap();
+        let report = r.staged_writes.unwrap().commit_all().unwrap();
         assert_eq!(report.files.len(), 1);
         assert_eq!(report.files[0].path, std::path::PathBuf::from("a.txt"));
         assert_eq!(std::fs::read(dir.path().join("a.txt")).unwrap(), b"hello");
@@ -157,7 +170,7 @@ mod tests {
     async fn creates_nested_dirs_when_requested() {
         let dir = tempfile::TempDir::new().unwrap();
         let s = SandboxPolicy::restrictive(dir.path()).unwrap();
-        WriteFile
+        let r = WriteFile
             .execute(
                 serde_json::json!({
                     "path": "src/lib/inner.rs",
@@ -168,6 +181,8 @@ mod tests {
             )
             .await
             .unwrap();
+        // v46: commit explicitly outside the dispatcher.
+        r.staged_writes.unwrap().commit_all().unwrap();
         assert_eq!(
             std::fs::read(dir.path().join("src/lib/inner.rs")).unwrap(),
             b"// hi"

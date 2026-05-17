@@ -21,7 +21,7 @@ use atelier_core::State;
 // to warrant a sibling `atelier-core-runner` crate, this is the seam.
 #[path = "../src/runner.rs"]
 mod runner;
-use runner::{EventSink, MockResponse, ProviderChoice, Runner};
+use runner::{DispatcherHandle, EventSink, MockResponse, ProviderChoice, Runner};
 
 fn envelope_done() -> Envelope {
     Envelope {
@@ -40,15 +40,98 @@ fn mock_envelope_tool_call(env: &Envelope) -> ToolCallRequest {
     }
 }
 
+// PC-6 regression: verifies the producer-side wiring lands all four
+// new event variants on the bus during a scripted run. The TUI's
+// AppState consumes these in `apply()`; the GUI's `bridge_event`
+// projects them. This test pins the producer contract.
+#[tokio::test]
+async fn run_broadcasts_message_plan_ledger_and_context_events() {
+    use atelier_core::Event;
+
+    let workspace = tempfile::TempDir::new().unwrap();
+
+    // Single turn: assistant text + a real write_file tool call (drives
+    // LedgerAppended via the dispatcher) + the harness_meta envelope
+    // (which carries claimed_done so the loop terminates after the
+    // ContextSnapshot fires).
+    let write_call = ToolCallRequest {
+        id: "tc-pc6".into(),
+        name: "write_file".into(),
+        arguments: serde_json::json!({"path": "pc6.txt", "content": "ok"}),
+    };
+    let responses = vec![MockResponse {
+        assistant_text: "doing the write".into(),
+        tool_calls: vec![write_call, mock_envelope_tool_call(&envelope_done())],
+    }];
+
+    let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let runner = Runner::new(
+        workspace.path().to_path_buf(),
+        ProviderChoice::Mock { responses },
+        EventSink::Capture(events.clone()),
+    )
+    .expect("mock runner construction is infallible")
+    .with_max_turns(2);
+
+    let report = runner.run("write pc6".into()).await.unwrap();
+    assert_eq!(report.final_state, State::Done);
+
+    let captured = events.lock();
+
+    // MessageCommitted: at minimum the initial user prompt + the
+    // assistant turn + the tool result.
+    let messages: Vec<_> = captured
+        .iter()
+        .filter_map(|e| match e {
+            Event::MessageCommitted { role, text } => Some((*role, text.clone())),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        messages.len() >= 3,
+        "expected ≥3 MessageCommitted events, got {messages:?}"
+    );
+    let summary = format!("{messages:?}");
+    assert!(summary.contains("User"), "events: {summary}");
+    assert!(summary.contains("Assistant"), "events: {summary}");
+    assert!(summary.contains("Tool"), "events: {summary}");
+    assert!(
+        summary.contains("write pc6"),
+        "user prompt missing from bus: {summary}"
+    );
+    assert!(
+        summary.contains("doing the write"),
+        "assistant text missing: {summary}"
+    );
+
+    // LedgerAppended: one per tool call (the write_file dispatch).
+    let ledger_count = captured
+        .iter()
+        .filter(|e| matches!(e, Event::LedgerAppended { .. }))
+        .count();
+    assert!(
+        ledger_count >= 1,
+        "expected ≥1 LedgerAppended events, got {ledger_count}"
+    );
+
+    // ContextSnapshot: emitted at end-of-turn after token counting.
+    let context_count = captured
+        .iter()
+        .filter(|e| matches!(e, Event::ContextSnapshot { .. }))
+        .count();
+    assert!(
+        context_count >= 1,
+        "expected ≥1 ContextSnapshot, got {context_count}"
+    );
+}
+
 #[tokio::test]
 async fn run_loops_until_claimed_done_and_reaches_terminal_state() {
     let workspace = tempfile::TempDir::new().unwrap();
 
     let responses = vec![MockResponse {
         assistant_text: "ack".into(),
-        envelope: envelope_done(),
         tool_calls: vec![mock_envelope_tool_call(&envelope_done())],
-        claims_done: true,
     }];
 
     let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -86,15 +169,11 @@ async fn run_dispatches_real_tool_calls_and_loops() {
     let responses = vec![
         MockResponse {
             assistant_text: "writing".into(),
-            envelope: Envelope::default(),
             tool_calls: vec![write_call],
-            claims_done: false,
         },
         MockResponse {
             assistant_text: "done".into(),
-            envelope: envelope_done(),
             tool_calls: vec![mock_envelope_tool_call(&envelope_done())],
-            claims_done: true,
         },
     ];
 
@@ -125,15 +204,11 @@ async fn run_bails_after_max_turns_without_claimed_done() {
     let responses = vec![
         MockResponse {
             assistant_text: "..".into(),
-            envelope: Envelope::default(),
             tool_calls: vec![],
-            claims_done: false,
         },
         MockResponse {
             assistant_text: "..".into(),
-            envelope: Envelope::default(),
             tool_calls: vec![],
-            claims_done: false,
         },
     ];
 
@@ -170,7 +245,6 @@ async fn run_scripted_multi_file_rename_drives_phase_c_mechanical_gate() {
     for n in 1..=3 {
         responses.push(MockResponse {
             assistant_text: format!("rewriting file_{n}"),
-            envelope: Envelope::default(),
             tool_calls: vec![ToolCallRequest {
                 id: format!("tc-{n}"),
                 name: "write_file".into(),
@@ -179,14 +253,11 @@ async fn run_scripted_multi_file_rename_drives_phase_c_mechanical_gate() {
                     "content": format!("new contents {n}"),
                 }),
             }],
-            claims_done: false,
         });
     }
     responses.push(MockResponse {
         assistant_text: "all renamed".into(),
-        envelope: envelope_done(),
         tool_calls: vec![mock_envelope_tool_call(&envelope_done())],
-        claims_done: true,
     });
 
     let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -222,9 +293,7 @@ async fn run_persists_session_to_disk_under_atelier_sessions() {
     let workspace = tempfile::TempDir::new().unwrap();
     let responses = vec![MockResponse {
         assistant_text: "done".into(),
-        envelope: envelope_done(),
         tool_calls: vec![mock_envelope_tool_call(&envelope_done())],
-        claims_done: true,
     }];
     let runner = Runner::new(
         workspace.path().to_path_buf(),
@@ -328,4 +397,200 @@ fn binary_run_rejects_empty_prompt() {
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("prompt is empty"), "stderr: {stderr}");
+}
+
+// v25.2-F regression: when a tool call fails with an error message
+// containing characters that need JSON escaping (quotes, backslashes,
+// newlines), the synthesized `tool_result` payload must be valid JSON.
+// Pre-fix `format!("{{\"error\":\"{e}\"}}")` produced invalid JSON the
+// model received and likely mishandled.
+#[tokio::test]
+async fn tool_error_with_quotes_produces_valid_json_tool_result() {
+    let workspace = tempfile::TempDir::new().unwrap();
+
+    // A write_file call with a path that's outside the workspace — the
+    // tool dispatcher returns a PermissionDenied error whose Display
+    // contains the path string. Path traversal escapes (`..`) trigger
+    // the error reliably.
+    let bad_write = ToolCallRequest {
+        id: "tc-bad".into(),
+        name: "write_file".into(),
+        arguments: serde_json::json!({
+            "path": "../escape.txt",
+            "content": "x",
+        }),
+    };
+
+    let responses = vec![
+        MockResponse {
+            assistant_text: "trying to escape".into(),
+            tool_calls: vec![bad_write],
+        },
+        MockResponse {
+            assistant_text: "done".into(),
+            tool_calls: vec![mock_envelope_tool_call(&envelope_done())],
+        },
+    ];
+
+    let runner = Runner::new(
+        workspace.path().to_path_buf(),
+        ProviderChoice::Mock { responses },
+        EventSink::Null,
+    )
+    .expect("mock runner construction is infallible")
+    .with_max_turns(4);
+
+    // The run completes successfully — the failed tool call's error
+    // message is fed back as a JSON-escaped tool_result, and the next
+    // turn proceeds without the conversation history being corrupted by
+    // unescaped quotes.
+    let report = runner.run("escape".into()).await.unwrap();
+    assert_eq!(report.final_state, State::Done);
+}
+
+// v47 DR-F: GUI driver path — Runner with AwaitApproval +
+// DispatcherHandle end-to-end. The GUI's `start_demo_run` Tauri
+// command builds exactly this shape; this test exercises it without
+// Tauri.
+#[tokio::test]
+async fn await_approval_via_runner_with_dispatcher_handle_round_trips() {
+    use atelier_core::dispatcher::ApprovalPolicy;
+    use atelier_core::session::Event;
+
+    let workspace = tempfile::TempDir::new().unwrap();
+
+    let write_call = ToolCallRequest {
+        id: "tc-write".into(),
+        name: "write_file".into(),
+        arguments: serde_json::json!({
+            "path": "approved.txt",
+            "content": "gated by user",
+        }),
+    };
+    let responses = vec![MockResponse {
+        assistant_text: "demo write".into(),
+        tool_calls: vec![write_call, mock_envelope_tool_call(&envelope_done())],
+    }];
+
+    // Two sinks: Capture for event assertions, plus the DispatcherHandle
+    // to route the eventual submit_approval.
+    let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let handle = DispatcherHandle::new();
+
+    let runner = Runner::new(
+        workspace.path().to_path_buf(),
+        ProviderChoice::Mock { responses },
+        EventSink::Capture(events.clone()),
+    )
+    .expect("mock runner construction is infallible")
+    .with_approval_policy(ApprovalPolicy::AwaitApproval)
+    .with_dispatcher_handle(handle.clone())
+    .with_max_turns(2);
+
+    // Spawn the runner; concurrently poll the captured events for the
+    // pending-approval signal, then submit through the handle.
+    let runner_task = tokio::spawn(async move { runner.run("write a file".into()).await });
+
+    // Poll until either we see StagingPendingApproval (and submit) or
+    // the runner finishes. Bounded so a regression that never emits
+    // the pending event fails the test instead of hanging.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut submitted = false;
+    while std::time::Instant::now() < deadline && !submitted {
+        let snapshot: Vec<Event> = events.lock().clone();
+        for ev in snapshot {
+            if let Event::StagingPendingApproval {
+                commit_id, files, ..
+            } = ev
+            {
+                assert_eq!(files.len(), 1, "one pending file");
+                assert_eq!(files[0].path, PathBuf::from("approved.txt"));
+                let sd = handle
+                    .get()
+                    .expect("DispatcherHandle populated by runner before staging");
+                assert!(sd.submit_approval(commit_id, vec![PathBuf::from("approved.txt")]));
+                submitted = true;
+                break;
+            }
+        }
+        if !submitted {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+    assert!(submitted, "never saw StagingPendingApproval within 10s");
+
+    let report = runner_task.await.unwrap().unwrap();
+    assert_eq!(report.final_state, State::Done);
+
+    // File landed on disk — proves the round-trip drove commit_selected.
+    let body = std::fs::read(workspace.path().join("approved.txt")).unwrap();
+    assert_eq!(body, b"gated by user");
+
+    // After the run ends, the DispatcherHandle should be cleared.
+    assert!(
+        handle.get().is_none(),
+        "Runner::run must clear the DispatcherHandle on shutdown"
+    );
+}
+
+#[tokio::test]
+async fn await_approval_via_runner_with_full_reject_drops_the_write() {
+    use atelier_core::dispatcher::ApprovalPolicy;
+    use atelier_core::session::Event;
+
+    let workspace = tempfile::TempDir::new().unwrap();
+    let write_call = ToolCallRequest {
+        id: "tc-write".into(),
+        name: "write_file".into(),
+        arguments: serde_json::json!({
+            "path": "rejected.txt",
+            "content": "user said no",
+        }),
+    };
+    let responses = vec![MockResponse {
+        assistant_text: "demo write".into(),
+        tool_calls: vec![write_call, mock_envelope_tool_call(&envelope_done())],
+    }];
+
+    let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let handle = DispatcherHandle::new();
+    let runner = Runner::new(
+        workspace.path().to_path_buf(),
+        ProviderChoice::Mock { responses },
+        EventSink::Capture(events.clone()),
+    )
+    .expect("mock runner construction is infallible")
+    .with_approval_policy(ApprovalPolicy::AwaitApproval)
+    .with_dispatcher_handle(handle.clone())
+    .with_max_turns(2);
+
+    let runner_task = tokio::spawn(async move { runner.run("write a file".into()).await });
+
+    // Submit empty accept-set = full reject.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut submitted = false;
+    while std::time::Instant::now() < deadline && !submitted {
+        let snapshot: Vec<Event> = events.lock().clone();
+        for ev in snapshot {
+            if let Event::StagingPendingApproval { commit_id, .. } = ev {
+                let sd = handle.get().unwrap();
+                assert!(sd.submit_approval(commit_id, vec![]));
+                submitted = true;
+                break;
+            }
+        }
+        if !submitted {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+    assert!(submitted);
+
+    let report = runner_task.await.unwrap().unwrap();
+    assert_eq!(report.final_state, State::Done);
+
+    // File NOT on disk — rejection short-circuited commit.
+    assert!(
+        !workspace.path().join("rejected.txt").exists(),
+        "rejected file should not land"
+    );
 }

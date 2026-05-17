@@ -1,5 +1,298 @@
 # Atelier Spec — Changelog
 
+## v50 — 2026-05-17
+
+**OpenAI-compatible adapter lands + v49 LOW residuals closed.** Atelier now talks to any server speaking `POST /v1/chat/completions` — LM Studio, llama.cpp's `llama-server`, vLLM, sglang, Ollama (via its `/v1/` compat layer), and OpenAI itself. Pair with the existing Anthropic adapter and the `Mock` for tests, that's three of the four §1 BYOM providers in. Companion to the adapter: four v49 LOW residuals (LR-1..4) cleaned up from the rescan.
+
+### v50 features
+
+- **`crates/atelier-core/src/adapter/openai_compat.rs`** (NEW, ~870 lines). `OpenAiCompatAdapter` implements `Adapter` end-to-end:
+  - `chat()` — non-streaming, single round-trip to `<base_url>/chat/completions`. Tool calls are surfaced through OpenAI's `tool_calls` array (each `function.arguments` is a JSON-encoded string on the wire, which the adapter parses back into `serde_json::Value` for `ToolCallRequest::arguments`). `finish_reason` mapped to `StopReason` (`stop`→`EndTurn`, `length`→`MaxTokens`, `tool_calls`→`ToolUse`, `content_filter`→`Refusal`).
+  - `stream()` — SSE parser mirroring `anthropic.rs`'s line-buffered state machine: handles `\r\n`/`\n`/`\r`, UTF-8 decoded only on complete events, `[DONE]` terminator recognised, 8 MB buffer cap. Tool-call deltas keyed by `index` so fragmented JSON across multiple SSE frames re-assembles correctly; arguments parsed once at finish.
+  - `count_tokens()` — chars/4 approximation tagged `TokenSource::Approx` (no server-side counter exists for the compat protocol; ContextManager treats this as fallback).
+  - HTTP error mapping (`map_http_error`): 401→`Auth`, 429→`RateLimited` with `Retry-After` honored (clamped to `MIN_RATE_LIMIT_BACKOFF_MS=100`), 400 with `code: "context_length_exceeded"`→`ContextOverflow`, 5xx + other→`Provider`. Network/serde failures→`Network`/`Protocol` per the established taxonomy.
+  - `to_openai_messages()` mapping: `System`/`User` inline; `Assistant` carries `tool_calls` as an array with `function.arguments` re-encoded as JSON strings; `Tool` role with required `tool_call_id`. Round-trips through the wire format.
+  - Constants: `DEFAULT_BASE_URL=https://api.openai.com/v1`, `API_KEY_ENV=OPENAI_API_KEY`, `BASE_URL_ENV=OPENAI_BASE_URL`, `DEFAULT_MAX_TOKENS=4096`, `DEFAULT_CONTEXT_WINDOW_TOKENS=8192` (overridable via `with_context_window`).
+  - **19 wiremock tests** covering: happy path, no-auth (empty key), tool calls, 401, 429 with Retry-After, 429 zero floor, context overflow, 500, malformed body, length finish reason, tools shape, assistant tool_calls round-trip, streaming text, streaming tool args, capabilities, context window override, token count, model-name parsing, `Debug` redaction.
+- **`crates/atelier-core/src/adapter/mod.rs`** — `pub mod openai_compat;` next to `pub mod anthropic;`.
+- **`crates/atelier-cli/src/runner.rs`** — new `ProviderChoice::OpenAiCompat { model_id, base_url: Option<String> }` variant. `Runner::new` reads `OPENAI_API_KEY` (empty string allowed — most local servers don't require auth; a 401 from a server that *does* require it surfaces as `AdapterError::Auth` on first call). `None` `base_url` falls back to `OPENAI_BASE_URL`, then to the adapter's `DEFAULT_BASE_URL`.
+- **`crates/atelier-cli/src/main.rs`** — new `--base-url <URL>` flag and `openai-compat` provider arm. Usage text expanded with concrete defaults for the common local servers (LM Studio :1234, llama-server :8080, Ollama :11434). `--model` is now required for `openai-compat`; `--base-url` is rejected for any other provider with a clear error.
+
+### Demo flow
+
+```text
+# Local-LLM dev loop (LM Studio with `qwen2.5-coder:7b` loaded):
+$ cargo run -p atelier-cli -- run \
+    --provider openai-compat \
+    --base-url http://localhost:1234/v1 \
+    --model local:qwen2.5-coder:7b \
+    "add a hello() function to src/main.rs"
+
+# Ollama via its OpenAI-compat surface:
+$ cargo run -p atelier-cli -- run \
+    --provider openai-compat \
+    --base-url http://localhost:11434/v1 \
+    --model local:llama3:8b \
+    "fix the failing test in tests/parser_test.rs"
+
+# OpenAI itself (omit --base-url; export OPENAI_API_KEY):
+$ OPENAI_API_KEY=sk-... cargo run -p atelier-cli -- run \
+    --provider openai-compat \
+    --model openai:gpt-4o-mini \
+    "..."
+```
+
+### v49 LOW residuals closed
+
+- **LR-1** — `crates/atelier-core/src/session.rs`, `crates/atelier-cli/src/lib.rs`, `crates/atelier-gui/src/lib.rs`, `crates/atelier-gui/ui/src/App.svelte`. Doc-only: `CommitDecision` docstring updated to reflect the v49 emission order (per-file `EditStaged` → `LedgerAppended` → `CommitDecision`), `ApprovalPolicy` re-exported from `atelier_cli` for consumers, `remove_dir_all` symlink-safety comment, prompt-too-long error clarifies bytes vs chars, App.svelte `state`→`app` rename inline-documented.
+- **LR-2** — `crates/atelier-tui/src/lib.rs`. `MAX_PROMPT_BYTES = 64 KiB` cap on `spawn_driver_run`'s prompt arg, parity with the GUI's v49 boundary check. Oversized prompts return `io::Error::new(InvalidInput, ...)` before any allocation grows. `event_stream_ended` one-shot semantics now documented inline.
+- **LR-3** — `crates/atelier-core/src/dispatcher.rs`. Extended `session_dispatcher_broadcasts_edit_staged_for_writes` to assert `CommitDecision` arrives *after* `LedgerAppended` and that under `AutoApproveAll` the decision's `committed` set lists every changed file with `dropped` empty. Locks the v49 ordering fix against regression.
+- **LR-4** — Deferred (low-value, deeper refactor — atelier-tui's `_run_task: Option<JoinHandle>` would need a `Drop` to abort the spawned task; revisit when the TUI driver mode grows a quit-while-running scenario beyond the current end-of-run cleanup).
+
+### Verified
+
+- `cargo fmt --check` clean.
+- `cargo clippy --workspace --all-targets -- -D warnings` clean.
+- `cargo test --workspace` → **atelier-core 438** (was 419; +19 openai_compat tests) + **atelier-cli 14** + **atelier-gui 12** + **atelier-tui 46**. All green.
+- `make check` — schemas + 52 artifacts + 112 rig tests + 11 dry-runs all OK.
+
+### Rig counts
+- **21 schemas / 52 artifacts / 112 tests / 11 dry-runs / 438 atelier-core unit tests + 14 atelier-cli integration tests + 12 atelier-gui unit tests + 46 atelier-tui unit tests** (atelier-core +19 from v49).
+
+### Phase-1 BYOM status
+- **Mock** (in-tree, `MockAdapter`) — v0
+- **Anthropic** Messages API — v45
+- **OpenAI-compatible** (LM Studio, llama-server, vLLM, sglang, Ollama-compat, OpenAI) — **v50**
+- **Bedrock / Vertex** — Phase E/F
+
+## v49 — 2026-05-17
+
+**Audit follow-up: ten v48 deep-scan findings fixed.** No new features — all hardening / correctness against the cross-cutting concerns the v48 scan surfaced. Highest-impact items: event-ordering inversion, missing Runner cleanup on error paths, no concurrent-run guard in the GUI, prototype-pollution surface in DiffPane's accept toggle, mount-race losing the first run's events.
+
+- **`crates/atelier-core/src/dispatcher.rs`** — FIX-1. `ApprovalGate::notify_outcome` removed; the dispatcher's commit branch now builds an `ApprovalSummary { commit_id, committed, dropped }` and stores it on `DispatchOutcome.approval_summary`. `SessionDispatcher::dispatch` emits the bus events in the canonical user-visible-first order: per-file `EditStaged` → `LedgerAppended` → `CommitDecision`. Closes the v48 audit's "documented intent inverted" finding.
+- **`crates/atelier-cli/src/runner.rs`** — FIX-2. New `DispatcherHandleGuard` private struct with a `Drop` impl that runs on every exit path from `Runner::run` (success, `?`-propagated errors, panic). Pre-v49 the `handle.clear()` was a tail call only the success path reached — an error mid-loop would leave a stale Arc pointing at a torn-down dispatcher.
+- **`crates/atelier-gui/src/lib.rs`** — FIX-3 + FIX-5 + FIX-10. `SessionState.run_in_flight: Arc<AtomicBool>` guards against concurrent `start_demo_run` calls (compare_exchange Acquire/Relaxed; rejected calls return a typed error the frontend surfaces). `MAX_PROMPT_BYTES = 64 KiB` cap on the Tauri command's `prompt` argument so a multi-GB string can't OOM the process before any rejection. Each `start_demo_run` now creates a fresh UUID-named subdirectory under `workspace_root`; a new `RunCleanup` Drop guard on the spawned task clears the run-in-flight flag *and* (best-effort) removes the per-run workspace on every exit path — solving both "v47 demo clobbered by v48 demo" and "workspace leak across launches."
+- **`crates/atelier-cli/src/lib.rs`** + **runner.rs** — FIX-4. Documented that `pub mod runner;` is a deliberate test affordance, not a supported API surface, and re-export the blessed types (`Runner`, `ProviderChoice`, `MockResponse`, `EventSink`, `RunError`, `RunReport`, `DispatcherHandle`) at the crate root. Verified the `runner` module's internal helpers (`extract_native_envelope`, `built_in_registry`, `now_rfc3339`, `days_to_ymd`, `registry_to_tool_specs`, `build_mock_adapter`, `spawn_sink_drain`, `adapter_to_run_error`) are all module-private `fn`, not `pub` — they were never actually reachable as `atelier_cli::runner::*`. The audit's HIGH finding was over-stated; the only real leak was `read_prompt` (binary-internal but `pub` because the bin crate is separate from the lib crate), now documented.
+- **`crates/atelier-tui/src/lib.rs`** — FIX-6 + FIX-8. New `event_stream_ended: bool` flag gates the `recv` arm of the run loop's `tokio::select!` via the `, if !event_stream_ended` guard — closes the v48 busy-loop where the post-RunEnded `never_rx` re-fired `None` on every poll, appending "RunEnded" lines forever. `render_pending_diff` banner replaced the v46-era developer text ("submit via `SessionDispatcher::submit_approval(commit_id, accepted)`") with a coloured user-facing line: "press **y** to accept all · **n** to reject all" — matching the keys the v48 handler already binds.
+- **`crates/atelier-gui/ui/src/lib/components/DiffPane.svelte`** — FIX-7. `acceptedPaths` switched from a literal `Record<string, boolean>` (vulnerable to prototype pollution when paths like `__proto__` or `constructor` are used as keys) to `Object.create(null)` — a null-prototype object that can't reach `Object.prototype`. `togglePath` does a copy-on-write update so Svelte's reactivity proxy still sees the assignment. Also added `submitError` state — when `submit_approval` returns false (stale commit_id), the user now sees an inline red error instead of a silent `console.warn`. The Tauri command's return value is now consumed (previously discarded).
+- **`crates/atelier-gui/ui/src/App.svelte`** — FIX-9. New `listenerReady: boolean` state; `composerBusy` derived from `!listenerReady || runBusy` so the Composer's Send button is disabled until `await listen('atelier://event')` resolves. Pre-v49 a fast user could click Send before mount finished and lose the first run's events. Local state var renamed `state` → `app` to dodge a TypeScript-mode quirk in svelte-check that was treating `let state = $state(...)` as the Svelte-3-era store-auto-subscribe syntax.
+
+Verified: `cargo test --workspace` → **atelier-core 419 + atelier-cli 14 + atelier-gui 12 + atelier-tui 46** (unchanged test counts — these are correctness fixes, not new tests; the existing tests still pass through the refactor); `cargo fmt --check` clean; `cargo clippy --workspace --all-targets -- -D warnings` clean; `npm run check` → 94 files, 0 errors, 0 warnings; `npm run build` → 62.6 kB JS / 22.8 kB gzip; `make check` green.
+
+### Findings still deferred (per v48 audit)
+
+These are documented in the audit but deferred — they're lower-impact or require deeper refactors:
+
+- `dispatcher.rs:613` — `rx.await.unwrap_or_default()` collapses "user explicitly rejected" with "consumer dropped oneshot" into the same empty-Vec result.
+- `session.rs:192-199` — `PendingFile` drops `SyntaxOutcome`; UI can't show grammar-missing/not-applicable badges.
+- `state.rs` — `AwaitingApproval` transitions defined but never emitted (matters when §4 checkpoint replay lands).
+- `atelier-cli/tests/run_integration.rs` — `#[path]` test still compiles a second copy of runner.rs (low-impact; would require migrating tests to use the lib).
+- `atelier-tui` — `_run_task: Option<JoinHandle>` doesn't abort the task on Drop (runner keeps executing in background after user quits).
+- Hand-rolled `now_rfc3339` instead of `chrono`/`time` dep.
+
+### Rig counts
+- **21 schemas / 52 artifacts / 112 tests / 11 dry-runs / 419 atelier-core unit tests + 14 atelier-cli integration tests + 12 atelier-gui unit tests + 46 atelier-tui unit tests** (unchanged from v48).
+
+## v48 — 2026-05-17
+
+**TUI driver mode lands.** Same v47 pattern, terminal edition: pass a prompt as `argv[1]` and the TUI builds a `Runner` with `AwaitApproval` policy, drives a scripted MockAdapter run, pops the pending-diff banner with the `(PENDING)` title, waits for `y`/`n`, routes the decision to the live `SessionDispatcher::submit_approval`. `cargo run -p atelier-tui -- "rename foo"` is now a working end-to-end demo of the spec §3 hunk accept/reject contract from a terminal.
+
+- **`crates/atelier-tui/Cargo.toml`** — TD-A. Added `atelier-cli` + `serde_json` workspace deps (same hop the GUI takes in v47).
+- **`crates/atelier-tui/src/lib.rs`** — TD-B + TD-C. Two new `InputOutcome` variants: `AcceptAll`, `RejectAll`. `handle_key` signature changed to `handle_key(key, pending: Option<&PendingApproval>)`; `y`/`n` only return their accept/reject outcomes when `pending` is `Some`, otherwise they fall through to `Continue` (keeps the keys safe for a future text-input mode). The run loop gained two modes:
+  - **Driver mode** (when `argv[1]` is a non-empty prompt): builds a Runner with `AwaitApproval` + `DispatcherHandle`, `EventSink::Callback` feeds an mpsc that the select-loop drains. `y` accepts every pending file via `submit_approval(commit_id, all_paths)`; `n` rejects with an empty accept-set.
+  - **Viewer mode** (no prompt arg): preserved v45 behaviour — spawns a NoopHook session, forwards its broadcast onto the same mpsc. Useful for testing the terminal lifecycle in isolation.
+  - New helpers: `spawn_driver_run`, `submit_pending`, `first_word_or_default` (mirror of the GUI's helper of the same name; same sanitisation rules).
+- **`crates/atelier-tui/src/lib.rs`** (render path) — `render_help` now pivots to a yellow bold `APPROVAL REQUIRED · y accept all · n reject all · q quit` line when `pending_approval` is set, returning to the scrub-keys footer once `CommitDecision` clears the pending state.
+- **5 new tests** (`handle_key_emits_accept_all_on_y_when_pending`, `..._reject_all_on_n_when_pending`, `..._y_and_n_are_inert_when_no_pending`, `help_footer_swaps_to_approval_hints_when_pending`, `help_footer_returns_to_scrub_hints_after_decision`) lock the y/n contract + footer pivot. Existing handle_key tests updated to pass the new `pending` argument (always `None` for non-approval cases).
+
+Verified: `cargo test --workspace` → **atelier-core 419 + atelier-cli 14 + atelier-gui 12 + atelier-tui 46** (was 419 / 14 / 12 / 41 in v47; +5 TUI tests for the approval keys + footer pivot); `cargo fmt --check` clean; `cargo clippy --workspace --all-targets -- -D warnings` clean; `make check` green.
+
+### Demo flow
+
+```text
+$ cargo run -p atelier-tui -- "rename my-script"
+
+  ratatui terminal opens
+  ↓ Runner spawns, scripts a write_file → my-script.txt
+  ↓ dispatcher hits AwaitApproval
+  ↓ TUI DiffPane shows yellow (PENDING) box with my-script.txt
+  ↓ footer pivots to "APPROVAL REQUIRED · y accept all · n reject all · q quit"
+
+  user presses y
+  ↓ submit_pending() calls SessionDispatcher::submit_approval(commit_id, [my-script.txt])
+  ↓ dispatcher resumes, runs commit_selected
+  ↓ EditStaged + CommitDecision land on the bus
+  ↓ pending banner clears
+  ↓ footer returns to "q quit · [ prev · ] next · g HEAD"
+
+  on disk: /tmp/atelier-tui-<pid>-<nanos>/my-script.txt now contains
+  the demo write
+```
+
+### Phase C status — both UIs are now drivers
+
+| Surface | v45 | v46 | v47 | v48 |
+|---|---|---|---|---|
+| TUI rendering | ✓ multi-pane | ✓ pending state | ✓ pending state | ✓ |
+| TUI driver | — | — | — | ✓ (v48) |
+| GUI rendering | ✓ multi-pane | ✓ pending state | ✓ pending state | ✓ |
+| GUI driver | — | — | ✓ (v47) | ✓ |
+| Hunk accept/reject contract | — | ✓ (file-level) | ✓ | ✓ |
+
+### Rig counts
+- **21 schemas / 52 artifacts / 112 tests / 11 dry-runs / 419 atelier-core unit tests + 14 atelier-cli integration tests + 12 atelier-gui unit tests + 46 atelier-tui unit tests** (was 21 / 52 / 112 / 11 / 419 / 14 / 12 / 41).
+
+## v47 — 2026-05-17
+
+**GUI becomes a driver — hunk accept/reject works end-to-end through the webview.** The Svelte DiffPane's accept/reject buttons now route to a live `SessionDispatcher::submit_approval`, not a logging stub. The GUI builds + drives its own scripted run with `AwaitApproval` policy; the user types a prompt in the new Composer, sees the staging banner appear, clicks accept (or rejects per-file), and watches the committed write land in the workspace.
+
+- **`crates/atelier-cli/Cargo.toml`** — DR-A. Hybrid lib+bin. New `[lib] name = "atelier_cli"` so the runner is reachable from other crates (atelier-gui in particular). Binary `[[bin]] atelier` unchanged.
+- **`crates/atelier-cli/src/lib.rs`** — DR-A. New module that re-exports the runner's public surface (`Runner`, `ProviderChoice`, `MockResponse`, `EventSink`, `RunError`, `RunReport`).
+- **`crates/atelier-cli/src/main.rs`** — switched from `mod runner;` to `use atelier_cli::runner;` so the binary and the library share one source file.
+- **`crates/atelier-cli/src/runner.rs`** — DR-B. New `DispatcherHandle` (a shared `Arc<parking_lot::Mutex<Option<Arc<SessionDispatcher>>>>`) that the runner populates as soon as the dispatcher is built and clears on shutdown. New builder methods `Runner::with_approval_policy(ApprovalPolicy)` and `Runner::with_dispatcher_handle(DispatcherHandle)`. The dispatcher is now wrapped in `Arc` so the handle hand-off is cheap. New `EventSink::Callback(Arc<dyn Fn(&Event) + Send + Sync>)` variant — the drain task invokes the callback per event. The GUI uses it to forward bus events into the Tauri webview without standing up an external broadcast subscription.
+- **`crates/atelier-gui/Cargo.toml`** — DR-C. Added `atelier-cli` and `parking_lot` workspace deps.
+- **`crates/atelier-gui/src/lib.rs`** — DR-C + DR-D. `SessionState` redesigned: drops the pre-spawned session, holds a `DispatcherHandle` + an ephemeral `workspace_root` per process. `submit_approval` Tauri command now reads the dispatcher from the handle and calls `SessionDispatcher::submit_approval(commit_id, accepted)` for real. New `start_demo_run(prompt)` Tauri command — builds a `Runner` with `MockAdapter` scripted to emit a `write_file` + `harness_meta` envelope, installs `AwaitApproval` policy + the `DispatcherHandle`, wires `EventSink::Callback` to forward bus events to the webview as `atelier://event`, spawns the run loop on `tauri::async_runtime`. The file name is derived from the prompt's first word so the user sees their input reflected on disk.
+- **`crates/atelier-gui/ui/src/lib/components/Composer.svelte`** — DR-E. New textarea + Send button at the bottom of the workspace. Cmd/Ctrl+Enter submits. Disabled while a run is in flight (`busy` derived from `state.currentState`). Errors from the Tauri command surface inline.
+- **`crates/atelier-gui/ui/src/App.svelte`** — wires `Composer` into the layout grid (header / panes / composer / footer). `runBusy` derived from `currentState` so Composer disables itself during the run.
+- **`crates/atelier-cli/tests/run_integration.rs`** — DR-F. Two new tests (`await_approval_via_runner_with_dispatcher_handle_round_trips` and `..._full_reject_drops_the_write`) prove the Runner-side contract exactly matches what the GUI's `start_demo_run` builds: spawn a run with AwaitApproval + DispatcherHandle, watch the captured events for `StagingPendingApproval`, call `dispatcher.submit_approval` (accept-all or full-reject), verify the run terminates in `Done` and the file does/doesn't land on disk. Also asserts `DispatcherHandle.get()` returns `None` after the run shuts down (clean-up contract).
+
+Verified: `cargo test --workspace` → **atelier-core 419 + atelier-cli 14 + atelier-gui 12 + atelier-tui 41** (was 419 / 12 / 12 / 41 in v46; +2 cli integration tests for the GUI-shaped driver path); `cargo fmt --check` clean; `cargo clippy --workspace --all-targets -- -D warnings` clean; `npm run check` → 94 files, 0 errors, 0 warnings; `npm run build` → 62.3 kB JS bundle (22.7 kB gzip); `make check` green.
+
+### What still isn't wired
+
+- **Real-provider runs**: `start_demo_run` is scripted (MockAdapter). Routing live `--provider anthropic` runs from the GUI needs API-key input + provider selector + the lifecycle of multi-turn flows; v47 stops at "the demo proves the end-to-end approval contract end-to-end."
+- **Per-hunk granularity**: still file-level. Sub-file accept/reject requires reworking `Staging::commit_selected` to accept `Vec<(PathBuf, HunkSet)>`.
+- **TUI driver mode**: TUI is still bootstrap + render. Wiring it as a driver follows the same `DispatcherHandle` pattern; the API is now ready.
+- **State-machine `AwaitingApproval` transition**: still not emitted by the runner. The dispatcher blocks correctly on its oneshot but the `State` enum doesn't move through `AwaitingApproval` during the wait. Cosmetic for now; matters when checkpoints/replay land in §4.
+
+### Rig counts
+- **21 schemas / 52 artifacts / 112 tests / 11 dry-runs / 419 atelier-core unit tests + 14 atelier-cli integration tests + 12 atelier-gui unit tests + 41 atelier-tui unit tests** (was 21 / 52 / 112 / 11 / 419 / 12 / 12 / 41).
+
+## v46 — 2026-05-17
+
+**§3 hunk accept/reject lands at the contract level.** The dispatcher now gates commit on user approval when configured to do so. The flow: tool stages → dispatcher emits `StagingPendingApproval` → consumer (TUI/GUI) shows pending diff with accept/reject controls → consumer calls `SessionDispatcher::submit_approval(commit_id, accepted)` → dispatcher resumes, calls `StagedBatch::commit_selected(accepted)`, emits `CommitDecision` then `EditStaged` for each committed file. The pure Rust contract is end-to-end tested; the GUI's `submit_approval` Tauri command logs the intent today (the GUI doesn't yet drive its own dispatcher — that wiring lands when the GUI grows from viewer into driver).
+
+- **`crates/atelier-core/src/staging.rs`** — HR-A. `Staging::commit()` split into `Staging::stage() -> StagedBatch` + `StagedBatch::commit_selected(accepted) -> CommitReport` + `StagedBatch::commit_all()`. Existing `Staging::commit()` preserved as `stage().commit_all()` for callers that don't want approval gating. `StagedBatch` owns the `TempDir`; dropping it without committing discards the temp tree (same all-or-nothing semantic as v45). Not `Clone` (duplicating the handle would race for the same staged paths). 7 new tests: stage-no-rename, commit_all parity, commit_selected partial-accept, empty-accept full-reject, idempotent stale-path ignore, drop-without-commit cleanup, commit() === stage().commit_all().
+- **`crates/atelier-core/src/dispatcher.rs`** — HR-B + HR-D. `ToolResult.staged_writes: Option<CommitReport>` → `Option<StagedBatch>`; `ToolResult` dropped `Clone` derive (no caller used it). New `ApprovalGate` async trait + default `AutoApprove` impl (commits all) + `PendingApprovalGate` impl on the SessionDispatcher (emits `StagingPendingApproval`, waits on oneshot). New `ApprovalPolicy { AutoApproveAll (default), AwaitApproval }`. `Dispatcher::with_approval_gate` + `SessionDispatcher::with_approval_policy` builder methods. New `SessionDispatcher::submit_approval(commit_id, accepted) -> bool` (returns `false` when commit_id is unknown). The dispatcher's commit step now: stage → gate.approve(commit_id, pending) → commit_selected(accepted) → gate.notify_outcome(committed, dropped) → events. Commit failures fold into `ToolError::ExecutionFailed`. 3 new tests: pending-event + selective accept, full-reject drops everything, submit_approval for unknown commit_id returns false. EchoTool test fixture rewritten to build a real `StagedBatch` against a tempdir workspace (was a synthetic CommitReport).
+- **`crates/atelier-core/src/state.rs`** — HR-C. New `State::AwaitingApproval` variant. New transitions: `ToolExecuting → AwaitingApproval`, `AwaitingApproval → ToolExecuting`, `AwaitingApproval → Failed`.
+- **`crates/atelier-core/src/session.rs`** — HR-C. New `Event::StagingPendingApproval { commit_id: Uuid, files: Vec<PendingFile> }` (PendingFile carries path + hunks) and `Event::CommitDecision { commit_id, committed: Vec<PathBuf>, dropped: Vec<PathBuf> }`. Approval routing is deliberately NOT a session::Command — the actor's job is "validate transitions, fire hooks"; the approval lifecycle lives next to the staging it controls. Documented in-place.
+- **`crates/atelier-core/src/tools/write_file.rs`, `tools/edit_file.rs`** — HR-B. Tools call `Staging::stage()` instead of `.commit()` and return `StagedBatch` in `staged_writes`. The dispatcher's auto-approve path produces identical end-state behaviour. Existing tool unit tests updated to call `commit_all()` themselves to verify on-disk results (they're testing the tool, not the dispatcher).
+- **`crates/atelier-tui/src/lib.rs`** — HR-E. `AppState.pending_approval: Option<PendingApproval>` + `PendingApprovalFile` types. `apply()` folds `StagingPendingApproval` → set pending, `CommitDecision` → clear pending. `render_diff` defers to new `render_pending_diff` when pending is set — yellow `(PENDING)` title + banner + per-file path list. New `hunks_kind_label` / `short_uuid` helpers. `project_event` covers the two new variants. 4 new tests: apply records pending, decision clears pending, render shows badge + path, render returns to normal after decision. Total TUI tests: 41 (was 37).
+- **`crates/atelier-tui/Cargo.toml`** — `uuid` workspace dep added (for `PendingApproval.commit_id`).
+- **`crates/atelier-gui/src/lib.rs`** — HR-F. `bridge_event` covers `StagingPendingApproval` + `CommitDecision`. New Tauri command `submit_approval(commit_id, accepted) -> bool` — currently a logging stub; real routing waits on the GUI shell becoming a driver. 2 new bridge tests.
+- **`crates/atelier-gui/Cargo.toml`** — `uuid` workspace dep added.
+- **`crates/atelier-gui/ui/src/lib/state.ts`** — HR-F. `PendingApprovalFile` + `PendingApproval` types; `AppState.pendingApproval: PendingApproval | null`. `applyEvent` handles both new variants (mirror of TUI `apply()`). `projectEvent` covers both for the event log.
+- **`crates/atelier-gui/ui/src/lib/components/DiffPane.svelte`** — HR-F. New `pendingApproval` prop. When non-null, renders an APPROVAL banner with commit-id, per-file checkboxes, "accept selected" / "reject all" buttons. Buttons invoke the `submit_approval` Tauri command. Yellow border + bold `PENDING` title visually distinguish from the committed-diff path. Per-file accept-toggle state resets when a new pending arrives (UX: "review and reject what you don't want", not "opt in to every file").
+- **`crates/atelier-gui/ui/src/App.svelte`** — threads `pendingApproval` from app state into `DiffPane`.
+
+Verified: `cargo test --workspace` → **atelier-core 419 + atelier-cli 12 + atelier-gui 12 + atelier-tui 41** (was 409 / 12 / 10 / 37 in v45; +16 new tests across HR-A through HR-F); `cargo fmt --check` clean; `cargo clippy --workspace --all-targets -- -D warnings` clean; `npm run check` → 0 errors, 0 warnings; `npm run build` → 59.8 kB JS bundle (21.8 kB gzip); `make check` green.
+
+The `submit_approval` Tauri command in `atelier-gui/src/lib.rs` is a logging stub. The GUI shell today is a viewer of events from a session running elsewhere (the production driver is `atelier run` in atelier-cli). Routing the approval back to a live `SessionDispatcher::submit_approval` requires the GUI to drive its own session — a separate piece of work that builds on this contract. Until then, the bus + state-machine + dispatcher round-trip is exercised end-to-end via `await_approval_emits_pending_event_and_blocks_until_submit` in `dispatcher::tests` (drives the full round-trip via direct `submit_approval` calls).
+
+### Rig counts
+- **21 schemas / 52 artifacts / 112 tests / 11 dry-runs / 419 atelier-core unit tests + 12 atelier-cli integration tests + 12 atelier-gui unit tests + 41 atelier-tui unit tests** (was 21 / 52 / 112 / 11 / 409 / 12 / 10 / 37).
+
+## v45 — 2026-05-17
+
+**§3 GUI multi-pane workspace lands.** Mirrors the v43/v44 TUI subset in the Tauri webview. Same data contract (the `atelier://event` bus), same panes (conversation / plan / diff / cost+context meters), same scrubber keys. With v44's producer-side wiring already on the bus, `cargo tauri dev` now renders a live four-pane workspace fed by a real session.
+
+- **`crates/atelier-gui/ui/src/lib/state.ts`** — pure-TS state module mirroring the TUI's `AppState`. Same field shapes, same caps (`MAX_CONVERSATION_LINES = 1000`, `MAX_DIFF_HISTORY = 16`, `MAX_EVENT_LOG = 1000`, `DEFAULT_CONTEXT_WINDOW_TOKENS = 200000`), same `applyEvent` reducer logic as the Rust `AppState::apply`. Types: `BridgedEvent`, `ConversationRole`, `ConversationLine`, `Hunks`, `Hunk`, `LineRange`, `StagedEdit`, `PlanStatus`, `PlanStep`, `LedgerEntry`, `AppState`. Functions: `initialState()`, `applyEvent(state, event)`, `applyScrub(state, cmd)`, `projectEvent(event)`, `roleColour(role)`. Pure — no DOM, no Svelte runes; components wrap in `$state` themselves. Mirroring keeps the contract parallel for the day a vitest harness lands.
+- **`crates/atelier-gui/ui/src/app.css`** — global theme tokens. Palette mirrors the TUI's ratatui colours (user=yellow, assistant=cyan, tool=magenta, system=grey; diff add=green, remove=red, hunk-header=blue) so users switching between surfaces see the same visual contract. Plain CSS variables; per-component styles reference `var(--*)`.
+- **`crates/atelier-gui/ui/src/lib/components/Header.svelte`** — app brand + meta strip: `state=<label>`, `EditStaged=N`, `scrub=HEAD|-N`. Yellow when pinned, green when at HEAD — same colours as the TUI header.
+- **`crates/atelier-gui/ui/src/lib/components/ConversationPane.svelte`** — role-prefixed list, auto-scrolls to bottom on new messages via `$effect` watching `conversation.length`. Each line is a 2-column grid: role label (right-aligned, role-coloured) + text (`white-space: pre-wrap`, breaks long words).
+- **`crates/atelier-gui/ui/src/lib/components/DiffPane.svelte`** — renders the head of `recentEdits` with full `Hunks` variant coverage: `Lines` produces per-hunk `@@ -old,len +new,len @@` headers + `-`/`+` lines; `Created` / `Deleted` / `Binary` / `Same` show coloured badges. Uses a Svelte 5 `{#snippet}` for the hunk block so the markup stays factored.
+- **`crates/atelier-gui/ui/src/lib/components/PlanPane.svelte`** — step glyphs (`[ ]` / `[▸]` / `[✓]` / `[~]`) coloured by status, constraints indented under each step, terminal-status steps render strike-through with muted text.
+- **`crates/atelier-gui/ui/src/lib/components/MetersPane.svelte`** — cost as `$0.XXXX` (yellow, no upper bound); context as a custom progress bar with `known/window` label and an explicit `+N unknown` suffix when `unknown > 0` so a silently-underreporting meter is visible (spec §5 contract). ARIA `role="progressbar"` for accessibility.
+- **`crates/atelier-gui/ui/src/App.svelte`** — composes the four panes plus header + footer. CSS grid: header / `(conversation 60% | plan 40%)` / `(diff 60% | meters 40%)` / footer. Subscribes to `atelier://event` once, runs every payload through `applyEvent`, passes typed slices to each child. Owns the keyboard listener: `[` / `]` / `g` route through `applyScrub` for parity with the TUI scrubber.
+- **`crates/atelier-gui/src/lib.rs`** — unchanged from v44; the bridge already projects all four new variants.
+
+Verified: `npm run check` → 92 files, 0 errors, 0 warnings; `npm run build` → 56.5 kB JS bundle (20.7 kB gzip), 7.6 kB CSS. `cargo fmt --check` clean; `cargo clippy --workspace --all-targets -- -D warnings` clean; `cargo test --workspace` → atelier-core 409 + atelier-cli 12 + atelier-gui 10 + atelier-tui 37 (unchanged from v44 — no new Rust); `make check` green.
+
+The webview is not exercised in CI (no PTY-equivalent for Tauri), but the contract is pinned at three levels: (1) `bridge_event` unit tests in atelier-gui Rust assert the JSON shape every variant produces; (2) the pure-TS `state.ts` reducer is structurally identical to the TUI's Rust `apply()` — same caps, same fold semantics, same fallbacks; (3) `svelte-check` catches typos against `BridgedEvent` payload shapes.
+
+### Rig counts
+- **21 schemas / 52 artifacts / 112 tests / 11 dry-runs / 409 atelier-core unit tests + 12 atelier-cli integration tests + 10 atelier-gui unit tests + 37 atelier-tui unit tests** (Rust totals unchanged from v44; +1 frontend bundle).
+
+## v44 — 2026-05-17
+
+**Producer side of the §3/§5 broadcast bus wired.** Four new `Event` variants on the bus, emitted by the dispatcher + turn driver, consumed by both UIs. The v43 TUI multi-pane widgets already rendered conversation / plan / cost / context from `AppState` fields; pre-v44 nothing populated those fields in a real run. Now: `cargo run -p atelier-cli run --provider mock "..."` drives a live conversation pane, plan canvas, cost meter, and context meter end-to-end. Closes the producer-side gap the v43 TUI subset deferred.
+
+- **`crates/atelier-core/src/session.rs`** — `Event` extended with `MessageCommitted { role, text }`, `PlanSnapshot { steps }`, `LedgerAppended { entry }`, `ContextSnapshot { known_tokens, unknown_tokens }`. New `MessageRole { System, User, Assistant, Tool }` enum (duplicated from `adapter::Role` to keep `session` free of an `adapter` dep). Snapshot-shaped events (not deltas) so a late-joining subscriber converges on the next event without replay.
+- **`crates/atelier-core/src/dispatcher.rs`** — `SessionDispatcher::dispatch` now broadcasts `LedgerAppended` after every ledger append. Ordering matters: `EditStaged` (user-visible side effects) ships BEFORE `LedgerAppended` (bookkeeping) so a UI consumer rendering both a diff pane and a cost meter sees the diff arrive first. Failed tool calls still emit `LedgerAppended` (cost meter must count the failed call against the trust budget — spec §1 doesn't carve out a "free failure" path); `EditStaged` is not emitted in that case (no staged writes).
+- **`crates/atelier-cli/src/runner.rs`** — turn driver now broadcasts: `MessageCommitted::User` for the initial prompt, `MessageCommitted::Assistant` after each model turn, `MessageCommitted::Tool` after each tool result. Maintains a `PlanCanvas` across turns, applies `envelope.plan_update` on each turn, and emits `PlanSnapshot` per turn. Emits `ContextSnapshot { known_tokens, unknown_tokens: 0 }` at end-of-turn via `adapter.count_tokens(&messages)` (the runner doesn't yet wire a full §5 ContextManager; once it does, `unknown_tokens` will reflect the `TokenSource::Unavailable` items).
+- **`crates/atelier-tui/src/lib.rs`** — `AppState::apply` extended to consume the four new variants: `MessageCommitted` → `push_conversation`; `PlanSnapshot` → rebuild `PlanCanvas` from the snapshot vec; `LedgerAppended` → fold per-entry cost into `total_cost_usd` (CacheBust entries carry no cost field and are skipped, not zeroed); `ContextSnapshot` → update `context_tokens`. New `ConversationRole::from_message_role` exhaustive mapping so adding a `MessageRole` variant later forces a deliberate decision. `ledger_entry_cost` helper centralises the per-variant cost extraction. `project_event` extended for the new variants in the event log.
+- **`crates/atelier-gui/src/lib.rs`** — `bridge_event` projects the four new variants onto the webview JSON shape: `MessageCommitted` → `{ role, text }`; `PlanSnapshot` → `{ steps }`; `LedgerAppended` → `{ entry }`; `ContextSnapshot` → `{ known_tokens, unknown_tokens }`. The frontend `App.svelte` will consume these in the next iteration.
+- **Integration test `run_broadcasts_message_plan_ledger_and_context_events`** — drives a scripted single-turn run with a `write_file` tool call + the `harness_meta` envelope, captures the bus via `EventSink::Capture`, asserts at least 3 `MessageCommitted` (user/assistant/tool), at least 1 `LedgerAppended`, at least 1 `ContextSnapshot`. Pins the producer contract end-to-end.
+
+Verified: `cargo test --workspace` → **atelier-core 409 + atelier-cli 12 + atelier-gui 10 + atelier-tui 37** (was 409 / 11 / 6 / 31 in v43; +11 new tests: +1 atelier-cli integration, +4 atelier-gui bridge, +6 atelier-tui apply/project, +1 atelier-core dispatcher reordering); `cargo fmt --check` clean; `cargo clippy --workspace --all-targets -- -D warnings` clean; `make check` green.
+
+### Rig counts
+- **21 schemas / 52 artifacts / 112 tests / 11 dry-runs / 409 atelier-core unit tests + 12 atelier-cli integration tests + 10 atelier-gui unit tests + 37 atelier-tui unit tests** (was 21 / 52 / 112 / 11 / 409 / 11 / 6 / 31).
+
+## v43 — 2026-05-17
+
+**v25.3 residuals pass + §3 TUI subset multi-pane widgets.** Four remaining residuals from the v25.2 deferred list closed; the TUI shifts from bootstrap-only ("EditStaged counter + event log") to a real four-pane layout matching the §3 TUI subset spec (conversation / plan / diff / cost+context meters) with scrubber-key plumbing. Phase C "§3 TUI subset" mechanical gate is wired at the rendering level — the only missing piece is the producer side (the §2.5 actor doesn't yet broadcast conversation commits / plan applies / ledger ticks; the TUI's `set_conversation` / `set_plan` / `set_cost_usd` / `set_context_tokens` mutators are the seam the producer side will plug into).
+
+**Residuals fixed (v25.3-A through D):**
+
+- **`crates/atelier-core/src/subprocess.rs`** — reader-task awaits now bounded by `tokio::time::timeout(POST_KILL_REAP_TIMEOUT)`. A leaked descendant outside the pgid that keeps a pipe open can no longer hang the runtime forever — partial output is discarded on elapse and a `tracing::warn!` carries the program/pid for diagnosis.
+- **`crates/atelier-core/src/adapter/anthropic.rs`** — `extract_overflow_numbers` rewritten with two anchored regexes (`\b(\d+)\s+tokens\b\s*>\s*(\d+)` and a fallback `\b(\d+)\s+tokens\b`). A future error format that embeds a request_id or timestamp before the token counts can no longer misreport via positional scan. `message_delta` `output_tokens` now always overwrites (was: gated on `> 0`) — Anthropic emits the value monotonically and the last delta is authoritative.
+- **`crates/atelier-core/src/staging.rs`** — staging tempdir is `fsync_dir_best_effort`'d before the rename phase. The staged files were already content-fsync'd via `write_with_sync`, but the *staging-tree dirents* were still in the cache — a crash between staging completion and a successful rename could surface as ENOENT mid-batch.
+- **`crates/atelier-core/src/persistence.rs`** — two new regression tests (`save_to_re_tightens_relaxed_session_dir`, `registry_save_re_tightens_relaxed_parent_dir`) explicitly cover the chmod-relaxed → save → re-tightened path. Pre-fix the existing tests only checked fresh dirs, which would be 0700 from umask on CI anyway.
+
+**§3 TUI subset multi-pane (v25.3 TUI-1 through TUI-5):**
+
+- **`crates/atelier-tui/src/lib.rs`** — `AppState` extended with `conversation` (bounded `VecDeque<ConversationLine>`), `recent_edits` (bounded `VecDeque<StagedEdit>`), `plan: PlanCanvas`, `total_cost_usd`, `context_tokens: (u32, u32)` (known + unknown), `context_window_tokens` (defaulted to 200k), and `scrub_offset`. New types: `ConversationLine`, `ConversationRole { User, Assistant, Tool, System }` with stable colour mapping, `StagedEdit`, `ScrubCommand { Prev, Next, JumpToHead }`. `InputOutcome` gains `Scrub(ScrubCommand)`.
+- **Conversation pane** — role-prefixed list, tail-rendered (newest pinned at bottom), with empty-state placeholder.
+- **Diff pane** — renders the most recent `EditStaged` via `Hunks` variants: `Lines` produces `@@ -old,len +new,len @@` headers with `-`/`+` markers; `Created` / `Deleted` show line+byte-count badges; `Binary` and `Same` show their badges. Truncates to the available rows.
+- **Plan canvas pane** — per-step glyphs (`[ ]` pending, `[▸]` in-progress, `[✓]` done, `[~]` skipped); terminal-status steps render strike-through; constraints render indented under their step.
+- **Cost + context meters** — cost as `$0.XXXX` (no upper bound; meter would be misleading); context as a ratatui `Gauge` with the known/window ratio, plus an explicit `+N unknown` suffix when items have `TokenSource::Unavailable` so a silently-underreporting meter is visible (spec §5 contract).
+- **Scrubber-key plumbing** — `[` emits `ScrubCommand::Prev`, `]` emits `Next`, `g` emits `JumpToHead`. `apply_scrub` walks an `Option<usize>` offset (None = HEAD), with `Next` from `Some(1)` collapsing back to HEAD. Header renders `scrub=HEAD` or `scrub=-N`; help footer documents the keys + adds a pinned-mode hint. The §4 time-travel subsystem will consume the offset; until then the TUI just records intent.
+- **Layout** — header (2 rows) / top row split conversation+plan (60/40) / bottom row split diff and a vertical strip of cost-gauge + context-gauge + event-log tail (60/40) / 1-row help footer. The existing event-log widget moves into the bottom-right vertical strip; the bus-driven counters still go in the header.
+
+Verified: `cargo test --workspace` → **atelier-core 409 + atelier-cli 11 + atelier-gui 6 + atelier-tui 31** (was 407 / 11 / 6 / 10 in v42; +23 new tests: +2 atelier-core regression on 0700 re-tightening, +21 atelier-tui on the new panes and scrubber); `cargo fmt --check` clean; `cargo clippy --workspace --all-targets -- -D warnings` clean; `make check` green.
+
+### Rig counts
+- **21 schemas / 52 artifacts / 112 tests / 11 dry-runs / 409 atelier-core unit tests + 11 atelier-cli integration tests + 6 atelier-gui unit tests + 31 atelier-tui unit tests** (was 21 / 52 / 112 / 11 / 407 / 11 / 6 / 10).
+
+## v42 — 2026-05-16
+
+**Deep-scan v25.2 — residuals pass.** A second pass over the v25.1 re-scan findings. Six load-bearing residuals fixed; the rest documented as deferred quality-of-life items.
+
+- **`crates/atelier-core/src/protocol_strategy.rs`** — v25.2-A. `parse_json_sentinel` now scans past the JSON value via `serde_json::StreamDeserializer::byte_offset()` instead of `find(SENTINEL_CLOSE)`. An embedded `<<<end>>>` (or `<<<harness_meta>>>`) inside a JSON string literal no longer truncates the parse — pre-fix a model emitting `{"summary":"see <<<end>>> tag"}` would surface as `Envelope::Parse` and be miscategorised in the conformance ring. New `TrailingContentAfterSentinel { length, prefix }` variant carries up to 64 bytes of trailing content (UTF-8 char-boundary safe) for triage. Two new regression tests: embedded close-tag and embedded open-tag in summary strings.
+- **`crates/atelier-core/src/adapter/anthropic.rs`** — v25.2-B. `parse_retry_after_ms` floors at `MIN_RATE_LIMIT_BACKOFF_MS = 100` so a confused proxy emitting `Retry-After: 0` no longer lets the harness hot-loop the API. SSE EOF now flushes a partial event whose `data:` line lacks a terminating blank line (non-spec server protection) — `take_line(at_eof=true)` consumes the remaining bytes as a final line, and `drain_buffer(at_eof=true)` dispatches the buffered event before reporting "stream ended without message_stop". `handle_event` Malformed-event handling documented (does NOT push a partial Complete first, because the default `chat()` would silently rubber-stamp the malformed turn). New regression test for `Retry-After: 0`.
+- **`crates/atelier-core/src/init.rs`** — v25.2-C. `atomic_write` now `fsync_dir_best_effort`s the parent after `persist()` so a power loss between rename and natural dirent fsync can't roll ATELIER.md or `.gitignore` back to pre-write state. Same pattern staging.rs and persistence.rs already use.
+- **`crates/atelier-core/src/persistence.rs`** — v25.2-D. `restrict_dir_mode` now emits a `tracing::warn!` on `set_permissions` failure (with the dir's current mode for context) so the spec §14 "0700" promise can't be silently violated on shared hosts. Also warns when stat itself fails.
+- **`crates/atelier-core/src/protocol_conformance.rs`** — v25.2-E. `ConformanceSnapshot::rate()` now `#[must_use]` so a stray `unwrap_or(1.0)` after a refactor is at least linted. Empty-buffer test renamed from `empty_buffer_has_perfect_rate_so_new_adapters_dont_fail_a_threshold_check` (stale, contradicted the post-P4 assertion) to `empty_buffer_reports_no_evidence_not_perfect_rate`.
+- **`crates/atelier-cli/src/runner.rs`** — v25.2-F. Tool-error feedback path uses `serde_json::json!({ "error": e.to_string() }).to_string()` instead of the unescaped `format!` — error messages containing quotes, backslashes, or newlines now produce valid JSON the model can parse. Assistant turn's `tool_calls` now retains the `harness_meta` envelope-bearing call (filtering moved to a separate `real_tool_calls` view) so the envelope tool_use id survives in conversation history; only dispatch filters it out, not history. New integration test exercising the failing-tool path with characters that need escaping.
+
+Verified: `cargo test --workspace` → **atelier-core 407 + atelier-cli 11 + atelier-gui 6 + atelier-tui 10** (was 404 / 10 / 6 / 10 in v41; +8 new regression tests across A/B/F); `cargo fmt --check` clean; `cargo clippy --workspace --all-targets -- -D warnings` clean; `make check` green.
+
+### Rig counts
+- **21 schemas / 52 artifacts / 112 tests / 11 dry-runs / 407 atelier-core unit tests + 11 atelier-cli integration tests + 6 atelier-gui unit tests + 10 atelier-tui unit tests** (was 21 / 52 / 112 / 11 / 404 / 10 / 6 / 10).
+
+## v41 — 2026-05-16
+
+**Deep-scan v25 — five priority groups fixed.** A fresh 6-subsystem audit produced ~230 findings; the highest-priority groups (subprocess hardening, SSE parser correctness, atomicity, fail-open paths, BYOM trait shape) landed in one pass with full rig + workspace verification green.
+
+- **`crates/atelier-core/src/subprocess.rs`** — P1. Env scrubbing: `env_clear()` + explicit `ENV_PASSTHROUGH` allowlist (PATH, HOME, USER, LOGNAME, LANG, LC_*, TERM, TZ, TMPDIR, SHELL). `ANTHROPIC_API_KEY`, `AWS_*`, `GITHUB_TOKEN`, `SSH_AUTH_SOCK` no longer leak into model-controlled tool invocations. Child put in its own process group via tokio's `Command::process_group(0)` on Unix; on timeout we `libc::kill(-pgid, SIGKILL)` so grandchildren (`sh -c "long | pipe"`) are reaped, not orphaned. Per-pipe byte cap (default 1 MiB) with `stdout_truncated`/`stderr_truncated` flags. New `read_capped` helper. Tests cover env strip, PATH passthrough, byte cap truncation, killpg-reaches-grandchildren.
+- **`crates/atelier-core/src/adapter/anthropic.rs`** — P2 + P5. **P2:** rewrote `AnthropicSseSource` as a proper line-buffered state machine. `take_line` finds first `\r`/`\n`, handles `\r\n`/`\n`/lone `\r`, waits if buffer ends mid-CRLF. UTF-8 decoding happens only on the assembled event payload — multi-byte codepoints split across TCP chunks no longer corrupt. Bounded buffer (8 MiB) prevents OOM on missing terminators. `message_delta.delta.stop_reason` parsed and propagated; non-stream path too. `Retry-After` header parsed (seconds, 300s cap) replacing hardcoded 1s. `extract_overflow_numbers` lifts `needed`/`limit` out of the body. `too_long` substring tightened to three specific Anthropic markers. **P5:** assistant turn re-sent with `tool_use` content blocks (text + tool_use array) instead of flattened text-only — preserves `tool_use_id` for matching `tool_result` blocks. New tests: chunk-boundary split, one-byte-per-chunk stream, CRLF line terminators, 4-byte emoji split mid-codepoint, stop_reason propagation, Retry-After parsing + 300s cap, overflow token extraction, double-envelope rejection, assistant tool_calls round-trip.
+- **`crates/atelier-core/src/adapter/mod.rs`** — `StopReason` enum (`EndTurn`/`MaxTokens`/`ToolUse`/`StopSequence`/`Refusal`/`Other`). `ChatResponse.stop_reason: Option<StopReason>`. `Message.tool_calls: Vec<ToolCallRequest>` + `Message::text(role, content)` constructor.
+- **`crates/atelier-core/src/staging.rs`** — P3. Staged file writes use new `write_with_sync` (create → write → `sync_all` → close); rename loop collects unique parents into `BTreeSet` and `fsync_dir_best_effort`s each after the batch. A power-loss between rename N and rename N+1 no longer rolls the workspace back to its pre-batch state.
+- **`crates/atelier-core/src/persistence.rs`** — P3. `restrict_dir_mode` helper tightens `sessions/` and `~/.atelier/` directories to 0700 on Unix. Regression tests for both.
+- **`crates/atelier-core/src/init.rs`** — P3. `atomic_write` (tempfile + persist) replaces bare `fs::write` for ATELIER.md; `atomic_append_atelier_entry` does read-modify-write through the same helper for `.gitignore`. Crash mid-write can no longer leave a truncated remnant that the next `init` silently skips. Regression test asserts no leftover `.tmpXXX` after init.
+- **`crates/atelier-core/src/protocol_conformance.rs`** — P4. `ConformanceSnapshot::rate()` returns `Option<f32>` — empty buffer is `None` ("no evidence"), no silent 1.0 rubber-stamp. Added `has_evidence()` predicate.
+- **`crates/atelier-core/src/protocol_strategy.rs`** — P4. `parse_json_sentinel` errors with new `StrategyError::TrailingContentAfterSentinel` on any non-whitespace after the close tag. Catches the double-envelope drop the audit named. Trailing whitespace (newlines from the wire) is still fine.
+- **`crates/atelier-core/src/dod.rs`** — P4. `DodConfig::load` doc-warns callers against treating `Ok(None)` as "verification passed". New `paths_searched(repo_root)` helper so callers can log where discovery looked.
+- **`crates/atelier-cli/src/runner.rs`** — P4 + P5. `dod_passed = Some(true)` placeholder removed — now `None` until a real DoD runner lands (was lying to downstream readers). Assistant turn pushed with `tool_calls` so multi-turn tool flows preserve the original ids end-to-end.
+- **`crates/atelier-core/src/tools/shell.rs`** — surfaces `stdout_truncated`/`stderr_truncated` in the tool's JSON output.
+- **`Cargo.toml` + `crates/atelier-core/Cargo.toml`** — `libc = "0.2"` workspace dep, target-gated to `cfg(unix)` in atelier-core.
+
+Verified: `cargo test --workspace` → **atelier-core 404 + atelier-cli 10 + atelier-gui 6 + atelier-tui 10** (was 379 / 10 / 6 / 10; +25 new regression tests across P1–P5); `cargo fmt --check` clean; `cargo clippy --workspace --all-targets -- -D warnings` clean; `make check` green (21 schemas / 52 artifacts / 112 rig tests / 11 dry-runs).
+
+### Rig counts
+- **21 schemas / 52 artifacts / 112 tests / 11 dry-runs / 404 atelier-core unit tests + 10 atelier-cli integration tests + 6 atelier-gui unit tests + 10 atelier-tui unit tests** (was 21 / 52 / 112 / 11 / 379 / 10 / 6 / 10).
+
 ## v40 — 2026-05-16
 **Phase C unblock (4) — TUI bootstrap lands.** `crates/atelier-tui` is no longer a scaffold. `cargo run -p atelier-tui` opens a ratatui + crossterm shell that subscribes to the same `atelier-core` broadcast bus the GUI does, renders an event log + an `EditStaged` counter live, and quits cleanly on `q` / `Esc` / `Ctrl-C`. Closes the §3 TUI subset snapshot gate at the wiring level; the richer widgets (conversation, diff, file tree, plan canvas, cost + context meters, timeline scrubber) sit on top.
 

@@ -16,9 +16,20 @@ path = "src/lib.rs"
 
 [dependencies]
 atelier-core = { workspace = true }
+# v48: TUI is now a driver. Same library hop the GUI uses to build a
+# Runner + grab a DispatcherHandle for the y/n approval keys.
+atelier-cli = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = "0.1"
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+# Pending-approval correlation id (PendingApproval.commit_id mirrors
+# the bus event's `commit_id: Uuid`). Same workspace dep atelier-core
+# uses; we only need the type for storage + display.
+uuid = { workspace = true }
+# v48 driver-mode demo: build the scripted MockAdapter responses,
+# including the harness_meta envelope. Same workspace dep the GUI uses
+# for `bridge_event` payload construction.
+serde_json = { workspace = true }

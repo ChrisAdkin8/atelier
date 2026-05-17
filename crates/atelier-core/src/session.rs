@@ -27,6 +27,8 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::diff::Hunks;
+use crate::ledger::LedgerEntry;
+use crate::plan::PlanStep;
 use crate::staging::CommitReport;
 use crate::state::{CheckpointHook, IllegalTransition, LedgerHook, State, Transition};
 
@@ -89,6 +91,15 @@ pub enum Command {
     Shutdown,
 }
 
+// Note: spec §3 hunk accept/reject doesn't ride on `Command` —
+// approval is a dispatcher concern, not a state-machine concern. The
+// state actor emits `Advance(AwaitingApproval)` and later
+// `Advance(ToolExecuting)` from the dispatcher's flow; the UI feeds
+// the accept-set back via `SessionDispatcher::submit_approval`
+// directly. Keeping the session actor free of approval routing means
+// the actor's job stays "validate transitions, fire hooks" and the
+// approval lifecycle lives next to the staging it controls.
+
 /// Events broadcast by the session actor.
 ///
 /// UI consumers subscribe via [`Handle::subscribe`] and render off this stream.
@@ -115,8 +126,100 @@ pub enum Event {
     /// diff updates as the agent edits."
     EditStaged { path: PathBuf, hunks: Hunks },
 
+    /// One conversation message just appended to the session's history.
+    /// Published by the turn driver (the §2.5 actor's runner) so UI
+    /// consumers can render the live conversation pane without polling
+    /// the on-disk session. Spec §3 "conversation pane" + §5
+    /// "non-destructive compaction" both rely on this stream.
+    MessageCommitted { role: MessageRole, text: String },
+
+    /// A plan snapshot — the canvas as it stands after the most recent
+    /// `plan_update` was applied. Snapshots (not deltas) so a UI consumer
+    /// that joined mid-session converges to the truth on the next event
+    /// without replay. Spec §5 plan canvas; the canvas is small enough
+    /// (≤ tens of steps in practice) that snapshot cost is negligible.
+    PlanSnapshot { steps: Vec<PlanStep> },
+
+    /// One ledger entry just landed. Published from
+    /// [`crate::dispatcher::SessionDispatcher`] after every tool-call
+    /// outcome, and from the turn driver after every model call.
+    /// Consumers fold these into a rolling cost / token total — the
+    /// snapshot of the ledger itself is not on the bus because a
+    /// running session can already drive the cost meter from the stream.
+    LedgerAppended { entry: LedgerEntry },
+
+    /// Aggregate token-budget snapshot from the §5 context manager.
+    /// Emitted at end-of-turn (after the turn driver tallies its
+    /// `ContextManager::token_snapshot`) so the context meter never
+    /// silently underreports — `unknown_tokens` makes the
+    /// `TokenSource::Unavailable` items visible to the UI.
+    ContextSnapshot {
+        known_tokens: u32,
+        unknown_tokens: u32,
+    },
+
+    /// Spec §3 "Hunk accept / reject": a tool staged writes and the
+    /// dispatcher is waiting for the user's accept-set decision before
+    /// the rename phase. UI consumers render each `files[i]` (path +
+    /// hunks) with an accept/reject control and send
+    /// [`Command::ApproveCommit`] (or equivalent dispatcher call —
+    /// see `SessionDispatcher::submit_approval`) carrying the accepted
+    /// paths. The `commit_id` is the correlation token; the
+    /// dispatcher only acts on a matching approval.
+    StagingPendingApproval {
+        commit_id: Uuid,
+        files: Vec<PendingFile>,
+    },
+
+    /// Spec §3 follow-on to [`Event::StagingPendingApproval`]: the user
+    /// approved a subset (possibly empty for a full reject) of the
+    /// pending files. `committed` are the paths that successfully
+    /// renamed into the workspace; `dropped` are the paths the user
+    /// rejected (or that failed to commit).
+    ///
+    /// **Ordering (v49 onwards):** emitted by `SessionDispatcher` as
+    /// the last bus event for a tool call that produced staged writes,
+    /// AFTER each per-file `EditStaged` and the `LedgerAppended`
+    /// summary. The per-file events are authoritative for diff
+    /// rendering; this summary is a convenience for UIs that want to
+    /// clear pending state in one place. The `committed`/`dropped`
+    /// vectors carry the same paths a consumer would derive from the
+    /// preceding `EditStaged` stream — if the two ever disagree,
+    /// `EditStaged` wins.
+    ///
+    /// **AutoApprove note (v49):** also emitted under
+    /// `ApprovalPolicy::AutoApproveAll` (with `dropped` empty), not
+    /// just under `AwaitApproval`. Pre-v49 consumers that treated
+    /// `CommitDecision` as the "AwaitApproval marker" must migrate to
+    /// check `dropped.is_empty()` or correlate via `commit_id`.
+    CommitDecision {
+        commit_id: Uuid,
+        committed: Vec<PathBuf>,
+        dropped: Vec<PathBuf>,
+    },
+
     /// The actor is shutting down. No further events will be emitted.
     Shutdown,
+}
+
+/// One pending file in a [`Event::StagingPendingApproval`]. Carries
+/// the same `hunks` payload as [`Event::EditStaged`] so the UI can
+/// render the diff before any rename has happened.
+#[derive(Debug, Clone)]
+pub struct PendingFile {
+    pub path: PathBuf,
+    pub hunks: Hunks,
+}
+
+/// Speaker role for [`Event::MessageCommitted`]. Mirrors the adapter's
+/// `Role` shape — duplicated here so the session crate doesn't pull the
+/// adapter module into every consumer of the bus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MessageRole {
+    System,
+    User,
+    Assistant,
+    Tool,
 }
 
 /// Translate a [`CommitReport`] into the matching sequence of

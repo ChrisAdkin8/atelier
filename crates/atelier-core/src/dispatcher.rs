@@ -52,7 +52,6 @@ use crate::hooks::{HookEvent, HookManifest, HookSet};
 use crate::ledger::{local_cost_usd, LedgerEntry, DEFAULT_LOCAL_RATE_USD_PER_SEC};
 use crate::sandbox::SandboxPolicy;
 use crate::session::{edit_staged_events, Event};
-use crate::staging::CommitReport;
 
 /// Spec §8 trust-budget side-effect classification. Mirrors the
 /// `tool_manifest.v1.json` enum exactly so a Rust `Tool` impl and its bundled
@@ -100,13 +99,25 @@ impl SideEffectClass {
 /// What a `Tool` returns to the dispatcher. `output` flows into the next
 /// model turn as a tool-result message. `staged_writes` (when present) means
 /// the tool produced edits via §3 staging; the dispatcher publishes one
-/// `EditStaged` event per file in the commit report.
-#[derive(Debug, Clone)]
+/// `EditStaged` event per file once the batch commits.
+///
+/// As of v46 the tool hands back a [`StagedBatch`] (validated + staged on
+/// disk, NOT renamed). The dispatcher's [`ApprovalPolicy`] decides
+/// whether to call `commit_all` immediately (the v45 behaviour, default)
+/// or to emit `StagingPendingApproval` and wait for a user decision
+/// (spec §3 "Hunk accept / reject"). Tools therefore call
+/// `Staging::stage()` instead of `Staging::commit()`.
+///
+/// `Clone` was previously derived for `ToolResult` but no caller uses it
+/// — the dispatcher consumes the result by value. Removing the derive
+/// keeps the `StagedBatch` resource (owns a `TempDir`) inside a value
+/// that can't be accidentally duplicated, which would leak temp trees.
+#[derive(Debug)]
 pub struct ToolResult {
     pub output: serde_json::Value,
-    /// `None` for read-only tools, `Some(CommitReport)` for tools that
-    /// went through `Staging::commit` to write files.
-    pub staged_writes: Option<CommitReport>,
+    /// `None` for read-only tools, `Some(StagedBatch)` for tools that
+    /// went through `Staging::stage` to prepare writes.
+    pub staged_writes: Option<crate::staging::StagedBatch>,
 }
 
 /// Per-call environment passed to a `Tool`. Borrows the session-scoped
@@ -203,15 +214,67 @@ pub enum RegisterError {
     DuplicateName(String),
 }
 
-/// Stateful dispatcher composing a [`ToolRegistry`], a [`HookSet`], and the
-/// [`HookExecutor`] that actually runs hooks at the per-call lifecycle
-/// boundaries (pre-tool + post-tool). Default executor is
-/// [`NoopHookExecutor`]; production wires in [`ShellHookExecutor`] via
-/// [`Self::with_executor`].
+/// Spec §3 hunk accept/reject contract.
+///
+/// Called by [`Dispatcher::dispatch`] between staging and commit when a
+/// tool produced [`crate::staging::StagedBatch`]. The gate decides which
+/// files commit — auto-approve all (the default [`AutoApprove`]
+/// behaviour, identical to v45), or block on a user decision routed
+/// through the broadcast bus (the production
+/// [`PendingApprovalGate`] used by [`SessionDispatcher`] when its
+/// policy is [`ApprovalPolicy::AwaitApproval`]).
+///
+/// The trait is async because real implementations wait on a `oneshot`
+/// channel; the trivial impl returns instantly.
+#[async_trait]
+pub trait ApprovalGate: Send + Sync {
+    /// Decide which of `pending` to commit. Returns the accepted paths
+    /// (subset of `pending[i].path`). An empty return = full reject.
+    /// `commit_id` is the correlation token the implementation may use
+    /// for round-tripping over the bus.
+    async fn approve(
+        &self,
+        commit_id: uuid::Uuid,
+        pending: &[crate::staging::FileOutcome],
+    ) -> Vec<std::path::PathBuf>;
+
+    // v49 — `notify_outcome` removed. `CommitDecision` emission moved
+    // to `SessionDispatcher::dispatch` so the bus ordering
+    // (EditStaged per file → LedgerAppended → CommitDecision) matches
+    // the documented "user-visible side effects before bookkeeping"
+    // intent. The dispatcher returns the commit summary on
+    // `DispatchOutcome.approval_summary`; the SessionDispatcher
+    // broadcasts the CommitDecision event from there.
+}
+
+/// Default [`ApprovalGate`] — commits every staged file unconditionally.
+/// Pre-v46 behaviour; used by tests and headless runs (`atelier run`
+/// without explicit `--require-approval`).
+pub struct AutoApprove;
+
+#[async_trait]
+impl ApprovalGate for AutoApprove {
+    async fn approve(
+        &self,
+        _commit_id: uuid::Uuid,
+        pending: &[crate::staging::FileOutcome],
+    ) -> Vec<std::path::PathBuf> {
+        pending.iter().map(|f| f.path.clone()).collect()
+    }
+}
+
+/// Stateful dispatcher composing a [`ToolRegistry`], a [`HookSet`], the
+/// [`HookExecutor`] that runs hooks at the per-call lifecycle boundaries
+/// (pre-tool + post-tool), and the [`ApprovalGate`] that decides which
+/// staged writes commit (spec §3 hunk accept/reject). Defaults are
+/// [`NoopHookExecutor`] + [`AutoApprove`]; production wires in
+/// [`ShellHookExecutor`] + [`PendingApprovalGate`] via the builder
+/// methods.
 pub struct Dispatcher {
     registry: ToolRegistry,
     hooks: HookSet,
     executor: Arc<dyn HookExecutor>,
+    approval_gate: Arc<dyn ApprovalGate>,
 }
 
 impl Dispatcher {
@@ -220,6 +283,7 @@ impl Dispatcher {
             registry,
             hooks,
             executor: Arc::new(NoopHookExecutor),
+            approval_gate: Arc::new(AutoApprove),
         }
     }
 
@@ -228,6 +292,14 @@ impl Dispatcher {
     /// `Dispatcher::new(reg, hooks).with_executor(Arc::new(ShellHookExecutor::new(policy)))`.
     pub fn with_executor(mut self, executor: Arc<dyn HookExecutor>) -> Self {
         self.executor = executor;
+        self
+    }
+
+    /// Replace the approval gate. Default is [`AutoApprove`].
+    /// [`SessionDispatcher::with_approval_policy`] constructs a
+    /// [`PendingApprovalGate`] and threads it in.
+    pub fn with_approval_gate(mut self, gate: Arc<dyn ApprovalGate>) -> Self {
+        self.approval_gate = gate;
         self
     }
 
@@ -278,6 +350,7 @@ impl Dispatcher {
                     ),
                     events: Vec::new(),
                     matched_hooks: HookPhases::default(),
+                    approval_summary: None,
                 };
             }
         };
@@ -303,6 +376,7 @@ impl Dispatcher {
                 ),
                 events: Vec::new(),
                 matched_hooks: HookPhases::default(),
+                approval_summary: None,
             };
         }
 
@@ -330,25 +404,81 @@ impl Dispatcher {
         .await;
 
         // 3. Execute the tool.
-        let result = tool.execute(call.arguments.clone(), ctx).await;
+        let raw_result = tool.execute(call.arguments.clone(), ctx).await;
         let latency_ms = started.elapsed().as_secs_f64() * 1000.0;
         let cost_usd = Some(local_cost_usd(latency_ms, DEFAULT_LOCAL_RATE_USD_PER_SEC));
 
-        // 4. Translate staged writes (if any) into per-file EditStaged
-        //    events. Ledger entry's `note` carries error class on failure.
-        let (events, ledger_note) = match &result {
-            Ok(ok) => {
-                let events = ok
-                    .staged_writes
-                    .as_ref()
-                    .map(edit_staged_events)
-                    .unwrap_or_default();
-                (events, None)
-            }
-            Err(e) => {
-                let note = Some(format!("{}: {}", e.kind(), e));
-                (Vec::new(), note)
-            }
+        // 4. Stage → approval gate → commit_selected → events.
+        //
+        //    The pure `Dispatcher` invokes its `approval_gate` between
+        //    stage and commit. The default [`AutoApprove`] returns
+        //    every pending path so behaviour is identical to pre-v46.
+        //    `SessionDispatcher` installs a [`PendingApprovalGate`]
+        //    when its [`ApprovalPolicy::AwaitApproval`] is set —
+        //    that gate emits `StagingPendingApproval` on the bus and
+        //    awaits the user's accept-set via
+        //    `SessionDispatcher::submit_approval`.
+        //
+        //    Commit errors fold into the final `result` as a tool
+        //    error so the ledger note + the next-turn model message
+        //    both see the failure.
+        let (result, events, approval_summary) = match raw_result {
+            Ok(mut ok) => match ok.staged_writes.take() {
+                Some(batch) => {
+                    let commit_id = uuid::Uuid::new_v4();
+                    let pending_paths: Vec<std::path::PathBuf> = batch
+                        .pending_files()
+                        .iter()
+                        .map(|f| f.path.clone())
+                        .collect();
+                    let accepted_vec = self
+                        .approval_gate
+                        .approve(commit_id, batch.pending_files())
+                        .await;
+                    let accepted: std::collections::HashSet<std::path::PathBuf> =
+                        accepted_vec.into_iter().collect();
+                    match batch.commit_selected(&accepted) {
+                        Ok(report) => {
+                            let committed: Vec<std::path::PathBuf> =
+                                report.files.iter().map(|f| f.path.clone()).collect();
+                            let committed_set: std::collections::HashSet<_> =
+                                committed.iter().cloned().collect();
+                            let dropped: Vec<std::path::PathBuf> = pending_paths
+                                .into_iter()
+                                .filter(|p| !committed_set.contains(p))
+                                .collect();
+                            let events = edit_staged_events(&report);
+                            let summary = ApprovalSummary {
+                                commit_id,
+                                committed,
+                                dropped,
+                            };
+                            (Ok(ok), events, Some(summary))
+                        }
+                        Err(commit_err) => {
+                            // Commit failed wholesale — everything we
+                            // wanted to commit is "dropped".
+                            let summary = ApprovalSummary {
+                                commit_id,
+                                committed: Vec::new(),
+                                dropped: pending_paths,
+                            };
+                            let err = ToolError::ExecutionFailed {
+                                tool: call.name.clone(),
+                                exit_code: -1,
+                                stderr: format!("staging commit failed: {commit_err}"),
+                            };
+                            (Err(err), Vec::new(), Some(summary))
+                        }
+                    }
+                }
+                None => (Ok(ok), Vec::new(), None),
+            },
+            Err(e) => (Err(e), Vec::new(), None),
+        };
+        let ledger_note = match &result {
+            Ok(_) => None,
+            Err(e) => Some(format!("{}: {}", e.kind(), e)),
         };
 
         let ledger_entry = LedgerEntry::tool_call(
@@ -391,6 +521,7 @@ impl Dispatcher {
             ledger_entry,
             events,
             matched_hooks,
+            approval_summary,
         }
     }
 }
@@ -413,6 +544,23 @@ pub struct DispatchOutcome {
     /// lands in a follow-on; returning names today lets tests + the UI
     /// surface "X hooks will fire" without the runner being in place.
     pub matched_hooks: HookPhases,
+    /// Spec §3 hunk-accept-reject summary. `Some` when the tool
+    /// produced staged writes (regardless of policy); `None` for
+    /// read-only tools. Carried out so the SessionDispatcher can
+    /// emit `Event::CommitDecision` *after* the per-file `EditStaged`
+    /// events — the v49 fix to the ordering inversion the v48 audit
+    /// surfaced.
+    pub approval_summary: Option<ApprovalSummary>,
+}
+
+/// Snapshot of how a staged batch was resolved by the approval gate.
+/// Lives on [`DispatchOutcome`]; emitted as `Event::CommitDecision`
+/// by [`SessionDispatcher::dispatch`].
+#[derive(Debug, Clone)]
+pub struct ApprovalSummary {
+    pub commit_id: uuid::Uuid,
+    pub committed: Vec<std::path::PathBuf>,
+    pub dropped: Vec<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -422,6 +570,66 @@ pub struct HookPhases {
 }
 
 // ---------- SessionDispatcher (side-effecting wrapper) ----------
+
+/// Hunk-accept-reject policy for [`SessionDispatcher`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ApprovalPolicy {
+    /// Auto-approve every staged file — pre-v46 behaviour. Default for
+    /// headless runs (`atelier run`) and tests.
+    #[default]
+    AutoApproveAll,
+    /// Spec §3 "Hunk accept / reject" — dispatcher emits
+    /// `Event::StagingPendingApproval` and blocks until the consumer
+    /// calls [`SessionDispatcher::submit_approval`].
+    AwaitApproval,
+}
+
+/// Production approval gate that emits the pending event on the bus
+/// and waits for the user's decision. Lives on the `SessionDispatcher`
+/// rather than the pure `Dispatcher` because the bus is a side-effect.
+struct PendingApprovalGate {
+    events: tokio::sync::broadcast::Sender<Event>,
+    pending: Arc<
+        parking_lot::Mutex<
+            std::collections::HashMap<
+                uuid::Uuid,
+                tokio::sync::oneshot::Sender<Vec<std::path::PathBuf>>,
+            >,
+        >,
+    >,
+}
+
+#[async_trait]
+impl ApprovalGate for PendingApprovalGate {
+    async fn approve(
+        &self,
+        commit_id: uuid::Uuid,
+        pending: &[crate::staging::FileOutcome],
+    ) -> Vec<std::path::PathBuf> {
+        // Register a oneshot and emit the bus event. The consumer
+        // calls SessionDispatcher::submit_approval(commit_id, accepted)
+        // which fulfils the oneshot, unblocking this await.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.pending.lock().insert(commit_id, tx);
+
+        let pending_files: Vec<crate::session::PendingFile> = pending
+            .iter()
+            .map(|f| crate::session::PendingFile {
+                path: f.path.clone(),
+                hunks: f.hunks.clone(),
+            })
+            .collect();
+        let _ = self.events.send(Event::StagingPendingApproval {
+            commit_id,
+            files: pending_files,
+        });
+
+        // If the sender is dropped (consumer crashed mid-decision)
+        // the receiver errors. Treat that as full reject — safer than
+        // committing without user consent.
+        rx.await.unwrap_or_default()
+    }
+}
 
 /// Thin runtime wrapper around the pure [`Dispatcher`]. Owns a shared
 /// reference to the §1 [`crate::ledger::Ledger`] and a clone of the
@@ -438,6 +646,18 @@ pub struct SessionDispatcher {
     dispatcher: Dispatcher,
     ledger: Arc<crate::ledger::Ledger>,
     events: tokio::sync::broadcast::Sender<Event>,
+    /// Pending oneshot senders, keyed by `commit_id`. Used by the
+    /// `AwaitApproval` policy's `PendingApprovalGate`. Always present
+    /// (even under `AutoApproveAll`) so `submit_approval` is callable
+    /// without first toggling the policy.
+    pending: Arc<
+        parking_lot::Mutex<
+            std::collections::HashMap<
+                uuid::Uuid,
+                tokio::sync::oneshot::Sender<Vec<std::path::PathBuf>>,
+            >,
+        >,
+    >,
 }
 
 impl SessionDispatcher {
@@ -450,6 +670,51 @@ impl SessionDispatcher {
             dispatcher,
             ledger,
             events,
+            pending: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+        }
+    }
+
+    /// Install the spec §3 hunk-accept-reject policy. With
+    /// `AwaitApproval`, [`Self::dispatch`] for tools that produce staged
+    /// writes emits `Event::StagingPendingApproval` and blocks until
+    /// the consumer calls [`Self::submit_approval`].
+    pub fn with_approval_policy(mut self, policy: ApprovalPolicy) -> Self {
+        match policy {
+            ApprovalPolicy::AutoApproveAll => {
+                // Default; nothing to do — the pure dispatcher's
+                // default gate is AutoApprove.
+            }
+            ApprovalPolicy::AwaitApproval => {
+                let gate = Arc::new(PendingApprovalGate {
+                    events: self.events.clone(),
+                    pending: self.pending.clone(),
+                });
+                // Swap the inner dispatcher to one with the new gate.
+                // Builder consumes self; we re-construct in place.
+                let old = std::mem::replace(
+                    &mut self.dispatcher,
+                    Dispatcher::new(ToolRegistry::new(), HookSet::empty()),
+                );
+                self.dispatcher = old.with_approval_gate(gate);
+            }
+        }
+        self
+    }
+
+    /// Spec §3 follow-on to `Event::StagingPendingApproval`: deliver
+    /// the user's accept set for a pending commit. Returns `false`
+    /// when `commit_id` doesn't match an outstanding pending (e.g.
+    /// already approved, or the dispatcher dropped its receiver
+    /// because the consumer disconnected).
+    pub fn submit_approval(
+        &self,
+        commit_id: uuid::Uuid,
+        accepted: Vec<std::path::PathBuf>,
+    ) -> bool {
+        let sender = self.pending.lock().remove(&commit_id);
+        match sender {
+            Some(tx) => tx.send(accepted).is_ok(),
+            None => false,
         }
     }
 
@@ -471,12 +736,31 @@ impl SessionDispatcher {
     ) -> DispatchOutcome {
         let outcome = self.dispatcher.dispatch(call, ctx, now).await;
         self.ledger.append(outcome.ledger_entry.clone());
-        // `broadcast::Sender::send` errors when there are zero subscribers,
-        // which is fine — we still want the ledger entry, and a
-        // subscriber that joins later reconciles from the on-disk session
-        // (§14) rather than expecting these events to be replayable.
+        // Order matters here:
+        //   1. EditStaged per file (user-visible diff)
+        //   2. LedgerAppended (cost meter tick)
+        //   3. CommitDecision (approval summary, if staged_writes ran)
+        //
+        // A subscriber rendering both a diff pane and a cost meter
+        // should see the diff arrive first; the summary lands last so
+        // any UI clearing pending state does so AFTER it sees the
+        // committed-file events.
+        //
+        // `broadcast::Sender::send` errors when there are zero
+        // subscribers; we ignore that — the on-disk session is the
+        // recoverable source of truth (§14), the bus is for live UI.
         for event in &outcome.events {
             let _ = self.events.send(event.clone());
+        }
+        let _ = self.events.send(crate::session::Event::LedgerAppended {
+            entry: outcome.ledger_entry.clone(),
+        });
+        if let Some(summary) = &outcome.approval_summary {
+            let _ = self.events.send(crate::session::Event::CommitDecision {
+                commit_id: summary.commit_id,
+                committed: summary.committed.clone(),
+                dropped: summary.dropped.clone(),
+            });
         }
         outcome
     }
@@ -608,11 +892,8 @@ impl HookExecutor for ShellHookExecutor {
 mod tests {
     use super::*;
     use crate::adapter::ToolCallRequest;
-    use crate::diff::Hunks;
     use crate::sandbox::SandboxPolicy;
-    use crate::staging::{FileOutcome, SyntaxOutcome};
     use serde_json::json;
-    use std::path::PathBuf;
 
     // A minimal in-tree Tool impl for tests. Returns whatever args it was
     // given as the output (echo semantics), with an optional pre-built
@@ -621,7 +902,11 @@ mod tests {
     struct EchoTool {
         name: String,
         side_effect: SideEffectClass,
-        staged: Option<CommitReport>,
+        /// Relative paths the tool will stage on each execute() call.
+        /// We rebuild a fresh `StagedBatch` per call against the
+        /// `ctx.workspace_root` (a real tempdir in dispatcher tests),
+        /// because `StagedBatch` owns a `TempDir` and can't be cloned.
+        staged_paths: Option<Vec<String>>,
         err: Option<ToolError>,
     }
 
@@ -630,24 +915,13 @@ mod tests {
             Self {
                 name: name.into(),
                 side_effect: SideEffectClass::LocalSafe,
-                staged: None,
+                staged_paths: None,
                 err: None,
             }
         }
 
         fn with_staged(mut self, paths: Vec<&str>) -> Self {
-            let files = paths
-                .iter()
-                .map(|p| FileOutcome {
-                    path: PathBuf::from(p),
-                    syntax: SyntaxOutcome::NotApplicable,
-                    hunks: Hunks::Created {
-                        new_byte_len: 1,
-                        new_line_count: 1,
-                    },
-                })
-                .collect();
-            self.staged = Some(CommitReport { files });
+            self.staged_paths = Some(paths.iter().map(|s| s.to_string()).collect());
             self
         }
 
@@ -670,7 +944,7 @@ mod tests {
         async fn execute(
             &self,
             args: serde_json::Value,
-            _ctx: &ToolContext<'_>,
+            ctx: &ToolContext<'_>,
         ) -> Result<ToolResult, ToolError> {
             if let Some(e) = &self.err {
                 return Err(match e {
@@ -698,9 +972,35 @@ mod tests {
                     }
                 });
             }
+            // Build a real StagedBatch lazily against the test's
+            // workspace tempdir. Each test that uses `with_staged`
+            // creates a workspace via `ctx_in_workspace`; this stages
+            // a one-byte file per path, returns the batch un-committed
+            // so the dispatcher can drive commit_all (AutoApprove) or
+            // commit_selected (AwaitApproval).
+            let staged_writes = if let Some(paths) = &self.staged_paths {
+                let check = crate::staging::NoopSyntaxCheck;
+                let mut s = crate::staging::Staging::new(ctx.workspace_root, &check);
+                for p in paths {
+                    s.add(crate::staging::StagedWrite::new(p.clone(), "x".to_string()))
+                        .map_err(|e| ToolError::ExecutionFailed {
+                            tool: self.name.clone(),
+                            exit_code: -1,
+                            stderr: format!("synth staging add failed: {e}"),
+                        })?;
+                }
+                let batch = s.stage().map_err(|e| ToolError::ExecutionFailed {
+                    tool: self.name.clone(),
+                    exit_code: -1,
+                    stderr: format!("synth staging stage failed: {e}"),
+                })?;
+                Some(batch)
+            } else {
+                None
+            };
             Ok(ToolResult {
                 output: args,
-                staged_writes: self.staged.clone(),
+                staged_writes,
             })
         }
     }
@@ -708,6 +1008,17 @@ mod tests {
     fn ctx(policy: &SandboxPolicy) -> ToolContext<'_> {
         ToolContext {
             workspace_root: Path::new("/repo"),
+            sandbox: policy,
+        }
+    }
+
+    /// Like `ctx`, but pins `workspace_root` to a real on-disk path —
+    /// required by any test that exercises `EchoTool::with_staged` now
+    /// that the staged path produces a real `StagedBatch` over the
+    /// workspace's filesystem.
+    fn ctx_in_workspace<'a>(workspace: &'a Path, policy: &'a SandboxPolicy) -> ToolContext<'a> {
+        ToolContext {
+            workspace_root: workspace,
             sandbox: policy,
         }
     }
@@ -820,11 +1131,16 @@ mod tests {
         ))
         .unwrap();
         let d = Dispatcher::new(r, HookSet::empty());
-        let policy = SandboxPolicy::restrictive("/repo").unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+        let policy = SandboxPolicy::restrictive(workspace.path()).unwrap();
         let outcome = d
-            .dispatch(&call("write_things", json!({})), &ctx(&policy), now)
+            .dispatch(
+                &call("write_things", json!({})),
+                &ctx_in_workspace(workspace.path(), &policy),
+                now,
+            )
             .await;
-        assert!(outcome.result.is_ok());
+        assert!(outcome.result.is_ok(), "{:?}", outcome.result);
         assert_eq!(outcome.events.len(), 2);
         let paths: Vec<_> = outcome
             .events
@@ -835,6 +1151,9 @@ mod tests {
             })
             .collect();
         assert_eq!(paths, vec!["a.rs", "src/b.rs"]);
+        // The auto-commit actually wrote the files to the workspace.
+        assert!(workspace.path().join("a.rs").exists());
+        assert!(workspace.path().join("src/b.rs").exists());
     }
 
     #[tokio::test]
@@ -1159,11 +1478,20 @@ mod tests {
     async fn session_dispatcher_broadcasts_edit_staged_for_writes() {
         let tool = Arc::new(EchoTool::new("write_things").with_staged(vec!["a.rs", "b.rs"]));
         let (sd, _ledger, mut rx) = build_session_dispatcher(vec![tool]);
-        let policy = SandboxPolicy::restrictive("/repo").unwrap();
-        sd.dispatch(&call("write_things", json!({})), &ctx(&policy), now)
-            .await;
+        let workspace = tempfile::TempDir::new().unwrap();
+        let policy = SandboxPolicy::restrictive(workspace.path()).unwrap();
+        sd.dispatch(
+            &call("write_things", json!({})),
+            &ctx_in_workspace(workspace.path(), &policy),
+            now,
+        )
+        .await;
 
-        // Two EditStaged events, in commit order.
+        // v49 ordering: EditStaged per file → LedgerAppended →
+        // CommitDecision. A UI rendering both a diff pane and a cost
+        // meter sees the diff arrive first; the summary lands last so
+        // any pending-state clear happens after the file events.
+        // This test locks the ordering against regression.
         match next_event(&mut rx).await {
             Event::EditStaged { path, .. } => assert_eq!(path.to_str(), Some("a.rs")),
             other => panic!("expected EditStaged, got {other:?}"),
@@ -1172,10 +1500,33 @@ mod tests {
             Event::EditStaged { path, .. } => assert_eq!(path.to_str(), Some("b.rs")),
             other => panic!("expected EditStaged, got {other:?}"),
         }
+        // Then the LedgerAppended for the tool call itself.
+        match next_event(&mut rx).await {
+            Event::LedgerAppended { .. } => {}
+            other => panic!("expected LedgerAppended, got {other:?}"),
+        }
+        // Then the CommitDecision summary (v49). Under AutoApproveAll
+        // (the default for this test), `committed` lists every file
+        // and `dropped` is empty.
+        match next_event(&mut rx).await {
+            Event::CommitDecision {
+                committed, dropped, ..
+            } => {
+                assert_eq!(
+                    committed,
+                    vec![
+                        std::path::PathBuf::from("a.rs"),
+                        std::path::PathBuf::from("b.rs"),
+                    ]
+                );
+                assert!(dropped.is_empty(), "AutoApprove leaves nothing dropped");
+            }
+            other => panic!("expected CommitDecision, got {other:?}"),
+        }
     }
 
     #[tokio::test]
-    async fn session_dispatcher_still_ledgers_failed_calls_without_broadcasting() {
+    async fn session_dispatcher_ledgers_failed_calls_and_broadcasts_ledger_only() {
         let failing = Arc::new(
             EchoTool::new("flaky").with_error(ToolError::ExecutionFailed {
                 tool: "flaky".into(),
@@ -1199,11 +1550,23 @@ mod tests {
             }
             other => panic!("expected ToolCall, got {other:?}"),
         }
-        // No EditStaged events.
-        assert!(matches!(
-            rx.try_recv(),
-            Err(broadcast::error::TryRecvError::Empty)
-        ));
+        // LedgerAppended IS emitted even for failures (cost meter must
+        // count the failed call against the trust budget — spec §1
+        // doesn't carve out a "free failure" path), but EditStaged is
+        // NOT (the call produced no staged writes).
+        match next_event(&mut rx).await {
+            Event::LedgerAppended { entry } => match entry {
+                LedgerEntry::ToolCall { note, .. } => {
+                    assert!(note.as_deref().unwrap_or("").contains("ExecutionFailed"));
+                }
+                other => panic!("expected ToolCall ledger entry, got {other:?}"),
+            },
+            other => panic!("expected LedgerAppended, got {other:?}"),
+        }
+        assert!(
+            matches!(rx.try_recv(), Err(broadcast::error::TryRecvError::Empty)),
+            "no further events after the LedgerAppended"
+        );
     }
 
     #[tokio::test]
@@ -1214,9 +1577,14 @@ mod tests {
         let tool = Arc::new(EchoTool::new("write_things").with_staged(vec!["a.rs"]));
         let (sd, ledger, rx) = build_session_dispatcher(vec![tool]);
         drop(rx); // remove the only subscriber
-        let policy = SandboxPolicy::restrictive("/repo").unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+        let policy = SandboxPolicy::restrictive(workspace.path()).unwrap();
         let outcome = sd
-            .dispatch(&call("write_things", json!({})), &ctx(&policy), now)
+            .dispatch(
+                &call("write_things", json!({})),
+                &ctx_in_workspace(workspace.path(), &policy),
+                now,
+            )
             .await;
         assert!(
             outcome.result.is_ok(),
@@ -1230,5 +1598,133 @@ mod tests {
         let (sd, _ledger, _rx) = build_session_dispatcher(vec![Arc::new(EchoTool::new("echo"))]);
         // Round-trip through the accessor.
         assert_eq!(sd.dispatcher().registry().len(), 1);
+    }
+
+    // ---------- HR-D: ApprovalPolicy round-trip ----------
+
+    #[tokio::test]
+    async fn await_approval_emits_pending_event_and_blocks_until_submit() {
+        let tool =
+            Arc::new(EchoTool::new("write_things").with_staged(vec!["accept.txt", "reject.txt"]));
+        let (sd, _ledger, mut rx) = build_session_dispatcher(vec![tool]);
+        let sd = Arc::new(sd.with_approval_policy(ApprovalPolicy::AwaitApproval));
+        let workspace = tempfile::TempDir::new().unwrap();
+        let policy = SandboxPolicy::restrictive(workspace.path()).unwrap();
+
+        // Drive dispatch concurrently with the consumer that watches
+        // the bus for StagingPendingApproval and submits an accept set.
+        let sd_dispatch = sd.clone();
+        let ws_path = workspace.path().to_path_buf();
+        let dispatch_task = tokio::spawn(async move {
+            let p = SandboxPolicy::restrictive(&ws_path).unwrap();
+            sd_dispatch
+                .dispatch(
+                    &call("write_things", json!({})),
+                    &ctx_in_workspace(&ws_path, &p),
+                    now,
+                )
+                .await
+        });
+
+        // Consumer loop: pull events, accept only "accept.txt".
+        let _ = policy; // unused locally — kept above for the sd_dispatch task
+        let commit_id = loop {
+            match next_event(&mut rx).await {
+                Event::StagingPendingApproval {
+                    commit_id: cid,
+                    files,
+                } => {
+                    assert_eq!(files.len(), 2, "two pending files");
+                    let accepted = vec![std::path::PathBuf::from("accept.txt")];
+                    assert!(
+                        sd.submit_approval(cid, accepted),
+                        "submit_approval should hit a registered pending"
+                    );
+                    break cid;
+                }
+                _ => continue,
+            }
+        };
+
+        let outcome = dispatch_task.await.unwrap();
+        assert!(outcome.result.is_ok(), "{:?}", outcome.result);
+
+        // Verify EditStaged + CommitDecision were emitted.
+        let mut got_edit_for_accept = false;
+        let mut got_decision = false;
+        loop {
+            match rx.try_recv() {
+                Ok(Event::EditStaged { path, .. }) => {
+                    if path.to_str() == Some("accept.txt") {
+                        got_edit_for_accept = true;
+                    }
+                }
+                Ok(Event::CommitDecision {
+                    commit_id: cid,
+                    committed,
+                    dropped,
+                }) => {
+                    assert_eq!(cid, commit_id);
+                    assert_eq!(committed, vec![std::path::PathBuf::from("accept.txt")]);
+                    assert_eq!(dropped, vec![std::path::PathBuf::from("reject.txt")]);
+                    got_decision = true;
+                }
+                Ok(_) => continue, // LedgerAppended etc.
+                Err(_) => break,
+            }
+        }
+        assert!(got_edit_for_accept, "EditStaged for accept.txt missing");
+        assert!(got_decision, "CommitDecision missing");
+
+        // Filesystem: accept.txt landed, reject.txt did not.
+        assert!(workspace.path().join("accept.txt").exists());
+        assert!(!workspace.path().join("reject.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn await_approval_full_reject_drops_everything() {
+        let tool = Arc::new(EchoTool::new("write_things").with_staged(vec!["a.txt", "b.txt"]));
+        let (sd, _ledger, mut rx) = build_session_dispatcher(vec![tool]);
+        let sd = Arc::new(sd.with_approval_policy(ApprovalPolicy::AwaitApproval));
+        let workspace = tempfile::TempDir::new().unwrap();
+
+        let sd_dispatch = sd.clone();
+        let ws_path = workspace.path().to_path_buf();
+        let dispatch_task = tokio::spawn(async move {
+            let p = SandboxPolicy::restrictive(&ws_path).unwrap();
+            sd_dispatch
+                .dispatch(
+                    &call("write_things", json!({})),
+                    &ctx_in_workspace(&ws_path, &p),
+                    now,
+                )
+                .await
+        });
+
+        loop {
+            match next_event(&mut rx).await {
+                Event::StagingPendingApproval { commit_id, .. } => {
+                    // Empty accept set = full reject.
+                    sd.submit_approval(commit_id, Vec::new());
+                    break;
+                }
+                _ => continue,
+            }
+        }
+        let outcome = dispatch_task.await.unwrap();
+        assert!(outcome.result.is_ok(), "{:?}", outcome.result);
+        assert!(
+            outcome.events.is_empty(),
+            "no EditStaged for rejected files"
+        );
+        assert!(!workspace.path().join("a.txt").exists());
+        assert!(!workspace.path().join("b.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn submit_approval_for_unknown_commit_id_returns_false() {
+        let (sd, _ledger, _rx) = build_session_dispatcher(vec![Arc::new(EchoTool::new("echo"))]);
+        let sd = sd.with_approval_policy(ApprovalPolicy::AwaitApproval);
+        assert!(!sd.submit_approval(uuid::Uuid::new_v4(), Vec::new()));
     }
 }

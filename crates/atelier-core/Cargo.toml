@@ -33,6 +33,11 @@ parking_lot = { workspace = true }
 reqwest = { workspace = true }
 bytes = { workspace = true }
 
+# §11 subprocess hardening: kill the timed-out child's process group, not just
+# the immediate child. Unix-only — Windows isn't a v1 target.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util", "time"] }
 wiremock = { workspace = true }

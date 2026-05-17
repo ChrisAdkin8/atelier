@@ -1,3 +1,103 @@
-/* App.svelte owns its own styles via a scoped <style> block. This file is
-   kept intentionally minimal so the cascade is predictable when the
-   multi-pane workspace lands. */
+/*
+ * Global theme tokens for the Atelier GUI shell. Component styles
+ * reference these via `var(--*)`; per-component `<style>` blocks own
+ * everything else (layout, sizing, hover/focus).
+ *
+ * Palette mirrors the TUI's ratatui colours so a user switching between
+ * the two surfaces sees the same visual contract:
+ *   user      yellow
+ *   assistant cyan
+ *   tool      magenta
+ *   system    grey
+ *
+ * Dark by default. Light-mode is deferred until a real OS-preference
+ * hook is wired (the `prefers-color-scheme` media query alone isn't
+ * enough — the Tauri shell may want a user override).
+ */
+
+:root {
+  /* Surface */
+  --bg-page: #1a1b1e;
+  --bg-pane: #101113;
+  --bg-pane-alt: #16181b;
+  --border-pane: #2c2d31;
+  --border-pane-strong: #3a3c41;
+
+  /* Text */
+  --fg-default: #e6e6e6;
+  --fg-muted: #9aa0a6;
+  --fg-dim: #6b7280;
+  --fg-strong: #ffffff;
+
+  /* Accents (match TUI palette) */
+  --accent-cyan: #79c0ff;
+  --accent-green: #4ec9b0;
+  --accent-yellow: #e2c08d;
+  --accent-magenta: #c586c0;
+  --accent-red: #f97583;
+  --accent-blue: #569cd6;
+
+  /* Role colours (conversation pane) */
+  --role-user: var(--accent-yellow);
+  --role-assistant: var(--accent-cyan);
+  --role-tool: var(--accent-magenta);
+  --role-system: var(--fg-dim);
+
+  /* Diff colours */
+  --diff-add: #4ec9b0;
+  --diff-remove: #f97583;
+  --diff-context: var(--fg-muted);
+  --diff-hunk-header: var(--accent-blue);
+
+  /* Plan-step status glyph colours */
+  --status-pending: var(--fg-dim);
+  --status-in-progress: var(--accent-yellow);
+  --status-done: var(--accent-green);
+  --status-skipped: var(--fg-dim);
+
+  /* Type */
+  --font-ui:
+    -apple-system,
+    BlinkMacSystemFont,
+    'Segoe UI',
+    system-ui,
+    sans-serif;
+  --font-mono: 'SF Mono', 'Menlo', 'Consolas', monospace;
+  --fs-small: 0.8rem;
+  --fs-base: 0.9rem;
+  --fs-large: 1.1rem;
+  --fs-h1: 1.4rem;
+
+  /* Spacing */
+  --pad-pane: 0.75rem 1rem;
+  --gap-pane: 0.6rem;
+  --radius-pane: 6px;
+}
+
+html,
+body,
+#app {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  overflow: hidden;
+}
+
+body {
+  font-family: var(--font-ui);
+  background: var(--bg-page);
+  color: var(--fg-default);
+}
+
+/* Scrollbar: subtle, dark-themed. Webkit only; Firefox uses default. */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border-pane-strong);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}

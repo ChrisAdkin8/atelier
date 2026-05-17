@@ -9,7 +9,9 @@
 //! Future subcommands (per spec §11 credential storage): `login`,
 //! `logout`, `rotate`, `whoami`.
 
-mod runner;
+// v47: `runner` now lives in the crate's library (see `src/lib.rs`).
+// Import the binary's view via the library name.
+use atelier_cli::runner;
 
 use std::env;
 use std::path::PathBuf;
@@ -29,16 +31,27 @@ SUBCOMMANDS:
                                    persist the session. Phase C unblock (1).
 
 `atelier run` options:
-    --provider <NAME>              Adapter to use. `mock` (default) exercises
-                                   the loop with no network. `anthropic`
-                                   talks to the Messages API and reads
-                                   `ANTHROPIC_API_KEY` from the environment;
-                                   pair with `--model <id>` to pick a
-                                   specific model.
+    --provider <NAME>              Adapter to use. One of:
+                                     mock          (default) — no network.
+                                     anthropic     — Messages API (`ANTHROPIC_API_KEY`).
+                                     openai-compat — any server speaking
+                                                     `POST /v1/chat/completions`
+                                                     (LM Studio, llama-server,
+                                                     vLLM, sglang, Ollama via
+                                                     its `/v1/` compat layer,
+                                                     OpenAI itself).
     --model <ID>                   Model id for the chosen provider, e.g.
-                                   `anthropic:claude-opus-4-7`. Required
-                                   for `--provider anthropic`; ignored
-                                   for `mock`.
+                                   `anthropic:claude-opus-4-7` or
+                                   `local:llama3:8b`. Required for the
+                                   network providers; ignored for `mock`.
+    --base-url <URL>               openai-compat only: full URL ending in
+                                   `/v1` — e.g. `http://localhost:11434/v1`
+                                   (Ollama), `http://localhost:1234/v1`
+                                   (LM Studio), `http://localhost:8080/v1`
+                                   (llama.cpp server). For openai-compat
+                                   pointing at OpenAI itself, omit to use
+                                   `https://api.openai.com/v1` and set
+                                   `OPENAI_API_KEY`.
     --workspace <PATH>             Repo root. Defaults to current dir.
     --max-turns <N>                Bail after N turns without claimed_done.
                                    Default 32 (PROVISIONAL).
@@ -107,6 +120,7 @@ fn run_init(mut args: impl Iterator<Item = String>) -> ExitCode {
 fn run_run(mut args: impl Iterator<Item = String>) -> ExitCode {
     let mut provider = "mock".to_string();
     let mut model: Option<String> = None;
+    let mut base_url: Option<String> = None;
     let mut workspace: Option<PathBuf> = None;
     let mut max_turns: Option<usize> = None;
     let mut prompt_file: Option<PathBuf> = None;
@@ -129,6 +143,13 @@ fn run_run(mut args: impl Iterator<Item = String>) -> ExitCode {
                 Some(v) => model = Some(v),
                 None => {
                     eprintln!("atelier run: --model requires a value");
+                    return ExitCode::from(2);
+                }
+            },
+            "--base-url" => match args.next() {
+                Some(v) => base_url = Some(v),
+                None => {
+                    eprintln!("atelier run: --base-url requires a URL");
                     return ExitCode::from(2);
                 }
             },
@@ -171,12 +192,27 @@ fn run_run(mut args: impl Iterator<Item = String>) -> ExitCode {
                 );
                 return ExitCode::from(2);
             }
+            if base_url.is_some() {
+                eprintln!("atelier run: --base-url is only valid with --provider openai-compat");
+                return ExitCode::from(2);
+            }
             runner::ProviderChoice::Anthropic { model_id }
+        }
+        "openai-compat" => {
+            let Some(model_id) = model else {
+                eprintln!(
+                    "atelier run: --provider openai-compat requires --model <ID> \
+                     (e.g. `local:llama3:8b` or `gpt-4o-mini`); the id is sent \
+                     verbatim to the server"
+                );
+                return ExitCode::from(2);
+            };
+            runner::ProviderChoice::OpenAiCompat { model_id, base_url }
         }
         other => {
             eprintln!(
                 "atelier run: unknown provider {other:?}. Supported: `mock`, \
-                 `anthropic`. (`bedrock`, `vertex`, `ollama` land in Phase E/F.)"
+                 `anthropic`, `openai-compat`. (`bedrock`, `vertex` land in Phase E/F.)"
             );
             return ExitCode::from(2);
         }

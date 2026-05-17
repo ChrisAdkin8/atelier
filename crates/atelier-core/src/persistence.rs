@@ -179,12 +179,18 @@ impl OnDiskSession {
     /// Atomic write: serialize to a temp file in the same directory, then
     /// rename over `session.json`. Same-filesystem rename is atomic on POSIX
     /// and avoids the partial-write corruption mode that plagues naive
-    /// persistence layers.
+    /// persistence layers. The session directory itself is mode 0700 on Unix
+    /// because session.json contains conversation snapshots and (eventually)
+    /// resumable tool fixtures that may include secrets the model saw.
     pub fn save_to(&self, dir: &Path) -> Result<PathBuf, PersistenceError> {
         std::fs::create_dir_all(dir).map_err(|e| PersistenceError::Io {
             path: dir.to_path_buf(),
             source: e,
         })?;
+        // Best-effort tighten mode to 0700 on Unix; harmless elsewhere.
+        // Atomically retighten on every save so a directory created by a
+        // pre-fix build gets fixed on the next write.
+        restrict_dir_mode(dir);
         let json = serde_json::to_vec_pretty(self)
             .map_err(|e| PersistenceError::Serialize(e.to_string()))?;
         let target = dir.join(SESSION_FILE);
@@ -307,7 +313,10 @@ impl Registry {
         }
     }
 
-    /// Atomic write.
+    /// Atomic write. The registry directory (`~/.atelier/` by default) is
+    /// tightened to mode 0700 on Unix because the registry exposes the
+    /// path of every Atelier session on disk; on a shared host a 0755
+    /// directory leaks that index to other users.
     pub fn save(&self, path: &Path) -> Result<(), PersistenceError> {
         let parent = path.parent().ok_or_else(|| PersistenceError::Io {
             path: path.to_path_buf(),
@@ -317,6 +326,7 @@ impl Registry {
             path: parent.to_path_buf(),
             source: e,
         })?;
+        restrict_dir_mode(parent);
         let json = serde_json::to_vec_pretty(self)
             .map_err(|e| PersistenceError::Serialize(e.to_string()))?;
         let mut tmp =
@@ -380,6 +390,45 @@ fn fsync_dir(_dir: &Path) -> Result<(), PersistenceError> {
     // we made no durability promise on these platforms.
     Ok(())
 }
+
+/// Tighten a directory's permissions to 0700 on Unix. Best-effort: we'd
+/// rather succeed at the surrounding write than fail it on a chmod
+/// glitch. But unlike a silent swallow, we emit a `tracing::warn!` so
+/// the operator can see when the spec §14 "session.json lives in a 0700
+/// dir" promise is silently violated (e.g. when the dir is owned by
+/// another user on a shared host).
+#[cfg(unix)]
+fn restrict_dir_mode(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    match std::fs::metadata(dir) {
+        Ok(meta) => {
+            let mut perms = meta.permissions();
+            let current = perms.mode() & 0o777;
+            if current != 0o700 {
+                perms.set_mode(0o700);
+                if let Err(e) = std::fs::set_permissions(dir, perms) {
+                    tracing::warn!(
+                        path = %dir.display(),
+                        current_mode = format!("{current:o}"),
+                        error = %e,
+                        "restrict_dir_mode failed; directory remains at its prior mode \
+                         (spec §14 contract weakened — investigate ownership / mount options)"
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                path = %dir.display(),
+                error = %e,
+                "restrict_dir_mode could not stat directory; permissions left as-is"
+            );
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn restrict_dir_mode(_dir: &Path) {}
 
 #[cfg(test)]
 mod tests {
@@ -585,5 +634,80 @@ mod tests {
         assert_eq!(removed.repo_path, PathBuf::from("/x"));
         assert!(reg.entries.is_empty());
         assert!(reg.forget(&uuid_for(13)).is_none());
+    }
+
+    // P3 regression: session dir tightened to 0700 because session.json
+    // (eventually) contains conversation snapshots + tool fixtures that
+    // may include secrets the model saw. Unix-only — the audit was
+    // explicit that 0644 / 0755 defaults are the wrong contract.
+    #[cfg(unix)]
+    #[test]
+    fn save_to_tightens_session_dir_to_0700() {
+        use std::os::unix::fs::PermissionsExt;
+        let td = TempDir::new().unwrap();
+        let dir = td.path().join("session");
+        let s = OnDiskSession::fresh(uuid_for(99), "0.0.0", "2026-05-16T10:00:00Z");
+        s.save_to(&dir).unwrap();
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "session dir should be 0700, got {mode:o}");
+    }
+
+    // P3 regression: registry parent directory (~/.atelier/) tightened
+    // to 0700. The registry lists every Atelier session on disk; on a
+    // shared host a 0755 directory leaks that index to other users.
+    #[cfg(unix)]
+    #[test]
+    fn registry_save_tightens_parent_dir_to_0700() {
+        use std::os::unix::fs::PermissionsExt;
+        let td = TempDir::new().unwrap();
+        let parent = td.path().join(".atelier");
+        let path = parent.join("registry.json");
+        let reg = Registry::default();
+        reg.save(&path).unwrap();
+        let mode = std::fs::metadata(&parent).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "registry parent should be 0700, got {mode:o}");
+    }
+
+    // v25.3-D regression: the production code claims re-tightening on
+    // every save. Verify directly: manually relax the dir to 0755,
+    // save, assert it's back to 0700. Pre-fix the "fresh dir already
+    // 0700 from umask" cases would silently pass even if the
+    // re-tightening branch never ran.
+    #[cfg(unix)]
+    #[test]
+    fn save_to_re_tightens_relaxed_session_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let td = TempDir::new().unwrap();
+        let dir = td.path().join("session");
+        let s = OnDiskSession::fresh(uuid_for(98), "0.0.0", "2026-05-16T10:00:00Z");
+        s.save_to(&dir).unwrap();
+        // Now manually relax it — simulating a pre-fix build that
+        // created the dir with the default umask, or a sysadmin chmod.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Save again; restrict_dir_mode should re-tighten.
+        s.save_to(&dir).unwrap();
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o700,
+            "session dir should be re-tightened to 0700 on subsequent save, got {mode:o}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_save_re_tightens_relaxed_parent_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let td = TempDir::new().unwrap();
+        let parent = td.path().join(".atelier");
+        let path = parent.join("registry.json");
+        let reg = Registry::default();
+        reg.save(&path).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        reg.save(&path).unwrap();
+        let mode = std::fs::metadata(&parent).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o700,
+            "registry parent should be re-tightened on subsequent save, got {mode:o}"
+        );
     }
 }

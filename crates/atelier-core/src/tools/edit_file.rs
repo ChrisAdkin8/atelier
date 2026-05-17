@@ -114,10 +114,12 @@ impl Tool for EditFile {
                     exit_code: -1,
                     stderr: format!("staging add failed: {e}"),
                 })?;
-            let report = staging.commit().map_err(|e| ToolError::ExecutionFailed {
+            // v46: stage instead of commit — dispatcher gates the
+            // rename on ApprovalPolicy (spec §3 hunk accept/reject).
+            let batch = staging.stage().map_err(|e| ToolError::ExecutionFailed {
                 tool: NAME.into(),
                 exit_code: -1,
-                stderr: format!("staging commit failed: {e}"),
+                stderr: format!("staging stage failed: {e}"),
             })?;
 
             Ok(ToolResult {
@@ -125,7 +127,7 @@ impl Tool for EditFile {
                     "path": parsed.path,
                     "replacements": actual_count,
                 }),
-                staged_writes: Some(report),
+                staged_writes: Some(batch),
             })
         })
         .await
@@ -163,11 +165,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.output["replacements"], 1);
+        // v46: EditFile stages but does NOT commit. Commit explicitly
+        // to verify the on-disk result; integration goes through the
+        // dispatcher in production.
+        assert!(r.staged_writes.is_some());
+        r.staged_writes.unwrap().commit_all().unwrap();
         assert_eq!(
             std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
             "alpha\nBETA\ngamma\n"
         );
-        assert!(r.staged_writes.is_some());
     }
 
     #[tokio::test]
@@ -208,6 +214,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.output["replacements"], 3);
+        // v46: commit the staged batch to materialise the edit on disk.
+        r.staged_writes.unwrap().commit_all().unwrap();
         assert_eq!(
             std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
             "bar\nbar\nbar\n"

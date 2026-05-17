@@ -49,7 +49,7 @@ use serde_json::{json, Value};
 
 use super::{
     Adapter, AdapterError, Capabilities, CapabilityClaim, ChatResponse, ChunkSource, ChunkStream,
-    Message, Role, StreamChunk, TokenCount, ToolCallRequest, ToolSpec, Usage,
+    Message, Role, StopReason, StreamChunk, TokenCount, ToolCallRequest, ToolSpec, Usage,
 };
 use crate::context::TokenSource;
 use crate::protocol_conformance::{ConformanceRingBuffer, ConformanceSnapshot};
@@ -229,12 +229,15 @@ impl Adapter for AnthropicAdapter {
             .await
             .map_err(|e| AdapterError::Unreachable(e.to_string()))?;
         let status = resp.status();
+        // Snapshot headers before bytes() consumes the response. Needed
+        // for Retry-After on 429.
+        let headers = resp.headers().clone();
         let body_bytes = resp
             .bytes()
             .await
             .map_err(|e| AdapterError::Unreachable(e.to_string()))?;
         if !status.is_success() {
-            return Err(map_http_error(status, &body_bytes));
+            return Err(map_http_error(status, &headers, &body_bytes));
         }
         let parsed: AnthropicMessage = serde_json::from_slice(&body_bytes)
             .map_err(|e| AdapterError::Malformed(format!("non-stream body: {e}")))?;
@@ -263,11 +266,13 @@ impl Adapter for AnthropicAdapter {
             .map_err(|e| AdapterError::Unreachable(e.to_string()))?;
         let status = resp.status();
         if !status.is_success() {
+            // Snapshot headers before bytes() consumes the response.
+            let headers = resp.headers().clone();
             let body_bytes = resp
                 .bytes()
                 .await
                 .map_err(|e| AdapterError::Unreachable(e.to_string()))?;
-            return Err(map_http_error(status, &body_bytes));
+            return Err(map_http_error(status, &headers, &body_bytes));
         }
         let body_stream: BodyStream = Box::pin(resp.bytes_stream());
         let source = AnthropicSseSource::new(body_stream, started);
@@ -295,10 +300,41 @@ fn split_system_and_messages(messages: &[Message]) -> (String, Vec<Value>) {
                 "role": "user",
                 "content": m.content,
             })),
-            Role::Assistant => out.push(json!({
-                "role": "assistant",
-                "content": m.content,
-            })),
+            Role::Assistant => {
+                // If the assistant turn included tool_use blocks, re-emit
+                // them alongside any text in the order: text first, then
+                // tool_use blocks. The model's prior tool_use ids MUST
+                // round-trip exactly because the subsequent tool_result
+                // blocks reference them by id (Anthropic's protocol
+                // rejects unmatched ids). Pre-P5 this flattened to
+                // text-only and broke multi-turn tool flows.
+                if m.tool_calls.is_empty() {
+                    out.push(json!({
+                        "role": "assistant",
+                        "content": m.content,
+                    }));
+                } else {
+                    let mut blocks: Vec<Value> = Vec::new();
+                    if !m.content.is_empty() {
+                        blocks.push(json!({
+                            "type": "text",
+                            "text": m.content,
+                        }));
+                    }
+                    for tc in &m.tool_calls {
+                        blocks.push(json!({
+                            "type": "tool_use",
+                            "id": tc.id,
+                            "name": tc.name,
+                            "input": tc.arguments,
+                        }));
+                    }
+                    out.push(json!({
+                        "role": "assistant",
+                        "content": blocks,
+                    }));
+                }
+            }
             Role::Tool => {
                 // Anthropic represents tool results as a user-role message
                 // whose content is a `tool_result` block.
@@ -325,6 +361,24 @@ struct AnthropicMessage {
     content: Vec<AnthropicContentBlock>,
     #[serde(default)]
     usage: Option<AnthropicUsage>,
+    #[serde(default)]
+    stop_reason: Option<String>,
+}
+
+/// Map Anthropic's wire-side `stop_reason` strings onto our cross-provider
+/// [`StopReason`]. Unknown values fall through to `Other`; an absent reason
+/// is reported as `None` so the harness can distinguish "provider didn't
+/// say" from "provider said something specific".
+fn map_stop_reason(raw: Option<&str>) -> Option<StopReason> {
+    let s = raw?;
+    Some(match s {
+        "end_turn" => StopReason::EndTurn,
+        "max_tokens" => StopReason::MaxTokens,
+        "tool_use" => StopReason::ToolUse,
+        "stop_sequence" => StopReason::StopSequence,
+        "refusal" => StopReason::Refusal,
+        _ => StopReason::Other,
+    })
 }
 
 #[derive(Deserialize)]
@@ -378,6 +432,7 @@ impl AnthropicMessage {
             Strategy::NativeTool
         };
         let usage = self.usage.unwrap_or_default();
+        let stop_reason = map_stop_reason(self.stop_reason.as_deref());
         ChatResponse {
             text,
             tool_calls,
@@ -389,39 +444,138 @@ impl AnthropicMessage {
                 latency_ms: Some(latency_ms),
             },
             strategy,
+            stop_reason,
         }
     }
 }
 
 // ---------- HTTP error mapping ----------
 
-fn map_http_error(status: StatusCode, body: &[u8]) -> AdapterError {
+/// Parse the `Retry-After` HTTP header. Per RFC 7231 the value is either
+/// "delta-seconds" (a non-negative integer) or an HTTP-date; Anthropic
+/// emits the seconds form. We only parse the seconds form here — an
+/// HTTP-date is rare on 429 and we fall back to the default rather than
+/// pull in a date parser.
+fn parse_retry_after_ms(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    let v = headers.get(reqwest::header::RETRY_AFTER)?;
+    let s = v.to_str().ok()?.trim();
+    let secs: u64 = s.parse().ok()?;
+    // Cap at 5 minutes to prevent a hostile server from wedging the loop
+    // forever with `Retry-After: 999999`. Also floor at
+    // `MIN_RATE_LIMIT_BACKOFF_MS` — a `Retry-After: 0` from a confused
+    // proxy would otherwise let the caller hot-loop the API and turn
+    // a brief overload into a self-inflicted DoS.
+    let capped = secs.min(300);
+    let ms = capped.saturating_mul(1_000);
+    Some(ms.max(MIN_RATE_LIMIT_BACKOFF_MS))
+}
+
+/// Conservative default when the server omits `Retry-After` on 429. Short
+/// enough to not stall the loop, long enough to let a burst clear.
+const DEFAULT_RATE_LIMIT_BACKOFF_MS: u64 = 1_000;
+
+/// Floor for `Retry-After` parsing. A server that emits
+/// `Retry-After: 0` (some proxies do this when they don't actually know
+/// the right value) must not let us hot-loop.
+const MIN_RATE_LIMIT_BACKOFF_MS: u64 = 100;
+
+fn map_http_error(
+    status: StatusCode,
+    headers: &reqwest::header::HeaderMap,
+    body: &[u8],
+) -> AdapterError {
     // Anthropic error body shape: `{"type":"error","error":{"type":"...","message":"..."}}`
     let body_str = String::from_utf8_lossy(body).into_owned();
+
+    // Try to lift `needed_tokens` / `limit_tokens` out of the error body
+    // for ContextOverflow so the modal isn't reduced to "0 of 0". The
+    // body shape is `{"error":{"message":"... 250000 tokens > 200000 ..."}}`
+    // — exact phrasing isn't stable, but if Anthropic embeds numbers in
+    // the message we'll extract the first two.
+    let (overflow_needed, overflow_limit) = extract_overflow_numbers(&body_str);
+
     match status {
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => AdapterError::Auth(body_str),
-        StatusCode::TOO_MANY_REQUESTS => {
-            // Anthropic includes `retry-after` in seconds on 429. Without
-            // the header we conservatively default to 1s — short enough to
-            // not stall the loop, long enough to let a burst clear.
-            AdapterError::RateLimited {
-                retry_after_ms: 1_000,
-            }
-        }
+        StatusCode::TOO_MANY_REQUESTS => AdapterError::RateLimited {
+            retry_after_ms: parse_retry_after_ms(headers).unwrap_or(DEFAULT_RATE_LIMIT_BACKOFF_MS),
+        },
         s if s.is_server_error() => AdapterError::Provider {
             status: status.as_u16(),
             body: body_str,
         },
-        // 400 with `input_too_long` / `prompt_too_long` → ContextOverflow.
-        StatusCode::BAD_REQUEST if body_str.contains("too_long") => AdapterError::ContextOverflow {
-            needed_tokens: 0,
-            limit_tokens: 0,
-        },
+        // 400 → ContextOverflow when the body identifies the request as
+        // exceeding the context window. Anthropic uses three known markers:
+        //   * legacy error-type names: `prompt_too_long`, `input_too_long`
+        //   * prose form: `"is too long"` (current shape)
+        // We match exactly these three rather than any substring containing
+        // `too_long` so a future error like `"argument too_long_to_serialize"`
+        // doesn't false-positive into ContextOverflow and mask the real
+        // failure.
+        StatusCode::BAD_REQUEST
+            if body_str.contains("prompt_too_long")
+                || body_str.contains("input_too_long")
+                || body_str.contains("is too long") =>
+        {
+            AdapterError::ContextOverflow {
+                needed_tokens: overflow_needed,
+                limit_tokens: overflow_limit,
+            }
+        }
         _ => AdapterError::Provider {
             status: status.as_u16(),
             body: body_str,
         },
     }
+}
+
+/// Best-effort extraction of `(needed, limit)` token counts from the
+/// Anthropic error message. Returns `(0, 0)` if not present — the modal UI
+/// renders that as "unknown / unknown" rather than a confidently-wrong
+/// "0 of 0".
+fn extract_overflow_numbers(body: &str) -> (u32, u32) {
+    // v25.3-B: anchor on the canonical Anthropic overflow phrasing
+    // rather than taking the first two ASCII-digit runs left-to-right.
+    // The pre-fix positional scan would silently misreport if a future
+    // error format embeds a request_id, model context length, or
+    // timestamp ahead of the token numbers.
+    //
+    // Two shapes we accept:
+    //   * "NNN tokens > MMM"  (the dominant form; the `MMM` carries the
+    //     limit even when not explicitly labelled)
+    //   * "NNN tokens" alone   (some error variants drop the comparator;
+    //     we report `(NNN, 0)` so the UI shows "needed N, limit unknown"
+    //     instead of "0 of 0")
+    //
+    // Compile both regexes once; static patterns can't fail compilation
+    // in practice — the fallback is here only to avoid an `unwrap()`
+    // that could panic on a future regex-syntax rev.
+    let with_limit = match regex::Regex::new(r"\b(\d+)\s+tokens\b\s*>\s*(\d+)") {
+        Ok(r) => r,
+        Err(_) => return (0, 0),
+    };
+    if let Some(cap) = with_limit.captures(body) {
+        let needed = cap
+            .get(1)
+            .and_then(|m| m.as_str().parse().ok())
+            .unwrap_or(0);
+        let limit = cap
+            .get(2)
+            .and_then(|m| m.as_str().parse().ok())
+            .unwrap_or(0);
+        return (needed, limit);
+    }
+    let just_needed = match regex::Regex::new(r"\b(\d+)\s+tokens\b") {
+        Ok(r) => r,
+        Err(_) => return (0, 0),
+    };
+    if let Some(cap) = just_needed.captures(body) {
+        let needed = cap
+            .get(1)
+            .and_then(|m| m.as_str().parse().ok())
+            .unwrap_or(0);
+        return (needed, 0);
+    }
+    (0, 0)
 }
 
 // ---------- SSE streaming ----------
@@ -430,13 +584,24 @@ type BodyStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Sen
 
 /// Parses Anthropic SSE events into [`StreamChunk`] values incrementally.
 ///
-/// State machine: each SSE event (`message_start`, `content_block_*`,
-/// `message_delta`, `message_stop`, `error`) is parsed off the byte stream
-/// and translated into 0..N chunks queued in `pending_chunks`. `next()`
-/// drains the queue, then pulls more bytes when empty.
+/// State machine: bytes from the body stream feed a byte buffer, the
+/// buffer is split into lines (per WHATWG SSE: `\r\n`, `\n`, or `\r`),
+/// lines accumulate the per-event `data:` payload until a blank line is
+/// seen, then the event is dispatched to [`Self::handle_event`].
+///
+/// The line splitter operates on raw bytes — UTF-8 decoding happens only
+/// once a full event's data payload has been assembled, so a multi-byte
+/// codepoint split across two TCP chunks (or any chunk boundary) never
+/// corrupts a frame.
 struct AnthropicSseSource {
     body: BodyStream,
+    /// Raw bytes waiting to be split into lines. Capped to
+    /// `MAX_SSE_BUFFER_BYTES` to prevent OOM if the server emits a giant
+    /// line without a terminator.
     buffer: Vec<u8>,
+    /// `data:` line bytes accumulated for the current event. Joined with
+    /// `\n` per SSE (see comment in `parse_lines_into_events`).
+    current_event_data: Vec<u8>,
     started: std::time::Instant,
     text_acc: String,
     tool_blocks: std::collections::HashMap<u32, ToolBlockInProgress>,
@@ -445,9 +610,18 @@ struct AnthropicSseSource {
     /// dispatcher executes them in the order the model issued them).
     tool_order: Vec<u32>,
     usage: AnthropicUsage,
+    /// Most recent `stop_reason` carried by a `message_delta` event.
+    /// Propagated to the final `ChatResponse` so the harness can tell
+    /// `end_turn` from `max_tokens` / `refusal`.
+    stop_reason: Option<StopReason>,
     pending_chunks: std::collections::VecDeque<StreamChunk>,
     finished: bool,
 }
+
+/// Per-event-buffer cap. Anthropic events are typically a few KB; an
+/// 8 MiB ceiling catches a hostile or buggy server emitting an unbounded
+/// line without a terminator before it OOMs the parent.
+const MAX_SSE_BUFFER_BYTES: usize = 8 << 20;
 
 struct ToolBlockInProgress {
     id: String,
@@ -455,58 +629,162 @@ struct ToolBlockInProgress {
     partial_json: String,
 }
 
+/// Result of attempting to take one line off the front of `buffer`.
+enum LineOutcome {
+    /// One full line (excluding terminator); empty `Vec` indicates the
+    /// blank-line event terminator.
+    Got(Vec<u8>),
+    /// Not enough bytes yet — caller should pull more from the body
+    /// stream. Returned when the buffer ends with a bare `\r` (which
+    /// could still grow into a `\r\n`).
+    NeedMore,
+}
+
 impl AnthropicSseSource {
     fn new(body: BodyStream, started: std::time::Instant) -> Self {
         Self {
             body,
             buffer: Vec::with_capacity(4096),
+            current_event_data: Vec::new(),
             started,
             text_acc: String::new(),
             tool_blocks: std::collections::HashMap::new(),
             tool_order: Vec::new(),
             usage: AnthropicUsage::default(),
+            stop_reason: None,
             pending_chunks: std::collections::VecDeque::new(),
             finished: false,
         }
     }
 
-    /// Try to extract one complete SSE event (`field: value\nfield: value\n\n`)
-    /// from the head of the buffer. Returns the parsed payload (just the
-    /// `data:` line(s) joined; `event:` is informational since the JSON
-    /// already carries `type`).
-    fn try_parse_event(&mut self) -> Option<String> {
-        let split = self
-            .buffer
-            .windows(2)
-            .position(|w| w == b"\n\n")
-            .or_else(|| self.buffer.windows(4).position(|w| w == b"\r\n\r\n"))?;
-        let (sep_len, event_len) = if self.buffer[split..].starts_with(b"\r\n\r\n") {
-            (4, split)
-        } else {
-            (2, split)
-        };
-        let event_bytes = self.buffer.drain(..event_len + sep_len).collect::<Vec<_>>();
-        let event_str = String::from_utf8_lossy(&event_bytes[..event_len]);
-        let mut data = String::new();
-        for line in event_str.lines() {
-            if let Some(rest) = line.strip_prefix("data:") {
-                let rest = rest.strip_prefix(' ').unwrap_or(rest);
-                if !data.is_empty() {
-                    data.push('\n');
+    /// Drain one SSE line from the head of `buffer`. Per WHATWG SSE,
+    /// lines may end with `\r\n`, `\n`, or a lone `\r`. We find the first
+    /// CR or LF; if it's CR but the next byte hasn't arrived yet, we
+    /// report `NeedMore` so we don't misclassify a `\r\n` chunk-split as
+    /// a lone-`\r` line ending.
+    fn take_line(&mut self, at_eof: bool) -> LineOutcome {
+        let nl = self.buffer.iter().position(|&b| b == b'\n' || b == b'\r');
+        let idx = match nl {
+            Some(i) => i,
+            None => {
+                // No terminator in buffer. At EOF a non-spec server may
+                // have closed mid-line; treat the remaining bytes as a
+                // final unterminated line so we don't silently drop
+                // the trailing data.
+                if at_eof && !self.buffer.is_empty() {
+                    let line = std::mem::take(&mut self.buffer);
+                    return LineOutcome::Got(line);
                 }
-                data.push_str(rest);
+                return LineOutcome::NeedMore;
+            }
+        };
+        // CR may be the first byte of CRLF. If we have only the CR and
+        // more bytes might still arrive, wait.
+        let is_cr = self.buffer[idx] == b'\r';
+        if is_cr && idx + 1 >= self.buffer.len() && !at_eof {
+            return LineOutcome::NeedMore;
+        }
+        let terminator_len =
+            if is_cr && idx + 1 < self.buffer.len() && self.buffer[idx + 1] == b'\n' {
+                2
+            } else {
+                1
+            };
+        let line: Vec<u8> = self.buffer.drain(..idx).collect();
+        self.buffer.drain(..terminator_len);
+        LineOutcome::Got(line)
+    }
+
+    /// Pump the line splitter over whatever is currently in `buffer`,
+    /// accumulating `data:` line bytes into `current_event_data` and
+    /// dispatching events when a blank-line terminator is seen. The
+    /// `at_eof` flag tells the line splitter that a trailing `\r` should
+    /// be treated as a complete terminator (otherwise we'd wait forever
+    /// for a `\n` that won't come).
+    fn drain_buffer(&mut self, at_eof: bool) {
+        loop {
+            match self.take_line(at_eof) {
+                LineOutcome::NeedMore => {
+                    // At EOF: a server that flushed a `data:` line
+                    // followed by stream-close (no terminating blank
+                    // line) would leave us with a pending event in
+                    // `current_event_data` and no further lines to
+                    // consume. Dispatch it as if a blank line had
+                    // arrived — robustness against non-spec servers.
+                    if at_eof && !self.current_event_data.is_empty() {
+                        let data = std::mem::take(&mut self.current_event_data);
+                        if let Ok(s) = String::from_utf8(data) {
+                            self.handle_event(&s);
+                        }
+                    }
+                    return;
+                }
+                LineOutcome::Got(line) if line.is_empty() => {
+                    // Blank line = event terminator.
+                    if !self.current_event_data.is_empty() {
+                        let data = std::mem::take(&mut self.current_event_data);
+                        match String::from_utf8(data) {
+                            Ok(s) => self.handle_event(&s),
+                            Err(_) => {
+                                self.pending_chunks.push_back(StreamChunk::Error {
+                                    error: AdapterError::Malformed(
+                                        "SSE event payload was not valid UTF-8".into(),
+                                    ),
+                                });
+                                self.finished = true;
+                                return;
+                            }
+                        }
+                    }
+                    // else: empty event (keep-alive comment terminator);
+                    // loop and try the next line.
+                }
+                LineOutcome::Got(line) => {
+                    // Comment line per SSE spec (starts with ':').
+                    if line.first() == Some(&b':') {
+                        continue;
+                    }
+                    // Field name = bytes up to (but not including) first
+                    // ':'. After ':', skip one optional space, then take
+                    // the rest as the value.
+                    let (field, value) = match line.iter().position(|&b| b == b':') {
+                        Some(i) => {
+                            let (f, rest) = line.split_at(i);
+                            // rest[0] is ':'; skip it, then skip one optional space.
+                            let mut v = &rest[1..];
+                            if v.first() == Some(&b' ') {
+                                v = &v[1..];
+                            }
+                            (f, v)
+                        }
+                        // SSE spec: a line with no ':' is the field name
+                        // with empty value. Anthropic doesn't use this
+                        // shape; ignore.
+                        None => continue,
+                    };
+                    if field == b"data" {
+                        if !self.current_event_data.is_empty() {
+                            self.current_event_data.push(b'\n');
+                        }
+                        self.current_event_data.extend_from_slice(value);
+                    }
+                    // `event:`, `id:`, `retry:` ignored — Anthropic's JSON
+                    // already carries the type.
+                }
             }
         }
-        if data.is_empty() {
-            // A `ping`-only event with no data payload, or a malformed
-            // event. Skip it; caller will loop and parse the next.
-            return Some(String::new());
-        }
-        Some(data)
     }
 
     fn handle_event(&mut self, data: &str) {
         let Ok(v) = serde_json::from_str::<Value>(data) else {
+            // Non-JSON event mid-stream. Emit Error and stop. We could
+            // preserve `text_acc` / `tool_blocks` here by also pushing a
+            // partial `Complete`, but the default `chat()` returns on the
+            // first Complete-or-Error, so a Complete-then-Error pair
+            // would silently rubber-stamp the malformed turn as
+            // successful. A streaming consumer that wants partial state
+            // can read it off the source directly before propagating the
+            // Error to its caller.
             self.pending_chunks.push_back(StreamChunk::Error {
                 error: AdapterError::Malformed(format!("non-JSON SSE event: {data}")),
             });
@@ -623,12 +901,32 @@ impl AnthropicSseSource {
             }
             "message_delta" => {
                 // Carries final usage (`output_tokens`) and stop_reason.
+                // The `usage` sub-object on `message_delta` only reports
+                // output_tokens — pre-existing input_tokens and
+                // cache_read_input_tokens captured at `message_start`
+                // must NOT be clobbered, so we extract only the output
+                // figure rather than deserializing the whole struct.
+                //
+                // v25.3-B: always overwrite (was: gated on `> 0`).
+                // Anthropic reports output_tokens monotonically and the
+                // last `message_delta` is authoritative — clobbering
+                // with the latest value is correct. The old `> 0` guard
+                // would leave stale values around if a mid-stream
+                // `message_delta` ever reported `0` (which shouldn't
+                // happen per protocol, but we shouldn't rely on it).
                 if let Some(u) = v.get("usage") {
-                    if let Ok(parsed) = serde_json::from_value::<AnthropicUsage>(u.clone()) {
-                        if parsed.output_tokens > 0 {
-                            self.usage.output_tokens = parsed.output_tokens;
-                        }
+                    if let Some(out) = u.get("output_tokens").and_then(|n| n.as_u64()) {
+                        self.usage.output_tokens = out as u32;
                     }
+                }
+                // stop_reason lives in `delta.stop_reason` for streaming
+                // (matches the non-streaming response shape).
+                if let Some(reason) = v
+                    .get("delta")
+                    .and_then(|d| d.get("stop_reason"))
+                    .and_then(|s| s.as_str())
+                {
+                    self.stop_reason = map_stop_reason(Some(reason));
                 }
             }
             "message_stop" => {
@@ -692,6 +990,7 @@ impl AnthropicSseSource {
                 latency_ms: Some(latency_ms),
             },
             strategy,
+            stop_reason: self.stop_reason,
         }
     }
 }
@@ -706,15 +1005,42 @@ impl ChunkSource for AnthropicSseSource {
             if self.finished {
                 return None;
             }
-            // Try parsing whatever is buffered before pulling more bytes.
-            if let Some(data) = self.try_parse_event() {
-                if !data.is_empty() {
-                    self.handle_event(&data);
-                }
+            // Drain whatever is buffered before pulling more bytes.
+            self.drain_buffer(false);
+            if let Some(c) = self.pending_chunks.pop_front() {
+                return Some(c);
+            }
+            if self.finished {
                 continue;
             }
+            // Bounded buffer (§ deep-scan finding): a server that emits a
+            // gigabyte of bytes with no terminator must not OOM the parent.
+            if self.buffer.len() > MAX_SSE_BUFFER_BYTES {
+                self.finished = true;
+                return Some(StreamChunk::Error {
+                    error: AdapterError::Malformed(format!(
+                        "SSE buffer exceeded {} bytes without an event terminator",
+                        MAX_SSE_BUFFER_BYTES
+                    )),
+                });
+            }
             match self.body.next().await {
-                Some(Ok(bytes)) => self.buffer.extend_from_slice(&bytes),
+                Some(Ok(bytes)) => {
+                    // Pre-check the cap BEFORE extending. The post-extend
+                    // check at the top of the loop misses the case where
+                    // a single chunk is itself larger than the cap (e.g. a
+                    // pathological 100 MB chunk).
+                    if self.buffer.len().saturating_add(bytes.len()) > MAX_SSE_BUFFER_BYTES {
+                        self.finished = true;
+                        return Some(StreamChunk::Error {
+                            error: AdapterError::Malformed(format!(
+                                "SSE chunk would push buffer past {} bytes",
+                                MAX_SSE_BUFFER_BYTES
+                            )),
+                        });
+                    }
+                    self.buffer.extend_from_slice(&bytes);
+                }
                 Some(Err(e)) => {
                     self.finished = true;
                     return Some(StreamChunk::Error {
@@ -722,10 +1048,12 @@ impl ChunkSource for AnthropicSseSource {
                     });
                 }
                 None => {
-                    // Stream closed without `message_stop`. Emit Complete
-                    // with what we have so the loop terminates rather than
-                    // hanging — but record an Error first so the caller
-                    // knows the turn was truncated.
+                    // Stream EOF. Flush any trailing event (with at_eof=true
+                    // so a final bare `\r` counts as a terminator).
+                    self.drain_buffer(true);
+                    if let Some(c) = self.pending_chunks.pop_front() {
+                        return Some(c);
+                    }
                     self.finished = true;
                     return Some(StreamChunk::Error {
                         error: AdapterError::Malformed(
@@ -746,19 +1074,11 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn user(content: &str) -> Message {
-        Message {
-            role: Role::User,
-            content: content.into(),
-            tool_call_id: None,
-        }
+        Message::text(Role::User, content)
     }
 
     fn system(content: &str) -> Message {
-        Message {
-            role: Role::System,
-            content: content.into(),
-            tool_call_id: None,
-        }
+        Message::text(Role::System, content)
     }
 
     fn adapter_for(server: &MockServer) -> AnthropicAdapter {
@@ -1237,16 +1557,13 @@ mod tests {
             role: Role::Tool,
             content: r#"{"ok":true}"#.into(),
             tool_call_id: Some("toolu_q".into()),
+            tool_calls: Vec::new(),
         };
         let r = adapter_for(&server)
             .chat(
                 &[
                     user("x"),
-                    Message {
-                        role: Role::Assistant,
-                        content: "calling tool".into(),
-                        tool_call_id: None,
-                    },
+                    Message::text(Role::Assistant, "calling tool"),
                     tool_msg,
                 ],
                 &[],
@@ -1292,5 +1609,550 @@ mod tests {
         assert_eq!(caps.streaming, CapabilityClaim::Supported);
         assert_eq!(caps.long_context, CapabilityClaim::Supported);
         assert_eq!(caps.context_window_tokens, 200_000);
+    }
+
+    // ---------- P5 regression: assistant tool_calls round-trip ----------
+
+    // The audit named this at anthropic.rs:283: pre-P5, sending back a
+    // prior assistant turn with tool_use blocks flattened the blocks to
+    // text-only on the next request, breaking multi-turn tool flows
+    // because Anthropic requires the subsequent `tool_result.tool_use_id`
+    // to match a tool_use that was actually sent.
+    #[tokio::test]
+    async fn assistant_turn_with_tool_calls_round_trips_as_content_blocks() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            // The body MUST carry the prior assistant tool_use blocks
+            // as a content array, with id + name + input preserved.
+            .and(wiremock::matchers::body_partial_json(json!({
+                "messages": [
+                    {"role": "user", "content": "x"},
+                    {"role": "assistant", "content": [
+                        {"type": "text", "text": "calling shell"},
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_42",
+                            "name": "shell",
+                            "input": {"command": "echo hi"}
+                        }
+                    ]},
+                    {"role": "user", "content": [
+                        {"type": "tool_result", "tool_use_id": "toolu_42", "content": "{\"exit_code\":0}"}
+                    ]}
+                ]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "msg_p5",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "done"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            })))
+            .mount(&server)
+            .await;
+
+        let assistant_with_tool_call = Message {
+            role: Role::Assistant,
+            content: "calling shell".into(),
+            tool_call_id: None,
+            tool_calls: vec![ToolCallRequest {
+                id: "toolu_42".into(),
+                name: "shell".into(),
+                arguments: json!({"command": "echo hi"}),
+            }],
+        };
+        let tool_result = Message {
+            role: Role::Tool,
+            content: r#"{"exit_code":0}"#.into(),
+            tool_call_id: Some("toolu_42".into()),
+            tool_calls: Vec::new(),
+        };
+        let r = adapter_for(&server)
+            .chat(&[user("x"), assistant_with_tool_call, tool_result], &[])
+            .await
+            .unwrap();
+        assert_eq!(r.text, "done");
+    }
+
+    #[tokio::test]
+    async fn assistant_turn_without_tool_calls_stays_plain_string_content() {
+        // Backwards compat: when an assistant message has no tool_calls,
+        // we emit `content: "string"` (the legacy shape), not a
+        // single-block array. Some providers special-case the string
+        // form; we don't gratuitously break that.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(wiremock::matchers::body_partial_json(json!({
+                "messages": [
+                    {"role": "user", "content": "x"},
+                    {"role": "assistant", "content": "just text"}
+                ]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "msg_p5b",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "ok"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            })))
+            .mount(&server)
+            .await;
+        let r = adapter_for(&server)
+            .chat(
+                &[user("x"), Message::text(Role::Assistant, "just text")],
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.text, "ok");
+    }
+
+    // ---------- P2 regression tests: SSE parser correctness ----------
+
+    // The pre-fix parser scanned the byte buffer for `\n\n` to find event
+    // boundaries; a payload containing literal `\n\n` (or that happened to
+    // straddle a chunk so the buffer briefly looked terminated) would
+    // split mid-event. The new parser is line-oriented and never confuses
+    // payload bytes with frame terminators.
+    //
+    // Anthropic JSON never contains a raw newline in a string (JSON
+    // requires `\\n`), but the test belt-and-braces against any future
+    // event whose `data:` payload reuses the byte.
+    #[tokio::test]
+    async fn sse_parser_propagates_stop_reason_from_message_delta() {
+        let server = MockServer::start().await;
+        let body = sse(&[
+            (
+                "message_start",
+                json!({
+                    "type": "message_start",
+                    "message": {"usage": {"input_tokens": 10, "output_tokens": 0}}
+                }),
+            ),
+            (
+                "content_block_start",
+                json!({
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "text", "text": ""}
+                }),
+            ),
+            (
+                "content_block_delta",
+                json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": "hi"}
+                }),
+            ),
+            (
+                "content_block_stop",
+                json!({"type": "content_block_stop", "index": 0}),
+            ),
+            (
+                "message_delta",
+                json!({
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "max_tokens"},
+                    "usage": {"output_tokens": 3}
+                }),
+            ),
+            ("message_stop", json!({"type": "message_stop"})),
+        ]);
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
+        let mut s = adapter_for(&server)
+            .stream(&[user("hi")], &[])
+            .await
+            .unwrap();
+        let mut response = None;
+        while let Some(c) = s.next().await {
+            if let StreamChunk::Complete { response: r } = c {
+                response = Some(r);
+                break;
+            }
+        }
+        let r = response.expect("stream should have produced Complete");
+        assert_eq!(r.stop_reason, Some(StopReason::MaxTokens));
+        // Plus: message_delta usage.output_tokens DOES land, but
+        // message_start's input_tokens MUST NOT be clobbered.
+        assert_eq!(r.usage.prompt_tokens, 10);
+        assert_eq!(r.usage.completion_tokens, 3);
+    }
+
+    #[tokio::test]
+    async fn sse_parser_propagates_stop_reason_end_turn_via_non_stream() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "msg_sr",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "ok"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            })))
+            .mount(&server)
+            .await;
+        let r = adapter_for(&server).chat(&[user("hi")], &[]).await.unwrap();
+        assert_eq!(r.stop_reason, Some(StopReason::EndTurn));
+    }
+
+    #[tokio::test]
+    async fn sse_parser_propagates_stop_reason_refusal_via_non_stream() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "msg_rfs",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "I cannot help with that."}],
+                "stop_reason": "refusal",
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            })))
+            .mount(&server)
+            .await;
+        let r = adapter_for(&server).chat(&[user("hi")], &[]).await.unwrap();
+        assert_eq!(r.stop_reason, Some(StopReason::Refusal));
+    }
+
+    #[tokio::test]
+    async fn sse_parser_handles_crlf_line_terminators() {
+        // Servers behind some HTTP proxies normalise to CRLF; the SSE
+        // spec accepts \r\n, \n, or lone \r. Same payload as the happy
+        // path, but every line terminator is \r\n.
+        let server = MockServer::start().await;
+        let mut body = String::new();
+        for line in [
+            r#"event: message_start"#,
+            r#"data: {"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}"#,
+            "",
+            r#"event: content_block_start"#,
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            "",
+            r#"event: content_block_delta"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#,
+            "",
+            r#"event: content_block_stop"#,
+            r#"data: {"type":"content_block_stop","index":0}"#,
+            "",
+            r#"event: message_delta"#,
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}"#,
+            "",
+            r#"event: message_stop"#,
+            r#"data: {"type":"message_stop"}"#,
+            "",
+        ] {
+            body.push_str(line);
+            body.push_str("\r\n");
+        }
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
+        let mut s = adapter_for(&server)
+            .stream(&[user("hi")], &[])
+            .await
+            .unwrap();
+        let mut response = None;
+        while let Some(c) = s.next().await {
+            if let StreamChunk::Complete { response: r } = c {
+                response = Some(r);
+                break;
+            }
+        }
+        let r = response.expect("stream should have produced Complete");
+        assert_eq!(r.text, "hi");
+        assert_eq!(r.stop_reason, Some(StopReason::EndTurn));
+    }
+
+    // Direct AnthropicSseSource exercise: a multi-byte UTF-8 codepoint
+    // split across two chunks must NOT corrupt the payload. The pre-fix
+    // parser ran `from_utf8_lossy` on every chunk window — a split would
+    // emit U+FFFD. With the new line-oriented parser, UTF-8 decoding
+    // happens only on the full assembled event payload.
+    //
+    // We feed bytes via a hand-rolled stream so we control the chunk
+    // boundary precisely.
+    #[tokio::test]
+    async fn sse_parser_preserves_multibyte_utf8_split_across_chunks() {
+        use futures::stream;
+
+        // Payload includes "💯" (4-byte UTF-8: F0 9F 92 AF). We split the
+        // SSE body at byte 1 of the emoji, which is the worst case for
+        // any parser that converts per-chunk.
+        let event = r#"event: message_start
+data: {"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"💯"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+"#;
+        let bytes_all: Vec<u8> = event.as_bytes().to_vec();
+
+        // Find the emoji's first byte (0xF0) and split there + 1, so
+        // chunk_a ends mid-codepoint.
+        let split_at = bytes_all
+            .iter()
+            .position(|&b| b == 0xF0)
+            .expect("emoji should be in payload")
+            + 1;
+        let chunk_a = bytes_all[..split_at].to_vec();
+        let chunk_b = bytes_all[split_at..].to_vec();
+
+        let body_stream = stream::iter(vec![
+            Ok::<Bytes, reqwest::Error>(Bytes::from(chunk_a)),
+            Ok::<Bytes, reqwest::Error>(Bytes::from(chunk_b)),
+        ]);
+        let src = AnthropicSseSource::new(Box::pin(body_stream), std::time::Instant::now());
+        let mut s = ChunkStream::from_inner(Box::new(src));
+
+        let mut text = String::new();
+        let mut got_complete = false;
+        while let Some(c) = s.next().await {
+            match c {
+                StreamChunk::Text { delta } => text.push_str(&delta),
+                StreamChunk::Complete { response } => {
+                    text = response.text;
+                    got_complete = true;
+                    break;
+                }
+                StreamChunk::Error { error } => panic!("unexpected error: {error:?}"),
+                _ => {}
+            }
+        }
+        assert!(got_complete, "stream should have completed");
+        assert_eq!(text, "💯", "emoji should round-trip intact across chunks");
+    }
+
+    // The pre-fix parser scanned for `\n\n` anywhere in the byte buffer.
+    // Drive the parser with a payload split byte-by-byte so the scanner
+    // can never "see" a complete \n\n until the actual frame terminator.
+    // The new parser is line-oriented and resilient to this.
+    #[tokio::test]
+    async fn sse_parser_handles_one_byte_per_chunk_stream() {
+        use futures::stream;
+
+        let event = r#"event: message_start
+data: {"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+"#;
+        let one_byte_chunks: Vec<Result<Bytes, reqwest::Error>> =
+            event.bytes().map(|b| Ok(Bytes::from(vec![b]))).collect();
+        let body_stream = stream::iter(one_byte_chunks);
+        let src = AnthropicSseSource::new(Box::pin(body_stream), std::time::Instant::now());
+        let mut s = ChunkStream::from_inner(Box::new(src));
+
+        let mut text = String::new();
+        let mut got_complete = false;
+        while let Some(c) = s.next().await {
+            match c {
+                StreamChunk::Text { delta } => text.push_str(&delta),
+                StreamChunk::Complete { response } => {
+                    text = response.text;
+                    got_complete = true;
+                    break;
+                }
+                StreamChunk::Error { error } => panic!("unexpected error: {error:?}"),
+                _ => {}
+            }
+        }
+        assert!(got_complete);
+        assert_eq!(text, "hello");
+    }
+
+    // ---------- P2 regression tests: Retry-After parsing ----------
+
+    #[tokio::test]
+    async fn chat_429_with_retry_after_header_propagates_seconds() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "7")
+                    .set_body_string(r#"{"error":{"type":"rate_limit_error"}}"#),
+            )
+            .mount(&server)
+            .await;
+        let err = adapter_for(&server)
+            .chat(&[user("hi")], &[])
+            .await
+            .unwrap_err();
+        match err {
+            AdapterError::RateLimited { retry_after_ms } => {
+                assert_eq!(retry_after_ms, 7_000, "should parse seconds → 7000 ms");
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_429_with_absurd_retry_after_is_capped() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "999999")
+                    .set_body_string(""),
+            )
+            .mount(&server)
+            .await;
+        let err = adapter_for(&server)
+            .chat(&[user("hi")], &[])
+            .await
+            .unwrap_err();
+        match err {
+            AdapterError::RateLimited { retry_after_ms } => {
+                // 300s cap → 300_000 ms.
+                assert_eq!(retry_after_ms, 300_000);
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_429_with_zero_retry_after_is_floored_to_prevent_hot_loop() {
+        // v25.2-B: a confused proxy emitting `Retry-After: 0` must not
+        // let us hot-loop the API — that turns a brief overload into a
+        // self-inflicted DoS. Floor to MIN_RATE_LIMIT_BACKOFF_MS.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "0")
+                    .set_body_string(""),
+            )
+            .mount(&server)
+            .await;
+        let err = adapter_for(&server)
+            .chat(&[user("hi")], &[])
+            .await
+            .unwrap_err();
+        match err {
+            AdapterError::RateLimited { retry_after_ms } => {
+                assert_eq!(retry_after_ms, MIN_RATE_LIMIT_BACKOFF_MS);
+                assert!(retry_after_ms >= 100, "must not allow hot-loop");
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_429_without_retry_after_uses_default() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(429).set_body_string(""))
+            .mount(&server)
+            .await;
+        let err = adapter_for(&server)
+            .chat(&[user("hi")], &[])
+            .await
+            .unwrap_err();
+        match err {
+            AdapterError::RateLimited { retry_after_ms } => {
+                assert_eq!(retry_after_ms, DEFAULT_RATE_LIMIT_BACKOFF_MS);
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+    }
+
+    // ---------- P2 regression tests: ContextOverflow numbers ----------
+
+    #[tokio::test]
+    async fn chat_400_extracts_overflow_token_counts_when_present() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(
+                r#"{"error":{"type":"invalid_request_error","message":"prompt is too long: 250000 tokens > 200000 maximum"}}"#,
+            ))
+            .mount(&server)
+            .await;
+        let err = adapter_for(&server)
+            .chat(&[user("hi")], &[])
+            .await
+            .unwrap_err();
+        match err {
+            AdapterError::ContextOverflow {
+                needed_tokens,
+                limit_tokens,
+            } => {
+                assert_eq!(needed_tokens, 250_000);
+                assert_eq!(limit_tokens, 200_000);
+            }
+            other => panic!("expected ContextOverflow, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_400_with_unrelated_too_long_substring_is_not_context_overflow() {
+        // A 400 about something else entirely; the body contains the
+        // substring `too_long` only as part of a different identifier
+        // (`too_long_to_serialize`). Must NOT collapse to ContextOverflow.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(
+                r#"{"error":{"type":"invalid_request_error","message":"argument too_long_to_serialize"}}"#,
+            ))
+            .mount(&server)
+            .await;
+        let err = adapter_for(&server)
+            .chat(&[user("hi")], &[])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, AdapterError::Provider { .. }),
+            "expected Provider, got {err:?}"
+        );
     }
 }

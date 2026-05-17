@@ -100,8 +100,17 @@ bytes = "1"
 # Session IDs (§14 — on-disk session lives at .atelier/sessions/<uuid>/)
 uuid = { version = "1", features = ["v4", "serde"] }
 
+# §11 subprocess hardening — direct `libc::kill(-pgid, SIGKILL)` so a timed-out
+# child's process group (and any grandchildren `sh -c` spawned) is reaped, not
+# just the direct child. Target-gated to Unix in the consuming crate.
+libc = "0.2"
+
 # Internal crate references
 atelier-core = { path = "crates/atelier-core" }
+# v47: atelier-cli now exposes a library (`atelier_cli::runner`) so the
+# GUI shell can construct a SessionDispatcher + drive the turn loop
+# without reimplementing the wiring.
+atelier-cli = { path = "crates/atelier-cli" }
 
 [profile.release]
 opt-level = 3

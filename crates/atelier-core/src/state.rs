@@ -19,6 +19,12 @@ pub enum State {
     Streaming,
     ToolDispatching,
     ToolExecuting,
+    /// Spec §3 "Hunk accept / reject": a tool produced staged writes
+    /// and the dispatcher is waiting for the user's accept set before
+    /// committing. Entered from `ToolExecuting`; the only legal exits
+    /// are back to `ToolExecuting` (continue with the approved subset)
+    /// or `Failed` (user fully rejected and the dispatcher gave up).
+    AwaitingApproval,
     Verifying,
     AwaitingUser,
     Failed,
@@ -33,6 +39,7 @@ impl State {
             Self::Streaming => "Streaming",
             Self::ToolDispatching => "ToolDispatching",
             Self::ToolExecuting => "ToolExecuting",
+            Self::AwaitingApproval => "AwaitingApproval",
             Self::Verifying => "Verifying",
             Self::AwaitingUser => "AwaitingUser",
             Self::Failed => "Failed",
@@ -101,7 +108,10 @@ pub const LEGAL_TRANSITIONS: &[(State, State)] = &[
     (State::ToolDispatching, State::Failed),
     (State::ToolExecuting, State::Streaming),
     (State::ToolExecuting, State::AwaitingUser),
+    (State::ToolExecuting, State::AwaitingApproval),
     (State::ToolExecuting, State::Failed),
+    (State::AwaitingApproval, State::ToolExecuting),
+    (State::AwaitingApproval, State::Failed),
     (State::Verifying, State::Done),
     (State::Verifying, State::Streaming),
     (State::Verifying, State::Failed),

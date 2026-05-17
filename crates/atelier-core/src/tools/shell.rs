@@ -116,6 +116,8 @@ impl Tool for Shell {
                 "exit_code": outcome.exit_code,
                 "stdout": outcome.stdout_str_lossy(),
                 "stderr": outcome.stderr_str_lossy(),
+                "stdout_truncated": outcome.stdout_truncated,
+                "stderr_truncated": outcome.stderr_truncated,
                 "duration_ms": outcome.duration_ms,
                 "timed_out": outcome.timed_out,
             }),

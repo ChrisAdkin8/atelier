@@ -121,23 +121,82 @@ pub fn parse_json_sentinel(reply: &str) -> Result<JsonSentinelParse, StrategyErr
         .find(SENTINEL_OPEN)
         .ok_or(StrategyError::SentinelMissing)?;
     let after_open = start + SENTINEL_OPEN.len();
-    let end_rel = reply[after_open..]
-        .find(SENTINEL_CLOSE)
-        .ok_or(StrategyError::SentinelMissing)?;
-    let end_abs = after_open + end_rel;
-    let json_slice = &reply[after_open..end_abs];
+    let rest = &reply[after_open..];
 
-    let env = Envelope::from_json(json_slice.as_bytes()).map_err(StrategyError::Envelope)?;
+    // Parse one JSON value off the front of `rest` and remember where it
+    // ended. Using `StreamDeserializer::byte_offset()` gives us the exact
+    // byte length of the JSON value — an embedded `<<<end>>>` inside a
+    // JSON string literal is part of the value, NOT a premature close
+    // tag. Pre-v25.2 we naively used `find(SENTINEL_CLOSE)` and a model
+    // emitting `{"summary":"see <<<end>>> tag"}` would corrupt the parse.
+    let mut stream = serde_json::Deserializer::from_str(rest).into_iter::<serde_json::Value>();
+    let value = stream
+        .next()
+        .ok_or_else(|| {
+            StrategyError::Envelope(EnvelopeError::Parse(
+                "no JSON value after sentinel open tag".into(),
+            ))
+        })?
+        .map_err(|e| StrategyError::Envelope(EnvelopeError::Parse(e.to_string())))?;
+    let json_end = stream.byte_offset();
 
-    // The natural-language portion is everything *before* the open tag; we
-    // intentionally discard anything after the close tag — spec §2 has the
-    // sentinel appended at end-of-turn.
+    let env = Envelope::from_value(value).map_err(StrategyError::Envelope)?;
+
+    // After the JSON value: optional whitespace, then the close tag.
+    // Anything else means the JSON ended mid-envelope or the close tag
+    // is missing entirely.
+    let after_json = &rest[json_end..];
+    let after_json_trimmed = after_json.trim_start();
+    if !after_json_trimmed.starts_with(SENTINEL_CLOSE) {
+        return Err(StrategyError::SentinelMissing);
+    }
+    let close_start = after_json.len() - after_json_trimmed.len();
+    let close_end_in_rest = json_end + close_start + SENTINEL_CLOSE.len();
+
+    // Spec §2: sentinel is appended at end-of-turn. Trailing whitespace is
+    // OK (newlines from the wire), but any non-whitespace after the close
+    // tag is either a second envelope or post-envelope chatter the
+    // contract forbids.
+    let trailing = rest[close_end_in_rest..].trim();
+    if !trailing.is_empty() {
+        return Err(StrategyError::TrailingContentAfterSentinel {
+            length: trailing.len(),
+            prefix: bounded_prefix(trailing, TRAILING_PREFIX_BYTES),
+        });
+    }
+
+    // The natural-language portion is everything *before* the open tag.
     let prose = reply[..start].trim_end().to_string();
 
     Ok(JsonSentinelParse {
         envelope: env,
         prose,
     })
+}
+
+/// How many bytes of trailing content we surface in
+/// [`StrategyError::TrailingContentAfterSentinel`]. 64 is enough to see
+/// "looks like a second sentinel" vs. "looks like prose" at a glance
+/// without leaking unbounded model output into logs.
+const TRAILING_PREFIX_BYTES: usize = 64;
+
+/// Take up to `max_bytes` of the input, suffixed with `…` if truncated.
+/// Splits on a UTF-8 char boundary so we never emit invalid UTF-8 in
+/// the error string.
+fn bounded_prefix(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    // Walk back to the last char boundary ≤ max_bytes. `str::is_char_boundary`
+    // is O(1), so this loop is bounded by UTF-8's 4-byte max.
+    let mut cut = max_bytes;
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let mut out = String::with_capacity(cut + 3);
+    out.push_str(&s[..cut]);
+    out.push('…');
+    out
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -423,6 +482,20 @@ pub enum StrategyError {
 
     #[error("sentinel tags not found in model reply")]
     SentinelMissing,
+
+    /// Spec §2: the JSON sentinel envelope is appended at end-of-turn —
+    /// any non-whitespace content after the close tag is either a second
+    /// envelope the model emitted (which would be silently lost) or
+    /// post-envelope chatter (which violates the contract). Either way
+    /// the reply is malformed; fail loudly rather than rubber-stamp.
+    ///
+    /// `length` is the total trailing-content byte length; `prefix`
+    /// carries up to [`TRAILING_PREFIX_BYTES`] of the trailing content
+    /// so a developer triaging the failure can tell "looks like a second
+    /// sentinel" from "looks like leftover prose" without re-deriving
+    /// from logs.
+    #[error("non-whitespace content after sentinel close tag (length {length} bytes; prefix: {prefix:?})")]
+    TrailingContentAfterSentinel { length: usize, prefix: String },
 }
 
 #[cfg(test)]
@@ -563,6 +636,99 @@ mod tests {
         let bad = format!("{SENTINEL_OPEN}not json{SENTINEL_CLOSE}");
         let err = parse_json_sentinel(&bad).unwrap_err();
         assert!(matches!(err, StrategyError::Envelope(_)));
+    }
+
+    // P4 regression: a second envelope (or any non-whitespace text) after
+    // the close tag must be rejected. Pre-P4 the parser silently discarded
+    // anything after the close, which let a model emit two envelopes and
+    // have only the first survive — a fail-open path.
+    #[test]
+    fn json_sentinel_rejects_trailing_content_after_close_tag() {
+        let env = example_envelope();
+        let appendage = encode_json_sentinel(&env).unwrap();
+        let reply = format!("{appendage}\nthen some chatter the model added");
+        let err = parse_json_sentinel(&reply).unwrap_err();
+        match err {
+            StrategyError::TrailingContentAfterSentinel { length, prefix } => {
+                assert!(length > 0);
+                assert!(
+                    prefix.contains("then some chatter"),
+                    "prefix should carry triage info, got {prefix:?}"
+                );
+            }
+            other => panic!("expected TrailingContentAfterSentinel, got {other:?}"),
+        }
+    }
+
+    // v25.2-A regression: an envelope whose JSON string content contains
+    // the literal "<<<end>>>" close tag must parse correctly. Pre-fix the
+    // parser used `find(SENTINEL_CLOSE)` and truncated mid-string,
+    // surfacing as Envelope::Parse instead of clean success.
+    #[test]
+    fn json_sentinel_handles_close_tag_embedded_in_json_string() {
+        let env = Envelope {
+            claimed_changes: Some(vec![ClaimedChange {
+                path: "notes.md".into(),
+                kind: ClaimedChangeKind::Edit,
+                summary: "see the <<<end>>> tag mentioned in the docs".into(),
+            }]),
+            claimed_done: Some(false),
+            ..Default::default()
+        };
+        let appendage = encode_json_sentinel(&env).unwrap();
+        let parsed = parse_json_sentinel(&appendage).unwrap();
+        assert_eq!(parsed.envelope, env);
+    }
+
+    // Companion case: open-tag embedded in the JSON. Same parser principle.
+    #[test]
+    fn json_sentinel_handles_open_tag_embedded_in_json_string() {
+        let env = Envelope {
+            claimed_changes: Some(vec![ClaimedChange {
+                path: "notes.md".into(),
+                kind: ClaimedChangeKind::Edit,
+                summary: "describes the <<<harness_meta>>> protocol".into(),
+            }]),
+            claimed_done: Some(false),
+            ..Default::default()
+        };
+        let appendage = encode_json_sentinel(&env).unwrap();
+        let parsed = parse_json_sentinel(&appendage).unwrap();
+        assert_eq!(parsed.envelope, env);
+    }
+
+    #[test]
+    fn json_sentinel_accepts_trailing_whitespace_after_close_tag() {
+        // Real wire payloads often have a trailing newline. Trailing
+        // whitespace (newlines, tabs, spaces) is fine — only
+        // non-whitespace is a contract violation.
+        let env = example_envelope();
+        let appendage = encode_json_sentinel(&env).unwrap();
+        let reply = format!("{appendage}\n\n  \n");
+        let parsed = parse_json_sentinel(&reply).unwrap();
+        assert_eq!(parsed.envelope, env);
+    }
+
+    #[test]
+    fn json_sentinel_rejects_double_envelope() {
+        // The specific footgun the audit named: a model emits two
+        // envelopes; pre-P4 the parser silently kept only the first.
+        // Now we error so the conformance tracker sees it.
+        let env = example_envelope();
+        let one = encode_json_sentinel(&env).unwrap();
+        let reply = format!("{one}{one}");
+        let err = parse_json_sentinel(&reply).unwrap_err();
+        match err {
+            StrategyError::TrailingContentAfterSentinel { prefix, .. } => {
+                // The second sentinel should be visible in the prefix —
+                // proves the error is genuinely from the right cause.
+                assert!(
+                    prefix.contains(SENTINEL_OPEN),
+                    "prefix should contain the second sentinel, got {prefix:?}"
+                );
+            }
+            other => panic!("expected TrailingContentAfterSentinel, got {other:?}"),
+        }
     }
 
     // ---------- regex-prose ----------

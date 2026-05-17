@@ -160,14 +160,31 @@ pub struct ConformanceSnapshot {
 }
 
 impl ConformanceSnapshot {
-    /// Success rate over the window. Returns 1.0 for an empty buffer so a
-    /// brand-new adapter doesn't immediately fail a 0/0 threshold check —
-    /// callers needing a meaningful rate should check `total > 0` first.
-    pub fn rate(&self) -> f32 {
+    /// Success rate over the window, or `None` when the buffer is empty.
+    ///
+    /// The empty-buffer case is genuinely *no evidence* — neither "the
+    /// adapter is healthy" nor "the adapter is broken". Returning `None`
+    /// forces callers to choose explicitly between rubber-stamping
+    /// (`unwrap_or(1.0) >= threshold`) and waiting for evidence
+    /// (`map_or(false, |r| r >= threshold)`); the former is the
+    /// fail-open trap the deep-scan flagged.
+    ///
+    /// `#[must_use]` because dropping the result on the floor is almost
+    /// always a bug — `snapshot.rate();` does nothing useful, and a
+    /// stray `unwrap_or(1.0)` after a refactor would silently rubber-stamp
+    /// the threshold check.
+    #[must_use]
+    pub fn rate(&self) -> Option<f32> {
         if self.total == 0 {
-            return 1.0;
+            return None;
         }
-        self.successes as f32 / self.total as f32
+        Some(self.successes as f32 / self.total as f32)
+    }
+
+    /// Whether the buffer has recorded any samples yet. Cheap predicate
+    /// for the common "skip the threshold check until we have data" pattern.
+    pub fn has_evidence(&self) -> bool {
+        self.total > 0
     }
 }
 
@@ -370,11 +387,15 @@ mod tests {
     // ---------- ConformanceRingBuffer ----------
 
     #[test]
-    fn empty_buffer_has_perfect_rate_so_new_adapters_dont_fail_a_threshold_check() {
+    fn empty_buffer_reports_no_evidence_not_perfect_rate() {
         let b = ConformanceRingBuffer::new();
         let snap = b.snapshot();
         assert_eq!(snap.total, 0);
-        assert_eq!(snap.rate(), 1.0);
+        // P4 regression: an empty buffer is "no evidence", not "100%
+        // healthy". Returning Some(1.0) would let any caller doing
+        // `rate() >= threshold` rubber-stamp a brand-new adapter.
+        assert_eq!(snap.rate(), None);
+        assert!(!snap.has_evidence());
     }
 
     #[test]
@@ -390,7 +411,9 @@ mod tests {
         assert_eq!(s.total, 10);
         assert_eq!(s.successes, 7);
         assert_eq!(s.failures, 3);
-        assert!((s.rate() - 0.7).abs() < 1e-6);
+        let r = s.rate().expect("non-empty buffer has a rate");
+        assert!((r - 0.7).abs() < 1e-6);
+        assert!(s.has_evidence());
     }
 
     #[test]

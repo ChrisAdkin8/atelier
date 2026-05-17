@@ -3,7 +3,7 @@
 //! Idempotent. Re-running on an initialised repo reports "no changes".
 
 use std::fs;
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 
 /// Seed template written as `<repo>/ATELIER.md` when the repo has none.
@@ -99,7 +99,10 @@ pub fn init(repo_root: &Path) -> io::Result<InitSummary> {
     let atelier_md_written = if atelier_md.exists() {
         false
     } else {
-        fs::write(&atelier_md, ATELIER_MD_TEMPLATE)?;
+        // Atomic write: tempfile+persist so a crash mid-write doesn't
+        // leave a half-written ATELIER.md that the next `init` will skip
+        // (because `exists()` returns true on the truncated remnant).
+        atomic_write(repo_root, &atelier_md, ATELIER_MD_TEMPLATE.as_bytes())?;
         true
     };
 
@@ -109,7 +112,7 @@ pub fn init(repo_root: &Path) -> io::Result<InitSummary> {
         if gitignore_has_atelier_entry(&existing) {
             (true, false)
         } else {
-            append_atelier_entry(&gitignore, &existing)?;
+            atomic_append_atelier_entry(repo_root, &gitignore, &existing)?;
             (true, true)
         }
     } else {
@@ -141,13 +144,54 @@ fn gitignore_has_atelier_entry(contents: &str) -> bool {
     })
 }
 
-fn append_atelier_entry(path: &Path, existing: &str) -> io::Result<()> {
-    let mut f = fs::OpenOptions::new().append(true).open(path)?;
-    if !existing.is_empty() && !existing.ends_with('\n') {
-        f.write_all(b"\n")?;
-    }
-    f.write_all(b".atelier/\n")?;
+/// Atomic write via tempfile+rename in the same directory. Used for
+/// ATELIER.md so a crash mid-write doesn't leave a truncated file that
+/// the next `init` would skip recreating.
+fn atomic_write(dir: &Path, target: &Path, bytes: &[u8]) -> io::Result<()> {
+    // The temp file lives next to the target so the rename is
+    // same-filesystem (cross-fs rename returns EXDEV and silently falls
+    // back to copy+delete, defeating atomicity).
+    let parent = target.parent().unwrap_or(dir);
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+    io::Write::write_all(tmp.as_file_mut(), bytes)?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(target).map_err(|e| e.error)?;
+    // POSIX rename is atomic for content but the directory entry's
+    // update is buffered until the next natural fsync — without this
+    // call, a power loss after `persist` returns can leave the directory
+    // in its pre-rename state on stable storage and the next `init`
+    // would re-create the file as if nothing happened. Same fix the
+    // staging and persistence layers apply (see staging.rs
+    // `fsync_dir_best_effort` and persistence.rs `fsync_dir`).
+    fsync_dir_best_effort(parent);
     Ok(())
+}
+
+/// Best-effort fsync of a directory entry. Mirrors the helper in
+/// staging.rs; we re-implement rather than share to keep this module
+/// dependency-light (init runs before the rest of the crate).
+#[cfg(unix)]
+fn fsync_dir_best_effort(dir: &Path) {
+    if let Ok(f) = std::fs::File::open(dir) {
+        let _ = f.sync_all();
+    }
+}
+
+#[cfg(not(unix))]
+fn fsync_dir_best_effort(_dir: &Path) {}
+
+/// Atomic read-modify-write append of `.atelier/\n` to `.gitignore`.
+/// A concurrent `git status` or another `atelier init` running on the
+/// same `.gitignore` would otherwise interleave bytes if we used
+/// `OpenOptions::append`.
+fn atomic_append_atelier_entry(dir: &Path, path: &Path, existing: &str) -> io::Result<()> {
+    let mut new_contents = String::with_capacity(existing.len() + 12);
+    new_contents.push_str(existing);
+    if !existing.is_empty() && !existing.ends_with('\n') {
+        new_contents.push('\n');
+    }
+    new_contents.push_str(".atelier/\n");
+    atomic_write(dir, path, new_contents.as_bytes())
 }
 
 #[cfg(test)]
@@ -312,5 +356,49 @@ mod tests {
             format!("{second}"),
             "atelier init: no changes (repo already initialised)"
         );
+    }
+
+    // P3 regression: ATELIER.md written via tempfile+persist, not bare
+    // fs::write — a crash mid-write would otherwise leave a truncated
+    // file that the next init silently skips. After init succeeds, no
+    // sibling temp file should remain under the repo root.
+    #[test]
+    fn init_does_not_leak_tempfile_in_repo_root_after_atomic_write() {
+        let r = TempRepo::new("p3-atomic-md");
+        init(&r.path).unwrap();
+        let leftovers: Vec<_> = std::fs::read_dir(&r.path)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "atomic write should clean up its temp file: {leftovers:?}"
+        );
+        assert!(r.path.join("ATELIER.md").exists());
+    }
+
+    // P3 regression: appending the .atelier entry is now read-modify-write
+    // via tempfile+rename, not OpenOptions::append. The end-state must
+    // still match the original behavior — one `.atelier/` line, preserved
+    // trailing newline, no doubling.
+    #[test]
+    fn gitignore_append_is_idempotent_and_preserves_trailing_newline() {
+        let r = TempRepo::new("p3-gi-atomic");
+        std::fs::write(r.path.join(".gitignore"), "target/\n").unwrap();
+        init(&r.path).unwrap();
+        let gi = std::fs::read_to_string(r.path.join(".gitignore")).unwrap();
+        assert!(gi.ends_with("\n"));
+        assert_eq!(
+            gi.matches(".atelier/").count(),
+            1,
+            "should append exactly once: {gi:?}"
+        );
+        // Re-running init must NOT append again (gitignore_has_atelier_entry
+        // already detects the line; this verifies atomic_append isn't
+        // called the second time).
+        init(&r.path).unwrap();
+        let gi2 = std::fs::read_to_string(r.path.join(".gitignore")).unwrap();
+        assert_eq!(gi, gi2);
     }
 }

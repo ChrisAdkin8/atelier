@@ -19,6 +19,9 @@ crate-type = ["lib"]
 
 [dependencies]
 atelier-core = { workspace = true }
+# v47: GUI drives a turn loop via the atelier-cli library. Pulls in
+# Runner, ProviderChoice, MockResponse, EventSink, DispatcherHandle.
+atelier-cli = { workspace = true }
 tauri = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = "0.1"
@@ -26,6 +29,12 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Bridge for `Event::StagingPendingApproval { commit_id: Uuid }` /
+# `CommitDecision { commit_id: Uuid }` — projected onto JSON strings
+# for the webview.
+uuid = { workspace = true }
+# DispatcherHandle Mutex.
+parking_lot = { workspace = true }
 
 [build-dependencies]
 tauri-build = { workspace = true }

@@ -26,10 +26,11 @@ use atelier_core::{
     hooks::HookSet,
     ledger::Ledger,
     persistence::OnDiskSession,
+    plan::PlanCanvas,
     protocol::Envelope,
     protocol_strategy::{parse_json_sentinel, parse_native_tool, NativeToolCall, Strategy},
     sandbox::SandboxPolicy,
-    session::{self, Command as SessionCommand, Event},
+    session::{self, Command as SessionCommand, Event, MessageRole},
     state::NoopHook,
     tools::{
         ast_grep::AstGrep, edit_file::EditFile, grep::Grep, list_dir::ListDir, read_file::ReadFile,
@@ -55,6 +56,12 @@ pub enum EventSink {
     Capture(Arc<parking_lot::Mutex<Vec<Event>>>),
     /// Discard.
     Null,
+    /// Invoke a caller-supplied callback for each event. The GUI uses
+    /// this to forward bus events into the Tauri webview as
+    /// `atelier://event`. The callback must be `Send + Sync` and
+    /// non-blocking; the drain task awaits broadcast::recv() between
+    /// invocations, not the callback itself.
+    Callback(Arc<dyn Fn(&Event) + Send + Sync + 'static>),
 }
 
 /// Provider selector — what `--provider` flips between. `Mock` is for tests
@@ -73,20 +80,31 @@ pub enum ProviderChoice {
     /// the cost ledger stores, e.g. `anthropic:claude-opus-4-7`. API key is
     /// read from `ANTHROPIC_API_KEY` at construction time.
     Anthropic { model_id: String },
+    /// v50: OpenAI-compatible endpoint — works with LM Studio,
+    /// llama.cpp server, vLLM, sglang, Ollama (compat layer), and
+    /// OpenAI itself. `base_url` is the full URL ending in `/v1`
+    /// (e.g. `http://localhost:11434/v1`); `None` uses the adapter's
+    /// default (OpenAI). `api_key` is read from `OPENAI_API_KEY`
+    /// (empty allowed for local servers that don't require auth).
+    /// `model_id` is `<provider>:<model>` — typically `local:<tag>`
+    /// for self-hosted, `openai:<model>` for OpenAI.
+    OpenAiCompat {
+        model_id: String,
+        base_url: Option<String>,
+    },
 }
 
 /// One pre-baked response the `MockAdapter` should return on the Nth
 /// `chat()` call. Lets tests script a multi-turn flow without writing the
 /// JSON-mode sentinel by hand.
+///
+/// The envelope rides in `tool_calls` via the `harness_meta` tool — tests
+/// construct it with the `mock_envelope_tool_call` helper. The fields
+/// below are exactly what the mock returns over the wire; the runner's
+/// `extract_native_envelope` recovers the envelope from `tool_calls`.
 pub struct MockResponse {
     pub assistant_text: String,
-    pub envelope: Envelope,
     pub tool_calls: Vec<ToolCallRequest>,
-    /// When true, this response carries `claimed_done: true` and the loop
-    /// transitions to `Verifying` afterwards. Independent of
-    /// `envelope.claimed_done` so a test can drive the transition without
-    /// rebuilding the envelope.
-    pub claims_done: bool,
 }
 
 /// What `Runner::run` returns. Caller (binary or test) decides whether a
@@ -101,6 +119,63 @@ pub struct RunReport {
     pub dod_passed: Option<bool>,
 }
 
+/// Shared slot a caller registers via [`Runner::with_dispatcher_handle`]
+/// to receive the `SessionDispatcher` Arc as soon as the runner builds
+/// it. The GUI uses this to wire its `submit_approval` Tauri command
+/// to the live dispatcher — spec §3 hunk accept/reject is otherwise
+/// only reachable through direct Rust calls.
+///
+/// Typical setup:
+///
+/// ```ignore
+/// let slot = DispatcherHandle::new();
+/// let runner = Runner::new(...)?
+///     .with_approval_policy(ApprovalPolicy::AwaitApproval)
+///     .with_dispatcher_handle(slot.clone());
+/// tokio::spawn(async move { runner.run(prompt).await });
+/// // Elsewhere (e.g. a Tauri command handler):
+/// if let Some(sd) = slot.get() {
+///     sd.submit_approval(commit_id, accepted);
+/// }
+/// ```
+#[derive(Clone, Default)]
+pub struct DispatcherHandle {
+    inner: Arc<parking_lot::Mutex<Option<Arc<SessionDispatcher>>>>,
+}
+
+impl DispatcherHandle {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn get(&self) -> Option<Arc<SessionDispatcher>> {
+        self.inner.lock().clone()
+    }
+    fn set(&self, sd: Arc<SessionDispatcher>) {
+        *self.inner.lock() = Some(sd);
+    }
+    fn clear(&self) {
+        *self.inner.lock() = None;
+    }
+}
+
+/// Drop-guard that clears the caller's `DispatcherHandle` slot when
+/// `Runner::run` exits via any path: success, `?`-propagated error,
+/// or panic. Without this, an early-return between `handle.set(...)`
+/// and the success-path `handle.clear()` would leave a stale
+/// `Arc<SessionDispatcher>` reachable via `DispatcherHandle::get` —
+/// `submit_approval` would route to a dispatcher that's mid-teardown.
+struct DispatcherHandleGuard<'a> {
+    handle: Option<&'a DispatcherHandle>,
+}
+
+impl Drop for DispatcherHandleGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle {
+            handle.clear();
+        }
+    }
+}
+
 pub struct Runner {
     workspace: PathBuf,
     adapter: Arc<dyn Adapter>,
@@ -109,6 +184,14 @@ pub struct Runner {
     /// emits `claimed_done`. 32 matches a generous canonical-workload
     /// median (PROVISIONAL).
     max_turns: usize,
+    /// Spec §3 hunk-accept-reject policy. Defaults to
+    /// `AutoApproveAll` so every existing caller keeps its v45
+    /// behaviour.
+    approval_policy: atelier_core::dispatcher::ApprovalPolicy,
+    /// Optional caller-supplied slot the runner writes into once the
+    /// SessionDispatcher is constructed. Lets the GUI thread a
+    /// `submit_approval` Tauri command to the live dispatcher.
+    dispatcher_handle: Option<DispatcherHandle>,
 }
 
 impl Runner {
@@ -126,17 +209,62 @@ impl Runner {
             ProviderChoice::Anthropic { model_id } => {
                 Arc::new(AnthropicAdapter::from_env(model_id).map_err(adapter_to_run_error)?)
             }
+            ProviderChoice::OpenAiCompat { model_id, base_url } => {
+                // Empty OPENAI_API_KEY is OK — most local servers
+                // (LM Studio, llama-server, vLLM, Ollama-compat)
+                // don't require auth. A 401 from a server that
+                // *does* require it surfaces as AdapterError::Auth
+                // at first call.
+                //
+                // base_url None → adapter default (OpenAI). Local
+                // servers must be explicit via --base-url (or
+                // OPENAI_BASE_URL via from_env), since pointing at
+                // OpenAI by accident with a `local:` model id would
+                // 404 in a confusing way.
+                let api_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
+                let base = base_url.unwrap_or_else(|| {
+                    std::env::var("OPENAI_BASE_URL")
+                        .unwrap_or_else(|_| "https://api.openai.com/v1".to_string())
+                });
+                Arc::new(
+                    atelier_core::adapter::openai_compat::OpenAiCompatAdapter::new(
+                        api_key, model_id, base,
+                    ),
+                )
+            }
         };
         Ok(Self {
             workspace,
             adapter,
             sink,
             max_turns: 32,
+            approval_policy: atelier_core::dispatcher::ApprovalPolicy::AutoApproveAll,
+            dispatcher_handle: None,
         })
     }
 
     pub fn with_max_turns(mut self, n: usize) -> Self {
         self.max_turns = n;
+        self
+    }
+
+    /// Spec §3 hunk accept/reject: install the policy. With
+    /// `AwaitApproval`, the dispatcher blocks at staging time and emits
+    /// `Event::StagingPendingApproval`; the consumer feeds the accept
+    /// set via `SessionDispatcher::submit_approval`.
+    pub fn with_approval_policy(
+        mut self,
+        policy: atelier_core::dispatcher::ApprovalPolicy,
+    ) -> Self {
+        self.approval_policy = policy;
+        self
+    }
+
+    /// Register a handle the runner writes into once the
+    /// SessionDispatcher is built. See [`DispatcherHandle`] for the
+    /// motivating use case.
+    pub fn with_dispatcher_handle(mut self, handle: DispatcherHandle) -> Self {
+        self.dispatcher_handle = Some(handle);
         self
     }
 
@@ -164,8 +292,28 @@ impl Runner {
 
         // 3. Session actor + SessionDispatcher.
         let session_handle = session::spawn(Arc::new(NoopHook), Arc::new(NoopHook));
-        let session_dispatcher =
-            SessionDispatcher::new(dispatcher, ledger.clone(), session_handle.events_sender());
+        let bus = session_handle.events_sender();
+        let session_dispatcher = Arc::new(
+            SessionDispatcher::new(dispatcher, ledger.clone(), bus.clone())
+                .with_approval_policy(self.approval_policy),
+        );
+        // Publish the dispatcher to any caller-registered handle BEFORE
+        // we start dispatching. The GUI's `submit_approval` Tauri
+        // command reads this slot to route accept-sets back to the
+        // dispatcher.
+        //
+        // v49 scope-guard: every exit path from `run()` — success,
+        // `?`-propagated error, panic — must clear the handle so a
+        // stale Arc isn't left pointing at a torn-down dispatcher. The
+        // Drop impl below runs in LIFO so the handle is cleared
+        // BEFORE the `session_dispatcher` Arc is dropped, which is the
+        // ordering `submit_approval` checks against.
+        if let Some(handle) = &self.dispatcher_handle {
+            handle.set(session_dispatcher.clone());
+        }
+        let _handle_guard = DispatcherHandleGuard {
+            handle: self.dispatcher_handle.as_ref(),
+        };
 
         // 4. Drain events into the sink. tokio task; exits when the
         //    broadcast channel closes (we hold `session_handle` so this is
@@ -175,11 +323,18 @@ impl Runner {
 
         // 5. Turn loop.
         let session_id = session_handle.id();
-        let mut messages: Vec<Message> = vec![Message {
-            role: Role::User,
-            content: prompt,
-            tool_call_id: None,
-        }];
+        let mut messages: Vec<Message> = vec![Message::text(Role::User, prompt.clone())];
+        // Broadcast the initial user prompt so the conversation pane
+        // catches up before the first turn. Best-effort send (no
+        // subscribers is fine — see SessionDispatcher::dispatch).
+        let _ = bus.send(Event::MessageCommitted {
+            role: MessageRole::User,
+            text: prompt,
+        });
+        // Live plan canvas — `envelope.plan_update` accumulates into
+        // this. After each apply we broadcast a snapshot so the plan
+        // pane converges without replay.
+        let mut plan_canvas = PlanCanvas::new();
         let mut turns = 0;
         let mut final_state = State::Idle;
         let tools_spec = registry_to_tool_specs();
@@ -213,13 +368,41 @@ impl Runner {
                 }
             };
 
+            // P5: re-send assistant turn with its tool_calls so multi-turn
+            // tool flows round-trip the tool_use ids correctly. Pre-P5 we
+            // flattened to text-only, which broke any provider whose
+            // protocol requires the prior `tool_use` block to reference
+            // its matching `tool_result` (Anthropic, OpenAI, Bedrock,
+            // Gemini all do).
+            //
+            // v25.2-F: keep ALL tool_calls — including the
+            // `harness_meta` envelope-bearing call — on the assistant
+            // message so the conversation history is complete. The
+            // dispatcher only executes the non-envelope ones (filtered
+            // below into `real_tool_calls`), but the envelope tool_use
+            // id must still appear in history because the next turn
+            // (or a future audit) may reference it.
             messages.push(Message {
                 role: Role::Assistant,
                 content: response.text.clone(),
                 tool_call_id: None,
+                tool_calls: response.tool_calls.clone(),
             });
-
-            // 7. Dispatch any non-envelope tool calls.
+            let _ = bus.send(Event::MessageCommitted {
+                role: MessageRole::Assistant,
+                text: response.text.clone(),
+            });
+            // Apply the envelope's plan_update (if any) and broadcast a
+            // fresh snapshot so the plan pane converges. `apply_envelope`
+            // is idempotent — re-applying the same update produces the
+            // same canvas — but we still broadcast on every turn so a
+            // late-joining subscriber sees something promptly.
+            if let Some(plan_update) = &envelope.plan_update {
+                let _report = plan_canvas.apply_envelope(plan_update);
+                let _ = bus.send(Event::PlanSnapshot {
+                    steps: plan_canvas.to_vec(),
+                });
+            }
             let real_tool_calls: Vec<_> = response
                 .tool_calls
                 .into_iter()
@@ -242,14 +425,23 @@ impl Runner {
                     let outcome = session_dispatcher.dispatch(&call, &ctx, now_rfc3339).await;
                     // Feed the tool result back into the next turn's
                     // messages so the adapter sees what happened.
+                    // v25.2-F: failure path uses serde_json::json! so an
+                    // error containing quotes/backslashes/newlines is
+                    // properly escaped. Pre-fix `format!("{{\"error\":\"{e}\"}}")`
+                    // produced invalid JSON when `e` contained `"`.
                     let result_str = match &outcome.result {
                         Ok(r) => serde_json::to_string(&r.output).unwrap_or_default(),
-                        Err(e) => format!("{{\"error\":\"{e}\"}}"),
+                        Err(e) => serde_json::json!({ "error": e.to_string() }).to_string(),
                     };
+                    let _ = bus.send(Event::MessageCommitted {
+                        role: MessageRole::Tool,
+                        text: result_str.clone(),
+                    });
                     messages.push(Message {
                         role: Role::Tool,
                         content: result_str,
                         tool_call_id: Some(outcome.tool_call_id),
+                        tool_calls: Vec::new(),
                     });
                 }
                 advance(&session_handle, State::ToolExecuting, State::Streaming).await?;
@@ -257,6 +449,20 @@ impl Runner {
             }
 
             turns = turn + 1;
+
+            // Per-turn ContextSnapshot. The runner doesn't yet wire a
+            // full §5 ContextManager; for now we approximate `known` by
+            // round-tripping the messages through the adapter's
+            // count_tokens (which falls back to char/4 on adapters
+            // without a real token counter). `unknown` is 0 because no
+            // item carries `TokenSource::Unavailable` yet — when a
+            // real ContextManager wires in, it'll provide both.
+            if let Ok(token_count) = self.adapter.count_tokens(&messages).await {
+                let _ = bus.send(Event::ContextSnapshot {
+                    known_tokens: token_count.count,
+                    unknown_tokens: 0,
+                });
+            }
 
             // 8. If the envelope or scripted response says done, exit.
             if envelope.claimed_done == Some(true) {
@@ -266,16 +472,22 @@ impl Runner {
             }
         }
 
-        // 9. DoD checks (placeholder — the runner doesn't yet shell out
-        //    to dod.checks. That's a follow-on in the runner; the trait
-        //    seam is here.)
-        let dod_passed = dod.as_ref().map(|_cfg| {
-            // TODO: spawn each check.command in the §11 sandbox + assert
-            // expect clauses. For now, reporting None of the checks fail
-            // gives a soft-pass signal; the field structure lets a real
-            // DoD runner replace this without API churn.
-            true
-        });
+        // 9. DoD checks. The runner doesn't yet shell out to dod.checks
+        //    — that's a follow-on. Until then we report `None`
+        //    unconditionally rather than `Some(true)` regardless of dod
+        //    presence: the latter is a lie that downstream readers (audit
+        //    log, UI badge) would interpret as "all DoD checks passed".
+        //    Spec §7 expects this field to mean what it says. Emit a
+        //    one-shot warning when a DoD config IS present so the user
+        //    knows their checks aren't being honoured.
+        if let Some(cfg) = &dod {
+            tracing::warn!(
+                checks = cfg.checks.len(),
+                "DoD config loaded but the runner's check executor is not yet wired; \
+                 reporting dod_passed=None. See tasks/todo.md (P4 follow-on)."
+            );
+        }
+        let dod_passed: Option<bool> = None;
 
         // 10. Done — transition to terminal and persist.
         if final_state == State::Verifying {
@@ -305,6 +517,8 @@ impl Runner {
         //     Sender clone, drop the handle's Sender clone, then the
         //     sink's rx.recv() sees Closed and the drain task exits.
         let _ = session_handle.send(SessionCommand::Shutdown).await;
+        // The DispatcherHandleGuard (created above) clears the slot
+        // on every exit path; nothing extra to do here.
         drop(session_dispatcher);
         drop(session_handle);
         // Safety belt: if a future regression keeps a Sender alive, the
@@ -443,6 +657,11 @@ fn build_mock_adapter(responses: Vec<MockResponse>) -> MockAdapter {
             StreamChunk::Complete {
                 response: ChatResponse {
                     text: r.assistant_text,
+                    stop_reason: Some(if !r.tool_calls.is_empty() {
+                        atelier_core::adapter::StopReason::ToolUse
+                    } else {
+                        atelier_core::adapter::StopReason::EndTurn
+                    }),
                     tool_calls: r.tool_calls,
                     usage: Usage {
                         prompt_tokens: 1,
@@ -451,13 +670,12 @@ fn build_mock_adapter(responses: Vec<MockResponse>) -> MockAdapter {
                         count_source: TokenSource::Approx,
                         latency_ms: Some(0),
                     },
-                    strategy: if r.envelope.claimed_done == Some(true) || r.claims_done {
-                        // The envelope rode in tool_calls; the runner's
-                        // extract_native_envelope picks it up.
-                        Strategy::NativeTool
-                    } else {
-                        Strategy::NativeTool
-                    },
+                    // MockResponse only exercises the native-tool path —
+                    // the envelope rides in `tool_calls` and the runner's
+                    // `extract_native_envelope` picks it up. Other
+                    // strategies are exercised by the strategy-level unit
+                    // tests in atelier-core, not by this end-to-end mock.
+                    strategy: Strategy::NativeTool,
                 },
             },
         ]);
@@ -496,6 +714,15 @@ fn spawn_sink_drain(
             let mut rx = rx.resubscribe();
             tokio::spawn(async move { while rx.recv().await.is_ok() {} })
         }
+        EventSink::Callback(cb) => {
+            let cb = cb.clone();
+            let mut rx = rx.resubscribe();
+            tokio::spawn(async move {
+                while let Ok(ev) = rx.recv().await {
+                    cb(&ev);
+                }
+            })
+        }
     }
 }
 
@@ -504,6 +731,10 @@ fn spawn_sink_drain(
 /// `allow(dead_code)` because the integration-test build of this module
 /// doesn't call it — only the binary does. See the EventSink comment for
 /// the dual-build context.
+// v49: binary-only helper. Stays `pub` because the [[bin]] target is
+// a separate crate from the library and `pub(crate)` would hide it.
+// The lib's doc warns consumers off `atelier_cli::runner::*`; this
+// is the one item there that's strictly binary-internal.
 #[allow(dead_code)]
 pub fn read_prompt(path: Option<&Path>) -> io::Result<String> {
     match path {

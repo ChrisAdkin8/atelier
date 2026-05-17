@@ -10,6 +10,14 @@ description = "Atelier command-line interface. Headless entry point — provides
 name = "atelier"
 path = "src/main.rs"
 
+# v47: also expose the runner as a library so atelier-gui (and future
+# atelier-tui driver mode) can build a SessionDispatcher + drive a
+# turn loop without re-implementing the wiring. Binary still uses the
+# same Runner via the local lib.
+[lib]
+name = "atelier_cli"
+path = "src/lib.rs"
+
 [dependencies]
 atelier-core = { workspace = true }
 # `atelier run` needs an async runtime + JSON serialisation for envelope/

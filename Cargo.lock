@@ -117,6 +117,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "futures",
+ "libc",
  "parking_lot",
  "regex",
  "reqwest 0.12.28",
@@ -141,7 +142,9 @@ dependencies = [
 name = "atelier-gui"
 version = "0.0.0"
 dependencies = [
+ "atelier-cli",
  "atelier-core",
+ "parking_lot",
  "serde",
  "serde_json",
  "tauri",
@@ -150,19 +153,23 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
 name = "atelier-tui"
 version = "0.0.0"
 dependencies = [
+ "atelier-cli",
  "atelier-core",
  "crossterm",
  "ratatui",
+ "serde_json",
  "tokio",
  "tokio-stream",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

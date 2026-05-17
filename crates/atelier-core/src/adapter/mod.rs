@@ -20,6 +20,7 @@
 //! tests off the network and lets us inject specific failure modes.
 
 pub mod anthropic;
+pub mod openai_compat;
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
@@ -44,6 +45,29 @@ pub struct Message {
     /// expects (e.g., Anthropic `tool_use_id`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// When `role == Assistant`, the tool-use blocks the model issued in
+    /// this turn. The adapter forwards them back on the next request so
+    /// multi-turn tool flows round-trip without losing the original
+    /// tool_use ids — pre-P5 the adapter flattened this to text-only,
+    /// which broke any provider whose protocol requires the prior
+    /// `tool_use` block to reference its matching `tool_result` (Anthropic,
+    /// OpenAI, Bedrock, Gemini all do).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolCallRequest>,
+}
+
+impl Message {
+    /// Construct a user/system/assistant message with no tool plumbing.
+    /// Most call sites use this — the `tool_call_id` + `tool_calls` cases
+    /// are rare enough to warrant explicit construction.
+    pub fn text(role: Role, content: impl Into<String>) -> Self {
+        Self {
+            role,
+            content: content.into(),
+            tool_call_id: None,
+            tool_calls: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -65,6 +89,33 @@ pub struct ToolSpec {
     pub input_schema: serde_json::Value,
 }
 
+/// Why the model stopped generating. Cross-provider abstraction over
+/// Anthropic's `stop_reason`, OpenAI's `finish_reason`, etc.
+///
+/// - `EndTurn` — the model voluntarily stopped (Anthropic `end_turn`,
+///   OpenAI `stop`). The turn is complete.
+/// - `MaxTokens` — the response was truncated because `max_tokens` was
+///   reached. The harness should treat this as a soft failure: the
+///   envelope (if any) is likely incomplete and re-prompting is in order.
+/// - `ToolUse` — the model wants to invoke one or more tools; the
+///   adapter has populated `ChatResponse.tool_calls`.
+/// - `StopSequence` — a configured stop sequence was emitted.
+/// - `Refusal` — the model refused (Anthropic `refusal`). The harness
+///   surfaces this to the user; do not retry.
+/// - `Other` — unrecognised provider-specific value; treat as
+///   `EndTurn` for terminal-state purposes but log so we know to extend
+///   the enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StopReason {
+    EndTurn,
+    MaxTokens,
+    ToolUse,
+    StopSequence,
+    Refusal,
+    Other,
+}
+
 /// One model invocation's structured response. Streaming adapters emit
 /// [`StreamChunk`] values incrementally and assemble this at the end; the
 /// non-streaming `chat()` returns it directly.
@@ -82,6 +133,13 @@ pub struct ChatResponse {
     /// authoritative on this — the harness reads it to decide which parser
     /// to use without re-inferring from response shape.
     pub strategy: Strategy,
+    /// Why the model stopped. Provider-agnostic; see [`StopReason`].
+    /// `None` only when the adapter cannot determine it (truncated stream,
+    /// pre-`StopReason` provider). The harness must distinguish `MaxTokens`
+    /// and `Refusal` from `EndTurn` — silently treating truncated-mid-thought
+    /// as success is the bug this field exists to prevent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<StopReason>,
 }
 
 /// Native tool-use call requested by the model. The dispatcher executes it
@@ -407,6 +465,7 @@ impl MockAdapter {
                         latency_ms: Some(0),
                     },
                     strategy: Strategy::JsonSentinel,
+                    stop_reason: Some(StopReason::EndTurn),
                 },
             },
         ]);
@@ -477,6 +536,7 @@ mod tests {
             role,
             content: content.into(),
             tool_call_id: None,
+            tool_calls: Vec::new(),
         }
     }
 
@@ -493,6 +553,7 @@ mod tests {
                     latency_ms: Some(42),
                 },
                 strategy: Strategy::JsonSentinel,
+                stop_reason: Some(StopReason::EndTurn),
             },
         }
     }
@@ -706,6 +767,7 @@ mod tests {
             role: Role::Tool,
             content: "result".into(),
             tool_call_id: Some("tc-7".into()),
+            tool_calls: Vec::new(),
         };
         let json = serde_json::to_string(&m).unwrap();
         let back: Message = serde_json::from_str(&json).unwrap();
@@ -715,6 +777,7 @@ mod tests {
             role: Role::User,
             content: "ask".into(),
             tool_call_id: None,
+            tool_calls: Vec::new(),
         };
         let json2 = serde_json::to_string(&m2).unwrap();
         assert!(!json2.contains("tool_call_id"));

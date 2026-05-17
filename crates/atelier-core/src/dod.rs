@@ -194,9 +194,18 @@ impl DodConfig {
         std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".atelier").join(DOD_FILE))
     }
 
-    /// Discovery: per-repo file overrides global. Missing both is `Ok(None)`
-    /// — a fresh repo has no DoD configured and the Verifying state
-    /// degrades to a UI banner ("no DoD configured for this repo").
+    /// Discovery: per-repo file overrides global. Missing both is
+    /// `Ok(None)`.
+    ///
+    /// **Fail-open warning.** Callers MUST NOT treat `Ok(None)` as
+    /// "verification passed". `None` means "no DoD was configured" —
+    /// the Verifying state should degrade to a UI banner ("no DoD
+    /// configured for this repo") and the persisted session's
+    /// `dod_passed` field should be `None`, not `Some(true)`. Reporting
+    /// `Some(true)` because no checks were defined is the
+    /// rubber-stamp anti-pattern the §7 contract exists to prevent.
+    /// See [`Self::paths_searched`] if you want to log where discovery
+    /// looked.
     pub fn load(repo_root: &Path) -> Result<Option<Self>, DodError> {
         let per_repo = Self::per_repo_path(repo_root);
         if per_repo.is_file() {
@@ -208,6 +217,18 @@ impl DodConfig {
             }
         }
         Ok(None)
+    }
+
+    /// The paths [`Self::load`] would (or did) consult, in priority order.
+    /// Useful for telling the user *why* DoD discovery returned `None` —
+    /// e.g. logging "no DoD configured (searched: <paths>)" instead of
+    /// silently degrading.
+    pub fn paths_searched(repo_root: &Path) -> Vec<PathBuf> {
+        let mut out = vec![Self::per_repo_path(repo_root)];
+        if let Some(global) = Self::global_path() {
+            out.push(global);
+        }
+        out
     }
 
     /// Load from an explicit path (testing, atypical layouts).
