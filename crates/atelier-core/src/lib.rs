@@ -74,10 +74,11 @@ pub use protocol_conformance::{
     CONFORMANCE_WINDOW, TURN_FAILURE_BUDGET,
 };
 pub use protocol_strategy::{
-    encode_json_sentinel, encode_native_tool, encode_regex_prose, parse_json_sentinel,
-    parse_native_tool, parse_regex_prose, JsonSentinelParse, NativeToolCall, Strategy,
-    StrategyError, HARNESS_META_NAME, PROSE_TAG_CHANGES, PROSE_TAG_DONE, PROSE_TAG_GROUNDING,
-    PROSE_TAG_UNCERTAINTY, SENTINEL_CLOSE, SENTINEL_OPEN,
+    encode_json_sentinel, encode_native_tool, encode_regex_prose, measure_overhead,
+    parse_json_sentinel, parse_native_tool, parse_regex_prose, JsonSentinelParse, NativeToolCall,
+    OverheadMeasurement, Strategy, StrategyError, APPROX_CHARS_PER_TOKEN, HARNESS_META_NAME,
+    PROSE_TAG_CHANGES, PROSE_TAG_DONE, PROSE_TAG_GROUNDING, PROSE_TAG_UNCERTAINTY, SENTINEL_CLOSE,
+    SENTINEL_OPEN,
 };
 pub use sandbox::{linux_bwrap_argv, macos_profile, SandboxError, SandboxPolicy};
 pub use session::{

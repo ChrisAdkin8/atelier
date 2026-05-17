@@ -1,0 +1,51 @@
+{
+  "version": 1,
+  "measured_at": "2026-05-17T22:20:19Z",
+  "providers": [
+    {
+      "provider": "mock",
+      "model_id": "mock:protocol-overhead",
+      "strategy": "json_mode",
+      "median_overhead_pct": 64.0,
+      "conformance_rate": 1.0,
+      "bytes_on_wire": 256,
+      "tokens_envelope": 64,
+      "parse_time_ns": 75709,
+      "rolling_median": {
+        "window_days": 7,
+        "value": 64.0,
+        "samples": 2
+      }
+    },
+    {
+      "provider": "mock",
+      "model_id": "mock:protocol-overhead",
+      "strategy": "native_tool",
+      "median_overhead_pct": 67.0,
+      "conformance_rate": 1.0,
+      "bytes_on_wire": 265,
+      "tokens_envelope": 67,
+      "parse_time_ns": 251958,
+      "rolling_median": {
+        "window_days": 7,
+        "value": 67.0,
+        "samples": 2
+      }
+    },
+    {
+      "provider": "mock",
+      "model_id": "mock:protocol-overhead",
+      "strategy": "regex_prose",
+      "median_overhead_pct": 33.0,
+      "conformance_rate": 1.0,
+      "bytes_on_wire": 129,
+      "tokens_envelope": 33,
+      "parse_time_ns": 4459,
+      "rolling_median": {
+        "window_days": 7,
+        "value": 33.0,
+        "samples": 2
+      }
+    }
+  ]
+}

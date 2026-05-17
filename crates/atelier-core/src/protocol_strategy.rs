@@ -467,6 +467,99 @@ fn uncertainty_short(k: crate::protocol::UncertaintyKind) -> &'static str {
     }
 }
 
+// ---------- measurement ----------
+
+/// One round-trip overhead measurement for an [`Envelope`] under one
+/// [`Strategy`]. Produced by [`measure_overhead`] and consumed by the §2
+/// nightly protocol-overhead harness (`atelier protocol-overhead`).
+///
+/// `bytes_on_wire` is the length of the *encoded* envelope payload — for
+/// `NativeTool` we encode the synthetic `harness_meta` tool call as JSON
+/// (the shape the adapter actually transmits in a `tool_use` block); for
+/// the prose strategies it's the UTF-8 byte length of the sentinel-wrapped
+/// or tagged string. `tokens_envelope` is the chars/4 heuristic — the same
+/// approximation [`crate::adapter::TokenSource::Approx`] uses, so the
+/// number is directly comparable across providers without dragging in a
+/// model-specific tokenizer. `parse_time_ns` is the wall-clock time of one
+/// decode pass back into a typed `Envelope`.
+///
+/// The three figures together let the nightly job compute median
+/// percentage overhead against a no-protocol baseline and surface
+/// regressions per the §2 spec.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OverheadMeasurement {
+    /// Wire-format byte length the adapter would transmit.
+    pub bytes_on_wire: u64,
+    /// Approximate token count (chars / 4) for the encoded payload.
+    pub tokens_envelope: u64,
+    /// Wall-clock nanoseconds to decode the payload back into an
+    /// [`Envelope`]. Single sample — the caller drives N iterations and
+    /// computes whatever statistic the §2 contract calls for.
+    pub parse_time_ns: u64,
+}
+
+/// Chars-per-token used by [`measure_overhead`]'s `tokens_envelope`
+/// estimate. Spec §1 "approximate counting" — the same 4:1 ratio the
+/// `Approx` token-count source assumes throughout the harness.
+pub const APPROX_CHARS_PER_TOKEN: u64 = 4;
+
+/// Encode `env` under `strategy`, then time one decode pass.
+///
+/// Returns the encoded byte length, the chars/4 token approximation, and
+/// the wall-clock parse time in nanoseconds.
+///
+/// **Lossy round-trip on `RegexProse`** is intentional and matches the
+/// strategy's documented contract (`plan_update`,
+/// `constraints_acknowledged` are dropped). For overhead measurement that
+/// is fine: we are measuring how many bytes/tokens the *carrier* costs,
+/// not whether the carrier preserves every envelope field.
+pub fn measure_overhead(
+    env: &Envelope,
+    strategy: Strategy,
+) -> Result<OverheadMeasurement, StrategyError> {
+    let payload = match strategy {
+        Strategy::NativeTool => {
+            let call = encode_native_tool(env)?;
+            // The wire representation of a native tool call is the JSON
+            // serialisation of `{name, arguments}` — that is what the
+            // adapter packages into a `tool_use` block. Using
+            // `to_string` (not `to_string_pretty`) so we measure the
+            // compact form the adapter actually sends.
+            serde_json::to_string(&call).map_err(|e| StrategyError::Encode(e.to_string()))?
+        }
+        Strategy::JsonSentinel => encode_json_sentinel(env)?,
+        Strategy::RegexProse => encode_regex_prose(env)?,
+    };
+
+    let bytes_on_wire = payload.len() as u64;
+    let tokens_envelope = (payload.chars().count() as u64).div_ceil(APPROX_CHARS_PER_TOKEN);
+
+    let start = std::time::Instant::now();
+    match strategy {
+        Strategy::NativeTool => {
+            // Re-derive the typed `NativeToolCall` from the serialised
+            // payload so the parse time mirrors the real wire path
+            // (deserialise the tool call, then decode the envelope).
+            let call: NativeToolCall =
+                serde_json::from_str(&payload).map_err(|e| StrategyError::Encode(e.to_string()))?;
+            let _ = parse_native_tool(&call)?;
+        }
+        Strategy::JsonSentinel => {
+            let _ = parse_json_sentinel(&payload)?;
+        }
+        Strategy::RegexProse => {
+            let _ = parse_regex_prose(&payload)?;
+        }
+    }
+    let parse_time_ns = start.elapsed().as_nanos() as u64;
+
+    Ok(OverheadMeasurement {
+        bytes_on_wire,
+        tokens_envelope,
+        parse_time_ns,
+    })
+}
+
 // ---------- errors ----------
 
 #[derive(Debug, thiserror::Error)]
@@ -882,6 +975,59 @@ mod tests {
         let long = "x".repeat(600);
         let text = format!("{PROSE_TAG_CHANGES}\n  E a.py: {long}\n");
         let err = parse_regex_prose(&text).unwrap_err();
+        assert!(matches!(err, StrategyError::Envelope(_)));
+    }
+
+    // ---------- measure_overhead ----------
+
+    #[test]
+    fn measure_overhead_reports_nonzero_bytes_and_tokens_for_all_strategies() {
+        // The §2 nightly harness expects every strategy to yield a
+        // positive `bytes_on_wire` and `tokens_envelope` against a
+        // non-trivial envelope. A zero here would mean encode silently
+        // returned an empty payload — exactly the failure mode the
+        // measurement was added to catch.
+        let env = example_envelope();
+        for strategy in [
+            Strategy::NativeTool,
+            Strategy::JsonSentinel,
+            Strategy::RegexProse,
+        ] {
+            let m = measure_overhead(&env, strategy)
+                .unwrap_or_else(|e| panic!("measure {strategy:?}: {e}"));
+            assert!(m.bytes_on_wire > 0, "{strategy:?} bytes_on_wire was 0");
+            assert!(m.tokens_envelope > 0, "{strategy:?} tokens_envelope was 0");
+            // parse_time_ns is best-effort; a single round-trip can be
+            // <1 ns on some hosts (sub-tick resolution). Don't assert a
+            // floor — just that the field is populated (u64 is always so).
+        }
+    }
+
+    #[test]
+    fn measure_overhead_token_approximation_matches_chars_per_token_ratio() {
+        // The token figure is `ceil(chars / 4)`. Reach into the raw
+        // payload to confirm we're not double-counting bytes vs. chars.
+        let env = example_envelope();
+        let m = measure_overhead(&env, Strategy::JsonSentinel).unwrap();
+        let payload = encode_json_sentinel(&env).unwrap();
+        let expected = (payload.chars().count() as u64).div_ceil(APPROX_CHARS_PER_TOKEN);
+        assert_eq!(m.tokens_envelope, expected);
+        assert_eq!(m.bytes_on_wire, payload.len() as u64);
+    }
+
+    #[test]
+    fn measure_overhead_propagates_validation_errors() {
+        // An invalid envelope (summary length over the schema cap) must
+        // surface as `Envelope`, not silently produce a number.
+        let env = Envelope {
+            claimed_changes: Some(vec![ClaimedChange {
+                path: "a".into(),
+                kind: ClaimedChangeKind::Edit,
+                summary: "x".repeat(600),
+            }]),
+            ..Default::default()
+        };
+        let err = measure_overhead(&env, Strategy::NativeTool).unwrap_err();
         assert!(matches!(err, StrategyError::Envelope(_)));
     }
 }
