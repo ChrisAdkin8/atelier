@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- atelier app icon — capital A in the banner wordmark style (Iowan Old Style, serif).
+     Colors and fonts mirror assets/banner-loop.svg.
+     Re-render the macOS iconset + .icns via assets/build-icon.sh. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024"
+     role="img" aria-label="atelier — A monogram">
+  <title>atelier</title>
+
+  <!-- Apple's macOS Big Sur+ "Production icon" template: 1024×1024 canvas with the
+       rounded body inscribed in an 824×824 inner grid (≈100 px padding on each
+       side) so the icon visually matches system apps in the Dock and Cmd+Tab.
+       Body corner radius keeps the same 22.4% ratio of the body's side. -->
+  <rect x="100" y="100" width="824" height="824" rx="185" ry="185" fill="#0e1116"/>
+
+  <!-- Capital A, banner serif, warm off-white. Scaled to fit the inner body;
+       baseline tuned to put the letter mid-height near canvas centre (y=512). -->
+  <text x="512" y="744"
+        text-anchor="middle"
+        font-family="'Iowan Old Style', 'Iowan Old Style BT', Georgia, 'Times New Roman', serif"
+        font-size="660"
+        font-weight="500"
+        letter-spacing="-6"
+        fill="#f0ead6">A</text>
+</svg>
