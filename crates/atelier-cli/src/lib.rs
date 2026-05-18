@@ -52,6 +52,12 @@ pub mod compaction;
 /// compaction and replays the originals back into context.
 pub mod expansion;
 
+/// §2 protocol-overhead harness. Backs the `atelier protocol-overhead`
+/// CLI subcommand and the nightly CI job; measures bytes-on-wire,
+/// approximate tokens, and parse time per emission strategy against
+/// scripted MockAdapter fixtures.
+pub mod overhead;
+
 pub use runner::{
     AdapterHandle, DispatcherHandle, EventSink, MockResponse, ProbePolicy, ProviderChoice,
     RunError, RunReport, Runner,

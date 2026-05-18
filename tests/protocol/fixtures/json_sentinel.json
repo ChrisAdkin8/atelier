@@ -1,0 +1,70 @@
+[
+  {
+    "label": "single_edit_with_grounding",
+    "envelope": {
+      "claimed_changes": [
+        {
+          "path": "utils.py",
+          "kind": "edit",
+          "summary": "Add divisible_by(n, m); raise ValueError when m == 0."
+        }
+      ],
+      "claimed_done": true,
+      "grounding": [
+        {
+          "text_span": "existing utils.py module-level scope",
+          "source": "tool:read"
+        }
+      ]
+    },
+    "round_trip_lossless": true
+  },
+  {
+    "label": "plan_update_only",
+    "envelope": {
+      "claimed_done": false,
+      "plan_update": {
+        "ops": [
+          { "op": "add", "step": "write the helper" },
+          { "op": "complete", "step": "write the helper" }
+        ]
+      }
+    },
+    "round_trip_lossless": true
+  },
+  {
+    "label": "embedded_sentinel_in_summary",
+    "envelope": {
+      "claimed_changes": [
+        {
+          "path": "docs/protocol.md",
+          "kind": "edit",
+          "summary": "Document the <<<harness_meta>>> sentinel and its <<<end>>> close tag."
+        }
+      ],
+      "claimed_done": false
+    },
+    "round_trip_lossless": true
+  },
+  {
+    "label": "constraints_and_grounding",
+    "envelope": {
+      "claimed_changes": [
+        {
+          "path": "utils.py",
+          "kind": "edit",
+          "summary": "Add divisible_by."
+        }
+      ],
+      "claimed_done": true,
+      "constraints_acknowledged": ["pure function", "no I/O"],
+      "grounding": [
+        {
+          "text_span": "function signature in prompt",
+          "source": "context:file"
+        }
+      ]
+    },
+    "round_trip_lossless": true
+  }
+]

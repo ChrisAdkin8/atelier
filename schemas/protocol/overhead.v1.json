@@ -26,6 +26,31 @@
             "minimum": 0,
             "maximum": 1,
             "description": "Fraction of turns where envelope passed JSONSchema validation after the re-prompt loop"
+          },
+          "bytes_on_wire": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Encoded envelope byte length for the strategy on the canonical fixture (added by the §2 overhead harness)."
+          },
+          "tokens_envelope": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Chars/4 token approximation of the encoded envelope payload."
+          },
+          "parse_time_ns": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Wall-clock nanoseconds for one decode pass back into a typed Envelope."
+          },
+          "rolling_median": {
+            "type": "object",
+            "description": "Rolling 7-day median of median_overhead_pct, populated by the nightly job from the prior week's runs. Used by the regression check (>10% drift fails the job).",
+            "required": ["window_days", "value"],
+            "properties": {
+              "window_days": {"type": "integer", "minimum": 1, "description": "Number of days the median was computed over."},
+              "value": {"type": "number", "description": "Median value of median_overhead_pct across the window."},
+              "samples": {"type": "integer", "minimum": 0, "description": "Number of data points contributing to the median."}
+            }
           }
         }
       }

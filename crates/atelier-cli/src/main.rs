@@ -11,6 +11,7 @@
 
 // v47: `runner` now lives in the crate's library (see `src/lib.rs`).
 // Import the binary's view via the library name.
+use atelier_cli::overhead;
 use atelier_cli::runner;
 
 use atelier_core::config::{
@@ -33,6 +34,11 @@ SUBCOMMANDS:
     run [OPTIONS] [PROMPT]         Drive a turn against the configured adapter,
                                    loop until claimed_done, run DoD checks,
                                    persist the session. Phase C unblock (1).
+    protocol-overhead [OPTIONS]    Measure §2 emission-strategy overhead against
+                                   the scripted MockAdapter fixtures, write the
+                                   result to tests/protocol/overhead.json, and
+                                   (optionally) flag >10% drift vs the rolling
+                                   median. Backs the nightly CI job.
 
 `atelier run` may read defaults from a TOML config (v53):
 
@@ -136,6 +142,7 @@ fn main() -> ExitCode {
         }
         "init" => run_init(args),
         "run" => run_run(args),
+        "protocol-overhead" => run_protocol_overhead(args),
         other => {
             eprintln!("atelier: unknown subcommand `{other}`\n");
             eprintln!("{USAGE}");
@@ -531,6 +538,179 @@ fn resolve_probe_policy(cli: &CliArgs, config: &ProvidersConfig) -> Option<runne
             ProbePolicyName::Skip => runner::ProbePolicy::Skip,
             ProbePolicyName::Force => runner::ProbePolicy::Force,
         })
+}
+
+// ---------- `atelier protocol-overhead` ----------
+//
+// The subcommand is intentionally small: it forwards to
+// `atelier_cli::overhead::run` with paths layered (CLI > defaults) and
+// prints a one-line summary on success. The harness module owns the
+// schema-aware writer + regression check; the binary's job is argv
+// parsing and exit-code mapping.
+
+const PROTOCOL_OVERHEAD_USAGE: &str = "\
+atelier protocol-overhead — measure §2 emission-strategy overhead
+
+USAGE:
+    atelier protocol-overhead [OPTIONS]
+
+OPTIONS:
+    --workspace <PATH>           Project root (default: current dir).
+                                 Used to resolve --fixtures-dir / --out
+                                 when those are not absolute.
+    --fixtures-dir <PATH>        Override the fixture directory
+                                 (default: <workspace>/tests/protocol/fixtures).
+    --out <PATH>                 Override the output file path
+                                 (default: <workspace>/tests/protocol/overhead.json).
+    --provider <NAME>            Provider name written to the report.
+                                 Default: \"mock\".
+    --model-id <ID>              Model id written to the report.
+                                 Default: \"mock:protocol-overhead\".
+    --check-regression           Compare current median_overhead_pct
+                                 against the prior file's
+                                 rolling_median.value and exit non-zero
+                                 on drift > --regression-threshold-pct.
+                                 The output file is still rewritten.
+    --regression-threshold-pct <N>  Drift percentage that constitutes a
+                                 regression. Default: 10.0.
+    -h, --help                   Print this message.
+";
+
+struct OverheadArgs {
+    workspace: Option<PathBuf>,
+    fixtures_dir: Option<PathBuf>,
+    out: Option<PathBuf>,
+    provider: Option<String>,
+    model_id: Option<String>,
+    check_regression: bool,
+    regression_threshold_pct: Option<f64>,
+}
+
+impl OverheadArgs {
+    fn empty() -> Self {
+        Self {
+            workspace: None,
+            fixtures_dir: None,
+            out: None,
+            provider: None,
+            model_id: None,
+            check_regression: false,
+            regression_threshold_pct: None,
+        }
+    }
+}
+
+fn run_protocol_overhead(mut args: impl Iterator<Item = String>) -> ExitCode {
+    let mut out = OverheadArgs::empty();
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "-h" | "--help" => {
+                print!("{PROTOCOL_OVERHEAD_USAGE}");
+                return ExitCode::SUCCESS;
+            }
+            "--workspace" => match args.next() {
+                Some(v) => out.workspace = Some(PathBuf::from(v)),
+                None => {
+                    eprintln!("atelier protocol-overhead: --workspace requires a path");
+                    return ExitCode::from(2);
+                }
+            },
+            "--fixtures-dir" => match args.next() {
+                Some(v) => out.fixtures_dir = Some(PathBuf::from(v)),
+                None => {
+                    eprintln!("atelier protocol-overhead: --fixtures-dir requires a path");
+                    return ExitCode::from(2);
+                }
+            },
+            "--out" => match args.next() {
+                Some(v) => out.out = Some(PathBuf::from(v)),
+                None => {
+                    eprintln!("atelier protocol-overhead: --out requires a path");
+                    return ExitCode::from(2);
+                }
+            },
+            "--provider" => match args.next() {
+                Some(v) => out.provider = Some(v),
+                None => {
+                    eprintln!("atelier protocol-overhead: --provider requires a name");
+                    return ExitCode::from(2);
+                }
+            },
+            "--model-id" => match args.next() {
+                Some(v) => out.model_id = Some(v),
+                None => {
+                    eprintln!("atelier protocol-overhead: --model-id requires an id");
+                    return ExitCode::from(2);
+                }
+            },
+            "--check-regression" => out.check_regression = true,
+            "--regression-threshold-pct" => match args.next().and_then(|s| s.parse::<f64>().ok()) {
+                Some(n) if n.is_finite() && n >= 0.0 => out.regression_threshold_pct = Some(n),
+                _ => {
+                    eprintln!(
+                        "atelier protocol-overhead: --regression-threshold-pct requires a non-negative number"
+                    );
+                    return ExitCode::from(2);
+                }
+            },
+            other => {
+                eprintln!("atelier protocol-overhead: unknown argument {other:?}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+
+    let workspace = match out
+        .workspace
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(env::current_dir)
+    {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("atelier protocol-overhead: cannot read current directory: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let mut config = overhead::OverheadConfig::with_workspace(&workspace);
+    if let Some(p) = out.fixtures_dir {
+        config.fixtures_dir = p;
+    }
+    if let Some(p) = out.out {
+        config.out_path = p;
+    }
+    if let Some(p) = out.provider {
+        config.provider = p;
+    }
+    if let Some(m) = out.model_id {
+        config.model_id = m;
+    }
+    if let Some(t) = out.regression_threshold_pct {
+        config.regression_threshold_pct = t;
+    }
+    config.check_regression = out.check_regression;
+
+    match overhead::run(&config) {
+        Ok(report) => {
+            println!(
+                "atelier protocol-overhead: wrote {} (providers: {}, version {})",
+                config.out_path.display(),
+                report.providers.len(),
+                report.version
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("atelier protocol-overhead: {e}");
+            // Regression is the load-bearing failure path for the
+            // nightly job. Distinguish it with a dedicated exit code so
+            // the workflow can branch on signal vs. infrastructure.
+            match e {
+                overhead::OverheadError::Regression { .. } => ExitCode::from(3),
+                _ => ExitCode::from(1),
+            }
+        }
+    }
 }
 
 /// Read the prompt from (in order): positional argv words,

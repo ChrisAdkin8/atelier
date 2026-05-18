@@ -1,0 +1,68 @@
+[
+  {
+    "label": "single_edit_with_grounding",
+    "envelope": {
+      "claimed_changes": [
+        {
+          "path": "utils.py",
+          "kind": "edit",
+          "summary": "Add divisible_by(n, m); raise ValueError when m == 0."
+        }
+      ],
+      "claimed_done": true,
+      "grounding": [
+        {
+          "text_span": "existing utils.py module-level scope",
+          "source": "tool:read"
+        }
+      ]
+    },
+    "round_trip_lossless": true
+  },
+  {
+    "label": "multi_edit_done",
+    "envelope": {
+      "claimed_changes": [
+        {
+          "path": "utils.py",
+          "kind": "edit",
+          "summary": "Implement divisible_by."
+        },
+        {
+          "path": "tests/test_utils.py",
+          "kind": "create",
+          "summary": "Cover happy path + ValueError on m == 0."
+        }
+      ],
+      "claimed_done": true
+    },
+    "round_trip_lossless": true
+  },
+  {
+    "label": "uncertainty_only",
+    "envelope": {
+      "claimed_done": false,
+      "uncertainty": [
+        {
+          "about": "exception type",
+          "kind": "ambiguous-spec",
+          "asks": "ValueError or ZeroDivisionError when m == 0?"
+        }
+      ]
+    },
+    "round_trip_lossless": true
+  },
+  {
+    "label": "lossy_plan_update_drops_silently",
+    "envelope": {
+      "claimed_done": false,
+      "plan_update": {
+        "ops": [
+          { "op": "add", "step": "write the helper" }
+        ]
+      },
+      "constraints_acknowledged": ["no new deps"]
+    },
+    "round_trip_lossless": false
+  }
+]
