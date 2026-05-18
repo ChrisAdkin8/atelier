@@ -1,5 +1,82 @@
 # Atelier Spec — Changelog
 
+## v60.10 — 2026-05-18 (two-bundle parallel release: §15 rmcp foundation + §1 mid-session provider swap)
+
+B3 + B2 ran in parallel worktrees, then merged sequentially into main (B2 first, B3 second — both fully disjoint). Workspace tests **963 → 974** (+11). All gates green. **Q7 resolved: GO WITH CAVEATS** on rmcp 0.1.5.
+
+### B3 — §15 rmcp foundation (Q7 spike + dep + stdio launcher)
+
+The §15 MCP-client residual was the biggest-ticket remaining Phase A item. This bundle resolves Q7 (rmcp maturity), adds the dep to `atelier-core`, and ships a stdio-launcher that spawns `@modelcontextprotocol/server-filesystem` end-to-end. The remaining §15 rows (HTTP/SSE, built-ins-as-MCP refactor, MCP resources as §5 context items, dispatcher wiring, mechanical gate) sit on top of this foundation and land in v60.11+.
+
+**Q7 verdict — GO WITH CAVEATS** (`experiments/rmcp_spike/README.md` carries the full matrix):
+
+- Stdio handshake against `@modelcontextprotocol/server-filesystem`: ~700ms cold-start via npx, then `list_tools` + `call_tool` clean. `list_directory` returns the expected 14-tool surface.
+- Crash recovery: SIGKILL on the live server PID surfaces `ServiceError::Transport("disconnected")` in ~20µs; serve loop quits `Closed` cleanly. No zombies.
+- Shutdown via `client.cancel()` (the `CancellationToken` path) is reliable; the natural stdout-EOF path doesn't wake the framed codec.
+
+**Five rmcp 0.1.5 smells worth flagging for v60.11+**:
+
+1. Broken feature gating — `paste::paste!` used unconditionally inside `capabilities.rs` but gated behind the `macros` feature. Setting `default-features = false` breaks the build.
+2. No public PID accessor on `TokioChildProcess` once rmcp owns the `Child`. Shutdown must go through `client.cancel()`, not direct subprocess signalling.
+3. Natural stdout-EOF path doesn't reliably wake the framed codec — `shutdown()` always uses cancel.
+4. `Tool.input_schema` is `Arc<serde_json::Map>`, not `Value::Object`. The launcher wraps it once at projection time so callers see `Value`.
+5. `Implementation::from_build_env()` injects the caller's *crate name* as `client_info.name` — MCP servers see "atelier-core" rather than "atelier". Override at v60.11+ dispatcher wiring.
+
+**Files shipped (B3)**:
+- `crates/atelier-core/Cargo.toml` + workspace `Cargo.toml` — `rmcp = "0.1.5"` dep.
+- `crates/atelier-core/src/mcp/mod.rs` + `errors.rs` + `stdio_launcher.rs` (~685 lines + 9 unit tests). `launch_stdio_server(manifest, sandbox, audit_dir) -> McpServerHandle` does the handshake; `list_tools`, `call_tool`, `shutdown` round out the surface. Respects v60.8's `mcp_config::McpServerManifest` (transport, env interpolation, allow_net) end-to-end.
+- `experiments/rmcp_spike/` — fully implemented stdio + crash modes; README's decision matrix populated.
+- `crates/atelier-cli/tests/mcp_integration.rs` — 2 always-on tests (`npx_availability_probe`, `egress_block_does_not_prevent_spawn`) + 1 `#[ignore]`-gated live-npx test that exercises the full handshake against the filesystem MCP server.
+
+**Out of scope (deferred to v60.11+)**: HTTP/SSE transport, built-ins-as-MCP refactor, MCP resources as §5 context items, dispatcher wiring (the launcher exposes the surface; the dispatcher doesn't yet register MCP tools alongside built-ins), and the §15 mechanical gate (canonical-workload run with `@modelcontextprotocol/server-filesystem` registered).
+
+**Known gaps documented in code**:
+- `launch_stdio_server`'s `audit_dir` parameter is existence-checked but doesn't yet write `§12` egress audit entries — that lands with the dispatcher integration.
+- The launcher doesn't wrap the MCP server in `sandbox-exec`/`bwrap` — the existing `sandboxed_argv` infrastructure assumes a short-lived child. A long-lived-MCP-aware sandbox is its own v60.11+ design problem. Egress is still blocked via the `http_proxy=127.0.0.1:1` env block from v60.8.
+
+### B2 — §1 BYOM mid-session provider swap
+
+Closes the §1 BYOM UX-target row: "mid-session provider swap preserves work."
+
+- New `Runner::swap_adapter(new_adapter, now)` method. Per-turn-boundary operation — the caller swaps between `run()` invocations (the types enforce it: `run()` takes `&self`, `swap_adapter` takes `&mut self`). The pre-swap adapter's in-flight `chat()` is not cancelled; drop-on-cancel applies via the existing `CancellationToken`.
+- New `Event::AdapterSwapped { from_model_id, to_model_id, swapped_at }` on the bus + standard `kind()` arm + GUI `bridge_event` + Svelte `state.ts` reducer arm + TUI `apply` / `project_event` arms.
+- New `AdapterHandle::swap(new)` public setter so the live slot updates atomically with the swap. Pending `swap_adapter` requests queue on `Runner.pending_adapter_swap` and the `AdapterSwapped` event fires on the next `run()` startup.
+- GUI Tauri command `swap_adapter(provider: SwapProviderWire) -> SwapResult` where `SwapProviderWire { kind: "mock" | "anthropic" | "openai_compat", model_id, base_url? }`. Builds the new adapter via a refactored `build_swap_adapter` helper.
+- State-preservation matrix (carries vs resets across the swap):
+  - **Carries**: `ContextManager`, `MemoryStore`, `PlanCanvas`, conversation transcript (via on-disk session + `with_resume`), `StagingPendingApproval`.
+  - **Resets**: `ConformanceRingBuffer` (new adapter = new behaviour signal), `Strategy` (re-resolved from new `ModelProfile`), `CapabilityMatrixRow` (refreshed from new model), few-shot cache (forcibly cleared in `swap_adapter`).
+  - **Recomputed at construction**: `CostPolicy` is fixed at `Runner::new` time; the caller decides the policy when building the new adapter.
+- `RecordingMockAdapter` helper + 2 integration tests in `run_integration.rs`.
+
+**Known follow-ons / candor**:
+
+- The GUI's `swap_adapter` Tauri command emits the bus events + updates the live `AdapterHandle` slot, but does **not** swap the adapter inside a running `Runner` — the Runner reads `self.adapter` per turn, not from the slot. True mid-`run()` swap needs a future Runner refactor to read from a shared slot.
+- The `RecordingMockAdapter` had to force `Strategy::JsonSentinel` because `OnDiskSession::resume_conversation_prefix` truncates at orphan tool-call ids — a `harness_meta` tool_call without a matching tool_result would have dropped the assistant turn on resume. Worth documenting in the resume contract.
+- No UI affordance lands here — the Tauri command surface is reachable via `invoke('swap_adapter', { provider })`; a footer dropdown / command palette entry is follow-on work.
+
+### Workspace test count delta
+
+- atelier-core unit: 737 → 746 (+9 from `mcp::stdio_launcher::tests`)
+- atelier-cli unit (lib): 45 → 45 (unchanged)
+- atelier-cli integration: 61 → 63 (+2 B2 swap round-trips)
+- atelier-cli mcp_integration (new binary): 2 always-on + 1 `#[ignore]`-gated live-npx
+- atelier-gui: 28 → 28 (B2 added 1 GUI bridge test; B3 zero)
+- atelier-tui: 92 → 92 (B2 added 2 TUI tests)
+- Total: **963 → 974** (+11 including the new mcp_integration binary)
+
+### Cross-bundle merge resolution
+
+Merge order: B2 → B3. **Zero conflicts.** The file-scoping discipline in the briefs paid off:
+- B2 touched `runner.rs`, `session.rs::Event`, GUI/TUI projections, integration tests.
+- B3 touched `experiments/rmcp_spike/`, `crates/atelier-core/Cargo.toml`, the new `crates/atelier-core/src/mcp/` module, `crates/atelier-cli/tests/mcp_integration.rs` (new file).
+- The only file both bundles touched was `crates/atelier-core/src/lib.rs` for re-exports — and git's auto-merge handled the additive case cleanly.
+
+This is the cleanest parallel batch since v60.7 — same lesson, smaller bundles, file-disjoint by design.
+
+### Process candor
+
+B3's agent reported a mid-flight slip: it initially developed in the main repo's working tree rather than the worktree, then caught the mistake + copied the changes into the worktree and reverted the main repo. The final commit is correctly on the worktree's branch; the main repo was verified clean before the merge. Worth noting in the parallel-agent pattern as a sharp edge: agents in `isolation: "worktree"` mode can accidentally edit the parent repo if they cd around or use absolute paths incorrectly. The agent's self-correction was honest and clean — no tracked-file leakage between repos.
+
 ## v60.9 — 2026-05-18 (two-bundle parallel release: §1 context-window asymmetry + §2 per-adapter few-shot override)
 
 Two-bundle parallel release. B1 + B4 ran in isolated worktrees, then merged sequentially into main (B1 first because its `MockResponse::overflow` field change had wider workspace blast radius). Workspace tests **928 → 963** (+35). All gates green.
