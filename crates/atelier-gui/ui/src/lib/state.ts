@@ -156,6 +156,25 @@ export type MemoryCardSummary = {
   cache_rewarm_tokens?: number
 }
 
+/// Phase C close — §5 mental-model panel state. Mirror of
+/// `atelier_core::mental_model::MentalModelSnapshot`. `enabled`
+/// defaults to `false` (off until the user opts in); the
+/// `updated_at` field is empty until the first set.
+///
+/// **Cost disclosure**: v0 does **not** inject `text` into the
+/// prompt. The panel's badge reads "0 tokens per turn at present"
+/// regardless of `text_tokens`.
+export type MentalModel = {
+  enabled: boolean
+  text: string
+  text_tokens: number
+  updated_at: string
+}
+
+export function initialMentalModel(): MentalModel {
+  return { enabled: false, text: '', text_tokens: 0, updated_at: '' }
+}
+
 /// v52 — the active BYOM model, populated by `ModelProfileLoaded`.
 /// Rendered in the footer (`App.svelte`) on the right-hand side so the
 /// user always knows which model + strategy the run is using.
@@ -210,6 +229,12 @@ export type AppState = {
   /// the file header so the user can see the agent's stated "why".
   /// Wholesale-replaced on each `ClaimedChanges` event.
   claimedChanges: Record<string, string>
+  /// Phase C close — §5 mental-model panel state. Hydrated by an
+  /// initial `snapshot_mental_model` Tauri call (App.svelte) and
+  /// updated by `MentalModelSnapshot` events from the bus. Defaults
+  /// to off so the panel stays hidden until the user opts in via
+  /// the header toggle.
+  mentalModel: MentalModel
 }
 
 export function initialState(): AppState {
@@ -229,6 +254,7 @@ export function initialState(): AppState {
     contextItems: [],
     memoryCards: [],
     claimedChanges: {},
+    mentalModel: initialMentalModel(),
   }
 }
 
@@ -335,6 +361,20 @@ export function applyEvent(state: AppState, evt: BridgedEvent): AppState {
         map[c.path] = c.summary
       }
       return { ...state, events, claimedChanges: map }
+    }
+    case 'MentalModelSnapshot': {
+      // Phase C close — refresh the enabled/text_tokens fields from
+      // the bus. We don't carry text on the bus (it lives in the
+      // dispatcher); the panel reads it back via a Tauri snapshot
+      // call when needed, and otherwise keeps the locally-edited
+      // text. This avoids a round-trip storm when the user types.
+      const p = evt.payload as { enabled: boolean; text_tokens: number }
+      const updated: MentalModel = {
+        ...state.mentalModel,
+        enabled: !!p.enabled,
+        text_tokens: p.text_tokens ?? 0,
+      }
+      return { ...state, events, mentalModel: updated }
     }
     // Variants we don't fold into pane state — just the event log.
     case 'IllegalTransitionAttempted':
@@ -468,6 +508,13 @@ export function projectEvent(evt: BridgedEvent): EventLogEntry {
       const p = evt.payload as { changes?: unknown[] }
       const n = Array.isArray(p.changes) ? p.changes.length : 0
       return { kind, detail: `${n} file rationale(s)` }
+    }
+    case 'MentalModelSnapshot': {
+      const p = evt.payload as { enabled?: boolean; text_tokens?: number }
+      return {
+        kind,
+        detail: `${p.enabled ? 'on' : 'off'} · ~${p.text_tokens ?? 0} tokens`,
+      }
     }
     case 'Cancelled':
       return { kind, detail: '' }

@@ -27,6 +27,33 @@
       "items": {"type": "string"},
       "minItems": 1,
       "description": "Command (argv list) the runner invokes to evaluate fixture state. Defaults to ['python', '-m', 'pytest', '--tb=short', '-q'] when omitted."
+    },
+    "pane_visibility": {
+      "type": "object",
+      "description": "Phase C close — §3 UX-target hint. Suggested pane-visibility map for a measurement run; the driver writes the actual record to `.atelier/sessions/<sid>/pane_visibility.json`. Booleans default to true (visible) when omitted.",
+      "additionalProperties": false,
+      "properties": {
+        "conversation": {"type": "boolean"},
+        "diff": {"type": "boolean"},
+        "plan": {"type": "boolean"},
+        "memory": {"type": "boolean"},
+        "context": {"type": "boolean"},
+        "mental_model": {"type": "boolean"}
+      }
+    },
+    "find_probe": {
+      "type": "object",
+      "description": "Phase C close — §5 UX-target hint. Suggested driver sequence + target median latency for the `atelier find` probe; the driver appends actual probes to `.atelier/sessions/<sid>/find_probes.json`.",
+      "additionalProperties": false,
+      "required": ["queries", "target_median_ms"],
+      "properties": {
+        "queries": {
+          "type": "array",
+          "items": {"type": "string"},
+          "minItems": 1
+        },
+        "target_median_ms": {"type": "integer", "minimum": 0}
+      }
     }
   }
 }

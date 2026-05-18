@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "task_id": "t13_find_what_agent_knows",
+  "title": "Find what agent knows about file X (§5 UX target probe)",
+  "priority": false,
+  "expected_starting_returncode": 5,
+  "turn_cap": 12,
+  "exercises": [
+    "ux-target measurement",
+    "context-item query",
+    "find-probe latency"
+  ],
+  "find_probe": {
+    "queries": [
+      "src/parser/lex.rs",
+      "src/parser/parse.rs",
+      "src/parser/missing.rs"
+    ],
+    "target_median_ms": 5000
+  }
+}

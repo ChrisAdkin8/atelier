@@ -293,6 +293,16 @@ pub enum Event {
         cache_rewarm_tokens: u32,
     },
 
+    /// Phase C close — §5 mental-model panel snapshot. Emitted by
+    /// `SessionDispatcher::set_mental_model` after every successful
+    /// `MentalModel::set` so subscribed UIs converge on the user's
+    /// latest text + toggle state. `text_tokens` is an approximate
+    /// byte/4 count for the cost-disclosure badge; v0 does **not**
+    /// inject the text into the prompt, so the badge renders
+    /// "0 tokens per turn at present" regardless of the snapshot's
+    /// `text_tokens` value.
+    MentalModelSnapshot { enabled: bool, text_tokens: u32 },
+
     /// The actor is shutting down. No further events will be emitted.
     Shutdown,
 }
@@ -324,6 +334,7 @@ impl Event {
             Self::ModelProfileLoaded { .. } => "ModelProfileLoaded",
             Self::CompactionExecuted { .. } => "CompactionExecuted",
             Self::ExpansionExecuted { .. } => "ExpansionExecuted",
+            Self::MentalModelSnapshot { .. } => "MentalModelSnapshot",
             Self::Shutdown => "Shutdown",
         }
     }
@@ -567,6 +578,15 @@ mod tests {
             cache_rewarm_tokens: 240,
         };
         assert_eq!(ev.kind(), "ExpansionExecuted");
+    }
+
+    #[test]
+    fn mental_model_snapshot_event_carries_expected_kind() {
+        let ev = Event::MentalModelSnapshot {
+            enabled: true,
+            text_tokens: 12,
+        };
+        assert_eq!(ev.kind(), "MentalModelSnapshot");
     }
 
     /// Hook impl that counts invocations — lets tests assert that hooks fired

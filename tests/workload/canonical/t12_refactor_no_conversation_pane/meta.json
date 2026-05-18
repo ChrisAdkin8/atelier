@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "task_id": "t12_refactor_no_conversation_pane",
+  "title": "Refactor a multi-concern function without the conversation pane open",
+  "priority": false,
+  "expected_starting_returncode": 0,
+  "turn_cap": 25,
+  "exercises": [
+    "ux-target measurement",
+    "pane visibility tracking",
+    "refactor-without-conversation-pane"
+  ],
+  "pane_visibility": {
+    "conversation": false,
+    "diff": true,
+    "plan": true,
+    "memory": false,
+    "context": true,
+    "mental_model": false
+  }
+}

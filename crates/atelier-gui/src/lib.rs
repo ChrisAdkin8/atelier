@@ -138,6 +138,9 @@ pub fn run() {
             compact_context_items,
             // v60.6 §5 Expand.
             expand_memory_card,
+            // Phase C close — §5 mental-model panel.
+            set_mental_model,
+            snapshot_mental_model,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -512,6 +515,53 @@ pub struct ExpansionResult {
     pub cache_rewarm_tokens: u32,
 }
 
+/// Phase C close — §5 mental-model wire shape returned by both
+/// `set_mental_model` and `snapshot_mental_model`. Mirrors
+/// [`atelier_core::mental_model::MentalModelSnapshot`].
+#[derive(Serialize, Debug)]
+pub struct MentalModelWire {
+    pub enabled: bool,
+    pub text: String,
+    pub text_tokens: u32,
+    pub updated_at: String,
+}
+
+impl From<atelier_core::mental_model::MentalModelSnapshot> for MentalModelWire {
+    fn from(s: atelier_core::mental_model::MentalModelSnapshot) -> Self {
+        Self {
+            enabled: s.enabled,
+            text: s.text,
+            text_tokens: s.text_tokens,
+            updated_at: s.updated_at,
+        }
+    }
+}
+
+/// Phase C close — cap on the mental-model text size. Same discipline
+/// as `MAX_MEMORY_CARD_BYTES` — a hostile webview shouldn't be able to
+/// push a multi-GB string through the IPC boundary into the bus.
+const MAX_MENTAL_MODEL_BYTES: usize = 32 * 1024;
+
+#[tauri::command]
+fn set_mental_model(
+    state: tauri::State<'_, SessionState>,
+    text: String,
+    enabled: bool,
+) -> Result<MentalModelWire, String> {
+    check_bytes("mental model text", &text, MAX_MENTAL_MODEL_BYTES)?;
+    let sd = require_dispatcher(&state)?;
+    let now = now_rfc3339();
+    sd.set_mental_model(text, enabled, &now)
+        .map(MentalModelWire::from)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn snapshot_mental_model(state: tauri::State<'_, SessionState>) -> Result<MentalModelWire, String> {
+    let sd = require_dispatcher(&state)?;
+    Ok(sd.snapshot_mental_model().into())
+}
+
 #[tauri::command]
 async fn expand_memory_card(
     state: tauri::State<'_, SessionState>,
@@ -865,6 +915,13 @@ pub fn bridge_event(evt: &SessionEvent) -> BridgedEvent {
             "summary_card_id": summary_card_id,
             "cache_rewarm_tokens": cache_rewarm_tokens,
         }),
+        SessionEvent::MentalModelSnapshot {
+            enabled,
+            text_tokens,
+        } => json!({
+            "enabled": enabled,
+            "text_tokens": text_tokens,
+        }),
     };
     BridgedEvent { kind, payload }
 }
@@ -1210,5 +1267,18 @@ mod tests {
         assert_eq!(b.payload["restored_item_count"], 5);
         assert_eq!(b.payload["summary_card_id"], "mem-abc");
         assert_eq!(b.payload["cache_rewarm_tokens"], 240);
+    }
+
+    // ---------- Phase C close: mental-model wiring ----------
+
+    #[test]
+    fn bridge_mental_model_snapshot_carries_enabled_and_text_tokens() {
+        let b = bridge_event(&SessionEvent::MentalModelSnapshot {
+            enabled: true,
+            text_tokens: 42,
+        });
+        assert_eq!(b.kind, "MentalModelSnapshot");
+        assert_eq!(b.payload["enabled"], true);
+        assert_eq!(b.payload["text_tokens"], 42);
     }
 }

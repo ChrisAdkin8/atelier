@@ -20,6 +20,16 @@
 
   import type { MemoryCardSummary } from '../state'
   import { invoke } from '@tauri-apps/api/core'
+  import InlineRenderers from './InlineRenderers.svelte'
+
+  // Phase C close — only attempt inline rendering when the preview
+  // contains a fence or an image-shaped URL; otherwise we stay on
+  // the v54 lightweight `<p>` preview to keep the row compact.
+  function previewHasRenderable(s: string): boolean {
+    if (!s) return false
+    if (s.includes('```mermaid') || s.includes('```d2')) return true
+    return /\.(png|jpe?g|gif|svg|webp)\b/i.test(s)
+  }
 
   interface Props {
     cards: MemoryCardSummary[]
@@ -221,7 +231,16 @@
             </div>
           {/if}
           {#if card.body_preview}
-            <p class="preview">{card.body_preview}</p>
+            {#if previewHasRenderable(card.body_preview)}
+              <div class="preview rich">
+                <InlineRenderers
+                  text={card.body_preview}
+                  blockId={`mem-${card.id}`}
+                />
+              </div>
+            {:else}
+              <p class="preview">{card.body_preview}</p>
+            {/if}
           {/if}
         </li>
       {/each}

@@ -154,6 +154,23 @@ pub struct AppState {
     /// header so the user can see the agent's stated "why" for each
     /// change. Wholesale-replaced on every `Event::ClaimedChanges`.
     pub claimed_changes: std::collections::HashMap<String, String>,
+    /// Phase C close — §5 mental-model panel state. The TUI does
+    /// **not** render a full editable surface for v0; instead the
+    /// footer carries a hint badge so the user can see whether the
+    /// panel is on and roughly how big the text is. Full TUI parity
+    /// (modal text editor + keybind to flip the toggle) lands when
+    /// the harness actually injects the text into the prompt.
+    pub mental_model: MentalModelHint,
+}
+
+/// Phase C close — TUI's projection of
+/// [`atelier_core::mental_model::MentalModelSnapshot`]. Off by
+/// default; toggled to `enabled=true` by an external mutator (the
+/// GUI today, the CLI's `mental-model` subcommand future-side).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MentalModelHint {
+    pub enabled: bool,
+    pub text_tokens: u32,
 }
 
 /// v55 — which pane has keyboard focus. Tab cycles forward.
@@ -512,6 +529,20 @@ impl AppState {
                 // via the same InputMode::Normal transition the run
                 // loop applies on ExpandConfirmYes).
             }
+            SessionEvent::MentalModelSnapshot {
+                enabled,
+                text_tokens,
+            } => {
+                // Phase C close — record the latest snapshot so the
+                // footer hint can render. TUI keeps just the
+                // visibility flag + approximate token count; the
+                // full editable surface lands when the harness
+                // actually feeds the text into the prompt.
+                self.mental_model = MentalModelHint {
+                    enabled: *enabled,
+                    text_tokens: *text_tokens,
+                };
+            }
             SessionEvent::IllegalTransitionAttempted { .. }
             | SessionEvent::Cancelled
             | SessionEvent::Shutdown => {}
@@ -750,6 +781,13 @@ pub fn project_event(evt: &SessionEvent) -> EventLine {
             cache_rewarm_tokens,
         } => format!(
             "restored {restored_item_count} items ← {summary_card_id} (paid ~{cache_rewarm_tokens} cache tokens)"
+        ),
+        SessionEvent::MentalModelSnapshot {
+            enabled,
+            text_tokens,
+        } => format!(
+            "{} · ~{text_tokens} tokens (0/turn in v0)",
+            if *enabled { "on" } else { "off" }
         ),
         SessionEvent::Shutdown => String::new(),
     };
@@ -1534,7 +1572,17 @@ fn render_help_left(state: &AppState) -> String {
     } else {
         ""
     };
-    format!(" q/Esc/Ctrl-C quit · [ prev · ] next · g HEAD{scrub_note}")
+    // Phase C close — the §5 mental-model panel lives in the GUI in
+    // v0. The TUI just surfaces a tiny status hint so the user
+    // knows whether the panel is on (and how big the text is, for
+    // cost awareness). Hidden when the panel is off so the help line
+    // stays compact for the common case.
+    let mm_hint = if state.mental_model.enabled {
+        format!(" · mm:on(~{}tk,0/turn)", state.mental_model.text_tokens)
+    } else {
+        String::new()
+    };
+    format!(" q/Esc/Ctrl-C quit · [ prev · ] next · g HEAD{scrub_note}{mm_hint}")
 }
 
 /// Build the right-side model badge as a styled

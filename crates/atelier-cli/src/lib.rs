@@ -58,6 +58,15 @@ pub mod expansion;
 /// scripted MockAdapter fixtures.
 pub mod overhead;
 
+/// Phase C close — UX-target measurement instrumentation.
+/// `PaneVisibilityRecord` + `FindProbeLog` write sibling JSON
+/// alongside `session.json` so the §3 ("refactor without
+/// conversation pane open") and §5 ("find what agent knows about
+/// file X median <5 s") spec targets have on-disk observables to
+/// read. Both are advisory — failing to write either does not fail
+/// the run.
+pub mod instrumentation;
+
 pub use runner::{
     AdapterHandle, DispatcherHandle, EventSink, MockResponse, ProbePolicy, ProviderChoice,
     RunError, RunReport, Runner,

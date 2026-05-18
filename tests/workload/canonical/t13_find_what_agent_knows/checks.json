@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "checks": [
+    {
+      "name": "atelier find subcommand exists",
+      "command": "atelier find --help",
+      "expect": {
+        "exit_code": 0
+      }
+    },
+    {
+      "name": "atelier find returns 0 when no session is present",
+      "command": "atelier find --path src/parser/lex.rs",
+      "expect": {
+        "exit_code": 0
+      }
+    }
+  ]
+}
