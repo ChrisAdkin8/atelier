@@ -35,6 +35,12 @@ CLAUDE.md
 # in .atelier/settings.json which is tracked.
 .atelier/settings.local.json
 
+# direnv per-project shell config. Holds developer-local secrets
+# (ANTHROPIC_API_KEY, OPENAI_API_KEY) that are loaded on `cd` into the
+# repo. NEVER commit — secrets-in-git is an irreversible leak that
+# requires key rotation + history scrubbing to remediate.
+.envrc
+
 # OS
 .DS_Store
 Thumbs.db
