@@ -342,6 +342,25 @@ pub enum Event {
     /// the ledger trail + post-mortem.
     FilesChangedAcknowledged { outcome: ConcurrentEditOutcome },
 
+    /// v62 — §7 verify pass terminal marker. Emitted by
+    /// `SessionDispatcher::verify_pass` after the (currently Tier 3
+    /// textual) [`crate::verify::compare`] runs. The `tier` carries
+    /// which producer ran so the GUI/TUI can render a small badge
+    /// (Tier 1 LSP green / Tier 2 tree-sitter yellow / Tier 3 textual
+    /// orange / NotRun gray) — when a higher tier is unavailable
+    /// (e.g. LSP not installed), the badge makes the coverage drop
+    /// visible to the user rather than silently degrading.
+    ///
+    /// `file_count` is the union of claimed paths + observed paths
+    /// the verify pass weighed; `claim_count` is the envelope's
+    /// `claimed_changes` length. Both are surfaced in the event log
+    /// detail and the badge tooltip.
+    VerificationPassed {
+        tier: crate::verify::VerificationTier,
+        file_count: usize,
+        claim_count: usize,
+    },
+
     /// The actor is shutting down. No further events will be emitted.
     Shutdown,
 }
@@ -376,6 +395,7 @@ impl Event {
             Self::MentalModelSnapshot { .. } => "MentalModelSnapshot",
             Self::FilesChanged { .. } => "FilesChanged",
             Self::FilesChangedAcknowledged { .. } => "FilesChangedAcknowledged",
+            Self::VerificationPassed { .. } => "VerificationPassed",
             Self::Shutdown => "Shutdown",
         }
     }
@@ -685,6 +705,19 @@ mod tests {
             outcome: ConcurrentEditOutcome::Reload,
         };
         assert_eq!(ev.kind(), "FilesChangedAcknowledged");
+    }
+
+    #[test]
+    fn verification_passed_event_carries_expected_kind() {
+        // v62 — `VerificationPassed.kind()` is the GUI bridge's
+        // routing key + the TUI event log label. Pinned so a future
+        // variant rename forces a deliberate edit on the wire side.
+        let ev = Event::VerificationPassed {
+            tier: crate::verify::VerificationTier::Tier3Textual,
+            file_count: 3,
+            claim_count: 2,
+        };
+        assert_eq!(ev.kind(), "VerificationPassed");
     }
 
     #[test]

@@ -7,16 +7,33 @@
   //   * Context: known-tokens / window ratio rendered as a gauge, with
   //     an explicit "+N unknown" suffix when `unknown > 0` so a
   //     silently-underreporting meter (spec §5 contract) is visible.
+  //   * Verify (v62): a small badge showing which §7 verification tier
+  //     ran on the last verify pass — Tier 1 LSP (green), Tier 2
+  //     tree-sitter (yellow), Tier 3 textual (orange), or "verify off"
+  //     (gray) when no pass has happened yet. Surfaces dropped
+  //     hallucination coverage when a higher-tier producer is
+  //     unavailable.
+
+  import {
+    verificationTierLabel,
+    type VerificationStatus,
+  } from '../state'
 
   type Props = {
     totalCostUsd: number
     knownTokens: number
     unknownTokens: number
     contextWindowTokens: number
+    verificationStatus: VerificationStatus
   }
 
-  let { totalCostUsd, knownTokens, unknownTokens, contextWindowTokens }: Props =
-    $props()
+  let {
+    totalCostUsd,
+    knownTokens,
+    unknownTokens,
+    contextWindowTokens,
+    verificationStatus,
+  }: Props = $props()
 
   // Floor the denominator at 1 so the percentage is well-defined even
   // before the host publishes the real context window.
@@ -27,6 +44,16 @@
   let costLabel = $derived(`$${totalCostUsd.toFixed(4)}`)
 
   let unknownLabel = $derived(unknownTokens > 0 ? ` (+${unknownTokens} unknown)` : '')
+
+  // v62 — verify-pass badge. The class drives the colour cue per the
+  // spec §7 tier semantics; the label string comes from the shared
+  // `verificationTierLabel` so the TUI and GUI render identical copy.
+  let verifyTier = $derived(verificationStatus.tier)
+  let verifyLabel = $derived(verificationTierLabel(verifyTier))
+  let verifyTitle = $derived(
+    `verification tier · ${verificationStatus.file_count} file(s) · ` +
+      `${verificationStatus.claim_count} claim(s)`,
+  )
 </script>
 
 <section class="pane">
@@ -51,6 +78,19 @@
         aria-valuemax={contextWindowTokens}
         aria-valuenow={knownTokens}>
         <div class="bar-fill" style:width="{percent}%"></div>
+      </div>
+    </div>
+
+    <div class="meter verify">
+      <div class="meter-row">
+        <span class="meter-label">verify</span>
+        <span
+          class="badge verify-{verifyTier}"
+          title={verifyTitle}
+          data-testid="verify-tier-badge"
+        >
+          {verifyLabel}
+        </span>
       </div>
     </div>
   </div>
@@ -115,5 +155,31 @@
     height: 100%;
     background: var(--accent-cyan);
     transition: width 120ms linear;
+  }
+  /* v62 — §7 verify-pass badge. Colour family encodes the tier so
+     the user can spot a "fallback to textual" run at a glance:
+     green = full LSP coverage, yellow = tree-sitter (syntactic only),
+     orange = textual lying-agent only, gray = no verify pass ran. */
+  .badge {
+    display: inline-block;
+    padding: 0.05rem 0.4rem;
+    border-radius: 4px;
+    border: 1px solid currentColor;
+    font-size: 0.65rem;
+    text-transform: lowercase;
+    letter-spacing: 0.04em;
+    font-weight: 600;
+  }
+  .badge.verify-tier1_lsp {
+    color: var(--accent-green, #4caf50);
+  }
+  .badge.verify-tier2_tree_sitter {
+    color: var(--accent-yellow);
+  }
+  .badge.verify-tier3_textual {
+    color: var(--accent-orange, #e67e22);
+  }
+  .badge.verify-not_run {
+    color: var(--fg-dim);
   }
 </style>

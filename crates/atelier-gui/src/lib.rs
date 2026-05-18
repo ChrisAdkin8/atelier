@@ -968,6 +968,20 @@ pub fn bridge_event(evt: &SessionEvent) -> BridgedEvent {
         SessionEvent::FilesChangedAcknowledged { outcome } => json!({
             "outcome": outcome.wire_label(),
         }),
+        // v62 — §7 verify-pass terminal marker. The tier rides as its
+        // canonical wire label (`tier1_lsp` / `tier2_tree_sitter` /
+        // `tier3_textual` / `not_run`) so the Svelte reducer in
+        // `state.ts` can switch on it directly without re-importing
+        // the Rust enum.
+        SessionEvent::VerificationPassed {
+            tier,
+            file_count,
+            claim_count,
+        } => json!({
+            "tier": tier.wire_label(),
+            "file_count": file_count,
+            "claim_count": claim_count,
+        }),
     };
     BridgedEvent { kind, payload }
 }
@@ -1362,5 +1376,33 @@ mod tests {
         assert_eq!(b.kind, "MentalModelSnapshot");
         assert_eq!(b.payload["enabled"], true);
         assert_eq!(b.payload["text_tokens"], 42);
+    }
+
+    // ---------- v62: §7 verify-pass tier indicator ----------
+
+    #[test]
+    fn bridge_verification_passed_carries_tier_wire_label_and_counts() {
+        // v62 — the Svelte reducer switches on the wire label directly
+        // (`tier1_lsp` / `tier2_tree_sitter` / `tier3_textual` /
+        // `not_run`), so the bridge must serialise the tier as that
+        // exact label. Pin the canonical labels here so a future
+        // variant rename forces a deliberate edit on the GUI side.
+        use atelier_core::verify::VerificationTier;
+        for (tier, label) in [
+            (VerificationTier::Tier1Lsp, "tier1_lsp"),
+            (VerificationTier::Tier2TreeSitter, "tier2_tree_sitter"),
+            (VerificationTier::Tier3Textual, "tier3_textual"),
+            (VerificationTier::NotRun, "not_run"),
+        ] {
+            let b = bridge_event(&SessionEvent::VerificationPassed {
+                tier,
+                file_count: 3,
+                claim_count: 2,
+            });
+            assert_eq!(b.kind, "VerificationPassed");
+            assert_eq!(b.payload["tier"], label);
+            assert_eq!(b.payload["file_count"], 3);
+            assert_eq!(b.payload["claim_count"], 2);
+        }
     }
 }

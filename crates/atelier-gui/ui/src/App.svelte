@@ -234,6 +234,7 @@
           knownTokens={app.contextTokens.known}
           unknownTokens={app.contextTokens.unknown}
           contextWindowTokens={app.contextWindowTokens}
+          verificationStatus={app.verificationStatus}
         />
         <ContextPane items={app.contextItems} />
       </div>
