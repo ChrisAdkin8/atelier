@@ -111,6 +111,22 @@ pub struct Plan {
     pub steps: Vec<PlanStep>,
 }
 
+/// v61 — flattened conversation row used by [`OnDiskSession::resume_conversation_prefix`].
+/// The runner converts each entry into an adapter [`crate::adapter::Message`]
+/// at resume time. Keeping the projection out of persistence lets the
+/// adapter type evolve without touching this layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationEntry {
+    pub role: String,
+    pub content: String,
+    /// `Some` for `role = "tool"` turns; the id of the tool_call the
+    /// result satisfies.
+    pub tool_call_id: Option<String>,
+    /// Raw JSON `tool_calls[]` for `role = "assistant"` turns that
+    /// emitted native tool calls. Empty for everything else.
+    pub tool_calls: Vec<serde_json::Value>,
+}
+
 /// One entry in the `recovery_log` slot. Mirrors the schema's required
 /// fields; `reason` is the closed enum the schema permits.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -219,6 +235,126 @@ impl OnDiskSession {
         // Windows isn't a v1 target.
         fsync_dir(dir)?;
         Ok(target)
+    }
+
+    /// v61 — reconstruct the resume-ready conversation prefix. Walks
+    /// `conversation` *up to and including* the last fully-completed
+    /// tool round-trip: an `assistant` turn with `tool_calls` is only
+    /// considered complete when every one of its tool_call ids has a
+    /// matching `tool` turn after it. Per spec §14, **partial output is
+    /// preserved in `recovery_log`, not conversation**, so we never
+    /// re-inject a stub `tool` turn for a missing result — we truncate
+    /// to before the orphan assistant turn instead.
+    ///
+    /// Returns a flat `Vec<(role, content, tool_call_id, tool_calls_json)>`
+    /// tuple-form the runner translates into adapter `Message`s. Keeps
+    /// the persistence layer free of the adapter type.
+    pub fn resume_conversation_prefix(&self) -> Vec<ConversationEntry> {
+        let mut out: Vec<ConversationEntry> = Vec::new();
+        let mut pending_tool_ids: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        // First pass: find the last index that closes any open
+        // tool-call set. We walk forward, tracking unmet tool-call ids
+        // emitted by assistant turns and ticking them off as `tool`
+        // turns arrive. A turn is "safe to keep" iff it doesn't leave
+        // pending ids behind at the end of the walk.
+        //
+        // Concretely: we accumulate a candidate prefix as we go, and
+        // commit it to `out` only at points where `pending_tool_ids`
+        // is empty (a quiescent boundary).
+        let mut tentative: Vec<ConversationEntry> = Vec::new();
+        let mut commit_to = 0usize;
+        for entry in &self.conversation {
+            let role = entry
+                .get("role")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let content = entry
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let tool_call_id = entry
+                .get("tool_call_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let tool_calls = entry
+                .get("tool_calls")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+
+            match role.as_str() {
+                "assistant" => {
+                    for tc in &tool_calls {
+                        if let Some(id) = tc
+                            .get("tool_call_id")
+                            .or_else(|| tc.get("id"))
+                            .and_then(|v| v.as_str())
+                        {
+                            pending_tool_ids.insert(id.to_string());
+                        }
+                    }
+                }
+                "tool" => {
+                    if let Some(id) = &tool_call_id {
+                        pending_tool_ids.remove(id);
+                    }
+                }
+                _ => {}
+            }
+
+            tentative.push(ConversationEntry {
+                role,
+                content,
+                tool_call_id,
+                tool_calls,
+            });
+
+            if pending_tool_ids.is_empty() {
+                commit_to = tentative.len();
+            }
+        }
+        out.extend(tentative.into_iter().take(commit_to));
+        out
+    }
+
+    /// v61 — record one round-tripped conversation turn. The session
+    /// keeps its conversation as `serde_json::Value` (the schema's
+    /// shape is the source of truth) so this helper centralises the
+    /// JSON building. Spec §14 — what we persist here is what
+    /// `Runner::resume` reads back on restart.
+    ///
+    /// `turn_id` is the model's session-local identifier (the runner
+    /// mints `turn-{n}` ids). `role` matches the schema enum:
+    /// `"user" | "assistant" | "system" | "tool"`. `tool_call_id` is
+    /// populated for `role = "tool"` only; `tool_calls` is a flattened
+    /// JSON array of `{tool_call_id, tool_name, args}` for assistant
+    /// turns that emitted native tool calls.
+    pub fn append_conversation_turn(
+        &mut self,
+        turn_id: impl Into<String>,
+        role: &str,
+        content: impl Into<String>,
+        tool_call_id: Option<String>,
+        tool_calls: Vec<serde_json::Value>,
+    ) {
+        let mut entry = serde_json::Map::new();
+        entry.insert("turn_id".into(), serde_json::Value::String(turn_id.into()));
+        entry.insert("role".into(), serde_json::Value::String(role.into()));
+        entry.insert("content".into(), serde_json::Value::String(content.into()));
+        if let Some(tcid) = tool_call_id {
+            // Schema doesn't carry tool_call_id at the turn level —
+            // it lives inside `tool_calls[]`. We synthesise a
+            // one-entry tool_calls array for `role=tool` so resume
+            // can correlate.
+            entry.insert("tool_call_id".into(), serde_json::Value::String(tcid));
+        }
+        if !tool_calls.is_empty() {
+            entry.insert("tool_calls".into(), serde_json::Value::Array(tool_calls));
+        }
+        self.conversation.push(serde_json::Value::Object(entry));
     }
 
     /// Load and deserialize. Rejects sessions whose
@@ -506,6 +642,119 @@ mod tests {
         assert_eq!(json, "\"concurrent_edit_pause\"");
         let back: RecoveryReason = serde_json::from_str("\"timeout\"").unwrap();
         assert_eq!(back, RecoveryReason::Timeout);
+    }
+
+    // ---------- v61 — resume_conversation_prefix ----------
+
+    fn turn_user(id: &str, text: &str) -> serde_json::Value {
+        serde_json::json!({
+            "turn_id": id,
+            "role": "user",
+            "content": text,
+        })
+    }
+    fn turn_assistant_with_tool(id: &str, text: &str, tc_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "turn_id": id,
+            "role": "assistant",
+            "content": text,
+            "tool_calls": [{
+                "tool_call_id": tc_id,
+                "tool_name": "read_file",
+                "args": {"path": "src/main.rs"},
+            }],
+        })
+    }
+    fn turn_tool_result(id: &str, tc_id: &str, text: &str) -> serde_json::Value {
+        serde_json::json!({
+            "turn_id": id,
+            "role": "tool",
+            "content": text,
+            "tool_call_id": tc_id,
+        })
+    }
+
+    #[test]
+    fn resume_prefix_keeps_completed_tool_round_trips() {
+        let mut s = OnDiskSession::fresh(uuid_for(20), "0.0.0", "2026-05-17T10:00:00Z");
+        s.conversation = vec![
+            turn_user("turn-1", "do thing"),
+            turn_assistant_with_tool("turn-2", "reading", "tc-a"),
+            turn_tool_result("turn-3", "tc-a", "file contents"),
+            turn_assistant_with_tool("turn-4", "reading again", "tc-b"),
+            turn_tool_result("turn-5", "tc-b", "more contents"),
+        ];
+        let prefix = s.resume_conversation_prefix();
+        assert_eq!(prefix.len(), 5);
+        assert_eq!(prefix.last().unwrap().role, "tool");
+        assert_eq!(prefix.last().unwrap().tool_call_id.as_deref(), Some("tc-b"));
+    }
+
+    #[test]
+    fn resume_prefix_truncates_orphan_assistant_tool_call() {
+        // The model emitted an assistant turn with a tool_call but the
+        // tool result never landed (crash mid-execute). Per spec §14,
+        // the orphan assistant turn is dropped — partial output lives
+        // in recovery_log, not conversation.
+        let mut s = OnDiskSession::fresh(uuid_for(21), "0.0.0", "2026-05-17T10:00:00Z");
+        s.conversation = vec![
+            turn_user("turn-1", "go"),
+            turn_assistant_with_tool("turn-2", "reading", "tc-a"),
+            turn_tool_result("turn-3", "tc-a", "contents"),
+            // Orphan: assistant emitted tool-call but result never landed.
+            turn_assistant_with_tool("turn-4", "now reading another", "tc-b"),
+        ];
+        let prefix = s.resume_conversation_prefix();
+        assert_eq!(prefix.len(), 3, "orphan assistant should be truncated");
+        assert_eq!(prefix.last().unwrap().role, "tool");
+        assert_eq!(prefix.last().unwrap().tool_call_id.as_deref(), Some("tc-a"));
+    }
+
+    #[test]
+    fn resume_prefix_empty_for_empty_conversation() {
+        let s = OnDiskSession::fresh(uuid_for(22), "0.0.0", "2026-05-17T10:00:00Z");
+        let prefix = s.resume_conversation_prefix();
+        assert!(prefix.is_empty());
+    }
+
+    #[test]
+    fn append_conversation_turn_records_role_and_content() {
+        let mut s = OnDiskSession::fresh(uuid_for(23), "0.0.0", "2026-05-17T10:00:00Z");
+        s.append_conversation_turn("turn-1", "user", "hello", None, Vec::new());
+        assert_eq!(s.conversation.len(), 1);
+        let row = &s.conversation[0];
+        assert_eq!(row["role"], "user");
+        assert_eq!(row["content"], "hello");
+        assert_eq!(row["turn_id"], "turn-1");
+    }
+
+    #[test]
+    fn append_conversation_turn_round_trips_through_resume_prefix() {
+        let mut s = OnDiskSession::fresh(uuid_for(24), "0.0.0", "2026-05-17T10:00:00Z");
+        s.append_conversation_turn("turn-1", "user", "go", None, Vec::new());
+        s.append_conversation_turn(
+            "turn-2",
+            "assistant",
+            "reading",
+            None,
+            vec![serde_json::json!({
+                "tool_call_id": "tc-1",
+                "tool_name": "read_file",
+                "args": {"path": "x"},
+            })],
+        );
+        s.append_conversation_turn(
+            "turn-3",
+            "tool",
+            "contents",
+            Some("tc-1".into()),
+            Vec::new(),
+        );
+        let prefix = s.resume_conversation_prefix();
+        assert_eq!(prefix.len(), 3);
+        assert_eq!(prefix[1].role, "assistant");
+        assert_eq!(prefix[1].tool_calls.len(), 1);
+        assert_eq!(prefix[2].tool_call_id.as_deref(), Some("tc-1"));
     }
 
     #[test]

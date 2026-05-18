@@ -118,6 +118,18 @@ Example `.atelier/providers.toml`:
                                    entry on success. `--no-probe` and
                                    `--force-probe` are mutually
                                    exclusive.
+    --non-interactive              Headless mode (§14). Auto-approves
+                                   every staged write and auto-reloads
+                                   on concurrent edits — no modals are
+                                   shown. Use for CI / scripted runs.
+    --resume <SESSION-UUID>        Resume a previously-persisted session
+                                   (§14). Reads .atelier/sessions/<uuid>/
+                                   session.json and replays the
+                                   conversation prefix up to the last
+                                   completed tool round-trip. The
+                                   prompt is appended as a fresh user
+                                   turn (omit it to resume without
+                                   adding one).
 
 OPTIONS:
     -h, --help     Print this message.
@@ -211,6 +223,15 @@ struct CliArgs {
     prompt_args: Vec<String>,
     no_probe: bool,
     force_probe: bool,
+    /// v61 — `--non-interactive`: composite flag that disables every
+    /// modal flow (approval + concurrent-edit). Always present (false
+    /// when omitted) so `parse_cli` doesn't need an `Option<bool>`.
+    non_interactive: bool,
+    /// v61 — `--resume <UUID>`: when present, the runner reads the
+    /// on-disk session under `.atelier/sessions/<uuid>/`, replays its
+    /// conversation prefix, and appends the supplied prompt as a
+    /// fresh user turn (or skips it if empty).
+    resume: Option<uuid::Uuid>,
 }
 
 impl CliArgs {
@@ -226,6 +247,8 @@ impl CliArgs {
             prompt_args: Vec::new(),
             no_probe: false,
             force_probe: false,
+            non_interactive: false,
+            resume: None,
         }
     }
 }
@@ -234,8 +257,14 @@ impl CliArgs {
 /// missing-value error). The caller dispatches on the result; this
 /// keeps the parsing function flat — no early `return ExitCode` from
 /// inside the parse loop.
+///
+/// v61: `CliArgs` grew enough fields (Option<PathBuf>, Option<Uuid>,
+/// Vec<String>, …) to trip clippy's `large_enum_variant`. Boxing the
+/// `Ok` variant pays one extra allocation per CLI invocation — well
+/// under the cost of a `parse_cli` round-trip — and keeps the parse
+/// loop flat.
 enum CliParseResult {
-    Ok(CliArgs),
+    Ok(Box<CliArgs>),
     Exit(ExitCode),
 }
 
@@ -277,11 +306,22 @@ fn parse_cli(mut args: impl Iterator<Item = String>) -> CliParseResult {
             },
             "--no-probe" => out.no_probe = true,
             "--force-probe" => out.force_probe = true,
+            "--non-interactive" => out.non_interactive = true,
+            "--resume" => match args.next() {
+                Some(v) => match uuid::Uuid::parse_str(&v) {
+                    Ok(u) => out.resume = Some(u),
+                    Err(_) => {
+                        eprintln!("atelier run: --resume requires a UUID, got {v:?}");
+                        return CliParseResult::Exit(ExitCode::from(2));
+                    }
+                },
+                None => return missing_value("--resume", "session-uuid"),
+            },
             // Everything else is positional prompt text.
             _ => out.prompt_args.push(a),
         }
     }
-    CliParseResult::Ok(out)
+    CliParseResult::Ok(Box::new(out))
 }
 
 fn missing_value(flag: &str, kind: &str) -> CliParseResult {
@@ -370,9 +410,16 @@ fn run_run(args: impl Iterator<Item = String>) -> ExitCode {
     let probe_policy_override = resolve_probe_policy(&cli, &config);
 
     // 5. Read the prompt (positional or --prompt-file or stdin).
-    let prompt = match read_prompt_from_cli(&cli) {
-        Ok(s) => s,
-        Err(code) => return code,
+    //    v61: an empty prompt is permitted when `--resume` is in play —
+    //    the runner just picks up the conversation prefix from disk.
+    let prompt = if cli.resume.is_some() && cli.prompt_args.is_empty() && cli.prompt_file.is_none()
+    {
+        String::new()
+    } else {
+        match read_prompt_from_cli(&cli) {
+            Ok(s) => s,
+            Err(code) => return code,
+        }
     };
 
     // 6. Build the tokio runtime + Runner + run.
@@ -406,6 +453,16 @@ fn run_run(args: impl Iterator<Item = String>) -> ExitCode {
     }
     if let Some(policy) = probe_policy_override {
         runner = runner.with_probe_policy(policy);
+    }
+    // v61 — §14 flags. Order matters: `with_non_interactive(true)`
+    // forces both AutoApproveAll and AutoReload, so call it last so a
+    // user's earlier policy choices (none today, but future flags)
+    // can't override the headless guarantee.
+    if let Some(uuid) = cli.resume {
+        runner = runner.with_resume(uuid);
+    }
+    if cli.non_interactive {
+        runner = runner.with_non_interactive(true);
     }
 
     match rt.block_on(runner.run(prompt)) {

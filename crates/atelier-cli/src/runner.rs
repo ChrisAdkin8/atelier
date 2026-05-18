@@ -23,9 +23,11 @@ use atelier_core::{
         ContextItem, ContextItemId, ContextManager, Payload, Provenance, TokenCount, TokenSource,
     },
     dispatcher::{
-        Dispatcher, SessionDispatcher, ShellHookExecutor, Tool, ToolContext, ToolRegistry,
+        ConcurrentEditPolicy, Dispatcher, SessionDispatcher, ShellHookExecutor, Tool, ToolContext,
+        ToolRegistry,
     },
     dod::DodConfig,
+    file_watcher,
     hooks::HookSet,
     ledger::Ledger,
     memory::MemoryStore,
@@ -34,7 +36,7 @@ use atelier_core::{
     protocol::Envelope,
     protocol_strategy::{parse_json_sentinel, parse_native_tool, NativeToolCall, Strategy},
     sandbox::SandboxPolicy,
-    session::{self, Command as SessionCommand, Event, MessageRole},
+    session::{self, Command as SessionCommand, ConcurrentEditOutcome, Event, MessageRole},
     state::NoopHook,
     tools::{
         ast_grep::AstGrep, edit_file::EditFile, grep::Grep, list_dir::ListDir, read_file::ReadFile,
@@ -289,6 +291,29 @@ pub struct Runner {
     /// pricing tables land in a later bundle. Surfaces in the §3
     /// cost meter as the "+ N unknown" suffix.
     cost_policy: ModelCostPolicy,
+    /// v61 — §14 concurrent-edit policy. `Modal` (the default) surfaces
+    /// `Event::FilesChanged` and waits for a user decision; `AutoReload`
+    /// auto-resolves to Reload for `--non-interactive` mode.
+    concurrent_edit_policy: ConcurrentEditPolicy,
+    /// v61 — §14 resume. When `Some(uuid)`, the runner loads the
+    /// on-disk session and replays its conversation prefix instead of
+    /// starting from the supplied prompt. The prompt is appended after
+    /// the prefix as a fresh user turn so the model picks up where the
+    /// crashed run left off.
+    resume_from: Option<uuid::Uuid>,
+    /// v61 — `--non-interactive`. Disables modals (approvals + concurrent
+    /// edits) and never prompts the user. Drives the auto-resolve
+    /// answers that headless runs need.
+    ///
+    /// `#[allow(dead_code)]` because integration tests pull this file
+    /// in via `#[path]` and don't reference the field — but it's wired
+    /// through `Runner::with_non_interactive` from `main.rs`. Removing
+    /// the allow under a different cfg-feature topology is fine when
+    /// the `Runner`'s field set is consumed via a method (today: only
+    /// the builder sets it; the run loop reads `concurrent_edit_policy`
+    /// / `approval_policy` which `with_non_interactive` mutates).
+    #[allow(dead_code)]
+    non_interactive: bool,
 }
 
 /// v60.7 — §1 latency-weighted local-cost selector. Determined once
@@ -406,6 +431,9 @@ impl Runner {
             probe_base_url,
             pane_visibility: None,
             cost_policy,
+            concurrent_edit_policy: ConcurrentEditPolicy::Modal,
+            resume_from: None,
+            non_interactive: false,
         })
     }
 
@@ -469,6 +497,45 @@ impl Runner {
         self
     }
 
+    /// v61 — install the §14 concurrent-edit policy. `Modal` (default)
+    /// surfaces `Event::FilesChanged` and awaits user choice;
+    /// `AutoReload` is the headless answer used by `--non-interactive`.
+    #[allow(dead_code)] // called from main.rs; integration tests pull this file via `#[path]`.
+    pub fn with_concurrent_edit_policy(mut self, policy: ConcurrentEditPolicy) -> Self {
+        self.concurrent_edit_policy = policy;
+        self
+    }
+
+    /// v61 — `--non-interactive` mode. Composite flag: forces
+    /// [`atelier_core::dispatcher::ApprovalPolicy::AutoApproveAll`] +
+    /// [`ConcurrentEditPolicy::AutoReload`] so no run can block on a
+    /// missing UI. Wins over any prior `with_approval_policy` /
+    /// `with_concurrent_edit_policy` call (call this last).
+    #[allow(dead_code)] // called from main.rs; integration tests pull this file via `#[path]`.
+    pub fn with_non_interactive(mut self, on: bool) -> Self {
+        self.non_interactive = on;
+        if on {
+            self.approval_policy = atelier_core::dispatcher::ApprovalPolicy::AutoApproveAll;
+            self.concurrent_edit_policy = ConcurrentEditPolicy::AutoReload;
+        }
+        self
+    }
+
+    /// v61 — resume a previously-persisted session by UUID. The runner
+    /// reads `<workspace>/.atelier/sessions/<uuid>/session.json`, replays
+    /// the conversation prefix per
+    /// [`atelier_core::OnDiskSession::resume_conversation_prefix`] (only
+    /// turns through the last completed tool round-trip), and surfaces
+    /// the on-disk `recovery_log` to UI consumers via
+    /// `Event::MessageCommitted { role: System, … }`. The fresh prompt
+    /// passed to [`Self::run`] is appended after the prefix as a new
+    /// user turn — pass an empty string to resume without an additional
+    /// prompt.
+    pub fn with_resume(mut self, session_uuid: uuid::Uuid) -> Self {
+        self.resume_from = Some(session_uuid);
+        self
+    }
+
     /// Drive the loop until `claims_done` or `max_turns`. Returns when:
     ///   * a turn carried `claims_done: true` (success path; runs DoD next),
     ///   * `max_turns` reached (timeout; `final_state = AwaitingUser`),
@@ -502,6 +569,24 @@ impl Runner {
         // 3. Session actor + SessionDispatcher.
         let session_handle = session::spawn(Arc::new(NoopHook), Arc::new(NoopHook));
         let bus = session_handle.events_sender();
+
+        // v61 — §14 per-session file watcher. The dispatcher feeds the
+        // read-set after each `read_file` / `list_dir` / `grep` / `ast_grep`
+        // call; external edits to any tracked path surface as
+        // `Event::FilesChanged`. Init failure is non-fatal: we fall back
+        // to a disabled handle so the run still progresses (concurrent
+        // edits just go undetected — same as a pre-v61 build).
+        let file_watcher_handle = match file_watcher::spawn(
+            bus.clone(),
+            file_watcher::FILE_WATCH_DEBOUNCE,
+        ) {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::warn!(error = %e, "file watcher init failed; concurrent-edit detection disabled");
+                file_watcher::FileWatcherHandle::disabled()
+            }
+        };
+
         let session_dispatcher = Arc::new(
             SessionDispatcher::new(dispatcher, ledger.clone(), bus.clone())
                 .with_approval_policy(self.approval_policy)
@@ -509,7 +594,20 @@ impl Runner {
                     context_manager.clone(),
                     memory_store.clone(),
                     plan_canvas.clone(),
-                ),
+                )
+                .with_file_watcher(file_watcher_handle.clone()),
+        );
+
+        // v61 — §14 concurrent-edit policy. Under `AutoReload` we wire
+        // a background task that auto-emits FilesChangedAcknowledged
+        // every time the watcher reports FilesChanged. The Modal arm
+        // leaves resolution to the UI consumer (GUI / TUI). Under
+        // Modal we also start the 5-minute auto-pause timer per
+        // spec §14; it's cancellable on the next FilesChangedAcknowledged.
+        let auto_reload_task = spawn_concurrent_edit_resolver(
+            bus.clone(),
+            self.concurrent_edit_policy,
+            std::time::Duration::from_secs(5 * 60),
         );
         // Publish the dispatcher to any caller-registered handle BEFORE
         // we start dispatching. The GUI's `submit_approval` Tauri
@@ -642,20 +740,95 @@ impl Runner {
         // strategy so the first turn skips the warm-up period.
         let _initial_strategy_hint = profile.strategy;
 
-        // 5. Turn loop.
+        // 5. Turn loop. v61 — when `resume_from` is set, replay the
+        //    persisted conversation prefix first; the supplied prompt
+        //    is then appended as a fresh user turn (or skipped when
+        //    empty). On a fresh run we keep the pre-v61 single-prompt
+        //    bootstrap.
         let session_id = session_handle.id();
-        let mut messages: Vec<Message> = vec![Message::text(Role::User, prompt.clone())];
+        let mut messages: Vec<Message> = Vec::new();
+        let mut resumed_session: Option<OnDiskSession> = None;
         let prompt_now = now_rfc3339();
-        context_manager
-            .lock()
-            .add(context_item_for_user_prompt(&prompt, &prompt_now));
-        // Broadcast the initial user prompt so the conversation pane
-        // catches up before the first turn. Best-effort send (no
-        // subscribers is fine — see SessionDispatcher::dispatch).
-        let _ = bus.send(Event::MessageCommitted {
-            role: MessageRole::User,
-            text: prompt,
-        });
+
+        if let Some(resume_uuid) = self.resume_from {
+            let session_dir = OnDiskSession::session_dir(&workspace, resume_uuid);
+            let on_disk = OnDiskSession::load_from(&session_dir).map_err(|e| {
+                RunError::Config(format!("resume: cannot load session {resume_uuid}: {e}"))
+            })?;
+            // Re-hydrate the in-memory message list from the prefix.
+            for entry in on_disk.resume_conversation_prefix() {
+                let role = match entry.role.as_str() {
+                    "user" => Role::User,
+                    "assistant" => Role::Assistant,
+                    "tool" => Role::Tool,
+                    "system" => Role::System,
+                    other => {
+                        tracing::warn!(role = %other, "resume: skipping unknown role");
+                        continue;
+                    }
+                };
+                let tool_calls: Vec<ToolCallRequest> = entry
+                    .tool_calls
+                    .iter()
+                    .filter_map(reconstruct_tool_call_request)
+                    .collect();
+                let msg = Message {
+                    role,
+                    content: entry.content.clone(),
+                    tool_call_id: entry.tool_call_id.clone(),
+                    tool_calls,
+                };
+                let role_bus = match role {
+                    Role::User => MessageRole::User,
+                    Role::Assistant => MessageRole::Assistant,
+                    Role::Tool => MessageRole::Tool,
+                    Role::System => MessageRole::System,
+                };
+                let _ = bus.send(Event::MessageCommitted {
+                    role: role_bus,
+                    text: entry.content,
+                });
+                messages.push(msg);
+            }
+            // Surface every recovery_log entry to UIs as a system
+            // message so the user knows what was preserved. The
+            // entries themselves stay on the persisted recovery_log;
+            // we re-write them to the next save so the audit trail is
+            // never erased.
+            for rec in &on_disk.recovery_log {
+                let _ = bus.send(Event::MessageCommitted {
+                    role: MessageRole::System,
+                    text: format!(
+                        "[recovery] turn={} reason={:?} captured_at={} partial={:?}",
+                        rec.turn_id, rec.reason, rec.captured_at, rec.partial_content
+                    ),
+                });
+            }
+            resumed_session = Some(on_disk);
+            if !prompt.trim().is_empty() {
+                context_manager
+                    .lock()
+                    .add(context_item_for_user_prompt(&prompt, &prompt_now));
+                let _ = bus.send(Event::MessageCommitted {
+                    role: MessageRole::User,
+                    text: prompt.clone(),
+                });
+                messages.push(Message::text(Role::User, prompt.clone()));
+            }
+        } else {
+            // Fresh run — pre-v61 behaviour.
+            messages.push(Message::text(Role::User, prompt.clone()));
+            context_manager
+                .lock()
+                .add(context_item_for_user_prompt(&prompt, &prompt_now));
+            // Broadcast the initial user prompt so the conversation pane
+            // catches up before the first turn. Best-effort send (no
+            // subscribers is fine — see SessionDispatcher::dispatch).
+            let _ = bus.send(Event::MessageCommitted {
+                role: MessageRole::User,
+                text: prompt.clone(),
+            });
+        }
         // v57 (M-bug-3 fix) — emit one ContextItems snapshot before
         // entering the turn loop so a UI subscriber that joins
         // immediately after `MessageCommitted{User}` doesn't see an
@@ -918,12 +1091,54 @@ impl Runner {
         //     cares about for `atelier run`. (The actor's checkpoint hook
         //     is where every-transition persistence would land; this is
         //     the end-of-run snapshot.)
-        let session_dir = OnDiskSession::session_dir(&workspace, session_id.0);
-        let snapshot = OnDiskSession::fresh(
-            session_id.0,
+        //
+        //     v61 — write the full conversation back so `--resume` has
+        //     something to reconstruct from. When resuming, we keep the
+        //     prior `session_uuid` so the on-disk path is stable; fresh
+        //     runs use the actor's session id.
+        let persist_uuid = self.resume_from.unwrap_or(session_id.0);
+        let session_dir = OnDiskSession::session_dir(&workspace, persist_uuid);
+        let mut snapshot = OnDiskSession::fresh(
+            persist_uuid,
             env!("CARGO_PKG_VERSION").to_string(),
             now_rfc3339(),
         );
+        // Re-attach the resumed recovery_log so its audit trail
+        // survives the round-trip. Fresh runs get an empty log.
+        if let Some(resumed) = &resumed_session {
+            snapshot.recovery_log = resumed.recovery_log.clone();
+        }
+        // Materialise the in-memory `messages` into the persisted
+        // conversation field. Turn ids are session-local positional —
+        // sufficient for the resume protocol's ordering invariants;
+        // a future audit-grade format will carry stable per-call ids.
+        for (idx, msg) in messages.iter().enumerate() {
+            let turn_id = format!("turn-{idx}");
+            let role_str = match msg.role {
+                Role::User => "user",
+                Role::Assistant => "assistant",
+                Role::Tool => "tool",
+                Role::System => "system",
+            };
+            let tool_calls_json: Vec<serde_json::Value> = msg
+                .tool_calls
+                .iter()
+                .map(|tc| {
+                    serde_json::json!({
+                        "tool_call_id": tc.id,
+                        "tool_name": tc.name,
+                        "args": tc.arguments,
+                    })
+                })
+                .collect();
+            snapshot.append_conversation_turn(
+                turn_id,
+                role_str,
+                msg.content.clone(),
+                msg.tool_call_id.clone(),
+                tool_calls_json,
+            );
+        }
         if let Err(e) = snapshot.save_to(&session_dir) {
             tracing::warn!(error = %e, "atelier run: session snapshot save failed");
         }
@@ -955,7 +1170,13 @@ impl Runner {
         // The DispatcherHandleGuard (created above) clears the slot
         // on every exit path; nothing extra to do here.
         drop(session_dispatcher);
+        drop(file_watcher_handle);
         drop(session_handle);
+        // v61 — the concurrent-edit resolver task exits when the
+        // broadcast channel closes. Abort it for promptness so the
+        // 5-min pause timer doesn't keep the runtime alive after a
+        // crash.
+        auto_reload_task.abort();
         // Safety belt: if a future regression keeps a Sender alive, the
         // drain task would block forever; bound the wait so the runner
         // doesn't hang the test or CLI process.
@@ -1059,6 +1280,85 @@ fn extract_native_envelope(calls: &[ToolCallRequest]) -> Option<Envelope> {
         }
     }
     None
+}
+
+/// v61 — concurrent-edit resolver. Subscribes to the session bus and
+/// either auto-acknowledges (`AutoReload` policy, no human in the loop)
+/// or starts a 5-minute auto-pause timer per spec §14 (`Modal` policy,
+/// fires `FilesChangedAcknowledged { outcome: PauseTimedOut }` if the
+/// user doesn't intervene).
+///
+/// Returns a `JoinHandle` so the caller can drop the task at session
+/// teardown. The task exits naturally when the broadcast channel closes
+/// (`session_handle` dropped).
+fn spawn_concurrent_edit_resolver(
+    bus: tokio::sync::broadcast::Sender<Event>,
+    policy: ConcurrentEditPolicy,
+    pause_timeout: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
+    let mut rx = bus.subscribe();
+    tokio::spawn(async move {
+        loop {
+            // Wait for a FilesChanged event (skip others).
+            let next = rx.recv().await;
+            match next {
+                Ok(Event::FilesChanged { .. }) => match policy {
+                    ConcurrentEditPolicy::AutoReload => {
+                        // Headless: auto-resolve immediately.
+                        let _ = bus.send(Event::FilesChangedAcknowledged {
+                            outcome: ConcurrentEditOutcome::AutoReload,
+                        });
+                    }
+                    ConcurrentEditPolicy::Modal => {
+                        // Interactive: start the 5-minute auto-pause
+                        // timer. Cancel it if a user-driven
+                        // FilesChangedAcknowledged arrives first.
+                        let mut local_rx = bus.subscribe();
+                        let timer = tokio::time::sleep(pause_timeout);
+                        tokio::pin!(timer);
+                        loop {
+                            tokio::select! {
+                                _ = &mut timer => {
+                                    let _ = bus.send(Event::FilesChangedAcknowledged {
+                                        outcome: ConcurrentEditOutcome::PauseTimedOut,
+                                    });
+                                    break;
+                                }
+                                ev = local_rx.recv() => match ev {
+                                    Ok(Event::FilesChangedAcknowledged { .. }) => {
+                                        // User (or auto-arm) resolved
+                                        // the modal — stand down the
+                                        // timer.
+                                        break;
+                                    }
+                                    Ok(Event::Shutdown) => return,
+                                    Err(_) => return,
+                                    _ => continue,
+                                },
+                            }
+                        }
+                    }
+                },
+                Ok(Event::Shutdown) => return,
+                Err(_) => return,
+                _ => continue,
+            }
+        }
+    })
+}
+
+/// v61 — reverse of the JSON shape `OnDiskSession::append_conversation_turn`
+/// writes into `tool_calls[]`. Returns `None` for malformed entries; the
+/// caller skips them.
+fn reconstruct_tool_call_request(v: &serde_json::Value) -> Option<ToolCallRequest> {
+    let id = v.get("tool_call_id")?.as_str()?.to_string();
+    let name = v.get("tool_name")?.as_str()?.to_string();
+    let arguments = v.get("args").cloned().unwrap_or(serde_json::Value::Null);
+    Some(ToolCallRequest {
+        id,
+        name,
+        arguments,
+    })
 }
 
 async fn advance(handle: &SessionHandle, _from: State, to: State) -> Result<(), RunError> {

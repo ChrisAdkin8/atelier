@@ -239,6 +239,12 @@ pub enum InputMode {
         item_count: u32,
         cache_rewarm_tokens: u32,
     },
+    /// v61 — §14 concurrent-edit modal. Surfaced when `Event::FilesChanged`
+    /// arrives during an interactive run. `r` chooses Reload, `w` Wait,
+    /// `p` Pause; Esc dismisses without choosing (the 5-minute auto-pause
+    /// timer in the runner is the ultimate arbiter). `paths` is the
+    /// debounced list of files whose external edit fired the modal.
+    ConcurrentEditConfirm { paths: Vec<PathBuf> },
 }
 
 /// Snapshot of the active model + strategy. Mirror of the GUI's
@@ -558,6 +564,25 @@ impl AppState {
                     text_tokens: *text_tokens,
                 };
             }
+            SessionEvent::FilesChanged { paths, .. } => {
+                // v61 — §14 concurrent-edit modal. Open the confirm
+                // mode so the next key (`r` / `w` / `p`) routes through
+                // `InputOutcome::ConcurrentEditResolve`. The dispatcher
+                // already queued the next tool call; we just surface
+                // the user's choice.
+                self.input_mode = InputMode::ConcurrentEditConfirm {
+                    paths: paths.clone(),
+                };
+            }
+            SessionEvent::FilesChangedAcknowledged { .. } => {
+                // v61 — clear the modal regardless of which arm
+                // resolved it (Reload / Wait / Pause / AutoReload /
+                // PauseTimedOut). The runner-side resolver task is
+                // authoritative for the outcome.
+                if matches!(self.input_mode, InputMode::ConcurrentEditConfirm { .. }) {
+                    self.input_mode = InputMode::Normal;
+                }
+            }
             SessionEvent::IllegalTransitionAttempted { .. }
             | SessionEvent::Cancelled
             | SessionEvent::Shutdown => {}
@@ -804,6 +829,13 @@ pub fn project_event(evt: &SessionEvent) -> EventLine {
             "{} · ~{text_tokens} tokens (0/turn in v0)",
             if *enabled { "on" } else { "off" }
         ),
+        SessionEvent::FilesChanged { paths, observed_at } => format!(
+            "{} path(s) changed at {observed_at}",
+            paths.len(),
+        ),
+        SessionEvent::FilesChangedAcknowledged { outcome } => {
+            outcome.wire_label().to_string()
+        }
         SessionEvent::Shutdown => String::new(),
     };
     EventLine { kind, detail }
@@ -1551,6 +1583,26 @@ fn render_help(state: &AppState, area: Rect, buf: &mut Buffer) {
         );
         return;
     }
+    // v61 — §14 concurrent-edit modal. Renders the three resolution
+    // keys (r/w/p) so the user knows their options without consulting
+    // docs. Surface count of paths so a sweeping IDE refactor is
+    // visible at the footer.
+    if let InputMode::ConcurrentEditConfirm { paths } = &state.input_mode {
+        Widget::render(
+            Paragraph::new(format!(
+                " EXTERNAL EDIT detected ({} path(s)) · r reload · w wait · p pause · Esc dismiss ",
+                paths.len()
+            ))
+            .style(
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            area,
+            buf,
+        );
+        return;
+    }
 
     let left = render_help_left(state);
     match state.current_model.as_ref() {
@@ -1766,6 +1818,15 @@ pub enum InputOutcome {
     ExpandConfirmYes {
         card_id: String,
     },
+    /// v61 — in `ConcurrentEditConfirm` mode: user chose one of the
+    /// three §14 outcomes. The run loop emits
+    /// `Event::FilesChangedAcknowledged { outcome }` and clears the
+    /// modal. `Reload` / `Wait` / `Pause` are the user-driven cases;
+    /// the headless `AutoReload` + `PauseTimedOut` arms are emitted
+    /// by the runner-side resolver task, not here.
+    ConcurrentEditResolve {
+        outcome: atelier_core::ConcurrentEditOutcome,
+    },
     /// In any modal: Esc / `q` cancels back to Normal.
     ModalCancel,
     /// Memory pane: `d` deletes selected card.
@@ -1847,6 +1908,21 @@ pub fn handle_key(key: KeyEvent, state: &AppState) -> InputOutcome {
                 (KeyCode::Esc, _) | (KeyCode::Char('n'), _) | (KeyCode::Char('q'), _) => {
                     InputOutcome::ModalCancel
                 }
+                _ => InputOutcome::Continue,
+            };
+        }
+        InputMode::ConcurrentEditConfirm { .. } => {
+            return match (key.code, key.modifiers) {
+                (KeyCode::Char('r'), _) => InputOutcome::ConcurrentEditResolve {
+                    outcome: atelier_core::ConcurrentEditOutcome::Reload,
+                },
+                (KeyCode::Char('w'), _) => InputOutcome::ConcurrentEditResolve {
+                    outcome: atelier_core::ConcurrentEditOutcome::Wait,
+                },
+                (KeyCode::Char('p'), _) => InputOutcome::ConcurrentEditResolve {
+                    outcome: atelier_core::ConcurrentEditOutcome::Pause,
+                },
+                (KeyCode::Esc, _) | (KeyCode::Char('q'), _) => InputOutcome::ModalCancel,
                 _ => InputOutcome::Continue,
             };
         }
@@ -2216,6 +2292,19 @@ async fn run_async(prompt: Option<String>) -> io::Result<()> {
                             InputOutcome::ExpandConfirmYes { card_id } => {
                                 state.input_mode = InputMode::Normal;
                                 submit_expand(&dispatcher_handle, card_id);
+                            }
+                            InputOutcome::ConcurrentEditResolve { outcome } => {
+                                // v61 — clear the modal locally and
+                                // route the user's choice to the
+                                // dispatcher; the resolver task in the
+                                // runner will see the bus event and
+                                // stand down the auto-pause timer.
+                                state.input_mode = InputMode::Normal;
+                                if let Some(handle) = dispatcher_handle.as_ref() {
+                                    if let Some(sd) = handle.get() {
+                                        sd.resolve_concurrent_edit(outcome);
+                                    }
+                                }
                             }
                             InputOutcome::ModalCancel => {
                                 state.input_mode = InputMode::Normal;

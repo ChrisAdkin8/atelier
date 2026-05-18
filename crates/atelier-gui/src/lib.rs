@@ -141,6 +141,8 @@ pub fn run() {
             // Phase C close — §5 mental-model panel.
             set_mental_model,
             snapshot_mental_model,
+            // v61 §14 concurrent-edit modal resolver.
+            resolve_concurrent_edit,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -234,6 +236,30 @@ fn submit_approval(
         .map(|(p, fa)| (std::path::PathBuf::from(p), fa.into_core()))
         .collect();
     sd.submit_approval(parsed_id, core_selection)
+}
+
+/// v61 — §14 concurrent-edit modal resolver. Surfaced from the
+/// webview's `ConcurrentEditModal.svelte`. `choice` is one of
+/// `"reload"` / `"wait"` / `"pause"`; anything else is rejected so a
+/// future variant rename forces a deliberate edit. Returns `false`
+/// when there's no active dispatcher (run already torn down).
+#[tauri::command]
+fn resolve_concurrent_edit(state: tauri::State<'_, SessionState>, choice: String) -> bool {
+    let outcome = match choice.as_str() {
+        "reload" => atelier_core::ConcurrentEditOutcome::Reload,
+        "wait" => atelier_core::ConcurrentEditOutcome::Wait,
+        "pause" => atelier_core::ConcurrentEditOutcome::Pause,
+        other => {
+            tracing::warn!(choice = %other, "resolve_concurrent_edit: unknown choice");
+            return false;
+        }
+    };
+    let Some(sd) = state.dispatcher_handle.get() else {
+        tracing::warn!("resolve_concurrent_edit: no active dispatcher");
+        return false;
+    };
+    sd.resolve_concurrent_edit(outcome);
+    true
 }
 
 // v57 (H6 fix): `now_rfc3339` lifted into `atelier_core::time`. The
@@ -929,6 +955,18 @@ pub fn bridge_event(evt: &SessionEvent) -> BridgedEvent {
         } => json!({
             "enabled": enabled,
             "text_tokens": text_tokens,
+        }),
+        // v61 — §14 concurrent-edit signals. Paths are stringified
+        // verbatim for the webview to render; the wire label of the
+        // resolution outcome ("reload" / "wait" / "pause" /
+        // "auto_reload" / "pause_timed_out") is the canonical form
+        // owned by atelier-core.
+        SessionEvent::FilesChanged { paths, observed_at } => json!({
+            "paths": paths.iter().map(|p| p.to_string_lossy()).collect::<Vec<_>>(),
+            "observed_at": observed_at,
+        }),
+        SessionEvent::FilesChangedAcknowledged { outcome } => json!({
+            "outcome": outcome.wire_label(),
         }),
     };
     BridgedEvent { kind, payload }

@@ -1424,3 +1424,142 @@ async fn run_skips_pane_visibility_when_driver_does_not_supply_record() {
     let pv = entries[0].join("pane_visibility.json");
     assert!(!pv.exists(), "no pane_visibility.json expected by default");
 }
+
+// ---------- v61 — §14 SIGKILL → resume mechanical gate ----------
+//
+// The full kill -9 path is platform-specific (POSIX-only `nix::sys::signal`
+// and a subprocess setup) and CI-flaky on macOS sandbox; we exercise the
+// same code path by *simulating* the post-kill state on disk:
+//
+//   1. Write an OnDiskSession to disk whose `conversation` ends with an
+//      orphan `assistant` turn (tool_call emitted, no tool result) and a
+//      `recovery_log` entry tagged `RecoveryReason::Crash`. This is the
+//      exact shape `Runner::run`'s end-of-run save would leave behind if
+//      the process died mid-`dispatch` after the assistant turn went on
+//      the bus but before the tool result landed.
+//   2. Spin a fresh `Runner::with_resume(uuid)` against the same workspace
+//      with a Mock adapter that scripts the rest of the turn.
+//   3. Capture the bus events. Assert:
+//        a) `Event::MessageCommitted { role: System }` carries the
+//           recovery_log entry (the prior partial output is preserved per
+//           spec §14, not lost),
+//        b) The orphan assistant turn is dropped per
+//           `resume_conversation_prefix` (no spurious `tool_calls` in the
+//           replayed conversation),
+//        c) The final state reaches `State::Done` — resume hands off to
+//           the normal turn loop cleanly.
+#[tokio::test]
+async fn sigkill_then_resume_recovers_partial_state_and_advances_to_done() {
+    use atelier_core::persistence::{RecoveryEntry, RecoveryReason};
+    use atelier_core::session::MessageRole;
+
+    let workspace = tempfile::TempDir::new().unwrap();
+    let resume_uuid = uuid::Uuid::new_v4();
+    let session_dir = atelier_core::OnDiskSession::session_dir(workspace.path(), resume_uuid);
+
+    // Simulate mid-tool-call crash: assistant turn with a tool_call but
+    // no tool result, plus a recovery_log entry capturing the partial
+    // output that was streaming when the process died.
+    let mut crashed = atelier_core::OnDiskSession::fresh(
+        resume_uuid,
+        env!("CARGO_PKG_VERSION").to_string(),
+        atelier_core::time::now_rfc3339(),
+    );
+    crashed.append_conversation_turn("turn-0", "user", "write a file then stop", None, Vec::new());
+    crashed.append_conversation_turn(
+        "turn-1",
+        "assistant",
+        "writing the file",
+        None,
+        vec![serde_json::json!({
+            "tool_call_id": "tc-orphan",
+            "tool_name": "write_file",
+            "args": {"path": "x.txt", "content": "partial"},
+        })],
+    );
+    crashed.append_recovery(RecoveryEntry {
+        turn_id: "turn-1".into(),
+        partial_content: "[stream interrupted: SIGKILL]".into(),
+        captured_at: atelier_core::time::now_rfc3339(),
+        reason: RecoveryReason::Crash,
+    });
+    crashed.save_to(&session_dir).expect("crash-state save");
+
+    // Resume: scripted MockAdapter says "done" with claimed_done so the
+    // run terminates after one turn.
+    let responses = vec![MockResponse {
+        assistant_text: "resumed and done".into(),
+        tool_calls: vec![mock_envelope_tool_call(&envelope_done())],
+    }];
+    let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let runner = Runner::new(
+        workspace.path().to_path_buf(),
+        ProviderChoice::Mock { responses },
+        EventSink::Capture(events.clone()),
+    )
+    .expect("mock runner construction is infallible")
+    .with_max_turns(2)
+    .with_resume(resume_uuid);
+
+    // An empty post-resume prompt: we want to verify the resume prefix
+    // alone is what feeds the model, not a fresh user turn.
+    let report = runner.run(String::new()).await.unwrap();
+    assert_eq!(
+        report.final_state,
+        State::Done,
+        "resumed run should reach Done"
+    );
+
+    let captured = events.lock();
+
+    // a) The recovery_log entry surfaced as a System message so the
+    //    user sees what was preserved.
+    let system_messages: Vec<String> = captured
+        .iter()
+        .filter_map(|e| match e {
+            Event::MessageCommitted { role, text } if *role == MessageRole::System => {
+                Some(text.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        system_messages.iter().any(|m| m.contains("[recovery]")),
+        "expected a [recovery] system message; got {system_messages:?}"
+    );
+    assert!(
+        system_messages
+            .iter()
+            .any(|m| m.contains("SIGKILL") || m.contains("partial")),
+        "expected the partial_content to be surfaced; got {system_messages:?}"
+    );
+
+    // b) The resume prefix dropped the orphan assistant turn — the
+    //    on-disk session after the resumed run no longer carries the
+    //    `tc-orphan` tool_call.
+    let resumed_on_disk =
+        atelier_core::OnDiskSession::load_from(&session_dir).expect("post-resume session load");
+    let orphan_present = resumed_on_disk.conversation.iter().any(|row| {
+        row.get("tool_calls")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .any(|tc| tc.get("tool_call_id").and_then(|v| v.as_str()) == Some("tc-orphan"))
+            })
+            .unwrap_or(false)
+    });
+    assert!(
+        !orphan_present,
+        "orphan assistant tool_call should be truncated by resume_conversation_prefix"
+    );
+
+    // c) The recovery_log audit trail survives the round-trip (spec
+    //    §14: partial output preserved, not re-emitted into conversation).
+    assert!(
+        resumed_on_disk
+            .recovery_log
+            .iter()
+            .any(|r| r.reason == RecoveryReason::Crash),
+        "Crash recovery_log entry should survive resume's re-save"
+    );
+}

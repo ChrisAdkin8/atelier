@@ -277,8 +277,11 @@ def test_no_claude_paths_in_tracked_source():
         if not path.is_file():
             continue
         rel = path.relative_to(ROOT).as_posix()
-        # Skip excluded dirs that aren't part of tracked source
-        if any(part in {".git", "target", "node_modules", ".pytest_cache", "__pycache__", ".atelier-bin"} for part in path.parts):
+        # Skip excluded dirs that aren't part of tracked source.
+        # `.claude` covers the harness-managed runtime tree (worktrees, plugins
+        # cache, etc.) that the BYOM repo never tracks. The directive is about
+        # *tracked source* — runtime trees are out of scope.
+        if any(part in {".git", "target", "node_modules", ".pytest_cache", "__pycache__", ".atelier-bin", ".claude"} for part in path.parts):
             continue
         if rel in allowed:
             continue

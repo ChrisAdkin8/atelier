@@ -664,6 +664,28 @@ pub struct HookPhases {
 
 // ---------- SessionDispatcher (side-effecting wrapper) ----------
 
+/// v61 — §14 concurrent-edit policy. Distinct axis from [`ApprovalPolicy`]
+/// (which gates *staging*); this one gates how the runner reacts when
+/// the file-watcher reports an external edit mid-turn.
+///
+/// `Modal` is the interactive default: queue the next dispatch, surface
+/// `Event::FilesChanged`, wait for a user decision (or the 5-min
+/// auto-pause timer to fire). `AutoReload` is `--non-interactive`'s
+/// answer — the runner immediately treats the change as a Reload
+/// without surfacing a modal.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ConcurrentEditPolicy {
+    /// Interactive. Surface `Event::FilesChanged`; await the user's
+    /// choice (Reload / Wait / Pause). Default for GUI / TUI driver
+    /// modes and `atelier run` without `--non-interactive`.
+    #[default]
+    Modal,
+    /// Headless. Auto-resolve every file-watch event as Reload; emit
+    /// `Event::FilesChangedAcknowledged { outcome: AutoReload }`
+    /// straight away. Set by `--non-interactive`.
+    AutoReload,
+}
+
 /// Hunk-accept-reject policy for [`SessionDispatcher`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ApprovalPolicy {
@@ -849,6 +871,57 @@ pub(crate) fn validate_plan_text(text: &str) -> Result<(), crate::plan::PlanErro
         .map_err(crate::plan::PlanError::InvalidContent)
 }
 
+/// v61 — extract the paths a read-only tool call touches so the §14
+/// file watcher's read-set stays in sync with the model's actual
+/// observations. Returns absolute paths (joined onto `workspace_root`
+/// since the tools accept repo-relative inputs).
+///
+/// Only the built-in read tools are recognised: `read_file`,
+/// `list_dir`, `grep`, `ast_grep`. Unknown tool names (MCP-routed or
+/// not in the catalogue) return an empty vector; the watcher gracefully
+/// degrades — we just don't track their reads.
+fn extract_read_paths(
+    tool_name: &str,
+    args: &serde_json::Value,
+    workspace_root: &Path,
+) -> Vec<std::path::PathBuf> {
+    use std::path::PathBuf;
+    let resolve = |raw: &str| -> Option<PathBuf> {
+        if raw.is_empty() {
+            return None;
+        }
+        let p = std::path::Path::new(raw);
+        if p.is_absolute() {
+            Some(p.to_path_buf())
+        } else {
+            Some(workspace_root.join(p))
+        }
+    };
+    match tool_name {
+        "read_file" | "list_dir" | "ast_grep" => args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .and_then(resolve)
+            .into_iter()
+            .collect(),
+        "grep" => {
+            // `grep` accepts an optional `path` (default = workspace root)
+            // plus the implicit recursion. Tracking just the root entry
+            // is the right granularity — recursive watching would balloon
+            // the read-set on a big repo. Spec §14 says the watcher
+            // detects edits to files in the *read set*; for `grep`, the
+            // read set is the directory the model targeted.
+            args.get("path")
+                .and_then(|v| v.as_str())
+                .and_then(resolve)
+                .or_else(|| Some(workspace_root.to_path_buf()))
+                .into_iter()
+                .collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
 /// Parse a `ContextItemId` from its stringified UUID form
 /// (`ContextItemSummary::id`).
 ///
@@ -897,6 +970,10 @@ pub struct SessionDispatcher {
     /// enabled flag + approximate token count so subscribed UIs
     /// converge.
     mental_model: Arc<parking_lot::Mutex<crate::mental_model::MentalModel>>,
+    /// v61 — §14 file watcher. Defaults to a no-op handle so callers
+    /// (tests, GUI demo runs) that don't wire the watcher pay nothing.
+    /// The Runner attaches a real handle via [`Self::with_file_watcher`].
+    file_watcher: crate::file_watcher::FileWatcherHandle,
 }
 
 impl SessionDispatcher {
@@ -918,7 +995,18 @@ impl SessionDispatcher {
             mental_model: Arc::new(parking_lot::Mutex::new(
                 crate::mental_model::MentalModel::new(),
             )),
+            file_watcher: crate::file_watcher::FileWatcherHandle::disabled(),
         }
+    }
+
+    /// v61 — attach a §14 file watcher. After each successful read-only
+    /// tool dispatch (`read_file`, `list_dir`, `grep`, `ast_grep`), the
+    /// dispatcher feeds the touched path into the watcher's read-set
+    /// via [`crate::file_watcher::FileWatcherHandle::track`]. External
+    /// edits to any tracked path surface as `Event::FilesChanged`.
+    pub fn with_file_watcher(mut self, handle: crate::file_watcher::FileWatcherHandle) -> Self {
+        self.file_watcher = handle;
+        self
     }
 
     /// v55 — share the runner's §5 state with this dispatcher. The
@@ -1033,6 +1121,18 @@ impl SessionDispatcher {
     fn emit_plan_snapshot(&self) {
         let steps = self.plan_canvas.lock().to_vec();
         let _ = self.events.send(Event::PlanSnapshot { steps });
+    }
+
+    /// v61 — surface a user's §14 concurrent-edit modal choice onto
+    /// the bus as `Event::FilesChangedAcknowledged`. Best-effort send;
+    /// no subscribers (post-shutdown) is acceptable, matching the
+    /// other dispatcher-side emit helpers. Called by the GUI's
+    /// `resolve_concurrent_edit` Tauri command and the TUI's
+    /// `ConcurrentEditResolve` outcome.
+    pub fn resolve_concurrent_edit(&self, outcome: crate::session::ConcurrentEditOutcome) {
+        let _ = self
+            .events
+            .send(Event::FilesChangedAcknowledged { outcome });
     }
 
     /// Pin a context item. UI handler. Returns `Ok` on success, with
@@ -1466,6 +1566,15 @@ impl SessionDispatcher {
         now: impl Fn() -> String,
     ) -> DispatchOutcome {
         let outcome = self.dispatcher.dispatch(call, ctx, now).await;
+        // v61 — §14 read-set tracking. On any *successful* read-only
+        // tool call, hand the path(s) the model just observed to the
+        // file watcher. Cheap no-op when the watcher is disabled (the
+        // default for tests / GUI demos).
+        if outcome.result.is_ok() && !self.file_watcher.is_disabled() {
+            for path in extract_read_paths(&call.name, &call.arguments, ctx.workspace_root) {
+                self.file_watcher.track(&path);
+            }
+        }
         self.ledger.append(outcome.ledger_entry.clone());
         // Order matters here:
         //   1. EditStaged per file (user-visible diff)
@@ -3584,5 +3693,76 @@ mod tests {
         assert!(!snap.enabled);
         assert!(snap.text.is_empty());
         assert_eq!(snap.text_tokens, 0);
+    }
+
+    // ---------- v61 — §14 concurrent-edit smoke tests ----------
+
+    #[test]
+    fn concurrent_edit_policy_default_is_modal() {
+        // Pin the default so a future Default derive change is a
+        // conscious migration — the GUI / TUI render an unsuppressed
+        // modal under Modal, which is the user-visible safe choice.
+        let policy = ConcurrentEditPolicy::default();
+        assert_eq!(policy, ConcurrentEditPolicy::Modal);
+    }
+
+    #[test]
+    fn extract_read_paths_resolves_relative_against_workspace() {
+        let ws = std::path::Path::new("/tmp/repo");
+        let paths =
+            super::extract_read_paths("read_file", &serde_json::json!({"path": "src/main.rs"}), ws);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0], std::path::Path::new("/tmp/repo/src/main.rs"));
+    }
+
+    #[test]
+    fn extract_read_paths_keeps_absolute_paths_untouched() {
+        let ws = std::path::Path::new("/tmp/repo");
+        let paths = super::extract_read_paths(
+            "list_dir",
+            &serde_json::json!({"path": "/abs/elsewhere"}),
+            ws,
+        );
+        assert_eq!(paths, vec![std::path::PathBuf::from("/abs/elsewhere")]);
+    }
+
+    #[test]
+    fn extract_read_paths_for_grep_falls_back_to_workspace_root() {
+        let ws = std::path::Path::new("/tmp/repo");
+        let paths = super::extract_read_paths(
+            "grep",
+            &serde_json::json!({"pattern": "foo"}), // no `path` key
+            ws,
+        );
+        assert_eq!(paths, vec![std::path::PathBuf::from("/tmp/repo")]);
+    }
+
+    #[test]
+    fn extract_read_paths_for_unknown_tool_is_empty() {
+        let ws = std::path::Path::new("/tmp/repo");
+        let paths = super::extract_read_paths("write_file", &serde_json::json!({"path": "x"}), ws);
+        assert!(paths.is_empty(), "write_file isn't a read tool: {paths:?}");
+    }
+
+    #[tokio::test]
+    async fn resolve_concurrent_edit_emits_files_changed_acknowledged() {
+        let (sd, _cm, _ms, _pc, _ledger, mut rx) = build_v55_dispatcher();
+        sd.resolve_concurrent_edit(crate::session::ConcurrentEditOutcome::Reload);
+        // Drain until we see the ack — other v55 setup events may
+        // beat it to the queue.
+        let mut saw = false;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await {
+                Ok(Ok(crate::session::Event::FilesChangedAcknowledged { outcome })) => {
+                    assert_eq!(outcome, crate::session::ConcurrentEditOutcome::Reload);
+                    saw = true;
+                    break;
+                }
+                Ok(Ok(_)) => continue,
+                _ => break,
+            }
+        }
+        assert!(saw, "resolve_concurrent_edit must publish on the bus");
     }
 }
