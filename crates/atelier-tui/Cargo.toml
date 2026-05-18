@@ -22,7 +22,6 @@ atelier-cli = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 tokio = { workspace = true }
-tokio-stream = "0.1"
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 # Pending-approval correlation id (PendingApproval.commit_id mirrors

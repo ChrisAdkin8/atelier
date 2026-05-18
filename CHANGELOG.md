@@ -1,5 +1,38 @@
 # Atelier Spec — Changelog
 
+## v60.14 — 2026-05-18 (Supply-chain + dead-dep gate via `make quality-cheap`)
+
+Adds a cheap, offline supply-chain hygiene gate. `make quality-cheap` runs `cargo-audit` against `Cargo.lock` and `cargo-machete` against `crates/`. Wired into `.github/workflows/check.yml` as a third job alongside `rust` and `rig` so a fresh advisory or a forgotten dep fails a PR. Caught and removed three genuinely unused workspace deps in `atelier-gui` (`tokio`, `tokio-stream`, `parking_lot`) plus `tokio-stream` in `atelier-tui` — Tauri provides the async runtime, and the `parking_lot` line carried a misleading "DispatcherHandle Mutex" comment despite zero symbol uses. Total: 4 deps dropped, 0 source-code changes required (the deletions are pure Cargo.toml work that the compiler confirms is sound via `cargo clippy --workspace --all-targets`).
+
+### Advisory triage
+
+One vulnerability + 20 warnings surfaced on first run; all are tauri/ratatui transitives. Triaged:
+
+- **RUSTSEC-2026-0009** — `time 0.3.41` DoS via stack exhaustion (medium, 6.8). Suppressed via `--ignore RUSTSEC-2026-0009` in the Makefile gate. Rationale (also captured at the gate): the fix lives in `time >= 0.3.47`, which requires rustc 1.88; the workspace is pinned to rustc 1.85 via `rust-toolchain.toml`. Affected versions reach us only through Tauri transitives (`cookie`, `plist`, `serde_with`); atelier-gui renders trusted local UI exclusively, no untrusted-time-input path exists in atelier code. Remove the ignore when the toolchain pin moves to ≥ 1.88 (likely required for a future Tauri 2.x bump regardless).
+- **20 warnings** — gtk-rs GTK3 unmaintained (10×, Linux-only via Tauri → wry), `lru 0.12.5` unsound (via ratatui), `glib 0.18.5` unsound (Linux Tauri), `instant`/`paste`/`proc-macro-error`/`unic-*` unmaintained. Warnings are non-fatal in `cargo-audit` by default; left as informational. A Tauri major bump is the natural cleanup point for the gtk-rs cluster.
+
+### Tool-install gotcha: rustc 1.85 pin
+
+Both tools' latest releases require rustc ≥ 1.86. Workarounds:
+
+- `cargo-audit`: `cargo install --locked cargo-audit` (the locked deps stay compatible with rustc 1.85).
+- `cargo-machete`: pinned to `0.7.0` — newer releases pull `cargo-platform 0.3.2` which needs rustc 1.88. The Makefile's install hint and the CI step both record this pin.
+
+CI uses `taiki-e/install-action@v2` with `tool: cargo-audit,cargo-machete@0.7.0` so the runner downloads pre-built binaries from each tool's GitHub releases rather than recompiling against the pinned toolchain — keeps the new job under 30 s wall-clock.
+
+### Why a separate CI job, not a step inside `rust`
+
+The audit + machete gates read `Cargo.lock` / `Cargo.toml` only — no toolchain build, no Tauri Linux system deps. Folding them into the `rust` job would chain them behind clippy's full workspace compile (~minutes on cold cache) for no reason. The new `quality` job runs on `ubuntu-latest` only because its outputs are platform-independent: the RustSec advisory DB doesn't differ by host, and `cargo machete` walks `Cargo.toml` not `target/`.
+
+### Files touched
+
+- `Makefile` — new `quality-cheap` target + `.PHONY` entry; rationale for the `RUSTSEC-2026-0009` ignore lives at the gate so a future contributor can decide whether to remove it.
+- `.github/workflows/check.yml` — new `quality` job (~25 lines).
+- `crates/atelier-gui/Cargo.toml` — drop `tokio`, `tokio-stream`, `parking_lot`.
+- `crates/atelier-tui/Cargo.toml` — drop `tokio-stream`.
+
+`cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test -p atelier-core` (794 tests), `cargo test -p atelier-cli` and `make quality-cheap` all green post-change.
+
 ## v60.13 — 2026-05-18 (Track A: §15 built-ins-as-MCP surface-symmetry refactor + Track C: Phase A nightly gate workflow)
 
 Closes Tracks A and C from the Phase A close-out plan. A sibling `BuiltInToolWrapper` mirrors `McpToolWrapper`'s exact shape so the two registration paths converge at the dispatcher boundary (Track A). A new `.github/workflows/nightly_phase_a_gate.yml` runs the mechanical Phase A gates every night, records pass/fail to `tests/phase_a_gate/last_run.json` per a new `schemas/ci/phase_a_gate.v1.json`, commits the artifact back, and surfaces a one-line digest via the new `phase_a_gate_status` binary (Track C). Workspace tests **1020 → 1038** (+18; +11 wrapper/register from A, +7 status binary from C).
