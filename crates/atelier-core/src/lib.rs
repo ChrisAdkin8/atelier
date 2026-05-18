@@ -69,8 +69,11 @@ pub use ledger::{
     local_cost_usd, Kind as LedgerKind, Ledger, LedgerEntry, DEFAULT_LOCAL_RATE_USD_PER_SEC,
 };
 pub use mcp::{
-    default_sandbox_for_workspace as default_mcp_sandbox, launch_stdio_server, McpLaunchError,
-    McpServerHandle, McpTool, FIRST_LIST_TIMEOUT_MS as MCP_FIRST_LIST_TIMEOUT_MS,
+    default_sandbox_for_workspace as default_mcp_sandbox, launch_and_register_mcp_servers,
+    launch_stdio_server, mcp_resource_to_context_item, register_mcp_resources_as_context,
+    register_mcp_servers, LaunchedMcpServers, McpLaunchError, McpResourceDescriptor,
+    McpServerHandle, McpTool, McpToolWrapper, RegisterMcpReport, RegisterMcpResourcesReport,
+    ServerFailure as McpServerFailure, FIRST_LIST_TIMEOUT_MS as MCP_FIRST_LIST_TIMEOUT_MS,
     HANDSHAKE_TIMEOUT_MS as MCP_HANDSHAKE_TIMEOUT_MS,
     SUPPORTED_PROTOCOL_VERSION as MCP_SUPPORTED_PROTOCOL_VERSION,
 };

@@ -26,10 +26,18 @@
 //! the dispatcher integration.
 
 pub mod errors;
+pub mod mcp_tool;
+pub mod registration;
 pub mod stdio_launcher;
 
 pub use errors::McpLaunchError;
+pub use mcp_tool::McpToolWrapper;
+pub use registration::{
+    launch_and_register_mcp_servers, mcp_resource_to_context_item,
+    register_mcp_resources_as_context, register_mcp_servers, LaunchedMcpServers, RegisterMcpReport,
+    RegisterMcpResourcesReport, ServerFailure,
+};
 pub use stdio_launcher::{
-    default_sandbox_for_workspace, launch_stdio_server, McpServerHandle, McpTool,
-    FIRST_LIST_TIMEOUT_MS, HANDSHAKE_TIMEOUT_MS, SUPPORTED_PROTOCOL_VERSION,
+    default_sandbox_for_workspace, launch_stdio_server, McpResourceDescriptor, McpServerHandle,
+    McpTool, FIRST_LIST_TIMEOUT_MS, HANDSHAKE_TIMEOUT_MS, SUPPORTED_PROTOCOL_VERSION,
 };

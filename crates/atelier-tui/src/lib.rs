@@ -1553,6 +1553,9 @@ fn provenance_badge(provenance: &str) -> &'static str {
         "memory_promoted" => "mem ",
         "pinned_by_user" => "pin ",
         "assistant_turn" => "asst",
+        // v60.11 (§15) — MCP-resource provenance label. Stable so the
+        // §5 mechanical gate can assert on it.
+        "mcp_resource" => "mcp ",
         _ => "????",
     }
 }
@@ -1565,6 +1568,9 @@ fn provenance_badge_style(provenance: &str) -> Style {
         "memory_promoted" => Style::default().fg(Color::Blue),
         "pinned_by_user" => Style::default().fg(Color::Yellow),
         "assistant_turn" => Style::default().fg(Color::White),
+        // v60.11 (§15) — MCP-resource style: cyan to read distinct
+        // from tool_result (magenta) and memory_promoted (blue).
+        "mcp_resource" => Style::default().fg(Color::Cyan),
         _ => Style::default().fg(Color::Red),
     }
 }
@@ -3263,6 +3269,7 @@ mod tests {
         assert_eq!(provenance_badge("memory_promoted"), "mem ");
         assert_eq!(provenance_badge("pinned_by_user"), "pin ");
         assert_eq!(provenance_badge("assistant_turn"), "asst");
+        assert_eq!(provenance_badge("mcp_resource"), "mcp ");
         assert_eq!(provenance_badge("garbage"), "????");
     }
 
@@ -3286,6 +3293,10 @@ mod tests {
             },
             Provenance::PinnedByUser { note: None },
             Provenance::AssistantTurn,
+            Provenance::McpResource {
+                server_name: "fs".into(),
+                resource_uri: "file:///tmp/x".into(),
+            },
         ] {
             let badge = provenance_badge(prov.wire_label());
             assert_ne!(

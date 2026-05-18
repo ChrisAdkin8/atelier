@@ -13,9 +13,19 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Arc;
 
-use atelier_core::mcp_config::{McpServerManifest, SideEffectClass, Transport};
-use atelier_core::{default_mcp_sandbox, launch_stdio_server, McpLaunchError, McpServerHandle};
+use atelier_core::adapter::ToolCallRequest;
+use atelier_core::context::ContextManager;
+use atelier_core::dispatcher::{SessionDispatcher, ToolContext, ToolRegistry};
+use atelier_core::hooks::HookSet;
+use atelier_core::ledger::Ledger;
+use atelier_core::mcp_config::{McpApprovals, McpServerManifest, SideEffectClass, Transport};
+use atelier_core::session::Event;
+use atelier_core::{
+    default_mcp_sandbox, launch_and_register_mcp_servers, launch_stdio_server,
+    register_mcp_resources_as_context, Dispatcher, McpLaunchError, McpServerHandle,
+};
 
 fn fixture_dir() -> std::path::PathBuf {
     // macOS resolves `/tmp` → `/private/tmp`; canonicalise so the server's
@@ -143,6 +153,156 @@ async fn launch_filesystem_server_and_list_tools() {
 
     // Clean shutdown — cancellation token path, not EOF reliance.
     handle.shutdown().await.expect("shutdown");
+}
+
+/// v60.11 — register an MCP server's tools into the dispatcher and
+/// dispatch one MCP-routed tool call end-to-end. Gated `#[ignore]` for
+/// the same reason as `launch_filesystem_server_and_list_tools`: needs
+/// `npx` + first-run network. Run with:
+///   `cargo test -p atelier-cli --test mcp_integration -- --ignored`
+///
+/// Asserts the full path: launch → list_tools → register into
+/// `ToolRegistry` → dispatch via `SessionDispatcher::dispatch` →
+/// outcome rides on the bus like a regular tool call (ledger entry +
+/// LedgerAppended event).
+#[tokio::test]
+#[ignore = "requires `npx` + first-run network for the npm registry; run explicitly"]
+async fn register_and_dispatch_mcp_routed_call() {
+    if !npx_on_path() {
+        eprintln!("npx missing — skipping.");
+        return;
+    }
+
+    let fixture = fixture_dir();
+    let manifest = filesystem_server_manifest(&fixture);
+    let workspace_tmp = tempfile::TempDir::new().unwrap();
+    let policy =
+        default_mcp_sandbox(workspace_tmp.path().to_path_buf(), true).expect("sandbox build");
+    let audit_dir = workspace_tmp.path().join("audit");
+
+    // Approve the server so registration walks it.
+    let mut approvals = McpApprovals::default();
+    approvals.approve("fs-integration", "2026-05-17T00:00:00Z");
+
+    let mut registry = ToolRegistry::new();
+    let launched = launch_and_register_mcp_servers(
+        &mut registry,
+        std::slice::from_ref(&manifest),
+        &approvals,
+        &policy,
+        &audit_dir,
+    )
+    .await;
+
+    if launched
+        .report
+        .server_failures
+        .iter()
+        .any(|f| f.reason.contains("spawn") || f.reason.contains("Spawn"))
+    {
+        eprintln!(
+            "npx spawn failed at runtime: {:?}; skipping.",
+            launched.report.server_failures
+        );
+        return;
+    }
+    assert!(
+        launched
+            .report
+            .servers_registered
+            .contains(&"fs-integration".to_string()),
+        "fs-integration must register, got {:?}",
+        launched.report
+    );
+    assert!(
+        launched
+            .report
+            .tools_registered
+            .iter()
+            .any(|t| t == "list_directory"),
+        "registry must carry list_directory, got {:?}",
+        launched.report.tools_registered
+    );
+
+    // Wrap into a SessionDispatcher so we can assert the bus events
+    // ride along.
+    let dispatcher = Dispatcher::new(registry, HookSet::empty());
+    let ledger = Arc::new(Ledger::new());
+    let (tx, mut rx) = tokio::sync::broadcast::channel(64);
+    let sd = SessionDispatcher::new(dispatcher, ledger.clone(), tx);
+
+    // Sandbox for the actual dispatch (not the MCP launch).
+    let dispatch_policy = atelier_core::SandboxPolicy::restrictive(workspace_tmp.path()).unwrap();
+    let ctx = ToolContext {
+        workspace_root: workspace_tmp.path(),
+        sandbox: &dispatch_policy,
+        tool_call_id: None,
+        audit_log_path: None,
+    };
+
+    let mut args = serde_json::Map::new();
+    args.insert(
+        "path".into(),
+        serde_json::Value::String(fixture.display().to_string()),
+    );
+    let call = ToolCallRequest {
+        id: "tc-mcp-1".into(),
+        name: "list_directory".into(),
+        arguments: serde_json::Value::Object(args),
+    };
+
+    let outcome = sd
+        .dispatch(&call, &ctx, || "2026-05-17T00:00:00Z".to_string())
+        .await;
+    assert!(
+        outcome.result.is_ok(),
+        "MCP-routed dispatch failed: {:?}",
+        outcome.result
+    );
+    // Bus event: LedgerAppended should land for this call.
+    let mut saw_ledger_event = false;
+    for _ in 0..4 {
+        match tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await {
+            Ok(Ok(Event::LedgerAppended { entry })) => {
+                if format!("{entry:?}").contains("list_directory") {
+                    saw_ledger_event = true;
+                    break;
+                }
+            }
+            Ok(Ok(_)) => continue,
+            _ => break,
+        }
+    }
+    assert!(
+        saw_ledger_event,
+        "expected a LedgerAppended event for the MCP-routed call"
+    );
+
+    // Walk resources into the context manager (some servers don't
+    // advertise resources — that's fine, the report's failed_servers
+    // tells us).
+    let mut ctx_manager = ContextManager::new();
+    let resources_report = register_mcp_resources_as_context(
+        &mut ctx_manager,
+        &launched.report.servers_registered,
+        &launched.handles,
+        "2026-05-17T00:00:00Z",
+    )
+    .await;
+    eprintln!(
+        "resources report: {} added, {} servers failed",
+        resources_report.added_item_ids.len(),
+        resources_report.failed_servers.len()
+    );
+
+    // Shut every handle down cleanly.
+    for handle in launched.handles {
+        // The Arc has one strong reference here; unwrap to get
+        // ownership and shutdown.
+        if let Ok(h) = Arc::try_unwrap(handle) {
+            let _ = h.shutdown().await;
+        }
+    }
 }
 
 /// Egress block validation. Spawn `/bin/sh -c "env | grep -i proxy"` (NOT a

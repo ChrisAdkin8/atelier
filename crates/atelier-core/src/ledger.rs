@@ -175,6 +175,7 @@ impl LedgerEntry {
             crate::context::Provenance::MemoryPromoted { .. } => "memory-promoted",
             crate::context::Provenance::PinnedByUser { .. } => "pinned-by-user",
             crate::context::Provenance::AssistantTurn => "assistant-turn",
+            crate::context::Provenance::McpResource { .. } => "mcp-resource",
         };
         Self::CacheBust {
             timestamp: event.evicted_at.clone(),
