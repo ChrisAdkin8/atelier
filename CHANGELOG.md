@@ -1,5 +1,59 @@
 # Atelier Spec — Changelog
 
+## v60.26 — 2026-05-18 (Phase B Track C2: TypeScript Tier-1 verify — pure-function half)
+
+Lands the pure-function half of the §7 Tier-1 LSP verify path: the new `Discrepancy::HallucinatedSymbol` variant + the TypeScript diagnostic-to-discrepancy mapper. The live LSP receiver (consuming `lsp_types::Diagnostic` from `async-lsp`) lands once `experiments/lsp_spike/` resolves a GO verdict — at which point the receiver translates `lsp_types::Diagnostic` → `crate::lsp::typescript::DiagnosticInput` → `map_diagnostic_to_discrepancy` and the existing path is wired end-to-end. The pure half ships today so Track C3's hallucinating-agent fixture has a producer it can target.
+
+### New `Discrepancy::HallucinatedSymbol`
+
+In `crates/atelier-core/src/verify.rs`:
+
+```rust
+HallucinatedSymbol {
+    path: String,
+    line: u32,         // 1-indexed (LSP wire is 0-indexed; mapper adds 1)
+    column: u32,       // 1-indexed
+    symbol: String,    // e.g. "nonExistentMethod"
+    lsp_message: String,
+}
+```
+
+`Discrepancy::wire_label()` and `Discrepancy::path()` extended to handle the new arm. `summary()` formats as `path:line:column: hallucinated symbol `X` — <lsp_message>` so log lines + the TUI event log can quote the LSP diagnostic directly. New `discrepancy_wire_labels_are_stable` test pins all five variants' wire labels per **L-D-5**.
+
+### GUI bridge arm
+
+`crates/atelier-gui/src/lib.rs::bridge_event` extended with the `HallucinatedSymbol` JSON shape: `{kind: "hallucinated_symbol", path, line, column, symbol, lsp_message}`. The Svelte side doesn't yet have a `VerificationFailed` reducer (the red-failed badge lands in Phase C); the new variant falls through the default event-log arm there, same as the other four `Discrepancy` variants. TUI projection automatically picks up the new arm via the existing `discrepancies.first().map(|d| d.summary())` call (no per-variant TUI arm needed — `summary()` covers it).
+
+### New module `crates/atelier-core/src/lsp/typescript.rs`
+
+Pure function: `map_diagnostic_to_discrepancy(path, &DiagnosticInput) -> Option<Discrepancy>`. Hand-rolled `DiagnosticInput { line_zero_indexed, character_zero_indexed, message }` mirrors the subset of `lsp_types::Diagnostic` the receiver consumes — keeps `lsp-types` out of `atelier-core` until the spike resolves.
+
+Hallucinated-symbol heuristic recognises the two canonical `typescript-language-server` shapes via `strip_prefix`:
+
+- `Property 'X' does not exist on type 'Y'` → `X`
+- `Cannot find name 'X'` → `X`
+
+Diagnostics that don't match return `None` so the caller falls through to Tier 3 textual without false-firing. `MAX_LSP_MESSAGE_BYTES = 1024` cap on `lsp_message` (matches the `schemas/audit/lsp_install.v1.json::reason.maxLength` posture); a runaway server emitting 4 KiB of message text gets truncated to 1 KiB + UTF-8-safe ellipsis.
+
+Six unit tests cover both matching shapes, the unrelated-diagnostic null case, the 0→1-indexed line/column bump, the 1 KiB cap, and the UTF-8 boundary respect.
+
+### Runner `verify_pass` wiring — already in place
+
+The plan's "fix the v60.8 follow-on: actually call `dispatcher.verify_pass()` instead of just transitioning to `State::Verifying`" was discharged at v60.12 (Phase A close A4 — the lying-agent gate's regression test transitively requires `verify_pass` to fire). `runner.rs:1885-1906` already calls `session_dispatcher.verify_pass(&last_envelope, &observed_changes)` (or `emit_verify_not_run()` when nothing to weigh). The closeout plan's claim was based on the pre-v60.12 state — v60.26 inherits the fix.
+
+### Lessons applied
+
+- **L-D-5** — `Discrepancy::wire_label()` agreement test pins all five variants in one place; future renames force a deliberate edit on the bridge consumers.
+- **L-D-7** — the pure-function mapper lands **before** the live LSP receiver, not after. The boundary is `DiagnosticInput`; the receiver can land in isolation once the spike resolves and the mapper is already proved against test fixtures.
+- **L-D-9** — the lying-agent vs hallucinating-symbol priority lattice will land in C3's table-driven test (the plan defers the lattice pinning until the fixture exists to exercise it).
+
+### Verification
+
+- `cargo test -p atelier-core --lib verify::` — 18 pass (+2 new: `discrepancy_wire_labels_are_stable`, `hallucinated_symbol_summary_quotes_lsp_message_and_location`).
+- `cargo test -p atelier-core --lib lsp::typescript` — 6 pass.
+- `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings` clean.
+- Full `cargo test --workspace --lib` green.
+
 ## v60.25 — 2026-05-18 (Phase B Track C1: LSP client foundation — data layer + spike harness)
 
 Lands the data-layer foundation for §7 Tier-1 LSP verification. The spike harness exists (`experiments/lsp_spike/`); the spike verdict is **PENDING** — the operator must execute it against `typescript-language-server` and record the decision-matrix outcome in `experiments/lsp_spike/README.md` before the `LspServerHandle` + `launch_typescript_server` implementations land. Everything in this commit compiles without `async-lsp` as a dependency, so Tracks C2 and C3 can proceed against the data-layer surface while the spike runs.

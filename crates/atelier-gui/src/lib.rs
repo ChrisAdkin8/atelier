@@ -1174,6 +1174,20 @@ pub fn bridge_event(evt: &SessionEvent) -> BridgedEvent {
                         "path": path,
                         "count": count,
                     }),
+                    // Phase B Track C2 — §7 Tier-1 LSP signal. Carries
+                    // the LSP diagnostic location + the hallucinated
+                    // symbol + the verbatim `lsp_message` so the red
+                    // badge can quote the language server directly.
+                    atelier_core::verify::Discrepancy::HallucinatedSymbol {
+                        path, line, column, symbol, lsp_message,
+                    } => json!({
+                        "kind": "hallucinated_symbol",
+                        "path": path,
+                        "line": line,
+                        "column": column,
+                        "symbol": symbol,
+                        "lsp_message": lsp_message,
+                    }),
                 })
                 .collect::<Vec<_>>(),
         }),

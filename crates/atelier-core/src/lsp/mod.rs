@@ -23,8 +23,10 @@
 //! variants from v60.22 (Day-0 prep).
 
 pub mod approval;
+pub mod typescript;
 
 pub use approval::{lsp_approvals_path, LspApprovals, LSP_APPROVALS_DIR, LSP_APPROVALS_FILE};
+pub use typescript::{map_diagnostic_to_discrepancy, DiagnosticInput, MAX_LSP_MESSAGE_BYTES};
 
 /// Outcome of an LSP install attempt — surfaced on the bus via
 /// [`crate::session::Event::LspInstallResolved`] so the UI can update the

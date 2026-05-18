@@ -232,6 +232,28 @@ pub enum Discrepancy {
     /// for the same path; UIs that summarise per-path can group via
     /// [`Discrepancy::path`].
     DuplicateClaim { path: String, count: usize },
+
+    /// Phase B Track C2 — §7 Tier-1 LSP signal. The model's
+    /// post-edit code references a symbol the language server says
+    /// doesn't exist on the inferred type (e.g. `foo.nonExistentMethod()`
+    /// where `foo: Foo` has no `nonExistentMethod`). This is the
+    /// "hallucinated method" gate — the lying-agent gate (v60.12)
+    /// catches the model claiming false edits; this catches the model
+    /// writing code against APIs that don't exist.
+    ///
+    /// `line` + `column` are 1-indexed (LSP wire is 0-indexed; the
+    /// mapper in `crate::lsp::typescript` adds 1 on the way in so
+    /// consumers can quote them directly in user-facing text).
+    /// `lsp_message` is the diagnostic's `message` field verbatim,
+    /// capped to 1 KiB by the mapper so a runaway server can't bloat
+    /// the discrepancy list.
+    HallucinatedSymbol {
+        path: String,
+        line: u32,
+        column: u32,
+        symbol: String,
+        lsp_message: String,
+    },
 }
 
 impl Discrepancy {
@@ -241,7 +263,22 @@ impl Discrepancy {
             Self::Claimed { path, .. }
             | Self::Unclaimed { path, .. }
             | Self::KindMismatch { path, .. }
-            | Self::DuplicateClaim { path, .. } => path,
+            | Self::DuplicateClaim { path, .. }
+            | Self::HallucinatedSymbol { path, .. } => path,
+        }
+    }
+
+    /// Stable wire label for the discrepancy variant. Used by the GUI
+    /// bridge + TUI projection so a variant rename doesn't silently
+    /// mis-route the red badge. Pinned by
+    /// `discrepancy_wire_labels_are_stable`.
+    pub fn wire_label(&self) -> &'static str {
+        match self {
+            Self::Claimed { .. } => "claimed",
+            Self::Unclaimed { .. } => "unclaimed",
+            Self::KindMismatch { .. } => "kind_mismatch",
+            Self::DuplicateClaim { .. } => "duplicate_claim",
+            Self::HallucinatedSymbol { .. } => "hallucinated_symbol",
         }
     }
 
@@ -268,6 +305,13 @@ impl Discrepancy {
             Self::DuplicateClaim { path, count } => {
                 format!("{path}: claimed {count} times in one envelope")
             }
+            Self::HallucinatedSymbol {
+                path,
+                line,
+                column,
+                symbol,
+                lsp_message,
+            } => format!("{path}:{line}:{column}: hallucinated symbol `{symbol}` — {lsp_message}"),
         }
     }
 }
@@ -549,6 +593,61 @@ mod tests {
         let s = d.summary();
         assert!(s.contains("delete"));
         assert!(s.contains("modified"));
+    }
+
+    // ---------- Phase B Track C2 — HallucinatedSymbol ----------
+
+    #[test]
+    fn discrepancy_wire_labels_are_stable() {
+        // Pinned so a variant rename forces a deliberate change — the
+        // GUI bridge (`bridge_event`) consumes these strings as the
+        // `kind` discriminator on `VerificationFailed.discrepancies[].kind`.
+        let claimed = Discrepancy::Claimed {
+            path: "x".into(),
+            claimed: ClaimedChangeKind::Edit,
+        };
+        let unclaimed = Discrepancy::Unclaimed {
+            path: "y".into(),
+            observed: ObservedKind::Modified,
+        };
+        let mismatch = Discrepancy::KindMismatch {
+            path: "z".into(),
+            claimed: ClaimedChangeKind::Delete,
+            observed: ObservedKind::Modified,
+        };
+        let dup = Discrepancy::DuplicateClaim {
+            path: "a".into(),
+            count: 2,
+        };
+        let hallucinated = Discrepancy::HallucinatedSymbol {
+            path: "b.ts".into(),
+            line: 7,
+            column: 4,
+            symbol: "nonExistentMethod".into(),
+            lsp_message: "Property does not exist on type 'Foo'".into(),
+        };
+        assert_eq!(claimed.wire_label(), "claimed");
+        assert_eq!(unclaimed.wire_label(), "unclaimed");
+        assert_eq!(mismatch.wire_label(), "kind_mismatch");
+        assert_eq!(dup.wire_label(), "duplicate_claim");
+        assert_eq!(hallucinated.wire_label(), "hallucinated_symbol");
+    }
+
+    #[test]
+    fn hallucinated_symbol_summary_quotes_lsp_message_and_location() {
+        let d = Discrepancy::HallucinatedSymbol {
+            path: "src/foo.ts".into(),
+            line: 12,
+            column: 4,
+            symbol: "nonExistentMethod".into(),
+            lsp_message: "Property 'nonExistentMethod' does not exist on type 'Foo'".into(),
+        };
+        let s = d.summary();
+        assert!(s.contains("src/foo.ts:12:4"));
+        assert!(s.contains("nonExistentMethod"));
+        assert!(s.contains("does not exist on type 'Foo'"));
+        // `path()` returns the source file path regardless of variant.
+        assert_eq!(d.path(), "src/foo.ts");
     }
 
     // ---------- §7 verification tier indicator ----------
