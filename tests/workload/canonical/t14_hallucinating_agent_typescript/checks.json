@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "checks": [
+    {
+      "name": "fixture present — Foo class declared",
+      "command": "grep -q 'class Foo' src/foo.ts",
+      "expect": {
+        "exit_code": 0
+      }
+    }
+  ]
+}

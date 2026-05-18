@@ -146,6 +146,53 @@ impl VerificationRun {
             discrepancies: Vec::new(),
         }
     }
+
+    /// Phase B Track C3 — combined Tier-3 textual + Tier-1 LSP verify
+    /// pass. Pins the **L-D-9 priority lattice** in code:
+    ///
+    ///   1. **Discrepancies merge** — a turn that triggers both Tier 1
+    ///      AND Tier 3 (wrong file *and* wrong type) emits all matching
+    ///      rows. No variant takes priority over another inside the
+    ///      `discrepancies` vec; UI consumers render the full list.
+    ///   2. **The event's `tier` badge** uses the *highest tier that
+    ///      ran*. If `tier1_discrepancies` is non-empty (i.e. the LSP
+    ///      receiver had something to map), the badge is `Tier1Lsp`
+    ///      even when the Tier-3 textual half also fired. This matches
+    ///      the spec: a higher-tier signal is more authoritative for
+    ///      the badge surface, but every discrepancy still counts for
+    ///      trust-budget weighting.
+    ///
+    /// Callers (today: tests + the runner once async-lsp lands) own
+    /// the LSP receiver + mapper boundary; this constructor just
+    /// applies the lattice.
+    pub fn merged_tier1_lsp(
+        envelope: &Envelope,
+        observed: &[ObservedChange],
+        tier1_discrepancies: Vec<Discrepancy>,
+    ) -> Self {
+        let textual = Self::tier3_textual(envelope, observed);
+        let tier = if tier1_discrepancies.is_empty() && textual.discrepancies.is_empty() {
+            // No LSP signal observed; preserve Tier 3 textual's tier badge
+            // (which is Tier3Textual whether or not it found anything —
+            // the producer ran).
+            VerificationTier::Tier3Textual
+        } else if tier1_discrepancies.is_empty() {
+            // Only Tier 3 found something — badge stays at Tier 3.
+            VerificationTier::Tier3Textual
+        } else {
+            // Tier 1 fired (with or without Tier 3 also firing) — badge
+            // moves to Tier 1 per the L-D-9 lattice rule #2.
+            VerificationTier::Tier1Lsp
+        };
+        let mut discrepancies = textual.discrepancies;
+        discrepancies.extend(tier1_discrepancies);
+        Self {
+            tier,
+            file_count: textual.file_count,
+            claim_count: textual.claim_count,
+            discrepancies,
+        }
+    }
 }
 
 /// Observed change to a single path produced by §3 staging. Built by
@@ -631,6 +678,113 @@ mod tests {
         assert_eq!(mismatch.wire_label(), "kind_mismatch");
         assert_eq!(dup.wire_label(), "duplicate_claim");
         assert_eq!(hallucinated.wire_label(), "hallucinated_symbol");
+    }
+
+    // ---------- L-D-9 priority lattice ----------
+
+    #[test]
+    fn merged_tier1_lsp_uses_tier1_badge_when_lsp_fires() {
+        // Pins L-D-9 rule #2: a turn that triggers BOTH Tier-1 LSP AND
+        // Tier-3 textual emits the highest-tier badge for the event.
+        // Build a Tier-3-failing envelope (claims a.ts but edits b.ts)
+        // plus a Tier-1 discrepancy and confirm the merged run has
+        // `tier: Tier1Lsp` while still carrying both discrepancies.
+        let envelope = Envelope {
+            claimed_done: Some(true),
+            claimed_changes: Some(vec![ClaimedChange {
+                path: "a.ts".into(),
+                kind: ClaimedChangeKind::Edit,
+                summary: "edited a.ts".into(),
+            }]),
+            ..Default::default()
+        };
+        let observed = vec![ObservedChange {
+            path: "b.ts".into(),
+            kind: ObservedKind::Modified,
+        }];
+        let tier1 = vec![Discrepancy::HallucinatedSymbol {
+            path: "c.ts".into(),
+            line: 4,
+            column: 2,
+            symbol: "nonExistent".into(),
+            lsp_message: "does not exist on type 'X'".into(),
+        }];
+        let run = VerificationRun::merged_tier1_lsp(&envelope, &observed, tier1);
+        // Tier-1 badge wins per L-D-9 rule #2.
+        assert_eq!(run.tier, VerificationTier::Tier1Lsp);
+        // Every discrepancy survives per L-D-9 rule #1 — Tier-3 found
+        // both `Claimed { a.ts }` and `Unclaimed { b.ts }`, plus the
+        // Tier-1 `HallucinatedSymbol`.
+        assert_eq!(run.discrepancies.len(), 3);
+        let has_claimed_a = run
+            .discrepancies
+            .iter()
+            .any(|d| matches!(d, Discrepancy::Claimed { path, .. } if path == "a.ts"));
+        let has_unclaimed_b = run
+            .discrepancies
+            .iter()
+            .any(|d| matches!(d, Discrepancy::Unclaimed { path, .. } if path == "b.ts"));
+        let has_hallucinated_c = run
+            .discrepancies
+            .iter()
+            .any(|d| matches!(d, Discrepancy::HallucinatedSymbol { path, .. } if path == "c.ts"));
+        assert!(
+            has_claimed_a,
+            "Tier-3 Claimed for a.ts must survive the merge"
+        );
+        assert!(
+            has_unclaimed_b,
+            "Tier-3 Unclaimed for b.ts must survive the merge"
+        );
+        assert!(
+            has_hallucinated_c,
+            "Tier-1 HallucinatedSymbol must survive the merge"
+        );
+    }
+
+    #[test]
+    fn merged_tier1_lsp_falls_back_to_tier3_when_no_lsp_input() {
+        // Tier-1 wasn't fed any diagnostics → badge stays at Tier-3
+        // even though the textual pass found discrepancies. The §7
+        // detector "ran" at Tier 3, not Tier 1.
+        let envelope = Envelope {
+            claimed_done: Some(true),
+            claimed_changes: Some(vec![ClaimedChange {
+                path: "a.ts".into(),
+                kind: ClaimedChangeKind::Edit,
+                summary: "edited a.ts".into(),
+            }]),
+            ..Default::default()
+        };
+        let observed = vec![ObservedChange {
+            path: "b.ts".into(),
+            kind: ObservedKind::Modified,
+        }];
+        let run = VerificationRun::merged_tier1_lsp(&envelope, &observed, Vec::new());
+        assert_eq!(run.tier, VerificationTier::Tier3Textual);
+        assert_eq!(run.discrepancies.len(), 2);
+    }
+
+    #[test]
+    fn merged_tier1_lsp_clean_run_keeps_tier3_badge() {
+        // No discrepancies on either tier → Tier-3 ran cleanly; badge
+        // stays at Tier 3.
+        let envelope = Envelope {
+            claimed_done: Some(true),
+            claimed_changes: Some(vec![ClaimedChange {
+                path: "a.ts".into(),
+                kind: ClaimedChangeKind::Edit,
+                summary: "edited a.ts".into(),
+            }]),
+            ..Default::default()
+        };
+        let observed = vec![ObservedChange {
+            path: "a.ts".into(),
+            kind: ObservedKind::Modified,
+        }];
+        let run = VerificationRun::merged_tier1_lsp(&envelope, &observed, Vec::new());
+        assert_eq!(run.tier, VerificationTier::Tier3Textual);
+        assert!(run.discrepancies.is_empty());
     }
 
     #[test]

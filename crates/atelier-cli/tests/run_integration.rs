@@ -3967,6 +3967,148 @@ fn canonical_loader_copies_fixture_to_isolated_tempdir() {
 }
 
 // =====================================================================
+// Phase B Track C3 — hallucinating-agent fixture gate.
+//
+// The lying-agent gate (v60.12) catches the model claiming false edits.
+// This Phase B Track C3 gate catches the symmetric failure: the model
+// writes code against an API that doesn't exist. The mock-scripted
+// agent writes `foo.nonExistentMethod()` where `Foo` has no such
+// method; the §7 verify pass merges Tier-3 textual with Tier-1 LSP
+// (the latter pre-mapped via `crate::lsp::map_diagnostic_to_discrepancy`
+// since the live LSP receiver is gated on the spike) and emits
+// `Event::VerificationFailed { tier: Tier1Lsp, discrepancies }` with
+// exactly one `Discrepancy::HallucinatedSymbol` on the very first turn.
+//
+// L-D-9 priority lattice pinned by this test + the `verify::tests`
+// `merged_tier1_lsp_uses_tier1_badge_when_lsp_fires` sibling: a turn
+// that triggers BOTH Tier 1 and Tier 3 emits all matching discrepancies,
+// but the event's `tier` badge follows the highest-tier-wins rule.
+// =====================================================================
+
+#[tokio::test]
+async fn mock_hallucinating_agent_fixture_flagged_within_one_turn_phase_b_seven_gate() {
+    use atelier_core::lsp::{map_diagnostic_to_discrepancy, DiagnosticInput};
+    use atelier_core::verify::{Discrepancy, VerificationTier};
+
+    let task = common::canonical::CanonicalTask::load("t14_hallucinating_agent_typescript")
+        .expect("t14 fixture must load");
+    let workspace = task
+        .copy_fixture_to_tempdir()
+        .expect("fixture tempdir copy");
+
+    // The "hallucinating" agent: rewrites src/foo.ts to call
+    // `nonExistentMethod` on the Foo instance. Honest about the edit
+    // claim (claims `src/foo.ts` as `edit`) — the failure isn't a
+    // lying claim, it's a hallucinated symbol the LSP catches.
+    let foo_ts = r#"export class Foo {
+    bar(): number {
+        return 42;
+    }
+}
+
+const f = new Foo();
+// Hallucinated method call — Foo has no nonExistentMethod.
+f.nonExistentMethod();
+"#;
+    let write_foo = ToolCallRequest {
+        id: "tc-hallucinate-1".into(),
+        name: "write_file".into(),
+        arguments: serde_json::json!({"path": "src/foo.ts", "content": foo_ts}),
+    };
+    let envelope = envelope_done_claiming_edits(&["src/foo.ts"]);
+
+    let responses = vec![MockResponse::new(
+        "adding helper call to Foo — hallucinating-agent fixture",
+        vec![write_foo, mock_envelope_tool_call(&envelope)],
+    )];
+
+    // Pre-map the canonical typescript-language-server diagnostic into
+    // the Tier-1 discrepancy the runner's verify pass will receive.
+    // This stands in for the live `async-lsp` receiver until the
+    // spike at `experiments/lsp_spike/` resolves GO; the boundary is
+    // `crate::lsp::DiagnosticInput`, so the receiver landing later
+    // doesn't change this test.
+    let canonical_diagnostic = DiagnosticInput {
+        line_zero_indexed: 8, // `f.nonExistentMethod();`
+        character_zero_indexed: 2,
+        message: "Property 'nonExistentMethod' does not exist on type 'Foo'".into(),
+    };
+    let tier1_discrepancies =
+        vec![map_diagnostic_to_discrepancy("src/foo.ts", &canonical_diagnostic).unwrap()];
+
+    let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let runner = Runner::new(
+        workspace.path().to_path_buf(),
+        ProviderChoice::Mock { responses },
+        EventSink::Capture(events.clone()),
+    )
+    .expect("mock runner construction is infallible")
+    .with_max_turns(task.meta.turn_cap)
+    .with_tier1_diagnostics_for_test(tier1_discrepancies);
+
+    let report = runner.run(task.prompt.clone()).await.unwrap();
+    // The hallucinating-agent gate does not abort the run — same
+    // posture as the v60.12 lying-agent gate. The §7 detector's job
+    // is to surface the signal; trust budget + UI act on it.
+    assert_eq!(report.final_state, State::Done);
+    assert_eq!(report.turns, 1, "detector must fire on the very first turn");
+
+    let captured = events.lock();
+    // Exactly one Tier-1 VerificationFailed; no Tier-1 VerificationPassed.
+    let tier1_failures: Vec<_> = captured
+        .iter()
+        .filter_map(|e| match e {
+            Event::VerificationFailed {
+                tier: VerificationTier::Tier1Lsp,
+                discrepancies,
+            } => Some(discrepancies.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        tier1_failures.len(),
+        1,
+        "expected exactly one Tier1Lsp VerificationFailed on the bus",
+    );
+    let no_passed = !captured
+        .iter()
+        .any(|e| matches!(e, Event::VerificationPassed { .. }));
+    assert!(
+        no_passed,
+        "VerificationPassed must NOT fire alongside Failed — one per turn",
+    );
+
+    // The discrepancy carries the hallucinated symbol + LSP message
+    // verbatim, with line/column 1-indexed for direct quoting in user
+    // text.
+    let failure = &tier1_failures[0];
+    assert_eq!(
+        failure.len(),
+        1,
+        "expected exactly one discrepancy; got {failure:?}"
+    );
+    match &failure[0] {
+        Discrepancy::HallucinatedSymbol {
+            path,
+            line,
+            column,
+            symbol,
+            lsp_message,
+        } => {
+            assert_eq!(path, "src/foo.ts");
+            assert_eq!(*line, 9, "1-indexed line from 0-indexed 8");
+            assert_eq!(*column, 3, "1-indexed column from 0-indexed 2");
+            assert_eq!(symbol, "nonExistentMethod");
+            assert!(
+                lsp_message.contains("does not exist on type 'Foo'"),
+                "lsp_message must quote the type name; got {lsp_message:?}",
+            );
+        }
+        other => panic!("expected HallucinatedSymbol; got {other:?}"),
+    }
+}
+
+// =====================================================================
 // Phase A close — Track B: live-API canonical gates (`#[ignore]`-gated).
 //
 // Closes the live half of `tasks/todo.md:151, 162, 174` and the §2

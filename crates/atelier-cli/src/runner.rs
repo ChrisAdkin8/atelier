@@ -421,6 +421,17 @@ pub struct Runner {
     /// `MockAdapter` (whose `Capabilities` always resolve to
     /// `NativeTool`). Production callers leave this `None`.
     starting_strategy_override: Option<Strategy>,
+    /// Phase B Track C3 — test-only seam for the §7 Tier-1 LSP
+    /// hallucinated-symbol gate. When set, the runner's verify-pass
+    /// call site uses `dispatcher.verify_pass_with_tier1` (instead of
+    /// the bare Tier-3 `verify_pass`) with these pre-mapped
+    /// discrepancies. Lets the hallucinating-agent fixture exercise
+    /// the merged-tier verify path before the live LSP receiver
+    /// (`async-lsp` + `typescript-language-server`) is wired — once the
+    /// spike at `experiments/lsp_spike/` resolves GO, the runner
+    /// produces these from `lsp_types::Diagnostic` instead and this
+    /// override stays unused.
+    tier1_diagnostics_for_test: Vec<atelier_core::verify::Discrepancy>,
 }
 
 /// v60.10 §1 BYOM — record of a pending mid-session adapter swap that
@@ -619,6 +630,7 @@ impl Runner {
             few_shot_cache: parking_lot::Mutex::new(None),
             pending_swap: parking_lot::Mutex::new(None),
             starting_strategy_override: None,
+            tier1_diagnostics_for_test: Vec::new(),
         })
     }
 
@@ -879,6 +891,21 @@ impl Runner {
     #[allow(dead_code)]
     pub fn with_starting_strategy_override(mut self, strategy: Strategy) -> Self {
         self.starting_strategy_override = Some(strategy);
+        self
+    }
+
+    /// Phase B Track C3 — pre-mapped Tier-1 LSP discrepancies for the
+    /// hallucinating-agent gate test. Pure test seam; production
+    /// callers leave the vec empty (the runner uses bare
+    /// `verify_pass` in that case). Once `async-lsp` lands, the
+    /// runner produces these from the LSP receiver and this builder
+    /// stays unused.
+    #[allow(dead_code)]
+    pub fn with_tier1_diagnostics_for_test(
+        mut self,
+        discrepancies: Vec<atelier_core::verify::Discrepancy>,
+    ) -> Self {
+        self.tier1_diagnostics_for_test = discrepancies;
         self
     }
 
@@ -1899,7 +1926,21 @@ impl Runner {
                 .map(|c| !c.is_empty())
                 .unwrap_or(false);
             if has_claims || !observed_changes.is_empty() {
-                let _ = session_dispatcher.verify_pass(&last_envelope, &observed_changes);
+                // Phase B Track C3 — when the test seam supplies
+                // Tier-1 LSP discrepancies (or, once async-lsp lands,
+                // the runner gathered them from the live receiver),
+                // use the merged-tier verify path. Otherwise the
+                // legacy Tier-3-only `verify_pass` keeps the v60.12
+                // behaviour.
+                if self.tier1_diagnostics_for_test.is_empty() {
+                    let _ = session_dispatcher.verify_pass(&last_envelope, &observed_changes);
+                } else {
+                    let _ = session_dispatcher.verify_pass_with_tier1(
+                        &last_envelope,
+                        &observed_changes,
+                        self.tier1_diagnostics_for_test.clone(),
+                    );
+                }
             } else {
                 session_dispatcher.emit_verify_not_run();
             }

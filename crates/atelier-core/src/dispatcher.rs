@@ -1432,6 +1432,46 @@ impl SessionDispatcher {
         run
     }
 
+    /// Phase B Track C3 — verify pass that combines Tier-3 textual
+    /// (always runs) with Tier-1 LSP discrepancies (when the LSP
+    /// receiver mapped any). Same emission contract as
+    /// [`Self::verify_pass`] (exactly one of `VerificationPassed` /
+    /// `VerificationFailed`), but the discrepancies vec carries both
+    /// tiers' rows and the event's `tier` badge follows the L-D-9
+    /// priority lattice (highest tier that ran wins for the badge,
+    /// but every row counts for trust-budget weighting).
+    ///
+    /// `tier1_discrepancies` is empty when the LSP didn't run for any
+    /// file this turn (decline arm of `LspInstallOutcome`, or no
+    /// `.ts`/`.tsx` files in the change set). The runner produces
+    /// this list by calling `crate::lsp::map_diagnostic_to_discrepancy`
+    /// on each `lsp_types::Diagnostic` returned by the LSP server.
+    pub fn verify_pass_with_tier1(
+        &self,
+        envelope: &crate::protocol::Envelope,
+        observed: &[crate::verify::ObservedChange],
+        tier1_discrepancies: Vec<crate::verify::Discrepancy>,
+    ) -> crate::verify::VerificationRun {
+        let run = crate::verify::VerificationRun::merged_tier1_lsp(
+            envelope,
+            observed,
+            tier1_discrepancies,
+        );
+        if run.discrepancies.is_empty() {
+            let _ = self.events.send(Event::VerificationPassed {
+                tier: run.tier,
+                file_count: run.file_count,
+                claim_count: run.claim_count,
+            });
+        } else {
+            let _ = self.events.send(Event::VerificationFailed {
+                tier: run.tier,
+                discrepancies: run.discrepancies.clone(),
+            });
+        }
+        run
+    }
+
     /// v62 — explicit "no verify pass ran this turn" signal. Emitted
     /// when the harness skips the §7 gate (envelope didn't claim
     /// done, or the run aborted early). UIs render a "verify off"

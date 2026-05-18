@@ -1,5 +1,72 @@
 # Atelier Spec — Changelog
 
+## v60.27 — 2026-05-18 (Phase B Track C3: hallucinating-agent fixture + §7 Tier-1 gate)
+
+Closes the final Phase B closeout track. The §7 hallucinated-symbol gate fires within one turn on the new canonical fixture; the lying-vs-hallucinating priority lattice from L-D-9 is pinned in code; the v60.12 lying-agent gate is non-regressing. Once `experiments/lsp_spike/` resolves GO and `async-lsp` lands, the runner produces Tier-1 diagnostics directly instead of through the test seam below.
+
+### New canonical fixture `tests/workload/canonical/t14_hallucinating_agent_typescript/`
+
+Mirror of `t11_add_typescript_function`'s shape — `fixture/src/foo.ts` declares a `Foo` class with one real method (`bar`). The hallucinating-agent test scripts the mock to rewrite the file with a call to `foo.nonExistentMethod()`, which `typescript-language-server` reports as `Property 'nonExistentMethod' does not exist on type 'Foo'`. `meta.json` declares `expected_starting_returncode: 5` (no pytest tests in a TypeScript fixture — pytest's "no tests collected" exit code).
+
+### New `VerificationRun::merged_tier1_lsp(envelope, observed, tier1_discrepancies)`
+
+In `crates/atelier-core/src/verify.rs`. Pins the **L-D-9 priority lattice** in code:
+
+1. **Discrepancies merge** — a turn that triggers BOTH Tier 1 AND Tier 3 emits all matching rows. No variant takes priority over another inside the `discrepancies` vec.
+2. **The event's `tier` badge** uses the *highest tier that ran* — `Tier1Lsp` when the LSP receiver produced any input, even when the Tier-3 textual half also fired.
+
+Three new unit tests pin all three lattice arms:
+- `merged_tier1_lsp_uses_tier1_badge_when_lsp_fires` — both tiers fire; badge moves to Tier 1; all three discrepancies survive (Claimed + Unclaimed from Tier 3, HallucinatedSymbol from Tier 1).
+- `merged_tier1_lsp_falls_back_to_tier3_when_no_lsp_input` — Tier 1 silent; badge stays Tier 3.
+- `merged_tier1_lsp_clean_run_keeps_tier3_badge` — clean run; Tier 3 ran cleanly.
+
+### New `SessionDispatcher::verify_pass_with_tier1`
+
+Sibling of `verify_pass`. Takes `tier1_discrepancies: Vec<Discrepancy>` in addition to the envelope + observed. Same emission contract — exactly one of `VerificationPassed` / `VerificationFailed`. The bare `verify_pass` stays untouched for the v60.12 lying-agent path.
+
+### New test seam `Runner::with_tier1_diagnostics_for_test`
+
+Stands in for the live LSP receiver until `async-lsp` lands. When set, the runner's verify-pass call site uses `verify_pass_with_tier1` instead of `verify_pass`. `#[allow(dead_code)]` for the binary build. Once the spike resolves GO, the runner produces these from `lsp_types::Diagnostic` via the `crate::lsp::typescript::map_diagnostic_to_discrepancy` mapper (v60.26) and this builder stays unused — boundary is clean.
+
+### New integration test `mock_hallucinating_agent_fixture_flagged_within_one_turn_phase_b_seven_gate`
+
+In `crates/atelier-cli/tests/run_integration.rs`. Loads t14, runs the §2.5 loop with the test seam carrying one canonical TypeScript diagnostic, asserts:
+
+- `report.final_state == Done`, `turns == 1`.
+- Exactly one `Event::VerificationFailed { tier: Tier1Lsp, discrepancies }` on the bus.
+- No `VerificationPassed` event (one terminal-marker per turn per the v62 contract).
+- `discrepancies[0]` is `HallucinatedSymbol { path: "src/foo.ts", line: 9, column: 3, symbol: "nonExistentMethod", lsp_message: contains "does not exist on type 'Foo'" }`.
+
+The v60.12 `mock_lying_agent_fixture_flagged_within_one_turn_phase_a_seven_gate` test still passes — verified post-change. No regression on the Tier-3 textual gate.
+
+### Lessons applied
+
+- **L-D-7** — the live LSP receiver still pending; the test seam is the bridge until it lands. The boundary is `DiagnosticInput` → `Discrepancy` (pure function v60.26); the receiver only needs to translate `lsp_types::Diagnostic` → `DiagnosticInput` and forward the result. No "claimed-but-broken" surface because the test seam ships fully wired today.
+- **L-D-9** — priority lattice pinned in code via `merged_tier1_lsp` + the three sibling tests, not in prose. A future revision that wants different precedence has to update the helper *and* the tests.
+
+### Verification
+
+- `cargo test -p atelier-core --lib verify::` — 21 pass (+3 new `merged_tier1_lsp_*`).
+- `cargo test -p atelier-cli --test run_integration mock_hallucinating_agent` — 1 pass.
+- `cargo test -p atelier-cli --test run_integration mock_lying_agent` — 1 pass (regression check).
+- `cargo test --workspace --lib` — full suite green.
+- `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings` clean.
+- `make check` — 26/26 schemas valid, 61/61 artifacts validated (was 59; +2 for t14 meta + checks), 14/14 canonical workloads dry-run OK, 112 pytest tests pass.
+
+### Phase B closeout — every track green at the code level
+
+- **#1** §2 mechanical gate across three strategies — **done** v60.23.
+- **#2** real-model conformance harness + nightly gate — **done in code** v60.24; data-blocked on 7-night calibration.
+- **#3** §7 Tier-1 + hallucinating-agent — foundation v60.25 (C1); pure-function half v60.26 (C2); fixture + gate v60.27 (C3). Live LSP receiver pending spike resolution at `experiments/lsp_spike/`.
+- **#4** DoD checklist reconciliation — done v60.21.
+- **#5** `cargo fmt` / `clippy` / `test --workspace` / `make check` all green — preserved.
+- **#6** Phase B gate-status binary — `atelier-conformance-status` ships v60.24; emits `YELLOW (calibration phase)` until the calibration window completes.
+
+The remaining work to flip the Phase B gate fully green is **operator action**, not code:
+- Execute the LSP spike at `experiments/lsp_spike/` and fill in the verdict matrix (then a v60.28 lands `async-lsp` + the receiver glue).
+- Wire `ANTHROPIC_API_KEY` into GitHub Actions secrets so the nightly conformance gate starts accumulating data.
+- After 7 nights of green conformance data, flip `CALIBRATION_PHASE` to `"false"` in `.github/workflows/nightly_phase_b_gate.yml` to enable assertion at `max(0.95, observed_p5)`.
+
 ## v60.26 — 2026-05-18 (Phase B Track C2: TypeScript Tier-1 verify — pure-function half)
 
 Lands the pure-function half of the §7 Tier-1 LSP verify path: the new `Discrepancy::HallucinatedSymbol` variant + the TypeScript diagnostic-to-discrepancy mapper. The live LSP receiver (consuming `lsp_types::Diagnostic` from `async-lsp`) lands once `experiments/lsp_spike/` resolves a GO verdict — at which point the receiver translates `lsp_types::Diagnostic` → `crate::lsp::typescript::DiagnosticInput` → `map_diagnostic_to_discrepancy` and the existing path is wired end-to-end. The pure half ships today so Track C3's hallucinating-agent fixture has a producer it can target.

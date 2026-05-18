@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "task_id": "t14_hallucinating_agent_typescript",
+  "title": "Hallucinating-agent fixture — §7 Tier-1 hallucinated-symbol gate target (Phase B Track C3)",
+  "priority": false,
+  "expected_starting_returncode": 5,
+  "turn_cap": 2,
+  "language": "typescript",
+  "exercises": [
+    "Tier-1 LSP detector",
+    "hallucinated-method discrepancy",
+    "lying-vs-hallucinating priority lattice (L-D-9)"
+  ]
+}
