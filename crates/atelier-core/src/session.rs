@@ -460,6 +460,30 @@ pub enum Event {
         swapped_at: String,
     },
 
+    /// Phase B Track C1 — §7 verify Tier-1 LSP first-use install prompt.
+    /// The runner observed an unverified language (today: TypeScript) and
+    /// no cached `LspApprovals` entry exists; the UI presents a modal
+    /// listing `candidate_packages` (e.g. `["typescript-language-server"]`)
+    /// and lets the user approve / decline. Pairs with a subsequent
+    /// [`Event::LspInstallResolved`] carrying the outcome.
+    ///
+    /// Q3 resolution (v60.12) — first-use approval, not always-install.
+    /// The flow mirrors v60.8's MCP first-use prompt (`McpApprovals`).
+    RequestLspInstall {
+        language: String,
+        candidate_packages: Vec<String>,
+    },
+
+    /// Phase B Track C1 — terminal marker for an LSP first-use install
+    /// flow started by [`Event::RequestLspInstall`]. `outcome` carries the
+    /// tier/fallback decision per **L-D-3**:
+    ///   * `Installed` / `AlreadyPresent` — Tier-1 LSP verify available.
+    ///   * `Declined` / `Failed` — fall back to Tier 2/3 for this language.
+    LspInstallResolved {
+        language: String,
+        outcome: crate::lsp::LspInstallOutcome,
+    },
+
     /// The actor is shutting down. No further events will be emitted.
     Shutdown,
 }
@@ -500,6 +524,8 @@ impl Event {
             Self::ContextOverflowResolved { .. } => "ContextOverflowResolved",
             Self::AgentStalled { .. } => "AgentStalled",
             Self::AdapterSwapped { .. } => "AdapterSwapped",
+            Self::RequestLspInstall { .. } => "RequestLspInstall",
+            Self::LspInstallResolved { .. } => "LspInstallResolved",
             Self::Shutdown => "Shutdown",
         }
     }
@@ -891,6 +917,27 @@ mod tests {
             assert_eq!(to_model_id, "local:qwen2.5-coder:7b");
             assert_eq!(swapped_at, "2026-05-18T12:00:00Z");
         }
+    }
+
+    #[test]
+    fn lsp_install_event_kinds_are_stable() {
+        // Phase B Track C1 prep — pin the wire labels for the two new
+        // §7 LSP first-use install variants. The four sinks
+        // (`bridge_event`, TUI `apply` + `project_event`, Svelte
+        // `applyEvent` + `projectEvent`) consume these strings; a
+        // variant rename would silently mis-route the modal payload
+        // without this regression test.
+        let req = Event::RequestLspInstall {
+            language: "typescript".into(),
+            candidate_packages: vec!["typescript-language-server".into()],
+        };
+        assert_eq!(req.kind(), "RequestLspInstall");
+
+        let resolved = Event::LspInstallResolved {
+            language: "typescript".into(),
+            outcome: crate::lsp::LspInstallOutcome::Installed,
+        };
+        assert_eq!(resolved.kind(), "LspInstallResolved");
     }
 
     #[test]

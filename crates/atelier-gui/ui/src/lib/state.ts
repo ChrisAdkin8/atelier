@@ -551,6 +551,12 @@ export function applyEvent(state: AppState, evt: BridgedEvent): AppState {
       // event log so the user can see the transition in-stream.
       return { ...state, events }
     }
+    // Phase B Track C1 prep — §7 Tier-1 LSP first-use install events.
+    // Lands as event-log entries today; the approval modal surface in
+    // App.svelte arrives with Track C1 proper.
+    case 'RequestLspInstall':
+    case 'LspInstallResolved':
+      return { ...state, events }
     // Variants we don't fold into pane state — just the event log.
     case 'IllegalTransitionAttempted':
     case 'Cancelled':
@@ -779,6 +785,25 @@ export function projectEvent(evt: BridgedEvent): EventLogEntry {
       return {
         kind,
         detail: `${p.from_model_id ?? '?'} → ${p.to_model_id ?? '?'}`,
+      }
+    }
+    // Phase B Track C1 prep — §7 Tier-1 LSP first-use install events.
+    // One-line event-log rendering until the approval modal lands.
+    case 'RequestLspInstall': {
+      const p = evt.payload as {
+        language?: string
+        candidate_packages?: string[]
+      }
+      return {
+        kind,
+        detail: `${p.language ?? '?'}: install ${(p.candidate_packages ?? []).join(', ')}`,
+      }
+    }
+    case 'LspInstallResolved': {
+      const p = evt.payload as { language?: string; outcome?: string }
+      return {
+        kind,
+        detail: `${p.language ?? '?'}: ${p.outcome ?? '?'}`,
       }
     }
     default:

@@ -20,6 +20,7 @@ pub mod file_watcher;
 pub mod hooks;
 pub mod init;
 pub mod ledger;
+pub mod lsp;
 pub mod mcp;
 pub mod mcp_config;
 pub mod memory;

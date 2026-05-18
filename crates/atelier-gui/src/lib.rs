@@ -1223,6 +1223,21 @@ pub fn bridge_event(evt: &SessionEvent) -> BridgedEvent {
             "turn": turn,
             "reason": reason,
         }),
+        // Phase B Track C1 prep — §7 Tier-1 LSP first-use install prompt.
+        // The webview renders a modal listing `candidate_packages`; the
+        // approval round-trip lands in C1. Wire shape pinned here so the
+        // four parallel bundles don't collide on this file (per **L-D-2**).
+        SessionEvent::RequestLspInstall {
+            language,
+            candidate_packages,
+        } => json!({
+            "language": language,
+            "candidate_packages": candidate_packages,
+        }),
+        SessionEvent::LspInstallResolved { language, outcome } => json!({
+            "language": language,
+            "outcome": outcome.wire_label(),
+        }),
     };
     BridgedEvent { kind, payload }
 }

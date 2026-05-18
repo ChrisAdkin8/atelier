@@ -744,6 +744,12 @@ impl AppState {
             // `Transitioned { Streaming → AwaitingUser }` updates the
             // state badge through the standard transition path.
             | SessionEvent::AgentStalled { .. }
+            // Phase B Track C1 prep — LSP first-use install events land
+            // as log lines today; the approval modal (TUI `InputMode`)
+            // is wired in Track C1 proper. No AppState mutation here
+            // (per **L-D-2** the prep commit only pins the wire shape).
+            | SessionEvent::RequestLspInstall { .. }
+            | SessionEvent::LspInstallResolved { .. }
             | SessionEvent::Shutdown => {}
         }
         self.events.push(line);
@@ -1052,6 +1058,18 @@ pub fn project_event(evt: &SessionEvent) -> EventLine {
         // updates the state badge through the standard path.
         SessionEvent::AgentStalled { turn, reason } => {
             format!("turn {turn}: {reason}")
+        }
+        // Phase B Track C1 prep — one-line summary in the event log
+        // until the approval modal lands in C1 proper.
+        SessionEvent::RequestLspInstall {
+            language,
+            candidate_packages,
+        } => format!(
+            "{language}: install {}",
+            candidate_packages.join(", ")
+        ),
+        SessionEvent::LspInstallResolved { language, outcome } => {
+            format!("{language}: {}", outcome.wire_label())
         }
         SessionEvent::Shutdown => String::new(),
     };

@@ -1,5 +1,40 @@
 # Atelier Spec — Changelog
 
+## v60.22 — 2026-05-18 (Phase B Day-0 prep: `Event::RequestLspInstall` + `LspInstallResolved` variants)
+
+Day-0 sequential prep commit for the Phase B closeout per `tasks/phase_b_closeout.md`. Per **L-D-2** any PR that introduces a new `Event::*` variant lands in its own commit with empty match arms in all four sinks, so the four parallel Phase B bundles (Tracks A / B / C1 / D) don't collide on `crates/atelier-core/src/session.rs::Event`, the GUI `bridge_event`, the Svelte `state.ts applyEvent` / `projectEvent`, or the TUI `apply` / `project_event`. This commit pins the wire shapes for the §7 Tier-1 LSP first-use install flow that Track C1 will fill in.
+
+### Two new `Event` variants — wire shapes pinned, behaviour stubbed
+
+- `Event::RequestLspInstall { language: String, candidate_packages: Vec<String> }` — emitted by Track C1's runner when it observes an unverified language (today only TypeScript) without a cached `LspApprovals` entry. The UI renders a first-use modal listing `candidate_packages` (e.g. `["typescript-language-server"]`); the approval round-trip lands as a sibling Tauri/TUI command in C1 proper.
+- `Event::LspInstallResolved { language: String, outcome: LspInstallOutcome }` — terminal marker for the install flow above. `LspInstallOutcome` is a tier/fallback ladder per **L-D-3**: `Installed` / `Declined` / `AlreadyPresent` / `Failed`, with `wire_label()` returning stable snake-case strings and an agreement test pinning the labels.
+
+### New module: `crates/atelier-core/src/lsp/`
+
+Today the module carries only `LspInstallOutcome` + its wire-label agreement test. Track C1 fleshes it out with `LspServerHandle`, `launch_typescript_server`, `LspApprovals`, and `schemas/audit/lsp_install.v1.json`. Stub-then-grow lets the prep commit ship without compile-time tangling against the future spike.
+
+### Four sinks updated in lockstep
+
+- **`session.rs::Event::kind()`** — two new arms returning `"RequestLspInstall"` / `"LspInstallResolved"`. New `lsp_install_event_kinds_are_stable` regression test pins both strings (matches the existing `concurrent_edit_outcome_wire_labels_are_stable` shape).
+- **GUI `bridge_event`** (`crates/atelier-gui/src/lib.rs`) — two new JSON arms; `RequestLspInstall` ships `{language, candidate_packages}`; `LspInstallResolved` ships `{language, outcome: outcome.wire_label()}`.
+- **TUI `apply`** (`crates/atelier-tui/src/lib.rs`) — the new variants join the IllegalTransitionAttempted / Cancelled / AdapterSwapped / AgentStalled / Shutdown "log-only, no state mutation" or-arm. The approval modal `InputMode` arm lands with Track C1.
+- **TUI `project_event`** — one-line event-log rendering: `"{language}: install {pkgs}"` / `"{language}: {outcome}"`.
+- **Svelte `applyEvent`** (`state.ts`) — log-only arms today; the approval modal in `App.svelte` lands with Track C1.
+- **Svelte `projectEvent`** — one-line event-log rendering symmetric with the TUI.
+
+### Verification
+
+- `cargo build` clean on all four crates (`atelier-core` / `atelier-cli` / `atelier-gui` / `atelier-tui`).
+- `cargo test -p atelier-core` — **802 → 804 tests pass** (two new: `lsp::tests::lsp_install_outcome_wire_labels_are_stable` and `session::tests::lsp_install_event_kinds_are_stable`).
+- `cargo test -p atelier-gui --lib` — 29 tests pass.
+- `cargo test -p atelier-tui --lib` — 94 tests pass.
+- `cargo fmt --check` clean.
+- `cargo clippy --workspace --all-targets -- -D warnings` clean.
+
+### What this enables
+
+Tracks A / B / C1 / D can now land on day 1 of Phase B without colliding on `session.rs` or any of the four sinks. C1 fills in the `LspServerHandle` + `LspApprovals` + sandboxed install runner; C2 wires the Tier-1 verify producer that emits `RequestLspInstall` on first use; C3's hallucinating-agent fixture asserts the install→verify→discrepancy flow end-to-end.
+
 ## v60.21 — 2026-05-18 (DoD checklist: spec becomes authoritative; todo.md mirror collapsed)
 
 Docs-only follow-on to v60.20. Closes a bookkeeping debt surfaced when the user asked "are phases A, B and C fully closed out?" the day after v60.20 shipped: the DoD checklist existed in **two copies** — one in `coding-harness-spec.md:927` as `## Definition of done`, one in `tasks/todo.md:428` as `## DoD checklist mirror` — both with every line `[ ]` despite Phase A green (v60.19), §3 GUI 10-file rename green (v56), §5 context-panel API assertions green (v53), and crash-and-recover green (v60.7). Discharges **L-D-2 / L-D-7** against the project's own bookkeeping: two-copy registries drift; the symptom looked like nothing was done.
