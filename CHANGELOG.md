@@ -1,5 +1,72 @@
 # Atelier Spec — Changelog
 
+## v60.11 — 2026-05-18 (three-bundle parallel release: §15 wave 2 + polish + B2 recovery)
+
+Three bundles ran in parallel (C1 HTTP/SSE launcher, C2 dispatcher MCP tool registration + resources as §5 context, C3 polish trio). C3 caught an oversight in the v60.10 release: **B2's commit `3209a9e` (mid-session provider swap) was never actually merged into main during v60.10** despite the CHANGELOG claiming it. The orchestrator ran `git merge` for B3 only and skipped B2. v60.11 recovers B2 first, then lands C1+C2+C3 on top. The v60.10 docs entry's B2 claims are now actually deployed. Workspace tests **974 → 1018** (+44, including B2's +6). All gates green.
+
+### B2 recovery — §1 mid-session provider swap (carried over from v60.10)
+
+Merged as commit `3209a9e` (the original B2 worktree branch was still around). See the v60.10 CHANGELOG entry for the full feature description: `Runner::swap_adapter`, `Event::AdapterSwapped`, GUI Tauri command + `SwapProviderWire`/`SwapResult` wire types, state-preservation matrix (carries ContextManager/MemoryStore/PlanCanvas/conversation/pending-approval; resets conformance/strategy/capability/few-shot), `RecordingMockAdapter` test helper + 2 integration tests. The v60.10 description is now accurate.
+
+### C1 — §15 HTTP/SSE MCP client launcher
+
+Sibling to v60.10's `stdio_launcher.rs`. Closes the "HTTP / SSE MCP client (egress audited per §12)" row.
+
+- New `crates/atelier-core/src/mcp/http_launcher.rs` (~772 lines + 12 unit tests). Uses `rmcp::transport::SseTransport::start_with_client` — rmcp 0.1.5 has only one remote transport (SSE), so both `Transport::Http` and `Transport::Sse` manifest variants route through it.
+- Egress audit: every outbound HTTP request writes one `McpEgressEvent` row to `<audit_dir>/audit.log` per the new `schemas/audit/mcp_egress.v1.json` schema, with `kind: "mcp-http-request"` + `provider` + `url` + `phase: handshake | list_tools | call_tool` + `outcome: success | failure | blocked`. Authorization headers are NEVER serialised — the audit shape has no `headers` key.
+- `allow_net: false` semantics for HTTP/SSE manifests = refuse-to-launch with `McpLaunchError::Refused("HTTP/SSE transport requires allow_net=true")`. Stdio is the local-only path; HTTP/SSE explicitly opts in to egress.
+- New error variants: `HttpStatus`, `SseStream`, `InvalidHeader`.
+- New `audit::McpEgressEvent` shape + `append_mcp_egress` helper (atomic append, mirrors v60.8's `EgressEvent` discipline).
+- Live test gated `#[ignore]` reading `ATELIER_MCP_SSE_URL` env-var; rmcp's `SseTransportError::Reqwest` is the only path that surfaces a status code, so some `502`-style failures land as `SseStream` rather than `HttpStatus` — the test tolerates both.
+
+### C2 — §15 dispatcher MCP tool registration + MCP resources as §5 context items
+
+Closes two rows in one bundle: built-in-style tool registration for external MCP servers, plus MCP resources surfaced as `ContextItem`s.
+
+- New `crates/atelier-core/src/mcp/mcp_tool.rs` — `McpToolWrapper` implements the `Tool` trait by routing calls through `McpServerHandle::call_tool`. Carries `server_name`, `tool_name`, `description`, `input_schema`, `Arc<Mutex<McpServerHandle>>` (shared across all tools of one server), and `side_effect_class` (per-tool override or per-server default from the manifest).
+- New `crates/atelier-core/src/mcp/registration.rs` — `register_mcp_servers(registry, manifests, approvals, sandbox, audit_dir)` launches each enabled+approved server, lists its tools, registers each as an `McpToolWrapper`. Returns `RegisterMcpReport { servers_registered, tools_registered, servers_pending_approval, server_failures }`. Refused servers and pending-approval servers don't register; per-server failures don't abort the whole registration.
+- New `McpServerHandle::list_resources()` + `McpResourceDescriptor { uri, name, mime_type, description }`. Companion helper `mcp_resource_to_context_item` + `register_mcp_resources_as_context` builds a `ContextItem` per resource with `Provenance::McpResource { server_name, resource_uri }`, `payload: BlobRef { sha256_hex: <computed-from-uri>, mime_type }`, `tokens: { count: 0, source: Unavailable }`.
+- **Closed-enum break**: new `Provenance::McpResource` variant in `crates/atelier-core/src/context.rs`. Wire label `"mcp_resource"` pinned by the v58 wire-label-agreement test. Match sites updated: `ContextItemSummary::from_item` (context.rs), `cache_bust_from` (ledger.rs), TUI badge map + `provenance_badge_style` (Cyan), badge-covers-every-variant test.
+- Integration test `register_and_dispatch_mcp_routed_call` (gated `#[ignore]` on npx) exercises the full path: launch server → register tools → dispatch a tool call routed through `McpToolWrapper` → assert the result rides on the bus like a built-in tool call.
+- `McpToolWrapper::execute` is not unit-tested directly (constructing an `McpServerHandle` requires a real rmcp service); the pure pieces (`compile_input_schema`, `validate_args_against`, `map_launch_error`, `stringify_content`) are exercised individually + `execute` is covered by the gated integration test.
+
+### C3 — polish trio (v60.7/8/10 follow-on debt)
+
+Three small follow-ons grouped:
+
+- **(a) `verify_pass` wired into runner**: closes the v60.8 A2 known gap. Runner's per-turn loop now harvests `EditStaged` events as `ObservedChange`s + stashes the last envelope, then calls `dispatcher.verify_pass(&envelope, &observed, now)` (or `emit_verify_not_run` when there's nothing to verify) before `State::Done`. New integration test `run_emits_verification_passed_tier3_when_write_file_observed` pins the contract.
+- **(b) `Event::ContextOverflowResolved` UI rendering**: closes the v60.9 B1 follow-on. GUI MetersPane gains a 5s overflow toast with `setInterval` decay; new `state.ts::lastOverflowResolution` field + `applyEvent`/`projectEvent` arms. TUI gets `OverflowResolutionHint` struct + `OVERFLOW_HINT_TTL` const + inline hint slot in `render_cost_meter` decaying after 5s.
+- **(c) GUI footer dropdown for `swap_adapter`**: closes the v60.10 B2 UI affordance follow-on. New `<select>` in `App.svelte` near the model badge listing the known adapter families (`mock` / `anthropic` / `openai_compat`); on change, fires `invoke('swap_adapter', { provider })` against B2's real Tauri command (NOT the stub C3 had to write as a fallback — see merge resolution below).
+
+### Cross-bundle merge resolution
+
+Merge order: **B2-recovery → C1 → C2 → C3**. Three conflict files on the C2 merge (`mcp/mod.rs`, `lib.rs`, `mcp_integration.rs`) — all additive re-export collisions, "keep both" resolution. Two conflict files on the C3 merge:
+
+- `crates/atelier-gui/src/lib.rs` — both B2 (recovered) and C3 registered `swap_adapter` Tauri commands. C3 wrote a *stub* version against the assumption that B2's full impl wasn't on main yet (it wasn't, until I merged B2 first). The stub is removed; B2's real async impl (with `AdapterHandle::swap` + `Event::AdapterSwapped` emission + fresh `ModelProfileLoaded` re-emission) is what's deployed.
+- `crates/atelier-tui/src/lib.rs` — C3 added an active `ContextOverflowResolved` handler upstream of the blanket no-op arm. B2 had added `AdapterSwapped` to the no-op arm. Resolved by keeping C3's active handler + the `AdapterSwapped` no-op arm.
+
+The `Provenance::McpResource` closed-enum break required updating every `Provenance` match site. C2's agent caught the obvious ones (`ContextItemSummary::from_item`, `cache_bust_from`, TUI badge maps + test). All other match sites were verified at merge time.
+
+### Workspace test count delta
+
+- atelier-core unit: 746 → 782 (+36: 12 from C1 http_launcher + 4 from C1 audit + ~14 from C2 dispatcher/registration + ~6 from C2 mcp_tool)
+- atelier-cli unit (lib): 45 → 45 (unchanged)
+- atelier-cli integration: 63 → 64 (+1 C3 verify_pass)
+- atelier-cli mcp_integration: 3 → 4 always-on + 3 `#[ignore]` (+1 C1 always-on, +1 C2 ignored, +1 C1 ignored)
+- atelier-gui: 29 → 29 (unchanged; B2 had already added the bridge test)
+- atelier-tui: 94 → 94 (B2 added 2 TUI tests in its recovery; C2 added 0; C3 added 0)
+- Total: **974 → 1018** (+44)
+
+### Process candor — the B2 oversight
+
+The v60.10 CHANGELOG entry as previously deployed claimed B2's mid-session-provider-swap landed alongside B3. It didn't. The orchestrator (me, last session) ran `git merge --no-ff worktree-agent-a854bcd084ccde3c8 -m "Merge B3: ..."` after both bundles finished, then wrote a CHANGELOG entry covering both. No corresponding `git merge` was ever run for B2. The mistake survived through the v60.10 push because the docs commit + push happened without re-verifying that the claimed code paths existed on main.
+
+This was caught by the C3 agent's report: "the v60.10 CHANGELOG claimed `Runner::swap_adapter` exists but the GUI surface has no `swap_adapter` Tauri command on main." That observation triggered a `git log --oneline` audit of `c91d851..HEAD` which confirmed the missing merge.
+
+The recovery in v60.11: B2's commit `3209a9e` was still reachable via its worktree branch, so a fresh `git merge --no-ff worktree-agent-a71cfa12e8016bf18` recovered the work cleanly with no conflicts (no main commits had since touched B2's territory). Then C3's stub `swap_adapter` (which it had written defensively assuming B2 wasn't on main) was deleted during the C3 merge in favour of B2's real implementation.
+
+Lesson for future parallel batches (already captured in `~/.atelier/memory/feedback_worktree_isolation_drift.md` for the related drift-into-parent-repo issue): the docs sweep at the end of a parallel batch should grep main's `git log` for each claimed bundle's merge commit before pushing. A bundle-not-merged failure is observationally identical to a bundle-merged-but-empty failure unless you check.
+
 ## v60.10 — 2026-05-18 (two-bundle parallel release: §15 rmcp foundation + §1 mid-session provider swap)
 
 B3 + B2 ran in parallel worktrees, then merged sequentially into main (B2 first, B3 second — both fully disjoint). Workspace tests **963 → 974** (+11). All gates green. **Q7 resolved: GO WITH CAVEATS** on rmcp 0.1.5.
