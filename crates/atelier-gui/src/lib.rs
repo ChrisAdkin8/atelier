@@ -968,6 +968,15 @@ pub fn bridge_event(evt: &SessionEvent) -> BridgedEvent {
         SessionEvent::FilesChangedAcknowledged { outcome } => json!({
             "outcome": outcome.wire_label(),
         }),
+        SessionEvent::StrategyDegraded { from, to, reason } => json!({
+            // Use the stable `as_str` wire labels (`native_tool` /
+            // `json_sentinel` / `regex_prose`) so the Svelte reducer
+            // can compare directly against `currentModel.strategy`
+            // without re-deriving labels.
+            "from": from.as_str(),
+            "to": to.as_str(),
+            "reason": reason,
+        }),
     };
     BridgedEvent { kind, payload }
 }
@@ -1362,5 +1371,26 @@ mod tests {
         assert_eq!(b.kind, "MentalModelSnapshot");
         assert_eq!(b.payload["enabled"], true);
         assert_eq!(b.payload["text_tokens"], 42);
+    }
+
+    // ---------- §1 BYOM: conformance-driven degradation ----------
+
+    #[test]
+    fn bridge_strategy_degraded_uses_stable_wire_labels() {
+        let b = bridge_event(&SessionEvent::StrategyDegraded {
+            from: atelier_core::protocol_strategy::Strategy::NativeTool,
+            to: atelier_core::protocol_strategy::Strategy::JsonSentinel,
+            reason: "3 malformed envelopes in last 20 calls".into(),
+        });
+        assert_eq!(b.kind, "StrategyDegraded");
+        // The labels must exactly match what `currentModel.strategy`
+        // carries on the wire — same `as_str` source. Pin them so a
+        // rename of the enum can't silently drift the projection.
+        assert_eq!(b.payload["from"], "native_tool");
+        assert_eq!(b.payload["to"], "json_sentinel");
+        assert_eq!(
+            b.payload["reason"],
+            "3 malformed envelopes in last 20 calls"
+        );
     }
 }
