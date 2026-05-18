@@ -124,9 +124,29 @@ pub struct ToolResult {
 /// Per-call environment passed to a `Tool`. Borrows the session-scoped
 /// pieces the tool needs to execute correctly (workspace root, sandbox
 /// profile). The lifetime is bound to the dispatch call.
+///
+/// ## §11 / §12 audit log seam
+///
+/// `tool_call_id` is `None` when the caller built the `ToolContext`
+/// directly (e.g. unit tests that bypass `Dispatcher::dispatch`).
+/// `Dispatcher::dispatch` always overrides it with the live
+/// `ToolCallRequest::id` before handing the context to `Tool::execute`,
+/// so production tool impls can rely on it being `Some`. The shell tool
+/// uses it to label the §11 egress audit row.
+///
+/// `audit_log_path`, when `Some`, points at the session's `audit.log`
+/// (NDJSON, one event per line). Tools that detect a §11 enforcement
+/// (egress block today; over-scope FS write tomorrow) append a row via
+/// `crate::audit::append_subprocess_egress`. `None` disables the
+/// producer — used by dispatcher-level unit tests that don't care about
+/// audit side-effects, and by older tests that pre-date this seam.
 pub struct ToolContext<'a> {
     pub workspace_root: &'a Path,
     pub sandbox: &'a SandboxPolicy,
+    /// Live tool-call id (set by `Dispatcher::dispatch` per call).
+    pub tool_call_id: Option<&'a str>,
+    /// Per-session audit-log path. See type-level docs.
+    pub audit_log_path: Option<&'a Path>,
 }
 
 /// The §15 dispatch contract. Async because tool execution may involve
@@ -499,7 +519,21 @@ impl Dispatcher {
         .await;
 
         // 3. Execute the tool.
-        let raw_result = tool.execute(call.arguments.clone(), ctx).await;
+        //
+        //    Thread the live `ToolCallRequest::id` onto a per-call clone
+        //    of the caller's `ToolContext` so the §11 egress audit
+        //    producer (in `tools/shell.rs`) can label rows with the
+        //    originating tool_call_id. The caller's `tool_call_id`
+        //    field is ignored — `Dispatcher::dispatch` is the single
+        //    source of truth for that id, since it's the layer that
+        //    sees the `ToolCallRequest` directly.
+        let per_call_ctx = ToolContext {
+            workspace_root: ctx.workspace_root,
+            sandbox: ctx.sandbox,
+            tool_call_id: Some(call.id.as_str()),
+            audit_log_path: ctx.audit_log_path,
+        };
+        let raw_result = tool.execute(call.arguments.clone(), &per_call_ctx).await;
         let latency_ms = started.elapsed().as_secs_f64() * 1000.0;
         let cost_usd = Some(local_cost_usd(latency_ms, DEFAULT_LOCAL_RATE_USD_PER_SEC));
 
@@ -1874,6 +1908,8 @@ mod tests {
         ToolContext {
             workspace_root: Path::new("/repo"),
             sandbox: policy,
+            tool_call_id: None,
+            audit_log_path: None,
         }
     }
 
@@ -1885,6 +1921,8 @@ mod tests {
         ToolContext {
             workspace_root: workspace,
             sandbox: policy,
+            tool_call_id: None,
+            audit_log_path: None,
         }
     }
 

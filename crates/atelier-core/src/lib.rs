@@ -9,6 +9,7 @@
 //!   §15  Extensibility — MCP-first tool transport
 
 pub mod adapter;
+pub mod audit;
 pub mod config;
 pub mod context;
 pub mod diff;
@@ -42,6 +43,7 @@ pub use adapter::{
     Adapter, AdapterError, Capabilities, CapabilityClaim, ChatResponse, ChunkStream, Message,
     MockAdapter, Role, StreamChunk, ToolCallRequest, ToolSpec, Usage,
 };
+pub use audit::{append_subprocess_egress, AuditError, EgressEvent};
 pub use context::{
     CacheBustEvent, ContextError, ContextItem, ContextItemId, ContextManager, Payload, Provenance,
     TokenCount, TokenSnapshot, TokenSource,

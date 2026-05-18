@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://atelier.example/schemas/audit/subprocess_egress.v1.json",
+  "title": "Atelier subprocess egress audit record",
+  "description": "One record per attempted network egress from a subprocess-launching tool call (today, the built-in `shell` tool). Spec §11 acceptance gate: `curl evil.example` blocked + logged; spec §12 makes the audit log exportable for privacy review. Lives next to the model-call audit record (`schemas/audit/egress.v1.json`) and shares the same on-disk `audit.log` file, discriminated by `kind`.",
+  "type": "object",
+  "required": [
+    "version",
+    "kind",
+    "timestamp",
+    "tool_call_id",
+    "tool_name",
+    "destination",
+    "outcome",
+    "reason"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "version": {"const": 1, "description": "Schema version."},
+    "kind": {
+      "const": "subprocess-egress",
+      "description": "Discriminator shared with `schemas/audit/egress.v1.json` (which carries `kind: \"model-call\"` once the model-call audit producer ships)."
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "RFC 3339 timestamp at the moment the egress attempt was detected by the harness."
+    },
+    "tool_call_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "ID of the originating ToolCallRequest. Matches the id persisted in `session.json` so an audit row can be traced back to the originating model turn."
+    },
+    "tool_name": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Name of the originating built-in or MCP-routed tool (e.g., `shell`)."
+    },
+    "destination": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Host (optionally with port) the subprocess attempted to reach. Parsed out of the command string. The full command is deliberately NOT recorded — see spec §12 privacy guarantees and the redaction policy."
+    },
+    "outcome": {
+      "type": "string",
+      "enum": ["blocked"],
+      "description": "Today always `blocked` — spec §11 default policy is deny-all egress. Reserved for a future `allowed` once the policy gains an allow-list mode."
+    },
+    "reason": {
+      "type": "string",
+      "enum": ["sandbox-deny-net"],
+      "description": "Why the harness enforced the block. Today always `sandbox-deny-net` (the §11 policy `allow_net: false` default)."
+    }
+  }
+}
