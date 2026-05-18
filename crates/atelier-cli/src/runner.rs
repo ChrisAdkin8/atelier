@@ -1936,7 +1936,15 @@ fn build_atelier_system_prompt(
              every file you created, edited, or deleted. The harness consumes \
              that envelope to recognise completion; without it the loop keeps \
              running and burns tokens. Invoke `harness_meta` on the same turn \
-             you communicate completion in prose."
+             you communicate completion in prose.\n\
+             \n\
+             If you believe the task is complete but couldn't fully verify (for \
+             example, the sandbox blocked `pytest`, `getcwd` printed a \
+             `shell-init` warning, or a check tool wasn't available), STILL emit \
+             `harness_meta` with `claimed_done: true`. Add an `uncertainty` entry \
+             describing what you couldn't verify. The harness's §7 verifier will \
+             catch any inconsistency; do NOT keep iterating because you couldn't \
+             reach pytest-green on your own."
         }
         Strategy::JsonSentinel => {
             "When you finish the user's task, append a §2 protocol envelope to \
@@ -1944,13 +1952,17 @@ fn build_atelier_system_prompt(
              The envelope is a JSON object with `claimed_done: true` and a \
              `claimed_changes` array listing every file you created, edited, or \
              deleted. The harness consumes the envelope; the user sees only your \
-             prose."
+             prose. If you couldn't verify (sandbox / missing tool), still emit \
+             `claimed_done: true` and use an `uncertainty` entry to flag it — \
+             do not silently iterate."
         }
         Strategy::RegexProse => {
             "When you finish the user's task, end your reply with tagged sections: \
              `DONE: yes` on its own line, followed by `CHANGED-FILES:` and a \
              newline-separated list of paths you created, edited, or deleted. \
-             The harness consumes those tags; the user sees only your prose."
+             Use `UNCERTAINTY:` if you couldn't verify (sandbox / missing tool) \
+             but still emit `DONE: yes`. The harness consumes those tags; the \
+             user sees only your prose."
         }
     };
     format!(

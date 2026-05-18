@@ -4,7 +4,7 @@
   "title": "Rename a symbol across 8+ files",
   "priority": true,
   "expected_starting_returncode": 0,
-  "turn_cap": 20,
+  "turn_cap": 30,
   "exercises": [
     "multi-file edits",
     "cross-file refs",

