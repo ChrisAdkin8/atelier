@@ -370,6 +370,14 @@ pub struct Runner {
     /// drivers will surface a flag/setting to flip it in a follow-on
     /// bundle. See [`ContextOverflowPolicy`] for the three arms.
     overflow_policy: ContextOverflowPolicy,
+    /// v60.9 §2 — per-session cache of the adapter's few-shot override
+    /// (resolved against the starting `active_strategy`). Populated on
+    /// first access in [`Self::run`]; `Some(empty)` means "the adapter
+    /// returned `None` — fall back to the shared baseline (currently
+    /// empty)". The cache is per-`Runner`, not per-process, so two
+    /// sequential runs with the same adapter each pay one
+    /// `few_shot_override` call.
+    few_shot_cache: parking_lot::Mutex<Option<Vec<Message>>>,
 }
 
 /// §1 BYOM — context-window asymmetry policy. Chosen at
@@ -549,6 +557,7 @@ impl Runner {
             degradation_threshold:
                 atelier_core::protocol_conformance::DEFAULT_DEGRADATION_THRESHOLD,
             overflow_policy: ContextOverflowPolicy::Compact,
+            few_shot_cache: parking_lot::Mutex::new(None),
         })
     }
 
@@ -582,6 +591,27 @@ impl Runner {
     /// from a UI thread without re-constructing the adapter.
     pub fn with_adapter_handle(mut self, handle: AdapterHandle) -> Self {
         self.adapter_handle = Some(handle);
+        self
+    }
+
+    /// v60.9 — test-only adapter swap. Lets the integration suite drop in
+    /// a custom `Adapter` impl (e.g. one that records the message history
+    /// it received) without going through [`ProviderChoice`]. The
+    /// production binary never calls this; production paths construct
+    /// the adapter via [`Self::new`].
+    ///
+    /// `#[doc(hidden)]` so this doesn't appear in published docs. Marked
+    /// `pub` (not `pub(crate)`) because integration tests live in a
+    /// separate crate that pulls this module in via `#[path]`.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn with_adapter_for_test(mut self, adapter: Arc<dyn Adapter>) -> Self {
+        self.adapter = adapter;
+        // Clear the cache so the next `run` re-queries the new adapter's
+        // `few_shot_override`. Without this, a Runner re-used across
+        // adapters would surface stale overrides — pathological in
+        // production, plausible in tests.
+        *self.few_shot_cache.lock() = None;
         self
     }
 
@@ -911,6 +941,43 @@ impl Runner {
         let audit_log_path =
             OnDiskSession::session_dir(&workspace, audit_session_uuid).join("audit.log");
         let mut messages: Vec<Message> = Vec::new();
+
+        // v60.9 §2 — consult the adapter's per-strategy few-shot override
+        // once per session (the cache below ensures it's not recomputed
+        // per turn). `None` means "use the shared baseline"; the runner's
+        // current shared baseline is empty (the spec §2 baseline lives in
+        // `prompts/protocol_fewshot/` as fixtures consumed by the rig),
+        // so we only prepend when the adapter actively wants to teach the
+        // model a provider-specific carrier shape. Today: Anthropic + the
+        // OpenAI-compat adapters override for `JsonSentinel`; Mock keeps
+        // the default `None`.
+        //
+        // The override is recorded on the per-session cache so a later
+        // re-query (e.g. for an in-flight UI inspection) returns the same
+        // messages without re-entering the adapter. We deliberately do
+        // NOT re-fetch the override if `active_strategy` degrades during
+        // the run — the conversation history already carries the
+        // initial-strategy example and re-priming mid-run with a
+        // different example would confuse the model. (If a future spec
+        // revision asks for re-priming, the cache layout makes that a
+        // one-line change.)
+        let few_shot_prefix: Vec<Message> = {
+            let mut cache = self.few_shot_cache.lock();
+            if let Some(cached) = cache.as_ref() {
+                cached.clone()
+            } else {
+                let computed = self
+                    .adapter
+                    .few_shot_override(active_strategy)
+                    .unwrap_or_default();
+                *cache = Some(computed.clone());
+                computed
+            }
+        };
+        for m in &few_shot_prefix {
+            messages.push(m.clone());
+        }
+
         let mut resumed_session: Option<OnDiskSession> = None;
         let prompt_now = now_rfc3339();
 

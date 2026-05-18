@@ -47,3 +47,7 @@ predicates = { workspace = true }
 # Integration tests use `EventSink::Capture(Arc<parking_lot::Mutex<…>>)`
 # to drain the broadcast bus without going through stdout.
 parking_lot = { workspace = true }
+# v60.9 — the `few_shot_override` integration test stands up a custom
+# adapter impl that records the message history it receives. Needs
+# `async-trait` to express the `async fn stream` method.
+async-trait = { workspace = true }

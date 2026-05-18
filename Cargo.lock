@@ -114,6 +114,7 @@ name = "atelier-cli"
 version = "0.0.0"
 dependencies = [
  "assert_cmd",
+ "async-trait",
  "atelier-core",
  "parking_lot",
  "predicates",
