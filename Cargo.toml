@@ -36,9 +36,14 @@ jsonschema = "0.26"
 # HTTP (remote LLM adapters + HTTP/SSE MCP servers)
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 
-# MCP (Model Context Protocol — §15 tool transport)
-# Pinned to a recent rmcp; revisit during Phase A scaffold per the maturity-assessment note.
-rmcp = "0.1"
+# MCP (Model Context Protocol — §15 tool transport).
+# v60.10 (`experiments/rmcp_spike`): pinned to the 0.1.x line; 1.x on crates.io
+# is a separate fork at the time of writing. Feature set: `client` enables the
+# `serve_client` path + `Peer<RoleClient>` API; `transport-child-process` brings
+# `TokioChildProcess` (stdio subprocess). Default features stay on because
+# rmcp 0.1.5 has a feature-gating bug where `macros` (which pulls `paste`) is
+# required even when not using `#[tool]` — see the spike Cargo.toml comment.
+rmcp = { version = "0.1", features = ["client", "transport-child-process"] }
 
 # Secrets / credentials (§11 credential storage)
 keyring = "3"

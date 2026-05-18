@@ -1,3 +1,8 @@
+# Empty `[workspace]` table keeps the spike out of the main atelier workspace.
+# The spike intentionally pulls a different rmcp feature set than atelier-core
+# will end up wiring, and we don't want cargo to amalgamate them.
+[workspace]
+
 [package]
 name = "rmcp-spike"
 version = "0.0.0"
@@ -7,12 +12,20 @@ publish = false
 
 [dependencies]
 # Pin a recent rmcp at spike time; update the README's matrix with the actual version tested.
-rmcp = "0.1"
+# Spike actually resolves to rmcp 0.1.5 (latest 0.1.x; the 1.0+ line is a separate fork at the
+# time of writing). `transport-child-process` pulls in `tokio/process`, `transport-async-rw`
+# pulls in `tokio/io-util` + `tokio-util/codec` — both are needed for the stdio handshake.
+# `macros` is unconditionally used inside rmcp's own `model/capabilities.rs`
+# (via `paste::paste!`); turning it off breaks the build. So we leave default
+# features on and additively enable `client` + `transport-child-process`.
+# Smell #1 flagged for the matrix: rmcp's feature gating is broken in 0.1.5.
+rmcp = { version = "0.1", features = ["client", "transport-child-process"] }
 
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
+libc = "0.2"
 
 [[bin]]
 name = "rmcp-spike"

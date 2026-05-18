@@ -20,6 +20,7 @@ pub mod file_watcher;
 pub mod hooks;
 pub mod init;
 pub mod ledger;
+pub mod mcp;
 pub mod mcp_config;
 pub mod memory;
 pub mod mental_model;
@@ -66,6 +67,12 @@ pub use hooks::{
 pub use init::{init, InitSummary, ATELIER_MD_TEMPLATE};
 pub use ledger::{
     local_cost_usd, Kind as LedgerKind, Ledger, LedgerEntry, DEFAULT_LOCAL_RATE_USD_PER_SEC,
+};
+pub use mcp::{
+    default_sandbox_for_workspace as default_mcp_sandbox, launch_stdio_server, McpLaunchError,
+    McpServerHandle, McpTool, FIRST_LIST_TIMEOUT_MS as MCP_FIRST_LIST_TIMEOUT_MS,
+    HANDSHAKE_TIMEOUT_MS as MCP_HANDSHAKE_TIMEOUT_MS,
+    SUPPORTED_PROTOCOL_VERSION as MCP_SUPPORTED_PROTOCOL_VERSION,
 };
 pub use mcp_config::{
     approvals_path as mcp_approvals_path, interpolate as mcp_interpolate, load_mcp_servers,
