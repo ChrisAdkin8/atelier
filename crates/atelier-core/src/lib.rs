@@ -19,6 +19,7 @@ pub mod file_watcher;
 pub mod hooks;
 pub mod init;
 pub mod ledger;
+pub mod mcp_config;
 pub mod memory;
 pub mod mental_model;
 pub mod path_safety;
@@ -63,6 +64,12 @@ pub use hooks::{
 pub use init::{init, InitSummary, ATELIER_MD_TEMPLATE};
 pub use ledger::{
     local_cost_usd, Kind as LedgerKind, Ledger, LedgerEntry, DEFAULT_LOCAL_RATE_USD_PER_SEC,
+};
+pub use mcp_config::{
+    approvals_path as mcp_approvals_path, interpolate as mcp_interpolate, load_mcp_servers,
+    parse_mcp_servers, McpApprovals, McpConfigError, McpServerManifest,
+    SideEffectClass as McpSideEffectClass, Transport as McpTransport, MCP_APPROVALS_FILE,
+    MCP_SERVERS_DIR, MCP_SERVERS_FILE, MCP_SERVERS_VERSION,
 };
 pub use memory::{MemoryCard, MemoryError, MemoryStore, PromoteOutput};
 pub use mental_model::{MentalModel, MentalModelError, MentalModelSnapshot};

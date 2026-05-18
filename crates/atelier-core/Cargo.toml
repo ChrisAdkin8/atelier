@@ -16,6 +16,8 @@ thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
+# §15 — validate `.atelier/mcp_servers.json` against its JSON Schema at load.
+jsonschema = { workspace = true }
 rmcp = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
