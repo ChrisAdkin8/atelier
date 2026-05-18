@@ -1,5 +1,65 @@
 # Atelier Spec — Changelog
 
+## v60.7 — 2026-05-18 (four-bundle release: §2 protocol overhead, Phase C close, §1 BYOM ledger, §14 persistence)
+
+Four bundles landed in parallel from separate sub-agent worktrees, then merged sequentially into main. Workspace tests **788 → 861** (+73). All gates green: `cargo fmt --check`, `cargo clippy --workspace -D warnings`, `cargo test --workspace`, `npm run check`, `make check` (11/11 canonical fixtures + 13 with new t12/t13, 112 rig tests).
+
+### Bundle 5 — §2 protocol-overhead harness + nightly CI + fixtures
+
+- New `atelier_core::protocol_strategy::measure_overhead` returns bytes-on-wire, approximate tokens, and parse-time-ms per emission strategy (`native_tool` / `json_sentinel` / `regex_prose`).
+- New `atelier protocol-overhead` CLI subcommand runs the harness against scripted `MockAdapter` fixtures (`tests/protocol/fixtures/{native_tool,json_sentinel,regex_prose}.json`) and writes `tests/protocol/overhead.json` per `schemas/protocol/overhead.v1.json` (additive optional fields).
+- New nightly GitHub Actions workflow `.github/workflows/nightly_protocol_overhead.yml` runs the harness daily; fails on >10% drift vs the rolling 7-day median.
+- New `atelier_cli::overhead` module + 7 unit tests; 3 strategy-side tests for `measure_overhead`.
+
+### Bundle 1 — Phase C close (mental-model panel + inline renderers + UX-target workloads)
+
+Closes the four remaining Phase C residuals. **Tasks/todo.md** §3 + §5 rows fully ticked.
+
+- **§5 mental-model panel** (off by default, cost-disclosed). New `atelier_core::mental_model::{MentalModel, MentalModelSnapshot, MentalModelError}`; `SessionDispatcher::{set_mental_model, snapshot_mental_model}`; `Event::MentalModelSnapshot { enabled, text_tokens }`; new Tauri commands `set_mental_model` + `snapshot_mental_model`; new `MentalModelPane.svelte` + header toggle row in `App.svelte`; TUI footer hint `mm:on(~Ntk,0/turn)` driven by a new `MentalModelHint` projection. v0 explicitly does NOT inject text into the prompt; the cost-disclosure badge reads "0 tokens per turn at present" until that ships.
+- **§3 inline rendering Mermaid / D2 / images**. New `InlineRenderers.svelte`; `mermaid@^11.4.1` npm dep added; integrated in `DiffPane.svelte` and `MemoryPane.svelte`. Mermaid + image cases render inline; D2 falls back to a "render not available, showing source" placeholder.
+- **§3 UX target measurement: refactor without conversation pane open**. New `PaneVisibility` + `PaneVisibilityRecord` in `atelier_cli::instrumentation`; `Runner::with_pane_visibility(panes, driver)` builder writes `<session_dir>/pane_visibility.json` at end of run. New canonical fixture `tests/workload/canonical/t12_refactor_no_conversation_pane/` exercises the path.
+- **§5 UX target measurement: "find what agent knows about file X"**. New `FindProbe` + `FindProbeLog` (atomic append + median) in `atelier_cli::instrumentation`. New fixture `tests/workload/canonical/t13_find_what_agent_knows/`. The matching `atelier find --path <P>` CLI subcommand is deferred to a later bundle — the on-disk format is frozen now.
+- **`schemas/workload/task_meta.v1.json`** extended with optional `pane_visibility` and `find_probe` objects (additive, no migration).
+
+### Bundle 2 — §1 BYOM ledger discipline + capability matrix
+
+- **Per-call cost ledger emission with declared `count_tokens` source**. Anthropic + OpenAI-compat adapters now set `count_source: TokenSource::Exact` iff the wire carried a `usage` block, else `Unavailable`. Mock stays `Exact` when its scripted response declares tokens, else `Unavailable`.
+- **Latency-weighted local cost; default `$0.00028/sec`**. New `ModelCostPolicy::{LatencyWeighted, UnknownPending}` enum + `Runner.cost_policy` field; computed once at `Runner::new` time from `ProviderChoice` + base URL. Local providers (Mock, OpenAI-compat against non-`api.openai.com`) emit `cost_usd = Some(local_cost_usd(latency_ms, DEFAULT_LOCAL_RATE_USD_PER_SEC))`; cloud providers (Anthropic, hosted OpenAI) emit `cost_usd = None` until per-provider pricing tables ship. New private helper `is_openai_cloud_base_url`.
+- **Capability matrix**. New `atelier_core::adapter::capability_matrix` module: static lookup table for 9 well-known models (`anthropic:claude-opus-4-7`, `openai-compat:gpt-4o`, `local:qwen2.5-coder:7b`, etc.) mapping to `Capabilities { native_tool_use, streaming, vision, prompt_cache, structured_output, long_context, context_window_tokens }` with `CapabilityClaim::{Supported, ClaimedButBroken, Unsupported}`. Cross-walks with `ModelProfile` probe observations to flag `ClaimedButBroken`. `Event::ModelProfileLoaded` gains an optional `capability_row` field; GUI footer renders a tooltip with the full row + a yellow "broken: <list>" badge when any column is `claimed_but_broken`; TUI footer renders the same suffix in `render_help_right_model`.
+
+### Bundle 4 — §14 file-watcher + concurrent-edit + resume + SIGKILL gate
+
+- **File-watcher integration**. New `atelier_core::file_watcher` module with `FileWatcherHandle`, `spawn_file_watcher`, `FILE_WATCH_DEBOUNCE`, `FileWatcherError`. Wraps the `notify` crate; debounces edit bursts; emits `Event::FilesChanged { paths, observed_at }` on the bus. `SessionDispatcher` gains a `file_watcher` field + `with_file_watcher` builder; the dispatcher tracks the read-set from each successful `read_file`/`list_dir`/`grep`/`ast_grep` dispatch via a new `extract_read_paths` helper.
+- **Concurrent-edit modal at tool-call boundary**. New `Event::FilesChangedAcknowledged { outcome }` companion event; new `ConcurrentEditPolicy::{Modal, AutoReload}` and `ConcurrentEditOutcome::{Reload, Wait, Pause, AutoReload, PauseTimedOut}` enums; `SessionDispatcher::resolve_concurrent_edit` + new Tauri command `resolve_concurrent_edit`. The dispatcher queues the *next* tool dispatch (spec §14: never cancel mid-stream); the GUI's new `ConcurrentEditModal.svelte` surfaces the user choice; TUI gets a new `InputMode::ConcurrentEditConfirm { paths }` rendered in `render_help` with `r`/`w`/`p` keybinds.
+- **Three named options + 5-min auto-pause (PROVISIONAL)**. `Pause` arms a 5-minute `tokio::sleep`; on timeout the resolver task auto-reloads (emits `ConcurrentEditOutcome::PauseTimedOut`).
+- **Resume-at-last-completed-tool-call**. New `OnDiskSession::{resume_conversation_prefix, append_conversation_turn}` traversal; new `ConversationEntry` struct. `Runner::with_resume(uuid)` builder loads the on-disk session, replays the conversation prefix as `Event::MessageCommitted` (recovery_log surfaces as `MessageRole::System`), and hands off to the normal turn loop. CLI flag `--resume <UUID>`.
+- **`--non-interactive` flag**. New `Runner::with_non_interactive` builder + CLI flag; sets `ApprovalPolicy::AutoApproveAll` + `ConcurrentEditPolicy::AutoReload`. `CliParseResult::Ok` now carries `Box<CliArgs>` to keep the variant size small.
+- **Mechanical gate: kill -9 mid-tool-call → restart → state restored**. New integration test `sigkill_then_resume_recovers_partial_state_and_advances_to_done`. Real `kill -9` is platform-specific and CI-flaky; the test instead simulates the post-crash on-disk state (orphan assistant turn + `RecoveryReason::Crash` entry) and verifies the resume path drops the orphan, surfaces the partial output as a System message, and advances to `State::Done`. Equivalent coverage of the resume code; deterministic on CI.
+
+### Workspace test count delta
+
+- atelier-core unit: 633 → 675 (+42)
+- atelier-cli unit (lib): 31 → 39 (+8: 6 instrumentation + 2 cost-policy)
+- atelier-cli integration: 26 → 37 (+11: 2 pane-visibility, 1 SIGKILL gate, ~8 from B1's `runner` `#[path]` re-include exposing extra integration tests)
+- atelier-gui: 24 → 26 (+2: bridges for `MentalModelSnapshot`, `ModelProfileLoaded` capability_row, `ExpansionExecuted`)
+- atelier-tui: 84 → 84 (unchanged — TUI mental-model is a hint, not a modal)
+- Total: **788 → 861**
+
+### Cross-bundle merge resolution notes
+
+The four worktrees branched from `eac03ec` (post-v60.6 docs) and were merged sequentially in order **B5 → B1 → B2 → B4**. The minor conflicts that needed manual resolution, all on the same load-bearing registries:
+
+- `atelier-cli/src/lib.rs` — additive `pub mod overhead` (B5) + `pub mod instrumentation` (B1).
+- `atelier-core/src/session.rs` — Event enum + `kind()` match: additive variants `MentalModelSnapshot` (B1), `FilesChanged` (B4), `FilesChangedAcknowledged` (B4); modified variant `ModelProfileLoaded` gains optional `capability_row` (B2).
+- `atelier-core/src/dispatcher.rs` — `SessionDispatcher` struct + `::new` initializer: additive fields `mental_model` (B1) + `file_watcher` (B4).
+- `atelier-cli/src/runner.rs` — `Runner` struct + `::new` initializer: additive fields `pane_visibility` (B1) + `cost_policy` + `ModelCostPolicy` enum (B2) + `concurrent_edit_policy` + `resume_from` + `non_interactive` (B4).
+- `atelier-gui/src/lib.rs` — `invoke_handler!` macro list + `bridge_event` match: additive Tauri commands + event projections.
+- `atelier-gui/ui/src/lib/state.ts` + `App.svelte` — additive type imports + `applyEvent` arms.
+- `atelier-tui/src/lib.rs` — additive `apply` arms + `project_event` arms in `render_help`.
+- `tests/test_runner.py` — added `.claude` to the excluded-parts filesystem walk so the `test_no_claude_paths_in_tracked_source` lint ignores harness-managed worktrees under `.claude/worktrees/` (runtime-only state, never tracked).
+
+No semantic conflicts — every conflict was a textual collision on a shared registry where the right answer was "keep both additions."
+
 ## v60.6 — 2026-05-17 (§5 Expand + drag-and-drop plan reorder)
 
 Closes two Phase C rows in a single release:
