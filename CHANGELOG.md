@@ -1,5 +1,45 @@
 # Atelier Spec — Changelog
 
+## v60.13 — 2026-05-18 (Track A: §15 built-ins-as-MCP surface-symmetry refactor)
+
+Closes Track A from the Phase A close-out plan: a sibling `BuiltInToolWrapper` mirrors `McpToolWrapper`'s exact shape so the two registration paths converge at the dispatcher boundary. Track C (CI nightly workflow) is deferred to a separate landing once org quota clears. Workspace tests **1020 → 1031** (+11 tests; +8 wrapper construction, +3 registration).
+
+### Surface symmetry — same shape as `McpToolWrapper`
+
+The spec §15 invariant ("built-in tools and MCP-routed tools share the same `ToolDispatching → ToolExecuting` state transitions; the loop does not branch on tool origin") was already runtime-true at v60.11 — both registration paths hand the dispatcher an `Arc<dyn Tool>`. What v60.13 adds is **construction-time symmetry**: the bundled `tool_manifest.v1.json` files at `crates/atelier-core/tools/*.v1.json` are now the source of truth for `name`, `description`, `side_effect_class` and `input_schema` for built-ins, exactly as the server-advertised `tools/list` payload is for MCP-routed tools.
+
+New module `crates/atelier-core/src/tools/builtin_wrapper.rs` (~340 lines including tests):
+
+- `BuiltInToolWrapper` struct: holds `name`, `description`, `side_effect_class`, `input_schema: Value`, compiled `Arc<jsonschema::Validator>`, and `inner: Arc<dyn Tool>`. `impl Tool` delegates `execute` to the inner; `validate_args` runs the manifest's JSONSchema validator first (catches patterns / ranges / `oneOf` / `additionalProperties:false` that serde can't always express) THEN delegates to the inner.
+- `BuiltInToolWrapper::from_manifest_json(manifest_json: &str, inner: Arc<dyn Tool>) -> Result<Self, BuiltInWrapError>` — parses the manifest, compiles the schema, asserts `parsed.name == inner.name()` and fails as `BuiltInWrapError::NameMismatch` otherwise so manifest/impl drift is a startup failure, not a silent dispatch error.
+- `BuiltInWrapError` enum: `ManifestParse(String)`, `SchemaCompile(String)`, `NameMismatch { manifest, inner }`.
+- The wrapper reuses `crate::mcp::mcp_tool::{compile_input_schema, validate_args_against}` so a future revision of the JSONSchema compilation path touches both wrappers in one place.
+
+### `register_builtins` — `register_mcp_servers` sibling
+
+`crates/atelier-core/src/tools/mod.rs::register_builtins(registry: &mut ToolRegistry) -> Result<RegisterBuiltinsReport, RegisterBuiltinsError>` walks a static 7-row `builtin_table()` (each row: name + `include_str!`-loaded manifest JSON + `Arc<dyn Tool>` inner), builds a wrapper per row via `BuiltInToolWrapper::from_manifest_json`, and registers each into the registry. Returns `RegisterBuiltinsReport { tools_registered: Vec<String> }` so the runner can ledger the registration alongside MCP-server registrations in one report shape.
+
+`spawn_subagent.v1.json` exists in the manifest set but its Rust `Tool` impl hasn't landed (§10 delegation work) — the table leaves it out until the impl arrives; the manifest's existence is a forward-looking surface contract.
+
+The runner's `crates/atelier-cli/src/runner.rs::built_in_registry()` is now a 4-line delegation to `register_builtins`. Direct imports of the seven tool structs from the runner go away; the `Tool` import becomes unused and is dropped from the use-list.
+
+### Tests — 11 new
+
+- `builtin_wrapper::tests` (8) — `name_comes_from_manifest_not_inner`, `side_effect_class_comes_from_manifest_not_inner`, `name_mismatch_rejected`, `malformed_manifest_rejected`, `invalid_schema_rejected`, `validate_args_runs_manifest_schema`, `execute_delegates_to_inner`, `all_bundled_manifests_parse` (drift gate: every one of the 7 bundled manifests parses + its schema compiles).
+- `tools::register_tests` (3) — `register_builtins_registers_all_seven_with_correct_metadata` (asserts the registration order matches the table + spot-checks `read_file: LocalSafe`, `write_file: LocalRisky`, `shell: LocalRisky`), `register_builtins_is_idempotent_only_once` (a second call surfaces as `RegisterBuiltinsError::Register` rather than silently overwriting), `wrapper_rejects_unknown_field_via_manifest_schema` (the JSONSchema gate rejects `additionalProperties:false` violations ahead of the inner impl).
+
+The seven inner `Tool` impls (`ReadFile`, `WriteFile`, `EditFile`, `ListDir`, `Grep`, `AstGrep`, `Shell`) and their ~30 existing unit tests are untouched — the refactor is purely additive at the inner layer. The 794 atelier-core tests + 72 atelier-cli tests + 94 atelier-gui tests + the TUI suite all stay green; `make check` runs all 112 rig tests + 13 canonical workloads + 57 artifacts.
+
+### Why not literal in-process MCP for the built-ins
+
+A literal in-process MCP transport for the built-ins (so they'd share `McpToolWrapper` not just its shape) was considered and rejected:
+
+1. rmcp 0.1.5 has no in-process transport — only stdio + SSE. Wrapping each built-in in a `tokio::process::Command` spawn just to round-trip through rmcp's JSON-RPC framing is pure overhead.
+2. Three built-ins (`write_file`, `edit_file`, `shell`) carry handles to in-process state — `Staging` (TempDir-owning), `SandboxPolicy`, the audit-log path — that don't cross an MCP boundary cleanly. The MCP server's view of the workspace would need to either rebuild these or take them by side-channel, neither of which is in scope.
+3. No current consumer wants atelier embedded as a sub-process for another harness. If/when that lands, the v60.13 wrapper symmetry is the right shape to start from.
+
+The wrapper symmetry buys the spec §15 promise (uniform dispatch shape) without paying for the speculative IPC layer.
+
 ## v60.12 — 2026-05-18 (Phase A close: canonical priority subset offline gates + §7 lying-agent E2E)
 
 Phase A's "atelier-core drives canonical priority subset end-to-end via the §2.5 loop" line lands offline against `ProviderChoice::Mock`, and the §7 lying-agent gate (`tasks/todo.md:228`) closes after a real fix in `dispatcher::verify_pass`. Live-API gates (against Anthropic + OpenAI-compat) and the nightly workflow remain for follow-up Track B + Track C. Workspace tests **1018 → 1020** (+1 paired dispatcher unit test for the new branch, +6 new integration tests in atelier-cli, –5 reused slots = +2 net at the suite-level summary).

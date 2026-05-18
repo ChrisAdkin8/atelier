@@ -23,7 +23,7 @@ use atelier_core::{
         ContextItem, ContextItemId, ContextManager, Payload, Provenance, TokenCount, TokenSource,
     },
     dispatcher::{
-        ConcurrentEditPolicy, Dispatcher, SessionDispatcher, ShellHookExecutor, Tool, ToolContext,
+        ConcurrentEditPolicy, Dispatcher, SessionDispatcher, ShellHookExecutor, ToolContext,
         ToolRegistry,
     },
     dod::DodConfig,
@@ -38,10 +38,7 @@ use atelier_core::{
     sandbox::SandboxPolicy,
     session::{self, Command as SessionCommand, ConcurrentEditOutcome, Event, MessageRole},
     state::NoopHook,
-    tools::{
-        ast_grep::AstGrep, edit_file::EditFile, grep::Grep, list_dir::ListDir, read_file::ReadFile,
-        shell::Shell, write_file::WriteFile,
-    },
+    tools::register_builtins,
     SessionHandle, SessionId, State, Transition,
 };
 
@@ -1865,19 +1862,7 @@ fn adapter_to_run_error(e: AdapterError) -> RunError {
 
 fn built_in_registry() -> Result<ToolRegistry, RunError> {
     let mut r = ToolRegistry::new();
-    let tools: Vec<Arc<dyn Tool>> = vec![
-        Arc::new(ReadFile),
-        Arc::new(ListDir),
-        Arc::new(Grep),
-        Arc::new(WriteFile),
-        Arc::new(EditFile),
-        Arc::new(AstGrep),
-        Arc::new(Shell),
-    ];
-    for t in tools {
-        r.register(t)
-            .map_err(|e| RunError::Config(format!("tool registry: {e}")))?;
-    }
+    register_builtins(&mut r).map_err(|e| RunError::Config(format!("tool registry: {e}")))?;
     Ok(r)
 }
 
