@@ -1843,3 +1843,267 @@ async fn run_does_not_emit_strategy_degraded_when_envelopes_are_clean() {
         "StrategyDegraded must not fire when envelopes parse cleanly"
     );
 }
+
+// ---------- v60.9 §2 — per-adapter few-shot override hook ----------
+
+/// Test adapter that:
+///   * advertises a few-shot override for `JsonSentinel` (mimicking what
+///     Anthropic / OpenAI-compat ship in production), and
+///   * records every message slice it receives via `chat()` so the test
+///     can assert the override messages appear at the head of the
+///     per-turn message history.
+///
+/// Constructed inline here rather than baked into `MockAdapter` so the
+/// existing adapter tests don't inherit the recording overhead.
+struct MockAdapterWithOverride {
+    inner: atelier_core::adapter::MockAdapter,
+    received: Arc<parking_lot::Mutex<Vec<Vec<atelier_core::adapter::Message>>>>,
+    override_messages: Vec<atelier_core::adapter::Message>,
+}
+
+impl MockAdapterWithOverride {
+    fn new() -> Self {
+        let inner = atelier_core::adapter::MockAdapter::new("mock:override-test");
+        let override_messages = vec![
+            atelier_core::adapter::Message::text(
+                atelier_core::adapter::Role::User,
+                "FEW_SHOT_USER_MARKER: rename foo to bar",
+            ),
+            atelier_core::adapter::Message::text(
+                atelier_core::adapter::Role::Assistant,
+                "FEW_SHOT_ASSISTANT_MARKER: <<<harness_meta>>>{}<<<end>>>",
+            ),
+        ];
+        Self {
+            inner,
+            received: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            override_messages,
+        }
+    }
+
+    fn queue_envelope_done_sentinel(&self) {
+        use atelier_core::adapter::{ChatResponse, StreamChunk, Usage};
+        use atelier_core::context::TokenSource;
+        use atelier_core::protocol_strategy::{
+            Strategy, HARNESS_META_NAME, SENTINEL_CLOSE, SENTINEL_OPEN,
+        };
+        let _ = HARNESS_META_NAME; // silence unused-import warning under partial cfg
+        let env = envelope_done();
+        let env_json = serde_json::to_string(&env).unwrap();
+        let text = format!("done\n{SENTINEL_OPEN}{env_json}{SENTINEL_CLOSE}");
+        self.inner.queue_stream(vec![StreamChunk::Complete {
+            response: ChatResponse {
+                text,
+                tool_calls: vec![],
+                usage: Usage {
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                    cached_tokens: None,
+                    count_source: TokenSource::Approx,
+                    latency_ms: Some(0),
+                },
+                strategy: Strategy::JsonSentinel,
+                stop_reason: Some(atelier_core::adapter::StopReason::EndTurn),
+            },
+        }]);
+    }
+
+    fn queue_text_only(&self, text: &str) {
+        use atelier_core::adapter::{ChatResponse, StreamChunk, Usage};
+        use atelier_core::context::TokenSource;
+        use atelier_core::protocol_strategy::Strategy;
+        self.inner.queue_stream(vec![StreamChunk::Complete {
+            response: ChatResponse {
+                text: text.into(),
+                tool_calls: vec![],
+                usage: Usage {
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                    cached_tokens: None,
+                    count_source: TokenSource::Approx,
+                    latency_ms: Some(0),
+                },
+                strategy: Strategy::JsonSentinel,
+                stop_reason: Some(atelier_core::adapter::StopReason::EndTurn),
+            },
+        }]);
+    }
+}
+
+#[async_trait::async_trait]
+impl atelier_core::adapter::Adapter for MockAdapterWithOverride {
+    fn model_id(&self) -> &str {
+        self.inner.model_id()
+    }
+
+    fn capabilities(&self) -> atelier_core::adapter::Capabilities {
+        self.inner.capabilities()
+    }
+
+    fn conformance(&self) -> atelier_core::protocol_conformance::ConformanceSnapshot {
+        self.inner.conformance()
+    }
+
+    async fn count_tokens(
+        &self,
+        messages: &[atelier_core::adapter::Message],
+    ) -> Result<atelier_core::adapter::TokenCount, atelier_core::adapter::AdapterError> {
+        self.inner.count_tokens(messages).await
+    }
+
+    async fn chat(
+        &self,
+        messages: &[atelier_core::adapter::Message],
+        tools: &[atelier_core::adapter::ToolSpec],
+    ) -> Result<atelier_core::adapter::ChatResponse, atelier_core::adapter::AdapterError> {
+        self.received.lock().push(messages.to_vec());
+        self.inner.chat(messages, tools).await
+    }
+
+    async fn stream(
+        &self,
+        messages: &[atelier_core::adapter::Message],
+        tools: &[atelier_core::adapter::ToolSpec],
+    ) -> Result<atelier_core::adapter::ChunkStream, atelier_core::adapter::AdapterError> {
+        self.received.lock().push(messages.to_vec());
+        self.inner.stream(messages, tools).await
+    }
+
+    fn few_shot_override(
+        &self,
+        strategy: atelier_core::protocol_strategy::Strategy,
+    ) -> Option<Vec<atelier_core::adapter::Message>> {
+        match strategy {
+            atelier_core::protocol_strategy::Strategy::JsonSentinel => {
+                Some(self.override_messages.clone())
+            }
+            _ => None,
+        }
+    }
+}
+
+#[tokio::test]
+async fn few_shot_override_prepends_adapter_messages_to_per_turn_history() {
+    // Custom adapter advertises an override; the runner must consult it
+    // at session start and place the returned messages at the head of
+    // the per-turn message history sent to `adapter.chat()`. The
+    // override is keyed on the active §2 strategy; we cap the
+    // MockAdapter capabilities so the runner picks JsonSentinel.
+    use atelier_core::adapter::{Capabilities, CapabilityClaim};
+
+    let workspace = tempfile::TempDir::new().unwrap();
+    // Force JsonSentinel by declaring native_tool_use as Unsupported.
+    // The Skip probe-policy branch in `Runner::run` reads this and
+    // selects JsonSentinel as the starting strategy.
+    let caps = Capabilities {
+        native_tool_use: CapabilityClaim::Unsupported,
+        streaming: CapabilityClaim::Supported,
+        vision: CapabilityClaim::Unsupported,
+        prompt_cache: CapabilityClaim::Unsupported,
+        structured_output: CapabilityClaim::Supported,
+        long_context: CapabilityClaim::Supported,
+        context_window_tokens: 200_000,
+    };
+    let mut wrapped = MockAdapterWithOverride::new();
+    wrapped.inner =
+        atelier_core::adapter::MockAdapter::new("mock:override-test").with_capabilities(caps);
+    wrapped.queue_envelope_done_sentinel();
+    let received = wrapped.received.clone();
+    let expected_override = wrapped.override_messages.clone();
+    let adapter: Arc<dyn atelier_core::adapter::Adapter> = Arc::new(wrapped);
+
+    let runner = Runner::new(
+        workspace.path().to_path_buf(),
+        ProviderChoice::Mock { responses: vec![] }, // displaced below
+        EventSink::Null,
+    )
+    .expect("mock runner construction is infallible")
+    .with_adapter_for_test(adapter)
+    .with_max_turns(2);
+
+    let _ = runner.run("user prompt body".into()).await.unwrap();
+
+    let calls = received.lock();
+    assert!(
+        !calls.is_empty(),
+        "the runner must have invoked adapter.chat() at least once"
+    );
+    // First turn's message history: override messages must lead.
+    let first = &calls[0];
+    assert!(
+        first.len() > expected_override.len(),
+        "expected >{} messages (override + user prompt), got {}",
+        expected_override.len(),
+        first.len(),
+    );
+    for (i, m) in expected_override.iter().enumerate() {
+        assert_eq!(
+            &first[i], m,
+            "few-shot override message {i} mismatch:\n  expected: {m:?}\n  got: {:?}",
+            first[i],
+        );
+    }
+    // The user prompt is appended right after the override pair.
+    assert_eq!(first[expected_override.len()].content, "user prompt body");
+    assert_eq!(
+        first[expected_override.len()].role,
+        atelier_core::adapter::Role::User,
+    );
+}
+
+#[tokio::test]
+async fn few_shot_override_is_cached_across_turns_not_recomputed() {
+    // The override is computed once per session. We can observe this
+    // indirectly: across multiple turns, every per-turn message history
+    // must carry the same override messages at the head (a re-query
+    // that returned a different `Some` would surface). The cache is
+    // also stress-tested by `with_adapter_for_test`, which clears it on
+    // swap; without the swap, the cache remains hot from session start.
+    use atelier_core::adapter::{Capabilities, CapabilityClaim};
+
+    let workspace = tempfile::TempDir::new().unwrap();
+    let mut wrapped = MockAdapterWithOverride::new();
+    wrapped.inner = atelier_core::adapter::MockAdapter::new("mock:override-test")
+        .with_capabilities(Capabilities {
+            native_tool_use: CapabilityClaim::Unsupported,
+            streaming: CapabilityClaim::Supported,
+            vision: CapabilityClaim::Unsupported,
+            prompt_cache: CapabilityClaim::Unsupported,
+            structured_output: CapabilityClaim::Supported,
+            long_context: CapabilityClaim::Supported,
+            context_window_tokens: 200_000,
+        });
+    // Two turns: a no-envelope turn (continues loop) followed
+    // by a claimed_done turn carrying the envelope via sentinel.
+    wrapped.queue_text_only("thinking...");
+    wrapped.queue_envelope_done_sentinel();
+    let received = wrapped.received.clone();
+    let expected_first = wrapped.override_messages[0].clone();
+    let adapter: Arc<dyn atelier_core::adapter::Adapter> = Arc::new(wrapped);
+
+    let runner = Runner::new(
+        workspace.path().to_path_buf(),
+        ProviderChoice::Mock { responses: vec![] },
+        EventSink::Null,
+    )
+    .expect("mock runner construction is infallible")
+    .with_adapter_for_test(adapter)
+    .with_max_turns(4);
+
+    let _ = runner.run("multi-turn prompt".into()).await.unwrap();
+
+    let calls = received.lock();
+    assert!(
+        calls.len() >= 2,
+        "expected ≥2 chat() calls, got {}",
+        calls.len()
+    );
+    // Override messages persist at the head of every turn's history.
+    for (turn_ix, history) in calls.iter().enumerate() {
+        assert_eq!(
+            history[0], expected_first,
+            "turn {turn_ix} must still carry the override at position 0; \
+             a per-turn re-query would break the cache contract",
+        );
+    }
+}

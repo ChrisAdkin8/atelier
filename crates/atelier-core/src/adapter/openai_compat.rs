@@ -297,6 +297,37 @@ impl Adapter for OpenAiCompatAdapter {
         Ok(parsed.into_chat_response(latency_ms))
     }
 
+    /// v60.9 — OpenAI-flavoured few-shot override.
+    ///
+    /// * `NativeTool` → `None`. The `tools` array + `tool_calls` reply
+    ///   shape is the canonical OpenAI path; the shared baseline already
+    ///   demonstrates it.
+    /// * `JsonSentinel` → an OpenAI-flavoured override that emphasises
+    ///   **strict** JSON between the sentinels (no surrounding prose,
+    ///   no commentary, no markdown fence). Local OpenAI-compat servers
+    ///   (LM Studio, llama-server, vLLM, Ollama) and OpenAI's own
+    ///   structured-output mode follow this best when the example is
+    ///   terse and the boundary is exact.
+    /// * `RegexProse` → `None`. Same rationale as Anthropic — the prose
+    ///   fallback is lossy by design and no provider-specific phrasing
+    ///   improves it.
+    fn few_shot_override(&self, strategy: Strategy) -> Option<Vec<Message>> {
+        match strategy {
+            Strategy::JsonSentinel => Some(vec![
+                Message::text(Role::User, "Rename `foo` to `bar` in utils.py."),
+                Message::text(
+                    Role::Assistant,
+                    "<<<harness_meta>>>\
+                     {\"claimed_changes\":[\
+                     {\"path\":\"utils.py\",\"kind\":\"edit\",\
+                     \"summary\":\"Renamed foo to bar\"}]}\
+                     <<<end>>>",
+                ),
+            ]),
+            Strategy::NativeTool | Strategy::RegexProse => None,
+        }
+    }
+
     async fn stream(
         &self,
         messages: &[Message],
@@ -1736,5 +1767,51 @@ mod tests {
         let s = format!("{a:?}");
         assert!(!s.contains("super-secret-key"));
         assert!(s.contains("<redacted>"));
+    }
+
+    // ---------- v60.9 few-shot override ----------
+
+    use crate::protocol_strategy::{SENTINEL_CLOSE, SENTINEL_OPEN};
+
+    #[test]
+    fn openai_compat_few_shot_override_returns_some_for_json_sentinel() {
+        let a = OpenAiCompatAdapter::new("k", "local:m", "http://localhost:11434/v1");
+        let msgs = a
+            .few_shot_override(Strategy::JsonSentinel)
+            .expect("OpenAI-compat overrides JsonSentinel with a strict-JSON example");
+        assert_eq!(msgs.len(), 2, "user + assistant pair");
+        assert_eq!(msgs[0].role, Role::User);
+        assert_eq!(msgs[1].role, Role::Assistant);
+        // The assistant turn must start with the sentinel — no prose
+        // preface — so local OSS models latch onto the carrier without
+        // narrating before it.
+        assert!(
+            msgs[1].content.starts_with(SENTINEL_OPEN),
+            "assistant turn must lead with the sentinel: {:?}",
+            msgs[1].content,
+        );
+        assert!(
+            msgs[1].content.contains(SENTINEL_CLOSE),
+            "assistant turn must include the sentinel close: {:?}",
+            msgs[1].content,
+        );
+    }
+
+    #[test]
+    fn openai_compat_few_shot_override_returns_none_for_native_tool() {
+        let a = OpenAiCompatAdapter::new("k", "local:m", "http://localhost:11434/v1");
+        assert!(
+            a.few_shot_override(Strategy::NativeTool).is_none(),
+            "NativeTool is the canonical OpenAI carrier; baseline suffices"
+        );
+    }
+
+    #[test]
+    fn openai_compat_few_shot_override_returns_none_for_regex_prose() {
+        let a = OpenAiCompatAdapter::new("k", "local:m", "http://localhost:11434/v1");
+        assert!(
+            a.few_shot_override(Strategy::RegexProse).is_none(),
+            "RegexProse falls through to the shared baseline"
+        );
     }
 }

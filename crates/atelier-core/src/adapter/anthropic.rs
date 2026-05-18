@@ -245,6 +245,38 @@ impl Adapter for AnthropicAdapter {
         Ok(parsed.into_chat_response(latency_ms))
     }
 
+    /// v60.9 — Anthropic-flavoured few-shot override.
+    ///
+    /// * `NativeTool` → `None`. Claude's `tool_use` block is the canonical
+    ///   carrier for the §2 envelope; the shared baseline already prompts
+    ///   for it correctly.
+    /// * `JsonSentinel` → a short user/assistant pair that emphasises the
+    ///   exact `<<<harness_meta>>>` / `<<<end>>>` sentinel pair Claude
+    ///   follows most reliably when its native tool-use channel is
+    ///   unavailable (e.g., a long-context degradation). We include the
+    ///   sentinel pair inline so the model sees the carrier explicitly
+    ///   rather than relying on the prose description alone.
+    /// * `RegexProse` → `None`. The prose fallback is lossy by design and
+    ///   the shared baseline already covers it; no adapter-specific
+    ///   phrasing improves it.
+    fn few_shot_override(&self, strategy: Strategy) -> Option<Vec<Message>> {
+        match strategy {
+            Strategy::JsonSentinel => Some(vec![
+                Message::text(Role::User, "Rename `foo` to `bar` in utils.py."),
+                Message::text(
+                    Role::Assistant,
+                    "Renamed `foo` to `bar` in `utils.py`.\n\n\
+                     <<<harness_meta>>>\
+                     {\"claimed_changes\":[\
+                     {\"path\":\"utils.py\",\"kind\":\"edit\",\
+                     \"summary\":\"Renamed foo to bar\"}]}\
+                     <<<end>>>",
+                ),
+            ]),
+            Strategy::NativeTool | Strategy::RegexProse => None,
+        }
+    }
+
     async fn stream(
         &self,
         messages: &[Message],
@@ -2186,6 +2218,51 @@ data: {"type":"message_stop"}
         assert!(
             matches!(err, AdapterError::Provider { .. }),
             "expected Provider, got {err:?}"
+        );
+    }
+
+    // ---------- v60.9 few-shot override ----------
+
+    use crate::protocol_strategy::{SENTINEL_CLOSE, SENTINEL_OPEN};
+
+    #[test]
+    fn anthropic_few_shot_override_returns_some_for_json_sentinel() {
+        let a = AnthropicAdapter::new("test-key", "anthropic:claude-opus-4-7");
+        let msgs = a
+            .few_shot_override(Strategy::JsonSentinel)
+            .expect("Anthropic overrides JsonSentinel with a sentinel-first example");
+        assert_eq!(msgs.len(), 2, "user + assistant pair");
+        assert_eq!(msgs[0].role, Role::User);
+        assert_eq!(msgs[1].role, Role::Assistant);
+        // The override must include the literal sentinel pair so Claude
+        // sees the carrier shape, not just a prose description of it.
+        assert!(
+            msgs[1].content.contains(SENTINEL_OPEN),
+            "assistant turn must demonstrate the sentinel open: {:?}",
+            msgs[1].content,
+        );
+        assert!(
+            msgs[1].content.contains(SENTINEL_CLOSE),
+            "assistant turn must demonstrate the sentinel close: {:?}",
+            msgs[1].content,
+        );
+    }
+
+    #[test]
+    fn anthropic_few_shot_override_returns_none_for_native_tool() {
+        let a = AnthropicAdapter::new("test-key", "anthropic:claude-opus-4-7");
+        assert!(
+            a.few_shot_override(Strategy::NativeTool).is_none(),
+            "NativeTool is the canonical Claude carrier; baseline suffices"
+        );
+    }
+
+    #[test]
+    fn anthropic_few_shot_override_returns_none_for_regex_prose() {
+        let a = AnthropicAdapter::new("test-key", "anthropic:claude-opus-4-7");
+        assert!(
+            a.few_shot_override(Strategy::RegexProse).is_none(),
+            "RegexProse falls through to the shared baseline"
         );
     }
 }

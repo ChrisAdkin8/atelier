@@ -336,6 +336,23 @@ pub trait Adapter: Send + Sync {
         messages: &[Message],
         tools: &[ToolSpec],
     ) -> Result<ChunkStream, AdapterError>;
+
+    /// v60.9 — per-adapter few-shot override. Returns `Some(messages)` to
+    /// replace the shared baseline for the given strategy, or `None` to
+    /// fall back to the harness's default. Default impl returns `None`;
+    /// adapters with strategy-specific quirks (Anthropic's `tool_use`
+    /// shape, OpenAI's structured-output formatting) override.
+    ///
+    /// The runner consults this once per session at start-up, caches the
+    /// result, and prepends it to the per-turn message history. Override
+    /// implementations must therefore return self-contained `Message`
+    /// pairs (the canonical shape is one `Role::User` example followed
+    /// by one `Role::Assistant` envelope-bearing reply) that can sit at
+    /// the head of the conversation without dangling tool-call ids.
+    fn few_shot_override(&self, strategy: Strategy) -> Option<Vec<Message>> {
+        let _ = strategy;
+        None
+    }
 }
 
 /// Boxed async stream of [`StreamChunk`] values. `Send` because the
@@ -821,6 +838,24 @@ mod tests {
             let json = serde_json::to_string(&chunk).unwrap();
             let back: StreamChunk = serde_json::from_str(&json).unwrap();
             assert_eq!(back, chunk);
+        }
+    }
+
+    // ---------- v60.9 few-shot override ----------
+
+    #[test]
+    fn mock_few_shot_override_returns_none_by_default() {
+        let m = MockAdapter::new("mock:test");
+        for s in [
+            Strategy::NativeTool,
+            Strategy::JsonSentinel,
+            Strategy::RegexProse,
+        ] {
+            assert!(
+                m.few_shot_override(s).is_none(),
+                "Mock must keep the baseline for {s:?}; overrides are an opt-in for \
+                 provider-specific quirks"
+            );
         }
     }
 }
