@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://atelier.example/schemas/audit/lsp_install.v1.json",
+  "title": "Atelier LSP install audit record",
+  "description": "One record per `Event::RequestLspInstall` → `Event::LspInstallResolved` round-trip. Spec §7 (Verification) line: LSP first-use install requires explicit user approval; the audit row is the durable evidence of which language was prompted, which packages were considered, and what the user chose. Lives in the same on-disk `audit.log` as `subprocess_egress.v1.json` / `mcp_egress.v1.json` / `egress.v1.json`, discriminated by `kind`. Path: `<workspace>/.atelier/sessions/<uuid>/audit.log`.",
+  "type": "object",
+  "required": ["version", "kind", "timestamp", "language", "candidate_packages", "outcome"],
+  "additionalProperties": false,
+  "properties": {
+    "version": {"const": 1, "description": "Schema version."},
+    "kind": {
+      "const": "lsp-install",
+      "description": "Discriminator. Distinct from `subprocess-egress`, `mcp-http-request`, and `model-call` rows sharing the same `audit.log`."
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "RFC 3339 timestamp at the moment the install attempt resolved (matches the `Event::LspInstallResolved` emission, not the preceding `Event::RequestLspInstall`)."
+    },
+    "language": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[a-z][a-z0-9_-]*$",
+      "description": "The LSP language identifier (e.g. `typescript`, `python`, `rust`). Stable lowercase identifier — matches the `language` field carried on `Event::RequestLspInstall`."
+    },
+    "candidate_packages": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"type": "string", "minLength": 1},
+      "description": "The packages the install flow proposed. For TypeScript today: `[\"typescript-language-server\"]`. Multiple entries when a language requires several packages (e.g. python: `pyright` alongside `python-lsp-server`)."
+    },
+    "outcome": {
+      "$ref": "#/$defs/LspInstallOutcome",
+      "description": "Outcome from `atelier_core::lsp::LspInstallOutcome::wire_label()`."
+    },
+    "duration_ms": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Wall-clock milliseconds from `Event::RequestLspInstall` to `Event::LspInstallResolved`. For `declined`, the time the user took to dismiss the prompt; for `installed`, the install-subprocess duration; for `already_present`, the version-probe duration; for `failed`, the time to the error surface."
+    },
+    "package_manager": {
+      "type": "string",
+      "enum": ["npm", "pip", "cargo", "go", "brew", "system"],
+      "description": "The package manager the launcher used. Optional — older artifacts may pre-date the field. `system` is the catch-all when the launcher delegated to a platform-specific path (apt, dnf, choco)."
+    },
+    "version_installed": {
+      "type": "string",
+      "description": "The package version actually installed, when `outcome` is `installed` or `already_present`. Free-form (e.g. `typescript-language-server@4.3.4`). Omitted otherwise."
+    },
+    "reason": {
+      "type": "string",
+      "maxLength": 1024,
+      "description": "Free-form diagnostic note. For `declined`: the dismissal reason if the UI captured one (otherwise omitted). For `failed`: short error category (`network`, `permission`, `unsupported-platform`, `package-manager-missing`). Omitted otherwise. Capped at 1 KiB so a malformed row can't bloat the audit log."
+    }
+  },
+  "$defs": {
+    "LspInstallOutcome": {
+      "enum": ["installed", "declined", "already_present", "failed"],
+      "description": "Stable wire labels from `atelier_core::lsp::LspInstallOutcome::wire_label()`. Pinned by `lsp_install_outcome_wire_labels_are_stable`."
+    }
+  }
+}

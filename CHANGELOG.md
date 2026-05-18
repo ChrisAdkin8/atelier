@@ -1,5 +1,65 @@
 # Atelier Spec — Changelog
 
+## v60.25 — 2026-05-18 (Phase B Track C1: LSP client foundation — data layer + spike harness)
+
+Lands the data-layer foundation for §7 Tier-1 LSP verification. The spike harness exists (`experiments/lsp_spike/`); the spike verdict is **PENDING** — the operator must execute it against `typescript-language-server` and record the decision-matrix outcome in `experiments/lsp_spike/README.md` before the `LspServerHandle` + `launch_typescript_server` implementations land. Everything in this commit compiles without `async-lsp` as a dependency, so Tracks C2 and C3 can proceed against the data-layer surface while the spike runs.
+
+### Spike harness `experiments/lsp_spike/`
+
+Mirror of `experiments/rmcp_spike/`'s shape (per **L-D-3** — reuse the maturity-spike pattern). Three modes:
+
+- `cargo run -- stdio` — happy path: spawn `npx -y typescript-language-server --stdio`, run the LSP `initialize` handshake, open a fixture `.ts` file with a deliberate type error (`foo.nonExistentMethod()`), wait for the matching `publishDiagnostics`.
+- `cargo run -- crash` — kill the server mid-handshake with SIGKILL, observe how `async-lsp` surfaces the disconnect.
+- `cargo run -- decline` — exit without `initialized`, simulating user dismissal of the first-use prompt; verify no zombie processes remain.
+
+The harness is intentionally stub-shaped — the driver loop is sketched but not driven, so the harness builds standalone without npm install at compile time. The first operator to execute the spike fills in the driver based on async-lsp 0.2's docs and records GO / GO-WITH-CAVEATS / NO-GO. Empty `[workspace]` keeps the spike out of the main workspace per the v60.10 rmcp-spike pattern.
+
+### New module `crates/atelier-core/src/lsp/approval.rs`
+
+`LspApprovals` is a bit-for-bit mirror of v60.8's `McpApprovals`. Stable layout:
+
+- `BTreeMap<String, String>` of `language → granted_at` (RFC 3339).
+- `load()` / `save()` round-trip through `tempfile::NamedTempFile::persist` (per **L-D-4** — every cross-call write routes through the atomic pattern).
+- Path: `<workspace>/.atelier/lsp/_approvals.json` (the `_` prefix matches the hooks + MCP convention so a misconfigured glob can't cross-contaminate trust surfaces).
+- `approve` / `revoke` / `is_approved` for the in-memory ops.
+
+Six unit tests cover round-trip persistence, idempotent re-approval, malformed-file detection, missing-file → empty-store semantics, and path convention.
+
+### Expanded `crates/atelier-core/src/lsp/mod.rs`
+
+The Day-0 prep (v60.22) shipped only `LspInstallOutcome`. v60.25 adds `tier_one_available()` for the decline-fallback decision (`Installed` / `AlreadyPresent` → Tier 1 available; `Declined` / `Failed` → Tier 2/3) plus re-exports of the new approval surface. Inline doc comments now point at the spike's PENDING status so a future reader picks up the foundation order.
+
+### New schema `schemas/audit/lsp_install.v1.json`
+
+One row per `Event::RequestLspInstall` → `Event::LspInstallResolved` round-trip. Lives in the same on-disk `audit.log` as `subprocess_egress.v1.json` / `mcp_egress.v1.json`, discriminated by `kind: "lsp-install"`. Fields: `language` (lowercase identifier, regex-validated), `candidate_packages` (minItems:1), `outcome` (referencing `LspInstallOutcome`'s wire labels), optional `duration_ms` / `package_manager` (enum of npm/pip/cargo/go/brew/system) / `version_installed` / `reason`.
+
+`tests/validate_schemas.py` discovers it automatically (recursive glob); count moves from 25/25 → 26/26.
+
+### Lessons applied
+
+- **L-D-3** — `LspApprovals` reuses `McpApprovals`'s shape exactly; `LspInstallOutcome::tier_one_available()` lands the tier/fallback decision in one helper rather than scattered boolean checks across consumers.
+- **L-D-4** — `LspApprovals::save` routes through `NamedTempFile::persist`.
+- **L-D-5** — `LspInstallOutcome::wire_label()` agreement test was already in v60.22; v60.25 adds `tier_one_available_only_when_installed_or_already_present` to pin the helper.
+- **L-D-7** — the spike harness lands **before** the foundation code that depends on it. No "claimed-but-broken" surface: `LspServerHandle` is not declared yet, so a downstream consumer can't accidentally call into nothing.
+
+### What's NOT in this commit
+
+- `async-lsp` / `lsp-types` deps in `atelier-core/Cargo.toml`. Those land in Track C2 once the spike verdict is GO.
+- `LspServerHandle`, `launch_typescript_server`. Same dependency on the spike.
+- `crate::lsp::typescript` module (the diagnostics → `Discrepancy::HallucinatedSymbol` mapper). Track C2.
+- The first-use modal UI in GUI/TUI. The bus events are already plumbed (v60.22); the actual modal UI lands when the install subprocess is ready to invoke.
+
+### Verification
+
+- `cargo test -p atelier-core --lib lsp::` — 8 tests pass (2 `lsp::tests` + 6 `lsp::approval::tests`).
+- `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings` clean.
+- `make check` — 26/26 schemas valid, 59/59 artifacts validated.
+
+### Phase B closeout progress
+
+- #1, #2, #4, #5, #6 — see v60.23 / v60.24 entries.
+- #3 (Tier-1 detector + hallucinating-agent fixture) — foundation half landed in C1; producer + fixture land in C2 + C3 after the spike resolves.
+
 ## v60.24 — 2026-05-18 (Phase B Track A: §2 real-model conformance harness + nightly gate)
 
 Lands the §2 real-model conformance half of the Phase B gate text. The mechanical half closed at v60.23 (Track D); v60.24 closes the harness side of the real-model half. The remaining piece is data accumulation — the workflow records-only for the first 7 nights per **L-D-6** + Phase B closeout decision row #3, then asserts at `max(0.95, observed_p5)`. Phase B closeout acceptance criteria #2 (measurement) is met; the gate-green criterion (#6) is data-blocked, not code-blocked.
