@@ -205,6 +205,8 @@ Accumulated from six rounds of deep-audit. None of these block Phase A; each is 
 **Depends on:** Phase A green.
 **Gate:** §2 mechanical + real-model conformance ≥95% (PROVISIONAL); §7 lying-agent and hallucinating-agent fixtures.
 
+**Closeout plan:** `tasks/phase_b_closeout.md` — five tracks (A: conformance harness; B: OpenAI-compat live runs; C1/C2/C3: LSP foundation → TS Tier-1 → hallucinating fixture; D: mock gate + bookkeeping). Sequential prep commit lands new `Event::RequestLspInstall` + `Event::LspInstallResolved` variants with empty match arms in all four sinks first (per **L-D-2**). Day-1 parallel: A + B + C1 + D. Day 2+: C2 then C3.
+
 ### §2 Model Protocol
 - [x] Envelope per `schemas/model_protocol/envelope.v1.json` — typed in `crates/atelier-core/src/protocol.rs` (`Envelope`, `ClaimedChange`, `Grounding`, `Uncertainty`, `PlanUpdate`, `ConstraintsAcknowledged`). Round-trips all three bundled few-shot examples; `serde(deny_unknown_fields)` mirrors the schema's `additionalProperties: false`; runtime validates the schema's `maxLength: 500` summary cap that JSON Schema enforces at the rig but not at runtime.
 - [x] Canonical system-prompt fragment + three few-shot examples at `prompts/protocol_fewshot/` — examples already exist (predated this session); the prompt fragment lands with the adapter's system-prompt assembly.

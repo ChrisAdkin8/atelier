@@ -1977,9 +1977,16 @@ fn render_help_left(state: &AppState) -> String {
     // v0. The TUI just surfaces a tiny status hint so the user
     // knows whether the panel is on (and how big the text is, for
     // cost awareness). Hidden when the panel is off so the help line
-    // stays compact for the common case.
+    // stays compact for the common case. v60.20: the suffix shows the
+    // real per-turn cost — `~Ntk/turn` when text is non-empty (injected
+    // by the runner) and `0/turn` when text is empty.
     let mm_hint = if state.mental_model.enabled {
-        format!(" · mm:on(~{}tk,0/turn)", state.mental_model.text_tokens)
+        let cost = if state.mental_model.text_tokens > 0 {
+            format!("~{}tk/turn", state.mental_model.text_tokens)
+        } else {
+            "0/turn".to_string()
+        };
+        format!(" · mm:on({cost})")
     } else {
         String::new()
     };

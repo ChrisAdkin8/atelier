@@ -2,11 +2,12 @@
   // Phase C close — §5 Mental Model panel.
   //
   // Off by default; toggled visible via the header button in
-  // `App.svelte`. The text is user-editable and **not** fed into the
-  // LLM in v0 — the cost-disclosure label reads "0 tokens per turn at
-  // present" regardless of the snapshot's `text_tokens` value. A
-  // future revision may inject the text; at that point the label
-  // updates to reflect the real per-turn cost.
+  // `App.svelte`. The text is user-editable; v60.20 **does** inject
+  // it as a second System message on every per-turn `adapter.chat`
+  // call when `enabled && text.trim() !== ''`. The cost-disclosure
+  // label below renders `~N tokens / turn` when injection is live and
+  // `0 tokens / turn` otherwise — `text_tokens` is the byte/4
+  // approximation matching the runner's wire-side cost.
   //
   // Two-way binding via the `set_mental_model` Tauri command;
   // round-trips re-emit `MentalModelSnapshot` on the bus so other
@@ -59,10 +60,13 @@
         enabled: newEnabled,
       })
       lastSyncedText = updated.text
+      const injected = newEnabled && updated.text.trim() !== ''
       showToast(
-        newEnabled
-          ? `saved — ~${updated.text_tokens} text tokens (0 injected per turn in v0)`
-          : 'saved (disabled)',
+        injected
+          ? `saved — ~${updated.text_tokens} tokens / turn injected`
+          : newEnabled
+            ? 'saved (enabled, but text is empty — nothing injected)'
+            : 'saved (disabled)',
         false,
       )
     } catch (e) {
@@ -71,6 +75,20 @@
       saving = false
     }
   }
+
+  // Live cost-disclosure label. When the panel is enabled and the
+  // text is non-empty, the runner injects on every per-turn chat
+  // call, so the user pays ~text_tokens per turn. Otherwise 0.
+  let perTurnCost = $derived(
+    mentalModel.enabled && mentalModel.text.trim() !== ''
+      ? `~${mentalModel.text_tokens} tokens / turn`
+      : '0 tokens / turn',
+  )
+  let costBadgeTitle = $derived(
+    mentalModel.enabled && mentalModel.text.trim() !== ''
+      ? 'Text injected as a second System message on every adapter.chat call.'
+      : 'Inactive — panel disabled or text is empty.',
+  )
 
   async function toggleEnabled() {
     await save(!mentalModel.enabled)
@@ -93,8 +111,8 @@
   <header class="pane-title">
     <span>§5 Mental Model</span>
     <span class="pane-actions">
-      <span class="cost-badge" title="v0: panel text is never injected into the prompt">
-        0 tokens per turn at present
+      <span class="cost-badge" title={costBadgeTitle}>
+        {perTurnCost}
       </span>
       <button
         class="action"

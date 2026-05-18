@@ -39,6 +39,12 @@ SUBCOMMANDS:
                                    result to tests/protocol/overhead.json, and
                                    (optionally) flag >10% drift vs the rolling
                                    median. Backs the nightly CI job.
+    find [OPTIONS]                 Query the most recent (or named) session for
+                                   what the agent knows about a given file path.
+                                   Appends a FindProbe to the session's
+                                   `find_probes.json` so the §5 UX target's
+                                   median-elapsed-ms can be computed. Exits 0
+                                   cleanly when no session exists yet.
 
 `atelier run` may read defaults from a TOML config (v53):
 
@@ -155,6 +161,7 @@ fn main() -> ExitCode {
         "init" => run_init(args),
         "run" => run_run(args),
         "protocol-overhead" => run_protocol_overhead(args),
+        "find" => run_find(args),
         other => {
             eprintln!("atelier: unknown subcommand `{other}`\n");
             eprintln!("{USAGE}");
@@ -766,6 +773,152 @@ fn run_protocol_overhead(mut args: impl Iterator<Item = String>) -> ExitCode {
                 overhead::OverheadError::Regression { .. } => ExitCode::from(3),
                 _ => ExitCode::from(1),
             }
+        }
+    }
+}
+
+// ---------- v60.20 `atelier find` subcommand ----------
+
+const FIND_USAGE: &str = "\
+atelier find — query the most recent (or named) session for what the
+agent already knows about a given file path. Appends a FindProbe to
+the session's `find_probes.json` so the §5 UX target's
+median-elapsed-ms can be computed.
+
+USAGE:
+    atelier find --path <PATH> [OPTIONS]
+
+OPTIONS:
+    --path <PATH>          Path to search for (required). Substring-matched
+                           against every conversation entry's serialized JSON.
+    --workspace <PATH>     Workspace root. Default: current directory.
+    --session <UUID>       Specific session UUID. Default: the most recently
+                           modified session directory under
+                           `<workspace>/.atelier/sessions/`.
+    --dry-run              Do NOT append a probe to find_probes.json. Used by
+                           the canonical t13 fixture so `make check` runs
+                           don't bloat the seeded probe log.
+    -h, --help             Show this help.
+
+EXIT CODES:
+    0   query completed (matches may be 0 — that is still success)
+    1   query errored (workspace missing / session.json malformed)
+    2   bad argument (missing --path, unknown flag)
+
+`atelier find` exits 0 when the workspace has no sessions yet — a
+fresh repo doesn't have an agent to query, and that's not an error.
+";
+
+#[derive(Default)]
+struct FindCliArgs {
+    path: Option<String>,
+    workspace: Option<PathBuf>,
+    session: Option<String>,
+    dry_run: bool,
+}
+
+fn run_find(mut args: impl Iterator<Item = String>) -> ExitCode {
+    let mut out = FindCliArgs::default();
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "-h" | "--help" => {
+                print!("{FIND_USAGE}");
+                return ExitCode::SUCCESS;
+            }
+            "--path" => match args.next() {
+                Some(v) => out.path = Some(v),
+                None => {
+                    eprintln!("atelier find: --path requires a value");
+                    return ExitCode::from(2);
+                }
+            },
+            "--workspace" => match args.next() {
+                Some(v) => out.workspace = Some(PathBuf::from(v)),
+                None => {
+                    eprintln!("atelier find: --workspace requires a path");
+                    return ExitCode::from(2);
+                }
+            },
+            "--session" => match args.next() {
+                Some(v) => out.session = Some(v),
+                None => {
+                    eprintln!("atelier find: --session requires a UUID");
+                    return ExitCode::from(2);
+                }
+            },
+            "--dry-run" => out.dry_run = true,
+            other => {
+                eprintln!("atelier find: unknown argument {other:?}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+
+    let Some(path) = out.path else {
+        eprintln!("atelier find: --path is required\n");
+        eprintln!("{FIND_USAGE}");
+        return ExitCode::from(2);
+    };
+
+    let workspace = match out
+        .workspace
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(env::current_dir)
+    {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("atelier find: cannot read current directory: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let session = match out.session.as_deref() {
+        Some(s) => match uuid::Uuid::parse_str(s) {
+            Ok(u) => Some(u),
+            Err(_) => {
+                eprintln!("atelier find: --session {s:?} is not a valid UUID");
+                return ExitCode::from(2);
+            }
+        },
+        None => None,
+    };
+
+    let query = atelier_cli::find::FindQuery {
+        workspace,
+        path: path.clone(),
+        session,
+        dry_run: out.dry_run,
+    };
+    match atelier_cli::find::find(query) {
+        Ok(outcome) => {
+            match outcome.session_uuid {
+                None => {
+                    println!("atelier find: no session found under <workspace>/.atelier/sessions/ — nothing to query yet.");
+                }
+                Some(uuid) => {
+                    if outcome.matches.is_empty() {
+                        println!(
+                            "atelier find: 0 matches for {path:?} in session {uuid} ({} ms)",
+                            outcome.elapsed_ms
+                        );
+                    } else {
+                        println!(
+                            "atelier find: {} matches for {path:?} in session {uuid} ({} ms)",
+                            outcome.matches.len(),
+                            outcome.elapsed_ms
+                        );
+                        for m in &outcome.matches {
+                            println!("  turn {} [{}]: {}", m.turn_index, m.role, m.excerpt);
+                        }
+                    }
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("atelier find: {e}");
+            ExitCode::from(1)
         }
     }
 }

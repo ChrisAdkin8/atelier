@@ -24,12 +24,13 @@ use serde::{Deserialize, Serialize};
 /// and an RFC 3339 `updated_at` timestamp set whenever
 /// [`Self::set`] mutates the contents.
 ///
-/// **Token cost is `0` in v0** — the harness does not inject the
-/// text into the prompt window. The text_tokens projection on
-/// [`MentalModelSnapshot`] therefore mirrors the underlying byte
-/// approximation, but the cost-disclosure label rendered next to
-/// the toggle reads "0 tokens per turn at present" until a future
-/// version actually injects it.
+/// **Prompt injection (v60.20):** when `enabled == true` and `text`
+/// is non-empty, the runner prepends a second System message to
+/// every `adapter.chat` call carrying the user's text. The
+/// `text_tokens` projection on [`MentalModelSnapshot`] is the
+/// per-turn cost, and the UI's cost-disclosure badge now renders
+/// `~N tokens / turn` when injection is live. When `enabled ==
+/// false` or `text` is empty, the cost is 0 and the UI says so.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MentalModel {
     /// Visibility / inject toggle. UIs render the panel only when
@@ -53,10 +54,11 @@ pub struct MentalModel {
 /// of magnitude for English prose and is honest about being
 /// approximate.
 ///
-/// v0: the panel is **not** injected into the prompt. `text_tokens`
-/// is therefore informational; the cost the user pays per turn is
-/// 0 until a future revision actually injects the text. UIs render
-/// the disclosure literally as "0 tokens per turn at present".
+/// v60.20: the runner injects the text as a second System message
+/// when `enabled == true && !text.trim().is_empty()`. `text_tokens`
+/// is therefore the per-turn cost the user actually pays. The
+/// disclosure badge reads `~N tokens / turn` when injection is
+/// live and `0 tokens / turn` otherwise.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MentalModelSnapshot {
     pub enabled: bool,

@@ -353,6 +353,14 @@ pub struct Runner {
     /// the prefix as a fresh user turn so the model picks up where the
     /// crashed run left off.
     resume_from: Option<uuid::Uuid>,
+    /// v60.20 — §5 mental-model panel. When `Some((text, enabled))` and
+    /// `enabled == true && !text.trim().is_empty()`, the runner seeds the
+    /// `SessionDispatcher`'s mental-model state at construction time and
+    /// injects the text as a second System message on every per-turn
+    /// `adapter.chat` call. `None` keeps the dispatcher's default (off,
+    /// empty); the GUI/TUI can still flip it via the existing
+    /// `set_mental_model` round-trip.
+    initial_mental_model: Option<(String, bool)>,
     /// v61 — `--non-interactive`. Disables modals (approvals + concurrent
     /// edits) and never prompts the user. Drives the auto-resolve
     /// answers that headless runs need.
@@ -587,6 +595,7 @@ impl Runner {
             cost_policy,
             concurrent_edit_policy: ConcurrentEditPolicy::Modal,
             resume_from: None,
+            initial_mental_model: None,
             non_interactive: false,
             degradation_window: atelier_core::protocol_conformance::DEFAULT_DEGRADATION_WINDOW,
             degradation_threshold:
@@ -829,6 +838,21 @@ impl Runner {
         self
     }
 
+    /// v60.20 §5 — seed the mental-model panel before the run starts.
+    /// When `enabled == true && !text.trim().is_empty()` the text is
+    /// injected as a second System message at the head of every
+    /// per-turn `adapter.chat` call. Persists into the
+    /// `SessionDispatcher`'s mental-model state so a subsequent GUI /
+    /// TUI mutation lands on the same store.
+    ///
+    /// `None` (the default) keeps the dispatcher at off/empty; the UI
+    /// can still flip it mid-run via the existing `set_mental_model`
+    /// Tauri command / TUI keybinds.
+    pub fn with_initial_mental_model(mut self, text: String, enabled: bool) -> Self {
+        self.initial_mental_model = Some((text, enabled));
+        self
+    }
+
     /// Drive the loop until `claims_done` or `max_turns`. Returns when:
     ///   * a turn carried `claims_done: true` (success path; runs DoD next),
     ///   * `max_turns` reached (timeout; `final_state = AwaitingUser`),
@@ -896,6 +920,17 @@ impl Runner {
                 )
                 .with_file_watcher(file_watcher_handle.clone()),
         );
+
+        // v60.20 §5 — seed the mental-model panel if the caller pre-set
+        // it via `with_initial_mental_model`. Errors here surface as
+        // `RunError::Config` because they only fire on text-safety
+        // violations (Trojan-Source bytes, etc.) — a misuse, not a
+        // runtime adapter issue.
+        if let Some((text, enabled)) = self.initial_mental_model.clone() {
+            session_dispatcher
+                .set_mental_model(text, enabled, &now_rfc3339())
+                .map_err(|e| RunError::Config(format!("initial mental_model: {e}")))?;
+        }
 
         // v61 — §14 concurrent-edit policy. Under `AutoReload` we wire
         // a background task that auto-emits FilesChangedAcknowledged
@@ -1282,10 +1317,61 @@ impl Runner {
                 atelier_core::protocol_strategy::Strategy::JsonSentinel
                 | atelier_core::protocol_strategy::Strategy::RegexProse => tools_spec.clone(),
             };
+
+            // v60.20 §5 — mental-model injection. Snapshot the
+            // SessionDispatcher's mental-model state once per turn
+            // (cheap; the snapshot is a clone of a tiny struct) and,
+            // when enabled + non-empty, prepend a second System
+            // message to the per-turn message vec carrying the user's
+            // text. The history `messages` is NOT mutated — the on-disk
+            // conversation transcript stays free of the panel preamble
+            // (which lives separately in `mental_model.json` and would
+            // re-inject on resume anyway).
+            let mm_snapshot = session_dispatcher.snapshot_mental_model();
+            let messages_for_call: Vec<Message> =
+                if mm_snapshot.enabled && !mm_snapshot.text.trim().is_empty() {
+                    let mut v = Vec::with_capacity(messages.len() + 1);
+                    // Insert immediately after the atelier system prompt
+                    // (which is messages[0] on a fresh run) so both system
+                    // messages land together at the head of the
+                    // conversation; Anthropic concatenates multiple system
+                    // entries cleanly, OpenAI-compat keeps them as separate
+                    // `system`-role rows. On a resumed run the prepended
+                    // entry sits ahead of the rehydrated prefix — both
+                    // shapes are acceptable wire-wise.
+                    let insert_pos =
+                        if !messages.is_empty() && matches!(messages[0].role, Role::System) {
+                            1
+                        } else {
+                            0
+                        };
+                    v.extend(messages.iter().take(insert_pos).cloned());
+                    v.push(Message::text(
+                        Role::System,
+                        format!(
+                            "User-supplied mental model / working hypothesis. The user \
+                         maintains this in the Atelier §5 mental-model panel; it is \
+                         additional context layered on top of the §2 protocol \
+                         instructions above. Treat it as guidance, not as ground \
+                         truth: the user may be wrong, and you should still verify \
+                         claims via tools.\n\n{}",
+                            mm_snapshot.text.trim()
+                        ),
+                    ));
+                    v.extend(messages.iter().skip(insert_pos).cloned());
+                    v
+                } else {
+                    messages.clone()
+                };
+
             let response = {
                 let mut overflow_retries: usize = 0;
                 loop {
-                    match self.adapter.chat(&messages, &turn_tools_spec).await {
+                    match self
+                        .adapter
+                        .chat(&messages_for_call, &turn_tools_spec)
+                        .await
+                    {
                         Ok(r) => break r,
                         Err(AdapterError::ContextOverflow {
                             needed_tokens,

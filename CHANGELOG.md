@@ -1,5 +1,80 @@
 # Atelier Spec — Changelog
 
+## v60.20 — 2026-05-18 (`atelier find` ships + §5 mental-model goes live + Phase B closeout plan)
+
+Three bundles land together. First, the deferred `atelier find --path <P>` CLI subcommand from v60.7's §5 UX-target row (`tasks/todo.md:304`) — the `FindProbe` + `FindProbeLog` instrumentation has been on disk since v60.7, but the user-facing entry point was punted. v60.20 closes it. Second, the §5 mental-model panel flips from "off in v0" (text editable but never injected) to live: when `enabled && text.trim() != ""` the runner prepends a second System message on every per-turn `adapter.chat` call carrying the user's text. Third, this revision's process work — ten Phase-A close-out lessons promoted into `tasks/lessons.md` with stable IDs `L-D-1` … `L-D-10`, Phase D/E/F sections of `tasks/todo.md` carrying `### Discipline carry-overs from Phase A–C` references at phase entry, and a new `tasks/phase_b_closeout.md` plan with five tracks (A/B/C1/C2/C3/D), ratified pre-work decisions, and a risk register.
+
+### `atelier find` subcommand (`crates/atelier-cli/src/find.rs` + `main.rs` + `lib.rs`)
+
+The §5 UX target *"find what agent knows about file X" median <5 s* was greenlit at v60.7 with the on-disk `FindProbe` + `FindProbeLog` format frozen and a canonical fixture (`tests/workload/canonical/t13_find_what_agent_knows/`) that referenced the forward-looking CLI via `--dry-run`. v60.20 wires up that CLI.
+
+- **New module `crates/atelier-cli/src/find.rs`** (~370 lines + tests). `pub fn run_find(args)` is the entry point reachable via the new `atelier find` subcommand. Walks the most-recent (or `--session <UUID>`-named) session under `<workspace>/.atelier/sessions/`, scans the persisted `session.json::conversation[]` for the path, and returns matches with a one-line excerpt. Total elapsed wall-clock (request → last match) is recorded as a `FindProbe` in the session's `find_probes.json` so the median-elapsed-ms target has data to compute against.
+- **Match shape:** substring search across three fields per conversation entry — any text content, any serialized `tool_calls[].arguments`, any `tool_call_id`. Each match carries `{entry_index, kind: "content" | "tool_call_args" | "tool_call_id", excerpt}`.
+- **"No session present" semantics:** exits `0` cleanly when the workspace has no sessions yet. A fresh repo doesn't have an agent to query, and that's not an error — it's the expected state pre-first-run.
+- **`--dry-run` flag** for the t13 canonical fixture: skips the `find_probes.json` append so `make check` runs don't bloat the seeded probe log.
+- **Exit codes:** `0` query completed (0 matches still counts as success), `1` query errored (malformed session.json, unreadable workspace), `2` bad argument (missing `--path`, unknown flag).
+- **Three integration tests** (`atelier_find_returns_matches_from_session_conversation`, `atelier_find_exits_zero_when_workspace_has_no_sessions`, `atelier_find_dry_run_does_not_mutate_probe_log`) plus the existing t13 fixture now exercises a real subcommand rather than the placeholder it had.
+
+### §5 mental-model panel — actually injected now (`crates/atelier-core/src/mental_model.rs` + `crates/atelier-cli/src/runner.rs` + GUI/TUI cost-disclosure)
+
+The panel landed in v60.7 with the explicit caveat that v0 *"does NOT inject the text into the prompt; the cost-disclosure badge reads '0 tokens per turn at present' until that ships."* v60.20 ships it.
+
+- **Runner injection** (`crates/atelier-cli/src/runner.rs`). On each turn, `session_dispatcher.snapshot_mental_model()` returns the current `MentalModelSnapshot`. When `enabled && !text.trim().is_empty()`, the runner builds a per-turn `messages_for_call` vec that inserts a second System message immediately after the atelier system prompt (so `messages[0]` is the §2 protocol preamble and `messages[1]` is the user's mental model). The history `messages` vec is **NOT** mutated — the on-disk conversation transcript stays free of the panel preamble. Anthropic concatenates multiple system entries cleanly; OpenAI-compat keeps them as separate `system`-role rows; both wire shapes are acceptable.
+- **Pre-seed at construction:** new `Runner::with_initial_mental_model(text, enabled)` builder lets callers seed the panel before the loop runs. Errors surface as `RunError::Config` because they only fire on text-safety violations (Trojan-Source bytes, etc.) — a misuse, not a runtime issue. The GUI/TUI's existing `set_mental_model` round-trip still works mid-run.
+- **System-message text** carries explicit framing: *"User-supplied mental model / working hypothesis. The user maintains this in the Atelier §5 mental-model panel; it is additional context layered on top of the §2 protocol instructions above. Treat it as guidance, not as ground truth: the user may be wrong, and you should still verify claims via tools."* Prevents the model from treating the panel as authoritative ground truth.
+- **Cost disclosure across all three frontends** updates from "0 tokens per turn at present" → live cost label:
+  - **GUI** (`MentalModelPane.svelte`, `state.ts`): badge renders `~N tokens / turn` when injected, `0 tokens / turn` otherwise. Toast on save reads `saved — ~N tokens / turn injected` / `saved (enabled, but text is empty — nothing injected)` / `saved (disabled)`.
+  - **TUI** (`lib.rs::render_help_left`): footer hint reads `mm:on(~Ntk/turn)` when injecting, `mm:on(0/turn)` when enabled-but-empty.
+  - **Doc comments** in `crates/atelier-core/src/mental_model.rs` updated to reflect v60.20 reality (the v0 caveat is gone).
+- **Three new integration tests** in `crates/atelier-cli/tests/run_integration.rs`: `mental_model_text_injected_as_second_system_message_when_enabled` (asserts the System message lands at `messages[1]` with the framing preamble), `mental_model_text_not_injected_when_disabled` (negative control), `mental_model_text_not_injected_when_empty_even_if_enabled` (the empty-text edge case). Shared helper `run_with_mental_model_and_capture` captures every `adapter.chat` call's message vec for assertion.
+
+### Process artifacts — Phase D/E/F lessons + Phase B closeout plan (`tasks/lessons.md` + `tasks/todo.md` + `tasks/phase_b_closeout.md`)
+
+Ten lessons distilled from v52–v60.17 — four deep-scan audit rounds, four parallel-bundle releases, the rmcp foundation, the §15 built-ins-as-MCP refactor, the Phase A nightly gate, and the live-API t01 bring-up. Each lesson has a stable ID so `tasks/todo.md` Phase D/E/F sections can reference them at phase entry without duplicating content:
+
+- **L-D-1** — Mock-only gates lie; live-probe muscle has to be part of each phase.
+- **L-D-2** — Parallel bundles must be file-disjoint, especially on shared registries (`session.rs::Event`, `bridge_event`, `state.ts applyEvent/projectEvent`, TUI `apply`/`project_event`).
+- **L-D-3** — Tier/fallback ladders are the project's signature pattern; reuse the shape (typed enum + `wire_label()` + agreement test + `*Hint` projection + colour-coded badge + "fallback was used" bus event).
+- **L-D-4** — Atomicity / fsync / TOCTOU bugs land late; route all writes through `atomic_write` + `fsync_dir_best_effort`.
+- **L-D-5** — Wire-format hygiene needs an agreement test, not a convention.
+- **L-D-6** — PROVISIONAL constants need a nightly calibration job, not a future-self promise.
+- **L-D-7** — A "claimed but broken" surface is half a bug; integration-test the actual wire (the v60.20 mental-model work is itself a discharge of this lesson — v60.7's panel was claimed-but-broken until this commit).
+- **L-D-8** — Adapter parity surfaces only when the same workload runs against ≥2 adapters.
+- **L-D-9** — Priority lattices need to be written as a table on day 1.
+- **L-D-10** — Worktree-isolation hygiene needs a CI step, not a convention.
+
+Lessons render in the existing `**Failure** / **Prevention**` format used for v50/v51 entries. Phase D/E/F sections of `tasks/todo.md` carry a `### Discipline carry-overs from Phase A–C` block referencing 4–5 lesson IDs each — landed in this session and now baked into the commit alongside the Phase B closeout plan.
+
+**Phase B closeout plan** (`tasks/phase_b_closeout.md`, ~205 lines) lays out five tracks for closing the §2 real-model conformance ≥95% gate and the §7 hallucinating-agent Tier-1 gate:
+
+- **Track A** — §2 real-model conformance harness + nightly gate. Sibling of v60.13's Phase A nightly. 7-night calibration window then asserts at `max(0.95, observed_p5)`.
+- **Track B** — Live OpenAI-compat canonical runs (t01/t02/t05/t06/t10 against hosted OpenAI via `secrets.OPENAI_API_KEY`).
+- **Track C1** — LSP client infrastructure (Q3 was resolved at v60.12 as prompt-on-first-use; this implements it). `LspApprovals` mirrors `McpApprovals` bit-for-bit. Spike against `async-lsp` first, mirroring the v60.10 rmcp spike pattern.
+- **Track C2** — TypeScript Tier-1 verify path; **also fixes the v60.8 follow-on** where `verify_pass` is never called from `runner.rs`. Both land in the same commit per **L-D-7**.
+- **Track C3** — Hallucinating-agent fixture + gate. New `Discrepancy::HallucinatedSymbol` variant. Priority lattice locked via paired test per **L-D-9**.
+- **Track D** — §2 mechanical-gate completion (three strategies × end-to-end) + DoD checklist mirror reconciliation.
+
+Day-0 prep commit (new `Event::RequestLspInstall` + `Event::LspInstallResolved` variants with empty match arms in all four sinks) lands sequentially per **L-D-2**; A/B/C1/D parallelise on day 1; C2 then C3 sequential. Risk register flags the four likely surprises (async-lsp dep maturity, sub-95% conformance, npm flakiness on CI, worktree-isolation drift).
+
+### Files touched
+
+- **`crates/atelier-cli/src/find.rs`** *(new, ~370 lines)* — `atelier find` implementation.
+- **`crates/atelier-cli/src/main.rs`** — `find` subcommand wiring + help text.
+- **`crates/atelier-cli/src/lib.rs`** — `pub mod find;` export.
+- **`crates/atelier-cli/src/runner.rs`** — `with_initial_mental_model` builder + per-turn second-System-message injection.
+- **`crates/atelier-cli/tests/run_integration.rs`** — three `atelier_find_*` tests + three `mental_model_*` injection tests.
+- **`crates/atelier-core/src/mental_model.rs`** — doc-comment updates (v0 caveat removed; v60.20 reality landed).
+- **`crates/atelier-gui/ui/src/lib/components/MentalModelPane.svelte`** — live cost-disclosure badge + per-state toast.
+- **`crates/atelier-gui/ui/src/lib/state.ts`** — `MentalModel` type doc-comment update.
+- **`crates/atelier-tui/src/lib.rs`** — `render_help_left` cost-disclosure suffix.
+- **`tasks/lessons.md`** — appended v52–v60.17 section with L-D-1 … L-D-10.
+- **`tasks/todo.md`** — Phase B `**Closeout plan:**` pointer.
+- **`tasks/phase_b_closeout.md`** *(new, ~205 lines)* — five-track closeout plan.
+
+### Verification
+
+`cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` (1063 workspace tests across all crates) all green. New test counts: atelier-cli integration **+6** (3 find + 3 mental-model); atelier-cli unit and atelier-core unchanged. `make check` green (58/58 artifacts validated, 112 rig tests passed, 13/13 canonical dry-runs incl. t13 now exercising the real `atelier find` subcommand).
+
 ## v60.19 — 2026-05-18 (Phase A closed: live-API nightly gate wired)
 
 Closes Phase A. Every Phase A mechanical gate is now backed by an automated nightly run. The new piece is the **`phase_a_live_anthropic` gate** in `.github/workflows/nightly_phase_a_gate.yml`: it runs the five priority `phase_a_live_anthropic_t<NN>_…` integration tests with `--include-ignored`, gated on `secrets.ANTHROPIC_API_KEY`. When the secret is absent (forks, before-the-maintainer-wires-it main) the gate records `status: skipped` instead of `failed` so `all_passed` stays green and the workflow doesn't go red on the first firing.

@@ -2543,6 +2543,157 @@ async fn few_shot_override_prepends_adapter_messages_to_per_turn_history() {
     );
 }
 
+// ---------- v60.20 §5 mental-model injection ----------
+
+/// Helper: build a Runner with a recording mock + a one-turn scripted
+/// response, seed the mental-model panel via the new builder, run,
+/// return the captured first-turn message vec. Used by the three
+/// regression tests below.
+async fn run_with_mental_model_and_capture(
+    workspace_path: std::path::PathBuf,
+    initial: Option<(&str, bool)>,
+) -> Vec<atelier_core::adapter::Message> {
+    use atelier_core::adapter::{Capabilities, CapabilityClaim};
+
+    let caps = Capabilities {
+        native_tool_use: CapabilityClaim::Unsupported,
+        streaming: CapabilityClaim::Supported,
+        vision: CapabilityClaim::Unsupported,
+        prompt_cache: CapabilityClaim::Unsupported,
+        structured_output: CapabilityClaim::Supported,
+        long_context: CapabilityClaim::Supported,
+        context_window_tokens: 200_000,
+    };
+    let mut wrapped = MockAdapterWithOverride::new();
+    wrapped.inner =
+        atelier_core::adapter::MockAdapter::new("mock:mental-model-test").with_capabilities(caps);
+    // Override messages would steal the body_start position; drop them
+    // so the test reads against the bare atelier system prompt + user.
+    wrapped.override_messages = vec![];
+    wrapped.queue_envelope_done_sentinel();
+    let received = wrapped.received.clone();
+    let adapter: Arc<dyn atelier_core::adapter::Adapter> = Arc::new(wrapped);
+
+    let mut runner = Runner::new(
+        workspace_path,
+        ProviderChoice::Mock { responses: vec![] },
+        EventSink::Null,
+    )
+    .expect("mock runner construction is infallible")
+    .with_adapter_for_test(adapter)
+    .with_max_turns(2);
+    if let Some((text, enabled)) = initial {
+        runner = runner.with_initial_mental_model(text.into(), enabled);
+    }
+
+    let _ = runner.run("user prompt body".into()).await.unwrap();
+
+    let mut calls = received.lock();
+    calls.remove(0)
+}
+
+#[tokio::test]
+async fn mental_model_text_injected_as_second_system_message_when_enabled() {
+    let workspace = tempfile::TempDir::new().unwrap();
+    let first = run_with_mental_model_and_capture(
+        workspace.path().to_path_buf(),
+        Some(("This codebase is a Tauri 2.x harness.", true)),
+    )
+    .await;
+
+    // messages[0] = atelier system prompt, messages[1] = mental-model
+    // System message carrying the user's text, messages[2] = user prompt.
+    assert!(
+        first.len() >= 3,
+        "expected ≥3 messages, got {}",
+        first.len()
+    );
+    assert_eq!(
+        first[0].role,
+        atelier_core::adapter::Role::System,
+        "messages[0] = atelier system prompt"
+    );
+    assert_eq!(
+        first[1].role,
+        atelier_core::adapter::Role::System,
+        "messages[1] = mental-model System message"
+    );
+    assert!(
+        first[1].content.contains("User-supplied mental model"),
+        "mental-model preamble must lead the second System message: {:?}",
+        first[1].content
+    );
+    assert!(
+        first[1]
+            .content
+            .contains("This codebase is a Tauri 2.x harness."),
+        "user's mental-model text must appear in the second System message"
+    );
+    // The user prompt is the next non-System message.
+    assert_eq!(first[2].role, atelier_core::adapter::Role::User);
+    assert_eq!(first[2].content, "user prompt body");
+}
+
+#[tokio::test]
+async fn mental_model_text_not_injected_when_disabled() {
+    let workspace = tempfile::TempDir::new().unwrap();
+    let first = run_with_mental_model_and_capture(
+        workspace.path().to_path_buf(),
+        // text set but enabled=false → no injection
+        Some(("This text must not appear on the wire.", false)),
+    )
+    .await;
+
+    // No second System message — messages[1] should be the user prompt.
+    assert!(
+        first.len() >= 2,
+        "expected ≥2 messages, got {}",
+        first.len()
+    );
+    assert_eq!(first[0].role, atelier_core::adapter::Role::System);
+    for m in &first {
+        assert!(
+            !m.content.contains("This text must not appear on the wire."),
+            "disabled mental-model text leaked onto the wire: {:?}",
+            m.content
+        );
+    }
+}
+
+#[tokio::test]
+async fn mental_model_text_not_injected_when_empty_even_if_enabled() {
+    let workspace = tempfile::TempDir::new().unwrap();
+    let first = run_with_mental_model_and_capture(
+        workspace.path().to_path_buf(),
+        // enabled but text is whitespace-only — runner trims and skips
+        Some(("   \n  \t  ", true)),
+    )
+    .await;
+
+    // No second System message — messages[1] should be the user prompt.
+    assert!(
+        first.len() >= 2,
+        "expected ≥2 messages, got {}",
+        first.len()
+    );
+    let user_prompt_pos = first
+        .iter()
+        .position(|m| m.role == atelier_core::adapter::Role::User);
+    assert_eq!(
+        user_prompt_pos,
+        Some(1),
+        "empty mental-model must not push the user prompt past index 1"
+    );
+    // No mental-model preamble anywhere.
+    for m in &first {
+        assert!(
+            !m.content.contains("User-supplied mental model"),
+            "mental-model preamble leaked while text was empty: {:?}",
+            m.content
+        );
+    }
+}
+
 #[tokio::test]
 async fn few_shot_override_is_cached_across_turns_not_recomputed() {
     // The override is computed once per session. We can observe this

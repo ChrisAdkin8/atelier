@@ -161,9 +161,11 @@ export type MemoryCardSummary = {
 /// defaults to `false` (off until the user opts in); the
 /// `updated_at` field is empty until the first set.
 ///
-/// **Cost disclosure**: v0 does **not** inject `text` into the
-/// prompt. The panel's badge reads "0 tokens per turn at present"
-/// regardless of `text_tokens`.
+/// **Cost disclosure (v60.20)**: when `enabled && text.trim() !== ''`
+/// the runner injects `text` as a second System message on every
+/// per-turn `adapter.chat` call. The panel's badge renders
+/// `~text_tokens tokens / turn` in that state and `0 tokens / turn`
+/// otherwise.
 export type MentalModel = {
   enabled: boolean
   text: string

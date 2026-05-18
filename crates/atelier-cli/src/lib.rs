@@ -67,6 +67,13 @@ pub mod overhead;
 /// the run.
 pub mod instrumentation;
 
+/// v60.20 — `atelier find --path <P>` subcommand. Searches the
+/// most recent (or named) session's conversation transcript for
+/// content related to a given path and appends a [`FindProbe`] to
+/// the session's `find_probes.json` so the median-elapsed-ms UX
+/// target has data to read.
+pub mod find;
+
 pub use runner::{
     AdapterHandle, DispatcherHandle, EventSink, MockResponse, ProbePolicy, ProviderChoice,
     RunError, RunReport, Runner,
