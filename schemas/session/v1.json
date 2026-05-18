@@ -128,7 +128,9 @@
                   "ResultMalformed",
                   "PermissionDenied",
                   "ExecutionFailed",
-                  "SchemaViolation"
+                  "SchemaViolation",
+                  "Cancelled",
+                  "Deadline"
                 ]
               },
               "message": {"type": "string"}

@@ -37,6 +37,7 @@ Change history in `../CHANGELOG.md`.
 - Schemas live under `../schemas/`. Spec references them by path.
 - The Rust workspace scaffold compiles in principle (atelier-core has lib.rs + error.rs); the GUI and TUI crates are intentionally minimal stubs until `cargo tauri init` is run (see `crates/atelier-gui/README.md`).
 - No real harness code written yet; that's Phase A.
+- v60.29 (2026-05-18): liveness & durability bundle landed (H9–H12 from `tasks/plan_high_severity_fixes.md`). `ToolContext.cancel/deadline` + `ToolError::{Cancelled,Deadline}` + `tool_manifest.v1.json:deadline_ms` (H9); SIGINT/SIGTERM handler in CLI `main` + `Runner::with_external_cancel` + new `sigint_resume.rs` integration test (H10); atomic `staging::write_with_sync` (tmp → fsync → rename → fsync-dir) (H11); canonicalize hoisted out of `file_watcher` lock + `canonicalize_for_track` helper (H12).
 
 ## Open questions (must resolve before the phase that depends on them)
 

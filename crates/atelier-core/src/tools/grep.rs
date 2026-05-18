@@ -184,6 +184,8 @@ mod tests {
             sandbox,
             tool_call_id: None,
             audit_log_path: None,
+            cancel: tokio_util::sync::CancellationToken::new(),
+            deadline: crate::dispatcher::DEFAULT_TOOL_DEADLINE,
         }
     }
 

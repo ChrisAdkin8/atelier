@@ -88,23 +88,23 @@ impl FileWatcherHandle {
     /// Add `path` to the read-set. Idempotent; calling repeatedly with
     /// the same path is a hash lookup.
     ///
-    /// Path canonicalisation runs here so the cross-comparison with
-    /// `notify` events is apples-to-apples. A non-existent path
-    /// canonicalises to itself (the call is no-op-ish for the watcher
-    /// since `notify::watch` would refuse a non-existent path anyway).
+    /// v60.29 H12: canonicalisation runs once, outside any `parking_lot`
+    /// mutex. The two locks below (`_watcher` and `read_set`) only ever
+    /// hold the lock long enough to call into `notify` and insert into
+    /// the set — no syscalls, no allocations beyond the set insert. A
+    /// path that fails to canonicalise (non-existent or permission
+    /// denied) falls back to the as-passed `PathBuf`; `notify::watch`
+    /// would refuse a non-existent target anyway.
     pub fn track(&self, path: &Path) {
         let Some(inner) = &self.inner else {
             return;
         };
-        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        let mut watcher = inner._watcher.lock();
-        // `notify` rejects double-watching with WatchAlreadyExists on
-        // some backends; ignore that. Other failures we trace —
-        // missing-file is not a test failure (e.g., `grep` over a
-        // pattern that didn't hit a real file). Watch the directory
-        // rather than the file when the path doesn't exist yet, so a
-        // later "the file appeared" event still surfaces.
-        let watch_target = if canonical.exists() {
+        // Single canonicalize call (was duplicated pre-v60.29 at the
+        // top + bottom of this function). Result is shared between the
+        // `notify::watch` target derivation and the `read_set` insert.
+        let canonical = canonicalize_for_track(path);
+        let exists = canonical.exists();
+        let watch_target = if exists {
             canonical.clone()
         } else {
             canonical
@@ -115,12 +115,10 @@ impl FileWatcherHandle {
         // `RecursiveMode::NonRecursive` is enough: read_file targets a
         // single file; list_dir targets a directory the user already
         // chose. Following symlinks is the OS watcher's call.
-        let _ = watcher.watch(&watch_target, RecursiveMode::NonRecursive);
-        drop(watcher);
-        // Membership is on the canonical (or as-passed) path the
-        // dispatcher will see again next call. We store the canonical
-        // form so cross-aliases match.
-        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        {
+            let mut watcher = inner._watcher.lock();
+            let _ = watcher.watch(&watch_target, RecursiveMode::NonRecursive);
+        }
         inner.read_set.lock().insert(canonical);
     }
 
@@ -153,6 +151,17 @@ impl FileWatcherHandle {
 pub enum FileWatcherError {
     #[error("notify watcher init failed: {0}")]
     Notify(#[from] notify::Error),
+}
+
+/// v60.29 H12: single canonicalize point used by both `track()` and the
+/// notify-worker filter. Production behaviour is `path.canonicalize()`
+/// with a fallback to the raw `PathBuf`; tests can inject a per-call
+/// delay (see `contention_tests`) to assert the call happens outside
+/// the watcher's `parking_lot::Mutex`es.
+fn canonicalize_for_track(path: &Path) -> PathBuf {
+    #[cfg(test)]
+    contention_tests::maybe_inject_slow_canonicalize();
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// Spawn a per-session file watcher. Returns a [`FileWatcherHandle`]
@@ -226,14 +235,22 @@ pub fn spawn(
             let Some(inner) = inner_for_task.upgrade() else {
                 return;
             };
-            let read_set = inner.read_set.lock();
-            let mut hits: Vec<PathBuf> = pending
+            // v60.29 H12: canonicalize *before* taking the membership
+            // lock. The pre-v60.29 path canonicalised inside the
+            // critical section; under 32-way contention against a slow
+            // fs that pushed P99 wait time to ~100ms × N.
+            let candidates: Vec<(PathBuf, PathBuf)> = pending
                 .drain(..)
-                .filter(|p| {
-                    // Compare on canonical form when possible.
-                    let canon = p.canonicalize().unwrap_or_else(|_| p.clone());
-                    read_set.contains(&canon) || read_set.contains(p)
+                .map(|p| {
+                    let canon = canonicalize_for_track(&p);
+                    (canon, p)
                 })
+                .collect();
+            let read_set = inner.read_set.lock();
+            let mut hits: Vec<PathBuf> = candidates
+                .into_iter()
+                .filter(|(canon, raw)| read_set.contains(canon) || read_set.contains(raw))
+                .map(|(canon, _)| canon)
                 .collect();
             drop(read_set);
             // Deduplicate while preserving first-seen order.
@@ -369,6 +386,101 @@ mod tests {
         assert!(
             extra.is_err(),
             "second FilesChanged should not fire — got {extra:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod contention_tests {
+    //! v60.29 H12 — assert canonicalize runs outside the
+    //! `parking_lot::Mutex` critical sections in [`super::track`].
+    //!
+    //! The test arms a thread-local that makes
+    //! [`super::canonicalize_for_track`] sleep 100ms per call. It then
+    //! spawns 32 parallel `track()` invocations. If canonicalize were
+    //! still inside the lock, every call would serialise on the mutex
+    //! and total wall-clock would be ≈ 32 × 100ms. With H12's hoisting
+    //! every thread can canonicalize in parallel and only the (~µs)
+    //! lock-insert sections serialise; the per-call P99 stays well
+    //! under 5ms past the unavoidable 100ms canonicalize itself.
+
+    use super::*;
+    use std::cell::Cell;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    thread_local! {
+        static SLOW_CANONICALIZE: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(super) fn maybe_inject_slow_canonicalize() {
+        if SLOW_CANONICALIZE.with(|c| c.get()) {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    fn arm_slow_canonicalize() {
+        SLOW_CANONICALIZE.with(|c| c.set(true));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn track_canonicalize_runs_outside_lock() {
+        let (tx, _rx) = broadcast::channel::<Event>(8);
+        let td = tempfile::TempDir::new().unwrap();
+        let f = td.path().join("hot.txt");
+        std::fs::write(&f, b"x").unwrap();
+        let h = spawn(tx, FILE_WATCH_DEBOUNCE).expect("spawn");
+        let h = Arc::new(h);
+
+        // Arm the slow-canonicalize hook from every worker thread by
+        // spawning a setter as the first thing each task does.
+        let mut handles = Vec::new();
+        let mut waits_ms: Vec<u128> = Vec::new();
+        let (latency_tx, mut latency_rx) = tokio::sync::mpsc::unbounded_channel::<u128>();
+        for _ in 0..32 {
+            let hh = h.clone();
+            let fp = f.clone();
+            let lt = latency_tx.clone();
+            handles.push(tokio::task::spawn_blocking(move || {
+                arm_slow_canonicalize();
+                let started = Instant::now();
+                hh.track(&fp);
+                let elapsed = started.elapsed().as_millis();
+                let _ = lt.send(elapsed);
+            }));
+        }
+        drop(latency_tx);
+
+        let overall_start = Instant::now();
+        for h in handles {
+            h.await.unwrap();
+        }
+        let overall_elapsed = overall_start.elapsed();
+
+        while let Some(ms) = latency_rx.recv().await {
+            waits_ms.push(ms);
+        }
+        waits_ms.sort_unstable();
+
+        // Sanity: the hook actually fired — every track() should have
+        // taken at least 100ms (its own canonicalize) but well under
+        // 32 × 100ms (which would mean serialised through the lock).
+        let p99 = waits_ms[(waits_ms.len() * 99 / 100).min(waits_ms.len() - 1)];
+        assert!(
+            p99 >= 100,
+            "slow-canonicalize hook did not fire (p99 = {p99}ms)"
+        );
+        assert!(
+            overall_elapsed < Duration::from_millis(1500),
+            "32 parallel tracks took {overall_elapsed:?}; would be ≥ 3.2s if serialised on the lock"
+        );
+        // Per-call: under 8 worker threads the worst case is
+        // ceil(32/8) × 100ms = 400ms even with perfect parallelism,
+        // far below the pre-H12 serialised behaviour. We just assert
+        // we're nowhere near the serialised bound.
+        assert!(
+            p99 < 800,
+            "p99 per-track latency {p99}ms suggests canonicalize is still inside the lock"
         );
     }
 }

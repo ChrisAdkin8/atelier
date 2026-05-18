@@ -85,6 +85,11 @@ pub struct McpToolWrapper {
     /// `call_tool` checks the URL host against `allowed_hosts` and
     /// appends an `McpEgressEvent` row to `<audit_dir>/audit.log`.
     egress: Option<EgressContext>,
+    /// v60.29 H9 — per-tool deadline override (server-manifest
+    /// `deadline_ms` for MCP-routed tools). `None` inherits the
+    /// runner default. Surfaces through `Tool::deadline_override` so
+    /// the dispatcher's `tokio::select!` enforces it.
+    deadline: Option<std::time::Duration>,
 }
 
 #[derive(Debug, Clone)]
@@ -106,6 +111,29 @@ impl McpToolWrapper {
         handle: Arc<McpServerHandle>,
         side_effect_class: SideEffectClass,
     ) -> Result<Self, String> {
+        Self::new_with_deadline(
+            server_name,
+            tool_name,
+            description,
+            input_schema,
+            handle,
+            side_effect_class,
+            None,
+        )
+    }
+
+    /// Like [`Self::new`] but accepts a v60.29 H9 deadline override.
+    /// `register_mcp_servers` reads `deadline_ms` from the server
+    /// manifest (when present) and threads it here.
+    pub fn new_with_deadline(
+        server_name: impl Into<String>,
+        tool_name: impl Into<String>,
+        description: impl Into<String>,
+        input_schema: Value,
+        handle: Arc<McpServerHandle>,
+        side_effect_class: SideEffectClass,
+        deadline: Option<std::time::Duration>,
+    ) -> Result<Self, String> {
         let validator = compile_input_schema(&input_schema)?;
         Ok(Self {
             server_name: server_name.into(),
@@ -116,6 +144,7 @@ impl McpToolWrapper {
             handle,
             side_effect_class,
             egress: None,
+            deadline,
         })
     }
 
@@ -305,6 +334,10 @@ impl Tool for McpToolWrapper {
             output,
             staged_writes: None,
         })
+    }
+
+    fn deadline_override(&self) -> Option<std::time::Duration> {
+        self.deadline
     }
 }
 

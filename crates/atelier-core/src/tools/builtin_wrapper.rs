@@ -49,6 +49,12 @@ struct ManifestProjection {
     description: String,
     side_effect_class: SideEffectClass,
     input_schema: Value,
+    /// v60.29 H9 — per-tool wall-clock deadline in milliseconds.
+    /// Optional; absence inherits `DEFAULT_TOOL_DEADLINE`. Threaded
+    /// onto `Tool::deadline_override` so the dispatcher's
+    /// `tokio::select!` picks it up.
+    #[serde(default)]
+    deadline_ms: Option<u64>,
 }
 
 /// Adapter that routes a built-in tool's execution through a wrapper
@@ -65,6 +71,10 @@ pub struct BuiltInToolWrapper {
     side_effect_class: SideEffectClass,
     input_schema: Value,
     validator: Arc<Validator>,
+    /// v60.29 H9 — per-tool deadline override from the bundled
+    /// manifest's `deadline_ms` field. `None` means inherit the
+    /// runner default.
+    deadline: Option<std::time::Duration>,
     /// The inner `Tool` impl that supplies the actual execution.
     /// Stored as `Arc<dyn Tool>` so a future test can swap it for a
     /// mock without changing the wrapper.
@@ -99,6 +109,7 @@ impl BuiltInToolWrapper {
             side_effect_class: parsed.side_effect_class,
             input_schema: parsed.input_schema,
             validator: Arc::new(validator),
+            deadline: parsed.deadline_ms.map(std::time::Duration::from_millis),
             inner,
         })
     }
@@ -172,6 +183,10 @@ impl Tool for BuiltInToolWrapper {
 
     async fn execute(&self, args: Value, ctx: &ToolContext<'_>) -> Result<ToolResult, ToolError> {
         self.inner.execute(args, ctx).await
+    }
+
+    fn deadline_override(&self) -> Option<std::time::Duration> {
+        self.deadline
     }
 }
 
@@ -339,6 +354,8 @@ mod tests {
             sandbox: &sandbox,
             tool_call_id: None,
             audit_log_path: None,
+            cancel: tokio_util::sync::CancellationToken::new(),
+            deadline: crate::dispatcher::DEFAULT_TOOL_DEADLINE,
         };
         let r = w
             .execute(json!({"path": "a.txt"}), &ctx)

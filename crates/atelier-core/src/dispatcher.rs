@@ -140,6 +140,20 @@ pub struct ToolResult {
 /// `crate::audit::append_subprocess_egress`. `None` disables the
 /// producer — used by dispatcher-level unit tests that don't care about
 /// audit side-effects, and by older tests that pre-date this seam.
+///
+/// ## v60.29 H9 — cancellation and deadline
+///
+/// `cancel` is the session-scoped `tokio_util::sync::CancellationToken`
+/// rooted at the §2.5 actor (cloned per dispatch). Tools may select on
+/// `cancel.cancelled()` from inside their own work for prompt teardown;
+/// the dispatcher always races the tool future against the token from
+/// the outside as well, so an impl that only checks at function entry
+/// is still correct — it'll be aborted at the next `await`.
+///
+/// `deadline` is the wall-clock budget for this tool call. Default is
+/// `DEFAULT_TOOL_DEADLINE` (60s) but the dispatcher overrides it from
+/// the per-tool `tool_manifest.v1.json:deadline_ms` field when the
+/// wrapper (built-in or MCP) supplies one.
 pub struct ToolContext<'a> {
     pub workspace_root: &'a Path,
     pub sandbox: &'a SandboxPolicy,
@@ -147,7 +161,23 @@ pub struct ToolContext<'a> {
     pub tool_call_id: Option<&'a str>,
     /// Per-session audit-log path. See type-level docs.
     pub audit_log_path: Option<&'a Path>,
+    /// Session-scoped cancellation token. Tools that perform long work
+    /// inside `tokio::spawn_blocking` may ignore this and rely on the
+    /// dispatcher's outer `tokio::select!`; pure-async impls can race
+    /// on `cancel.cancelled()` for finer-grained teardown.
+    pub cancel: tokio_util::sync::CancellationToken,
+    /// Per-call wall-clock deadline. Enforced by the dispatcher's
+    /// `tokio::select!` around `tool.execute(...)`.
+    pub deadline: std::time::Duration,
 }
+
+/// v60.29 H9 — default per-tool deadline when no `deadline_ms` is
+/// declared in the bundled manifest. 60s tracks the longest blocking
+/// shell job we expect to terminate normally (a recursive `grep` over
+/// a mid-sized repo on a slow disk); anything longer is either the
+/// model wedged in a busy loop or a hostile workload, both of which
+/// the deadline should interrupt.
+pub const DEFAULT_TOOL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The §15 dispatch contract. Async because tool execution may involve
 /// subprocess / I/O (`shell`, `grep`) or remote calls (MCP-routed tools).
@@ -207,6 +237,17 @@ pub trait Tool: Send + Sync {
         args: serde_json::Value,
         ctx: &ToolContext<'_>,
     ) -> Result<ToolResult, ToolError>;
+
+    /// v60.29 H9 — per-tool deadline override.
+    ///
+    /// Wrappers (built-in + MCP) read this from the bundled
+    /// `tool_manifest.v1.json:deadline_ms` field; bare `Tool` impls
+    /// return `None` and inherit `DEFAULT_TOOL_DEADLINE`. The
+    /// dispatcher consults this method ahead of `execute` and writes
+    /// the resolved value to `ToolContext::deadline`.
+    fn deadline_override(&self) -> Option<std::time::Duration> {
+        None
+    }
 }
 
 /// Read-only lookup of tools by name. Built from the union of built-in
@@ -567,13 +608,42 @@ impl Dispatcher {
         //    field is ignored — `Dispatcher::dispatch` is the single
         //    source of truth for that id, since it's the layer that
         //    sees the `ToolCallRequest` directly.
+        //
+        //    v60.29 H9 — resolve the per-tool deadline (manifest override
+        //    if any, else caller-supplied default) and race the tool
+        //    future against:
+        //      * caller-initiated cancellation (`ctx.cancel`), or
+        //      * the resolved wall-clock deadline.
+        //    A spawn_blocking-based built-in's underlying syscall isn't
+        //    abortable from outside, but the JoinHandle the tool awaits
+        //    is — when the select! takes the cancel / deadline branch
+        //    the tool's awaited handle is dropped, leaving the OS work
+        //    to wind down on its own. Both racing branches yield a
+        //    `ToolError` the §2.5 state machine routes through
+        //    `Recovery::Fail` (Cancelled) or `Recovery::Retry`
+        //    (Deadline).
+        let resolved_deadline = tool.deadline_override().unwrap_or(ctx.deadline);
         let per_call_ctx = ToolContext {
             workspace_root: ctx.workspace_root,
             sandbox: ctx.sandbox,
             tool_call_id: Some(call.id.as_str()),
             audit_log_path: ctx.audit_log_path,
+            cancel: ctx.cancel.clone(),
+            deadline: resolved_deadline,
         };
-        let raw_result = tool.execute(call.arguments.clone(), &per_call_ctx).await;
+        let raw_result = {
+            let tool_fut = tool.execute(call.arguments.clone(), &per_call_ctx);
+            let cancel = ctx.cancel.clone();
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => Err(ToolError::Cancelled { tool: call.name.clone() }),
+                _ = tokio::time::sleep(resolved_deadline) => Err(ToolError::Deadline {
+                    tool: call.name.clone(),
+                    deadline: resolved_deadline,
+                }),
+                res = tool_fut => res,
+            }
+        };
         let latency_ms = started.elapsed().as_secs_f64() * 1000.0;
         let cost_usd = Some(local_cost_usd(latency_ms, DEFAULT_LOCAL_RATE_USD_PER_SEC));
 
@@ -1912,6 +1982,236 @@ impl HookExecutor for ShellHookExecutor {
 }
 
 #[cfg(test)]
+mod cancellation_tests {
+    //! v60.29 H9 — `Dispatcher::dispatch` must enforce the per-call
+    //! deadline and propagate caller-initiated cancel via the session
+    //! `CancellationToken`. Pre-H9 a wedged tool ran to completion.
+
+    use super::*;
+    use crate::adapter::ToolCallRequest;
+    use crate::error::ToolError;
+    use crate::sandbox::SandboxPolicy;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use tokio_util::sync::CancellationToken;
+
+    /// A tool that sleeps forever (well, 5s — long enough that the
+    /// dispatcher's outer race must fire). We don't reach into the
+    /// inner sleep to observe cancellation; the dispatcher's outer
+    /// `tokio::select!` is the layer under test.
+    struct MockSlowTool;
+
+    #[async_trait]
+    impl Tool for MockSlowTool {
+        fn name(&self) -> &str {
+            "mock_slow"
+        }
+        fn side_effect_class(&self) -> SideEffectClass {
+            SideEffectClass::LocalSafe
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+            _ctx: &ToolContext<'_>,
+        ) -> Result<ToolResult, ToolError> {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            Ok(ToolResult {
+                output: serde_json::json!({"ok": true}),
+                staged_writes: None,
+            })
+        }
+    }
+
+    fn build_dispatcher_with(tool: Arc<dyn Tool>) -> Dispatcher {
+        let mut registry = ToolRegistry::new();
+        registry.register(tool).unwrap();
+        Dispatcher::new(registry, crate::hooks::HookSet::empty())
+    }
+
+    fn call(name: &str) -> ToolCallRequest {
+        ToolCallRequest {
+            id: format!("tc-{name}"),
+            name: name.into(),
+            arguments: serde_json::json!({}),
+        }
+    }
+
+    fn now() -> String {
+        "2026-05-18T00:00:00Z".into()
+    }
+
+    /// Plan §H9 verify: a 5s tool with `deadline: 200ms` must surface
+    /// `ToolError::Deadline` within 300ms wall-clock.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deadline_exceeded_returns_deadline_within_budget() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let sandbox = SandboxPolicy::restrictive(workspace.path()).unwrap();
+        let ctx = ToolContext {
+            workspace_root: workspace.path(),
+            sandbox: &sandbox,
+            tool_call_id: None,
+            audit_log_path: None,
+            cancel: CancellationToken::new(),
+            deadline: Duration::from_millis(200),
+        };
+        let d = build_dispatcher_with(Arc::new(MockSlowTool));
+
+        let started = Instant::now();
+        let outcome = d.dispatch(&call("mock_slow"), &ctx, now).await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(300),
+            "dispatch took {elapsed:?}; deadline race did not fire on time"
+        );
+        match outcome.result {
+            Err(ToolError::Deadline { tool, deadline }) => {
+                assert_eq!(tool, "mock_slow");
+                assert_eq!(deadline, Duration::from_millis(200));
+            }
+            other => panic!("expected ToolError::Deadline, got {other:?}"),
+        }
+        // Ledger note carries the kind tag so a post-mortem can find it.
+        let note_str = match &outcome.ledger_entry {
+            crate::ledger::LedgerEntry::ToolCall { note, .. } => note.clone(),
+            other => panic!("expected ToolCall ledger entry, got {other:?}"),
+        };
+        assert!(
+            note_str
+                .as_deref()
+                .map(|s| s.contains("Deadline"))
+                .unwrap_or(false),
+            "ledger note missing Deadline tag: {note_str:?}"
+        );
+    }
+
+    /// A pre-armed cancel token short-circuits the dispatch even when
+    /// the deadline is generous.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_token_returns_cancelled_promptly() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let sandbox = SandboxPolicy::restrictive(workspace.path()).unwrap();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let ctx = ToolContext {
+            workspace_root: workspace.path(),
+            sandbox: &sandbox,
+            tool_call_id: None,
+            audit_log_path: None,
+            cancel: cancel.clone(),
+            deadline: Duration::from_secs(60),
+        };
+        let d = build_dispatcher_with(Arc::new(MockSlowTool));
+
+        let started = Instant::now();
+        let outcome = d.dispatch(&call("mock_slow"), &ctx, now).await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "dispatch took {elapsed:?}; pre-armed cancel should be near-instant"
+        );
+        match outcome.result {
+            Err(ToolError::Cancelled { tool }) => {
+                assert_eq!(tool, "mock_slow");
+            }
+            other => panic!("expected ToolError::Cancelled, got {other:?}"),
+        }
+    }
+
+    /// Cancelling mid-flight aborts a sleeping tool — the
+    /// CancellationToken can be tripped from outside the dispatch
+    /// future and the select! drops the inner future.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_mid_flight_aborts_running_tool() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let sandbox = SandboxPolicy::restrictive(workspace.path()).unwrap();
+        let cancel = CancellationToken::new();
+        let ctx = ToolContext {
+            workspace_root: workspace.path(),
+            sandbox: &sandbox,
+            tool_call_id: None,
+            audit_log_path: None,
+            cancel: cancel.clone(),
+            deadline: Duration::from_secs(60),
+        };
+        let d = build_dispatcher_with(Arc::new(MockSlowTool));
+
+        let cancel_for_task = cancel.clone();
+        let canceller = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            cancel_for_task.cancel();
+        });
+        let started = Instant::now();
+        let outcome = d.dispatch(&call("mock_slow"), &ctx, now).await;
+        let elapsed = started.elapsed();
+        canceller.await.unwrap();
+
+        assert!(
+            elapsed < Duration::from_millis(300),
+            "dispatch took {elapsed:?}; mid-flight cancel did not interrupt"
+        );
+        assert!(matches!(outcome.result, Err(ToolError::Cancelled { .. })));
+    }
+
+    /// Per-tool `deadline_override` shrinks an over-generous caller
+    /// default. Confirms the manifest seam runs in dispatch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tool_deadline_override_takes_precedence_over_context_default() {
+        struct TightSlow;
+        #[async_trait]
+        impl Tool for TightSlow {
+            fn name(&self) -> &str {
+                "tight_slow"
+            }
+            fn side_effect_class(&self) -> SideEffectClass {
+                SideEffectClass::LocalSafe
+            }
+            async fn execute(
+                &self,
+                _args: serde_json::Value,
+                _ctx: &ToolContext<'_>,
+            ) -> Result<ToolResult, ToolError> {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                Ok(ToolResult {
+                    output: serde_json::json!({}),
+                    staged_writes: None,
+                })
+            }
+            fn deadline_override(&self) -> Option<Duration> {
+                Some(Duration::from_millis(150))
+            }
+        }
+        let workspace = tempfile::TempDir::new().unwrap();
+        let sandbox = SandboxPolicy::restrictive(workspace.path()).unwrap();
+        let ctx = ToolContext {
+            workspace_root: workspace.path(),
+            sandbox: &sandbox,
+            tool_call_id: None,
+            audit_log_path: None,
+            cancel: CancellationToken::new(),
+            // Generous caller default; override should still win.
+            deadline: Duration::from_secs(60),
+        };
+        let d = build_dispatcher_with(Arc::new(TightSlow));
+        let started = Instant::now();
+        let outcome = d.dispatch(&call("tight_slow"), &ctx, now).await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(300),
+            "override did not shorten the deadline (elapsed {elapsed:?})"
+        );
+        match outcome.result {
+            Err(ToolError::Deadline { tool, deadline }) => {
+                assert_eq!(tool, "tight_slow");
+                assert_eq!(deadline, Duration::from_millis(150));
+            }
+            other => panic!("expected Deadline via override, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::adapter::ToolCallRequest;
@@ -2050,6 +2350,8 @@ mod tests {
             sandbox: policy,
             tool_call_id: None,
             audit_log_path: None,
+            cancel: tokio_util::sync::CancellationToken::new(),
+            deadline: DEFAULT_TOOL_DEADLINE,
         }
     }
 
@@ -2063,6 +2365,8 @@ mod tests {
             sandbox: policy,
             tool_call_id: None,
             audit_log_path: None,
+            cancel: tokio_util::sync::CancellationToken::new(),
+            deadline: DEFAULT_TOOL_DEADLINE,
         }
     }
 

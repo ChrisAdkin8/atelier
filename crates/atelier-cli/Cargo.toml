@@ -40,6 +40,9 @@ tempfile = { workspace = true }
 # (serde) and mints `comp-<uuid>` blob ids (uuid).
 serde = { workspace = true, features = ["derive"] }
 uuid = { workspace = true, features = ["v4"] }
+# v60.29 H9 / H10 — `Runner` threads a CancellationToken into ToolContext
+# and the CLI main races the run-future against ctrl_c + SIGTERM.
+tokio-util = { workspace = true }
 
 [dev-dependencies]
 assert_cmd = { workspace = true }

@@ -34,6 +34,11 @@
       "type": "boolean",
       "default": false,
       "description": "Shell-only: if true, the subprocess sandbox permits outbound network. HTTP implementation implies network and ignores this flag."
+    },
+    "deadline_ms": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "v60.29 H9 — per-tool wall-clock deadline. The dispatcher races the tool future against this duration; on expiry the call returns ToolError::Deadline (§2.5 Retry). Omit to inherit the runner default (60_000ms / 60s)."
     }
   }
 }

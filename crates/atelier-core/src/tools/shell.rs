@@ -476,6 +476,8 @@ mod tests {
             sandbox,
             tool_call_id: None,
             audit_log_path: None,
+            cancel: tokio_util::sync::CancellationToken::new(),
+            deadline: crate::dispatcher::DEFAULT_TOOL_DEADLINE,
         }
     }
 
@@ -648,6 +650,8 @@ mod tests {
             sandbox: &sandbox,
             tool_call_id: Some("tc-curl-evil-1"),
             audit_log_path: Some(audit_path.as_path()),
+            cancel: tokio_util::sync::CancellationToken::new(),
+            deadline: crate::dispatcher::DEFAULT_TOOL_DEADLINE,
         };
 
         let err = Shell
@@ -703,6 +707,8 @@ mod tests {
             sandbox: &sandbox,
             tool_call_id: Some("tc-loopback"),
             audit_log_path: Some(audit_path.as_path()),
+            cancel: tokio_util::sync::CancellationToken::new(),
+            deadline: crate::dispatcher::DEFAULT_TOOL_DEADLINE,
         };
         // We don't care about the run outcome; we care that we did
         // NOT return early as SandboxViolation. Use `true` so the
@@ -740,6 +746,8 @@ mod tests {
             sandbox: &sandbox,
             tool_call_id: Some("tc-allow-net"),
             audit_log_path: Some(audit_path.as_path()),
+            cancel: tokio_util::sync::CancellationToken::new(),
+            deadline: crate::dispatcher::DEFAULT_TOOL_DEADLINE,
         };
         let res = Shell
             .execute(

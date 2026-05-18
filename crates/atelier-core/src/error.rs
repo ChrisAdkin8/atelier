@@ -39,6 +39,19 @@ pub enum ToolError {
 
     #[error("{tool} output violated its schema: {error}")]
     SchemaViolation { tool: String, error: String },
+
+    /// v60.29 H9 — caller-initiated cancellation. Tripped by the
+    /// session's root `CancellationToken` (SIGINT/SIGTERM in
+    /// `atelier-cli`, an explicit `SessionCommand::Cancel` from a
+    /// driver, or a parent `tokio::select!` racer giving up).
+    #[error("{tool} cancelled before completion")]
+    Cancelled { tool: String },
+
+    /// v60.29 H9 — per-tool deadline exceeded. The default is 60s; a
+    /// `tool_manifest.v1.json` `deadline_ms` field overrides per-tool.
+    /// The `Duration` is what the dispatcher actually waited.
+    #[error("{tool} exceeded its deadline of {deadline:?}")]
+    Deadline { tool: String, deadline: Duration },
 }
 
 impl ToolError {
@@ -48,17 +61,25 @@ impl ToolError {
             Self::SandboxViolation { .. } => Recovery::Fail,
             Self::PermissionDenied { .. } => Recovery::AwaitUser,
             Self::Timeout { .. }
+            | Self::Deadline { .. }
             | Self::ResultMalformed { .. }
             | Self::ExecutionFailed { .. }
             | Self::SchemaViolation { .. } => Recovery::Retry,
             Self::McpServerUnreachable { .. } | Self::McpServerCrashed { .. } => {
                 Recovery::RetryBudgeted
             }
+            // Cancellation came from a higher layer (SIGINT, parent
+            // dropped, explicit cancel); the agent loop should stop,
+            // not retry into a tighter loop with the same cancel still
+            // armed.
+            Self::Cancelled { .. } => Recovery::Fail,
         }
     }
 
     /// The error-kind tag persisted in session `tool_fixtures.error.kind`
-    /// (`schemas/session/v1.json`).
+    /// (`schemas/session/v1.json`). Doubles as the stable wire label
+    /// (no serde derive on `ToolError`; this method is the single
+    /// source of truth) — pinned by the `tool_error_kind_*` tests.
     pub fn kind(&self) -> &'static str {
         match self {
             Self::SandboxViolation { .. } => "SandboxViolation",
@@ -69,6 +90,8 @@ impl ToolError {
             Self::PermissionDenied { .. } => "PermissionDenied",
             Self::ExecutionFailed { .. } => "ExecutionFailed",
             Self::SchemaViolation { .. } => "SchemaViolation",
+            Self::Cancelled { .. } => "Cancelled",
+            Self::Deadline { .. } => "Deadline",
         }
     }
 }
@@ -127,6 +150,104 @@ mod tests {
             tool: "pytest".into(),
             exit_code: 1,
             stderr: "1 failed".into(),
+        };
+        assert_eq!(e.recovery(), Recovery::Retry);
+    }
+
+    /// v60.29 H9 — L-D-5 wire-label agreement.
+    ///
+    /// `ToolError` doesn't carry a serde derive (it's a runtime error,
+    /// not a wire payload) — `kind()` is the wire label. Each variant
+    /// must produce a stable tag that the session-schema enum lists
+    /// and that the post-mortem ledger pins.
+    #[test]
+    fn tool_error_kind_labels_are_stable() {
+        assert_eq!(
+            ToolError::SandboxViolation {
+                tool: "x".into(),
+                attempted: "y".into()
+            }
+            .kind(),
+            "SandboxViolation"
+        );
+        assert_eq!(
+            ToolError::Timeout {
+                tool: "x".into(),
+                elapsed: Duration::from_secs(1)
+            }
+            .kind(),
+            "Timeout"
+        );
+        assert_eq!(
+            ToolError::McpServerUnreachable { server: "x".into() }.kind(),
+            "McpServerUnreachable"
+        );
+        assert_eq!(
+            ToolError::McpServerCrashed {
+                server: "x".into(),
+                last_message: None
+            }
+            .kind(),
+            "McpServerCrashed"
+        );
+        assert_eq!(
+            ToolError::ResultMalformed {
+                tool: "x".into(),
+                parse_error: "y".into()
+            }
+            .kind(),
+            "ResultMalformed"
+        );
+        assert_eq!(
+            ToolError::PermissionDenied {
+                tool: "x".into(),
+                reason: "y".into()
+            }
+            .kind(),
+            "PermissionDenied"
+        );
+        assert_eq!(
+            ToolError::ExecutionFailed {
+                tool: "x".into(),
+                exit_code: 1,
+                stderr: "y".into()
+            }
+            .kind(),
+            "ExecutionFailed"
+        );
+        assert_eq!(
+            ToolError::SchemaViolation {
+                tool: "x".into(),
+                error: "y".into()
+            }
+            .kind(),
+            "SchemaViolation"
+        );
+        assert_eq!(
+            ToolError::Cancelled { tool: "x".into() }.kind(),
+            "Cancelled"
+        );
+        assert_eq!(
+            ToolError::Deadline {
+                tool: "x".into(),
+                deadline: Duration::from_secs(1)
+            }
+            .kind(),
+            "Deadline"
+        );
+    }
+
+    #[test]
+    fn cancelled_is_terminal() {
+        let e = ToolError::Cancelled { tool: "x".into() };
+        assert_eq!(e.recovery(), Recovery::Fail);
+    }
+
+    #[test]
+    fn deadline_retries() {
+        let e = ToolError::Deadline {
+            tool: "x".into(),
+            deadline: Duration::from_millis(200),
         };
         assert_eq!(e.recovery(), Recovery::Retry);
     }

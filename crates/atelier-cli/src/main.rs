@@ -472,8 +472,18 @@ fn run_run(args: impl Iterator<Item = String>) -> ExitCode {
         runner = runner.with_non_interactive(true);
     }
 
-    match rt.block_on(runner.run(prompt)) {
-        Ok(report) => {
+    // v60.29 H10 — wire a SIGINT/SIGTERM handler. The handler trips
+    // a cancellation token the runner threads down through the §2.5
+    // actor + dispatcher; in-flight tools surface `ToolError::Cancelled`
+    // and the run loop returns naturally, letting the existing
+    // run-and-save tail in `Runner::run` persist the partial session.
+    // On signal we exit 130 (SIGINT) or 143 (SIGTERM) per POSIX.
+    let cancel = tokio_util::sync::CancellationToken::new();
+    runner = runner.with_external_cancel(cancel.clone());
+
+    let signal_result = rt.block_on(run_with_signal_handling(runner, prompt, cancel));
+    match signal_result {
+        SignalOutcome::Completed(Ok(report)) => {
             println!(
                 "atelier run: session {} ended in {:?} after {} turn(s){}",
                 report.session_id,
@@ -487,10 +497,77 @@ fn run_run(args: impl Iterator<Item = String>) -> ExitCode {
             );
             ExitCode::SUCCESS
         }
-        Err(e) => {
+        SignalOutcome::Completed(Err(e)) => {
             eprintln!("atelier run: {e}");
             ExitCode::from(1)
         }
+        SignalOutcome::Interrupted { exit_code } => {
+            eprintln!("atelier run: interrupted; partial session persisted");
+            ExitCode::from(exit_code)
+        }
+    }
+}
+
+/// v60.29 H10 — signal-aware variant of "run a future to completion".
+///
+/// Races the `runner.run(prompt)` future against
+/// `tokio::signal::ctrl_c()` and (unix only) SIGTERM. On signal: trips
+/// the supplied `CancellationToken` and awaits the run future to
+/// completion so the runner's normal teardown — including the
+/// `OnDiskSession::save_to` tail — runs against the partial state. The
+/// exit code follows POSIX convention: 130 for SIGINT, 143 for SIGTERM.
+enum SignalOutcome {
+    Completed(Result<runner::RunReport, runner::RunError>),
+    Interrupted { exit_code: u8 },
+}
+
+async fn run_with_signal_handling(
+    runner: runner::Runner,
+    prompt: String,
+    cancel: tokio_util::sync::CancellationToken,
+) -> SignalOutcome {
+    use tokio::signal;
+    #[cfg(unix)]
+    use tokio::signal::unix::{signal as unix_signal, SignalKind};
+
+    let mut run_fut = Box::pin(runner.run(prompt));
+    // First select: race the run future against the signals. On
+    // signal, trip the token, then await the run to its persistence
+    // tail. The runner's own teardown writes the partial session.
+    let signal_exit_code: u8;
+    #[cfg(unix)]
+    {
+        let mut sigterm = match unix_signal(SignalKind::terminate()) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                tracing::warn!(error = %e, "SIGTERM handler init failed; ^C still wired");
+                None
+            }
+        };
+        tokio::select! {
+            res = &mut run_fut => return SignalOutcome::Completed(res),
+            _ = signal::ctrl_c() => {
+                signal_exit_code = 130;
+            }
+            _ = async { match sigterm.as_mut() { Some(s) => { s.recv().await; }, None => std::future::pending::<()>().await } } => {
+                signal_exit_code = 143;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::select! {
+            res = &mut run_fut => return SignalOutcome::Completed(res),
+            _ = signal::ctrl_c() => {
+                signal_exit_code = 130;
+            }
+        }
+    }
+
+    cancel.cancel();
+    let _ = run_fut.await;
+    SignalOutcome::Interrupted {
+        exit_code: signal_exit_code,
     }
 }
 

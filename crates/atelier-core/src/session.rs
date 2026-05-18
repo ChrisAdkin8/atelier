@@ -713,11 +713,24 @@ pub fn spawn_with_capacity(
     ledger: Arc<dyn LedgerHook>,
     inbox_capacity: usize,
 ) -> Handle {
+    spawn_with_cancel_token(checkpoint, ledger, inbox_capacity, CancellationToken::new())
+}
+
+/// v60.29 H10 — spawn with a caller-supplied cancellation token. The
+/// CLI's signal handler trips this token to cooperatively unwind the
+/// session on SIGINT / SIGTERM. Tests use the unparameterised spawn;
+/// `atelier-cli::runner::Runner::run` wires the binary's external
+/// cancel-token through this variant.
+pub fn spawn_with_cancel_token(
+    checkpoint: Arc<dyn CheckpointHook>,
+    ledger: Arc<dyn LedgerHook>,
+    inbox_capacity: usize,
+    cancel: CancellationToken,
+) -> Handle {
     let id = SessionId::new();
     let (tx, rx) = mpsc::channel(inbox_capacity);
     let (events, _) = broadcast::channel(EVENT_BUFFER);
     let tool_semaphore = Arc::new(Semaphore::new(TOOL_PARALLELISM_CAP));
-    let cancel = CancellationToken::new();
 
     let handle = Handle {
         id,

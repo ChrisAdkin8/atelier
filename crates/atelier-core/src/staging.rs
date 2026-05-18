@@ -773,13 +773,42 @@ fn splice_hunks(
     out.into_bytes()
 }
 
-/// Atomic-ish file write: create, write, sync_all, close. Used by the
-/// staging tree so a crash between staging-write and post-validation
-/// rename can't publish a zero-length file.
+/// Atomic file write (v60.29 H11): write to a sibling tmp file, fsync,
+/// rename onto the target path, fsync the parent directory. The crash
+/// between the create and the write that pre-v60.29 could publish a
+/// zero-length staged file is no longer reachable — the rename only
+/// happens once the tmp file's contents are on stable storage, and
+/// rename is atomic at the filesystem level.
+///
+/// Ordering: tmp-write → fsync(tmp) → rename → fsync(parent dir).
 fn write_with_sync(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let mut f = std::fs::File::create(path)?;
-    std::io::Write::write_all(&mut f, bytes)?;
-    f.sync_all()
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no parent")
+    })?;
+    let file_name = path.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no file name")
+    })?;
+    let tmp_path = parent.join(format!(
+        "{}.atelier-tmp.{}.{}",
+        file_name,
+        std::process::id(),
+        uuid::Uuid::new_v4().simple(),
+    ));
+    let write_result = (|| -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp_path)?;
+        std::io::Write::write_all(&mut f, bytes)?;
+        f.sync_all()?;
+        drop(f);
+        #[cfg(test)]
+        durability_tests::maybe_panic_between_tmp_and_rename();
+        std::fs::rename(&tmp_path, path)
+    })();
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+        return write_result;
+    }
+    let _ = fsync_dir_best_effort(parent);
+    Ok(())
 }
 
 /// fsync a directory entry. POSIX-only; on other platforms this is a
@@ -1577,5 +1606,111 @@ mod tests {
         let accepted: HashSet<usize> = [0].into_iter().collect();
         let out = splice_hunks(pre, new, &hunks, &accepted);
         assert_eq!(out, b"A\nb");
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod durability_tests {
+    //! v60.29 H11 — durability of `write_with_sync`.
+    //!
+    //! The function publishes a final path via `rename(tmp, path)`. A
+    //! crash between the tmp-write and the rename must leave the target
+    //! either non-existent or with full contents — never zero-length.
+    //!
+    //! The fault injection is a thread-local flag the test sets before
+    //! calling `write_with_sync`; the production `fn` checks the flag
+    //! under `#[cfg(test)]` and panics through it (caught here with
+    //! `catch_unwind`). This avoids signal acrobatics and runs
+    //! identically on every platform.
+
+    use std::cell::Cell;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    use std::path::Path;
+
+    thread_local! {
+        static FAIL_BETWEEN_TMP_AND_RENAME: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(super) fn maybe_panic_between_tmp_and_rename() {
+        let armed = FAIL_BETWEEN_TMP_AND_RENAME.with(|c| c.replace(false));
+        if armed {
+            panic!("durability_tests: injected panic between tmp-write and rename");
+        }
+    }
+
+    fn arm() {
+        FAIL_BETWEEN_TMP_AND_RENAME.with(|c| c.set(true));
+    }
+
+    #[test]
+    fn write_with_sync_atomic_under_injected_panic() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let target = dir.path().join("a.txt");
+        std::fs::write(&target, b"old contents").unwrap();
+
+        arm();
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            super::write_with_sync(&target, b"new contents that should never appear partially")
+        }));
+        assert!(result.is_err(), "injected panic should propagate");
+
+        // After the panic: target may still hold pre-existing contents
+        // (rename never ran) but it must NEVER be zero-length. A bare
+        // `File::create` ordering would leave it zero-length here.
+        let on_disk = std::fs::read(&target).expect("target file must exist");
+        assert_eq!(
+            on_disk, b"old contents",
+            "rename did not run; pre-existing contents must survive"
+        );
+        assert!(!on_disk.is_empty(), "target must never be zero-length");
+
+        // The sibling tmp file may linger because the panic skipped the
+        // `remove_file` cleanup branch — that's fine; it's outside the
+        // staging dir's lifetime in production and the TempDir drop
+        // sweeps it here.
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let e = entry.unwrap();
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            if name.contains(".atelier-tmp.") {
+                let bytes = std::fs::read(e.path()).unwrap();
+                assert_eq!(
+                    bytes, b"new contents that should never appear partially",
+                    "tmp file must hold full contents when it survives",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn write_with_sync_happy_path_publishes_full_contents() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let target = dir.path().join("b.txt");
+        super::write_with_sync(&target, b"hello world").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"hello world");
+        // No tmp files left behind on the happy path.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".atelier-tmp."))
+            .collect();
+        assert!(leftovers.is_empty(), "tmp files leaked: {leftovers:?}");
+    }
+
+    #[test]
+    fn write_with_sync_overwrites_existing_target_atomically() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let target = dir.path().join("c.txt");
+        std::fs::write(&target, b"v1").unwrap();
+        super::write_with_sync(&target, b"v2 longer").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"v2 longer");
+    }
+
+    // Used by `staging::write_with_sync`'s internal `#[cfg(test)]` hook
+    // to keep the production binary panic-free.
+    #[allow(dead_code)]
+    fn _ensure_hook_symbol_resolved() {
+        let _ = Path::new("/dev/null");
+        maybe_panic_between_tmp_and_rename();
     }
 }

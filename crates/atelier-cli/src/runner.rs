@@ -432,6 +432,12 @@ pub struct Runner {
     /// produces these from `lsp_types::Diagnostic` instead and this
     /// override stays unused.
     tier1_diagnostics_for_test: Vec<atelier_core::verify::Discrepancy>,
+    /// v60.29 H10 — external cancellation token. The CLI `main`
+    /// supplies one from its SIGINT/SIGTERM handler and trips it on
+    /// signal; the session actor + the dispatcher's `tokio::select!`
+    /// both observe it and unwind. `None` means the run is on its own
+    /// (test and GUI/TUI driver entry points today).
+    external_cancel: Option<tokio_util::sync::CancellationToken>,
 }
 
 /// v60.10 §1 BYOM — record of a pending mid-session adapter swap that
@@ -631,7 +637,18 @@ impl Runner {
             pending_swap: parking_lot::Mutex::new(None),
             starting_strategy_override: None,
             tier1_diagnostics_for_test: Vec::new(),
+            external_cancel: None,
         })
+    }
+
+    /// v60.29 H10 — wire a caller-supplied cancellation token so an
+    /// external SIGINT/SIGTERM handler can unwind the in-flight run.
+    /// `Runner::run` passes it through to `session::spawn_with_cancel_token`;
+    /// the dispatcher's outer `tokio::select!` observes it via
+    /// `ToolContext::cancel` and surfaces `ToolError::Cancelled` mid-tool.
+    pub fn with_external_cancel(mut self, token: tokio_util::sync::CancellationToken) -> Self {
+        self.external_cancel = Some(token);
+        self
     }
 
     pub fn with_max_turns(mut self, n: usize) -> Self {
@@ -946,7 +963,22 @@ impl Runner {
         let plan_canvas = Arc::new(parking_lot::Mutex::new(PlanCanvas::new()));
 
         // 3. Session actor + SessionDispatcher.
-        let session_handle = session::spawn(Arc::new(NoopHook), Arc::new(NoopHook));
+        //
+        //    v60.29 H10 — if the caller supplied an external
+        //    cancellation token (the CLI does this from its
+        //    SIGINT/SIGTERM handler), thread it into the session so
+        //    tripping the token unwinds the actor + every dispatched
+        //    tool. The default unparameterised path still works for
+        //    GUI/TUI driver runs that don't wire signal handling.
+        let session_handle = match self.external_cancel.clone() {
+            Some(token) => atelier_core::session::spawn_with_cancel_token(
+                Arc::new(NoopHook),
+                Arc::new(NoopHook),
+                atelier_core::session::INBOX_CAPACITY,
+                token,
+            ),
+            None => session::spawn(Arc::new(NoopHook), Arc::new(NoopHook)),
+        };
         let bus = session_handle.events_sender();
 
         // v61 — §14 per-session file watcher. The dispatcher feeds the
@@ -1754,6 +1786,13 @@ impl Runner {
                     // the value here is ignored.
                     tool_call_id: None,
                     audit_log_path: Some(audit_log_path.as_path()),
+                    // v60.29 H9 — session-rooted cancel token so a
+                    // SIGINT (`atelier-cli/src/main.rs`) can interrupt
+                    // a long-running tool. Deadline is the workspace
+                    // default; per-tool overrides flow through
+                    // `Tool::deadline_override` at dispatch time.
+                    cancel: session_handle.cancel_token(),
+                    deadline: atelier_core::dispatcher::DEFAULT_TOOL_DEADLINE,
                 };
                 for call in real_tool_calls {
                     let outcome = session_dispatcher.dispatch(&call, &ctx, now_rfc3339).await;

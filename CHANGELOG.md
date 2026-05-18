@@ -1,5 +1,29 @@
 # Atelier Spec — Changelog
 
+## v60.29 — 2026-05-18 (Liveness & durability — H9–H12)
+
+The "liveness & durability" bundle from `tasks/plan_high_severity_fixes.md`. Four targeted hardening touches on `crates/atelier-core/src/{dispatcher.rs,file_watcher.rs,staging.rs}` and `crates/atelier-cli/src/{runner.rs,main.rs}`.
+
+### H9 — `CancellationToken` + per-tool deadline threaded into `ToolContext`
+
+`ToolContext` gains two new fields: `cancel: tokio_util::sync::CancellationToken` and `deadline: std::time::Duration`. `Dispatcher::dispatch` resolves the per-call deadline (manifest override via the new `Tool::deadline_override()` method, else caller default), then races the tool future inside a `tokio::select!` against `cancel.cancelled()` and `tokio::time::sleep(deadline)`. Two new `ToolError` variants — `Cancelled { tool }` and `Deadline { tool, deadline }` — surface the race outcomes; both pinned in the `tool_error_kind_labels_are_stable` L-D-5 wire-label test and listed under `schemas/session/v1.json:tool_fixtures.error.kind`. `Cancelled` routes to `Recovery::Fail` (don't retry into the same trip), `Deadline` to `Recovery::Retry`. `DEFAULT_TOOL_DEADLINE = 60s`; per-tool override via `tool_manifest.v1.json:deadline_ms` (new optional field, schema-validated, consumed by both `BuiltInToolWrapper` and `McpToolWrapper::new_with_deadline`). Four new tests in `dispatcher::cancellation_tests` pin: deadline expiry within 300ms of a 5s tool with 200ms budget, pre-armed cancel short-circuits, mid-flight cancel aborts a sleeping tool, and `deadline_override` shrinks an over-generous caller default.
+
+### H10 — SIGINT/SIGTERM handler in CLI `main`
+
+`atelier-cli/src/main.rs::run_run` now wires a `tokio_util::sync::CancellationToken` through the new `Runner::with_external_cancel` builder and races `runner.run(prompt)` against `tokio::signal::ctrl_c()` plus (unix only) `signal(SignalKind::terminate())`. On signal: trips the token, awaits the run future so the existing `OnDiskSession::save_to` tail in `Runner::run` persists the partial session, exits 130 (SIGINT) / 143 (SIGTERM) per POSIX. New `atelier_core::session::spawn_with_cancel_token` lets the runner adopt the caller's token instead of minting its own — same `Handle` shape, drop-in for the default `spawn` path. New integration test `crates/atelier-cli/tests/sigint_resume.rs::external_cancel_writes_partial_session_to_disk` cancels mid-run via the external token and asserts the on-disk `session.json` is non-empty and resume-able; `binary_handles_sigint_cleanly_and_exits_130` spawns the actual `atelier` binary, sends `SIGINT`, and asserts a clean exit.
+
+### H11 — Atomic `write_with_sync` in staging
+
+`crates/atelier-core/src/staging.rs::write_with_sync` now writes to a sibling `{path}.atelier-tmp.<pid>.<rand>`, `sync_all`s, renames to the final path, and `fsync_dir_best_effort`s the parent. Pre-v60.29 ordering was create→write→sync (the file existed at the final path zero-length between create and write). New `staging::durability_tests` injects a panic between the tmp-write and the rename via a thread-local hook; asserts the target either does not exist or holds full pre-existing contents — never zero-length. Two further tests pin the happy path: no tmp files leaked on success, and a clean overwrite of an existing target.
+
+### H12 — Hoist canonicalize out of `file_watcher` lock
+
+`crates/atelier-core/src/file_watcher.rs::track()` canonicalises once at the top, then takes the `parking_lot::Mutex` only for the `notify::watch` call and the `read_set.insert`. The notify-worker filter does the same: it canonicalises every pending raw path *before* locking the read-set so 32-way contention against a slow filesystem no longer serialises on the lock. The duplicate canonicalize at lines 99/123 is folded into one call routed through a new `canonicalize_for_track` helper (which carries a `#[cfg(test)]` slowdown hook). New `file_watcher::contention_tests::track_canonicalize_runs_outside_lock` arms 100ms-per-call canonicalize across 32 parallel `track()` invocations and asserts P99 per-call latency stays well below the serialised bound (was ~100ms × N before).
+
+### Bundle gate
+
+`cargo test -p atelier-core --lib -- staging:: file_watcher:: dispatcher::cancellation` and `cargo test -p atelier-cli --test sigint_resume` both green; standing gates `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test -p atelier-core`, `cargo test -p atelier-cli`, and `make check` all green.
+
 ## v60.28 — 2026-05-18 (Secrets & egress hardening; H2–H8 + H16 from `deep_code_scan_v60.27.md`)
 
 File-disjoint bundle of high-severity audit fixes scoped to BYOM adapters, the §15 MCP HTTP/SSE surface, the GUI's `swap_adapter` command, and one §2 schema typo. H1 (rotate the leaked `.envrc` Anthropic key) is an operator action tracked separately. Bundle gate: `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test --workspace`, `make check` — all green.
