@@ -143,6 +143,8 @@ pub fn run() {
             snapshot_mental_model,
             // v61 §14 concurrent-edit modal resolver.
             resolve_concurrent_edit,
+            // v60.10 B2 follow-on — provider swap dropdown.
+            swap_adapter,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -604,6 +606,79 @@ async fn expand_memory_card(
             cache_rewarm_tokens: r.cache_rewarm_tokens,
         })
         .map_err(|e| e.to_string())
+}
+
+/// v60.10 B2 follow-on — wire-format the GUI footer dropdown sends
+/// when the user picks a different provider. `kind` is the stable
+/// adapter family (`"mock"` / `"anthropic"` / `"openai_compat"`);
+/// `model_id` is the `<provider>:<model>` token; `base_url` is
+/// optional and only consulted by the `openai_compat` arm.
+///
+/// The corresponding `Runner::swap_adapter` machinery isn't on this
+/// branch yet — this command is a stub that records the request via
+/// `tracing` and emits a system `MessageCommitted` to the webview so
+/// the round-trip is observable. The full mid-`run()` swap path
+/// lands when the v60.10 B2 bundle merges to main and this stub is
+/// replaced with the real `AdapterHandle::swap` call.
+#[derive(serde::Deserialize, Debug, Clone)]
+pub struct SwapProviderWire {
+    pub kind: String,
+    pub model_id: String,
+    #[serde(default)]
+    pub base_url: Option<String>,
+}
+
+/// v60.10 B2 follow-on — return shape for `swap_adapter`. Mirrors the
+/// minimum the GUI needs to confirm the round-trip; the full
+/// `Event::AdapterSwapped` payload (with `from_model_id` etc.)
+/// lands in a future cycle when the wider B2 bundle merges.
+#[derive(serde::Serialize, Debug, Clone)]
+pub struct SwapResult {
+    pub accepted: bool,
+    pub to_model_id: String,
+    pub kind: String,
+}
+
+#[tauri::command]
+fn swap_adapter(app: AppHandle, provider: SwapProviderWire) -> Result<SwapResult, String> {
+    // Whitelist the known adapter family wire tags so a typo from the
+    // webview surfaces as a typed error rather than a silent no-op.
+    match provider.kind.as_str() {
+        "mock" | "anthropic" | "openai_compat" => {}
+        other => return Err(format!("unknown adapter kind: {other}")),
+    }
+    if provider.model_id.is_empty() {
+        return Err("model_id must be non-empty".to_string());
+    }
+    tracing::info!(
+        kind = %provider.kind,
+        model_id = %provider.model_id,
+        base_url = ?provider.base_url,
+        "swap_adapter request received (stub — full Runner swap lands with v60.10 B2 merge)",
+    );
+    // Surface the swap as a system-role `MessageCommitted` so the
+    // conversation pane records the request. Pre-B2-merge this is the
+    // only feedback the UI gets; once B2 lands the runner will also
+    // emit `Event::AdapterSwapped` + a fresh `Event::ModelProfileLoaded`.
+    let detail = format!(
+        "swap_adapter requested: kind={} model_id={}",
+        provider.kind, provider.model_id,
+    );
+    let bridged = BridgedEvent {
+        kind: "MessageCommitted",
+        payload: json!({
+            "role": "system",
+            "text": detail,
+        }),
+    };
+    if let Err(e) = app.emit("atelier://event", &bridged) {
+        tracing::warn!(error = %e, "swap_adapter: failed to emit feedback event");
+    }
+    Ok(SwapResult {
+        accepted: true,
+        to_model_id: provider.model_id,
+        kind: provider.kind,
+    })
 }
 
 /// Start a mock-scripted run with `AwaitApproval` policy. v47 demo

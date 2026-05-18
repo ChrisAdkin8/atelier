@@ -1075,6 +1075,20 @@ impl Runner {
         let mut final_state = State::Idle;
         let tools_spec = registry_to_tool_specs();
 
+        // v60.8 A2 follow-on — accumulate the observed file changes
+        // across turns so we can feed them into the §7 verify pass at
+        // end-of-run. Each tool dispatch's `EditStaged` events carry
+        // the path + a `Hunks` discriminator that maps cleanly onto
+        // [`atelier_core::verify::ObservedKind`]; we keep the latest
+        // observation per path so repeat-edits collapse to one entry.
+        //
+        // The latest envelope rides alongside so the verify pass has
+        // its `claimed_changes` to compare against. `verify_pass` is
+        // a no-op (badge stays `NotRun`) when both vectors are empty,
+        // which is what `emit_verify_not_run` makes explicit on the bus.
+        let mut observed_changes: Vec<atelier_core::verify::ObservedChange> = Vec::new();
+        let mut last_envelope: Envelope = Envelope::default();
+
         for turn in 0..self.max_turns {
             advance(&session_handle, State::Idle, State::Streaming).await?;
             final_state = State::Streaming;
@@ -1413,6 +1427,32 @@ impl Runner {
                 };
                 for call in real_tool_calls {
                     let outcome = session_dispatcher.dispatch(&call, &ctx, now_rfc3339).await;
+                    // v60.8 A2 follow-on — harvest the per-file
+                    // `EditStaged` events so the §7 verify pass at
+                    // end-of-run has an `ObservedChange` per committed
+                    // path. Map `Hunks::Created`/`Deleted` directly;
+                    // every other variant collapses to `Modified`
+                    // (the staging layer only emits `Same`/`Lines`/
+                    // `Binary` for files that already existed).
+                    for evt in &outcome.events {
+                        if let Event::EditStaged { path, hunks } = evt {
+                            let kind = match hunks {
+                                atelier_core::diff::Hunks::Created { .. } => {
+                                    atelier_core::verify::ObservedKind::Created
+                                }
+                                atelier_core::diff::Hunks::Deleted { .. } => {
+                                    atelier_core::verify::ObservedKind::Deleted
+                                }
+                                _ => atelier_core::verify::ObservedKind::Modified,
+                            };
+                            let path_str = path.to_string_lossy().into_owned();
+                            observed_changes.retain(|o| o.path != path_str);
+                            observed_changes.push(atelier_core::verify::ObservedChange {
+                                path: path_str,
+                                kind,
+                            });
+                        }
+                    }
                     // Feed the tool result back into the next turn's
                     // messages so the adapter sees what happened.
                     // v25.2-F: failure path uses serde_json::json! so an
@@ -1481,6 +1521,12 @@ impl Runner {
                 cards: memory_store.lock().summarise(),
             });
 
+            // v60.8 A2 follow-on — stash the most recent envelope for
+            // the §7 verify pass below. The envelope is small (no
+            // streaming payload, just claims + plan_update) so the
+            // clone per turn is cheap; this stays the simplest seam.
+            last_envelope = envelope.clone();
+
             // 8. If the envelope or scripted response says done, exit.
             if envelope.claimed_done == Some(true) {
                 advance(&session_handle, State::Streaming, State::Verifying).await?;
@@ -1508,6 +1554,26 @@ impl Runner {
 
         // 10. Done — transition to terminal and persist.
         if final_state == State::Verifying {
+            // v60.8 A2 follow-on — exercise the §7 verify pass. When the
+            // run produced either claimed_changes or observed edits,
+            // fire `verify_pass` so the bus carries the Tier 3 textual
+            // outcome and the GUI/TUI verify-pass badge converges off
+            // its `NotRun` default. When neither side has anything to
+            // weigh, the explicit `emit_verify_not_run` keeps the badge
+            // at `NotRun` rather than letting it drift to a prior
+            // turn's tier — both arms emit exactly one
+            // `Event::VerificationPassed` so consumers can rely on
+            // the per-run terminal-marker contract.
+            let has_claims = last_envelope
+                .claimed_changes
+                .as_ref()
+                .map(|c| !c.is_empty())
+                .unwrap_or(false);
+            if has_claims || !observed_changes.is_empty() {
+                let _ = session_dispatcher.verify_pass(&last_envelope, &observed_changes);
+            } else {
+                session_dispatcher.emit_verify_not_run();
+            }
             advance(&session_handle, State::Verifying, State::Done).await?;
             final_state = State::Done;
         }

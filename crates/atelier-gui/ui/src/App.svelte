@@ -167,6 +167,54 @@
     if (row.long_context === 'claimed_but_broken') broken.push('long_context')
     return broken.length === 0 ? null : `broken: ${broken.join(', ')}`
   }
+
+  // v60.10 B2 follow-on — footer provider swap dropdown.
+  //
+  // The list is hard-coded for now: one option per known adapter
+  // family with a representative model id. A future cycle can hydrate
+  // this from `.atelier/providers.toml` (the same source `Runner::new`
+  // consults). The Tauri command surface is `swap_adapter(provider:
+  // SwapProviderWire)`; the dropdown sends `{ kind, model_id }` and
+  // the round-trip is recorded as a system `MessageCommitted` in the
+  // conversation pane until the full B2 bundle (mid-run swap on the
+  // Rust side) merges to main.
+  type SwapOption = { kind: 'mock' | 'anthropic' | 'openai_compat'; model_id: string; label: string }
+  const swapOptions: SwapOption[] = [
+    { kind: 'mock', model_id: 'mock:default', label: 'mock' },
+    { kind: 'anthropic', model_id: 'anthropic:claude-opus-4-7', label: 'anthropic · claude-opus-4-7' },
+    { kind: 'anthropic', model_id: 'anthropic:claude-sonnet-4-6', label: 'anthropic · claude-sonnet-4-6' },
+    {
+      kind: 'openai_compat',
+      model_id: 'local:qwen2.5-coder:7b',
+      label: 'openai-compat · local qwen2.5-coder:7b',
+    },
+  ]
+
+  // Pick the dropdown's selected option from the current model id when
+  // possible; otherwise fall back to the first entry so the `<select>`
+  // never renders a blank state.
+  let selectedSwapIndex = $derived.by(() => {
+    const id = app.currentModel?.modelId
+    if (!id) return 0
+    const idx = swapOptions.findIndex((o) => o.model_id === id)
+    return idx < 0 ? 0 : idx
+  })
+
+  async function onSwapChange(e: Event) {
+    const sel = e.currentTarget as HTMLSelectElement
+    const idx = Number(sel.value)
+    const opt = swapOptions[idx]
+    if (!opt) return
+    try {
+      await invoke('swap_adapter', {
+        provider: { kind: opt.kind, model_id: opt.model_id },
+      })
+    } catch (err) {
+      // Surface failures via console; the system `MessageCommitted`
+      // event the Rust side emits on success is the happy-path feedback.
+      console.warn('swap_adapter failed', err)
+    }
+  }
 </script>
 
 <div class="app">
@@ -235,6 +283,7 @@
           unknownTokens={app.contextTokens.unknown}
           contextWindowTokens={app.contextWindowTokens}
           verificationStatus={app.verificationStatus}
+          lastOverflowResolution={app.lastOverflowResolution}
         />
         <ContextPane items={app.contextItems} />
       </div>
@@ -283,6 +332,21 @@
       {:else}
         <span class="model-pending">no model</span>
       {/if}
+      <!-- v60.10 B2 follow-on — provider swap dropdown. Stub UI;
+           sends `{ kind, model_id }` to the `swap_adapter` Tauri
+           command. The full mid-run swap behaviour lands when the
+           v60.10 B2 bundle merges to main. -->
+      <select
+        class="swap-select"
+        value={String(selectedSwapIndex)}
+        onchange={onSwapChange}
+        title="swap adapter (§1 BYOM)"
+        data-testid="swap-adapter-select"
+      >
+        {#each swapOptions as opt, i (opt.model_id)}
+          <option value={String(i)}>{opt.label}</option>
+        {/each}
+      </select>
     </span>
   </footer>
 
@@ -442,5 +506,18 @@
   .help .model-broken {
     color: var(--accent-yellow, #cc6);
     font-weight: 600;
+  }
+  /* v60.10 B2 follow-on — provider swap dropdown. Minimal styling
+     so the affordance reads as a control without overpowering the
+     model badge text. */
+  .help .swap-select {
+    margin-left: 0.5rem;
+    background: var(--bg-pane-alt);
+    color: var(--fg-default);
+    border: 1px solid var(--border-pane);
+    border-radius: 3px;
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    padding: 0.1rem 0.3rem;
   }
 </style>

@@ -306,6 +306,21 @@ export type AppState = {
   /// tier (and therefore the hallucination coverage level) ran on
   /// the last verify pass. Defaults to `not_run`.
   verificationStatus: VerificationStatus
+  /// v60.9 B1 follow-on — most recent §1 context-overflow resolution.
+  /// Populated by `ContextOverflowResolved`; `null` before any
+  /// overflow has been resolved. `MetersPane` renders a transient
+  /// toast/badge keyed off the `at` timestamp; consumers can compare
+  /// `Date.now() - at` against their own decay window (the pane uses
+  /// ~5s) to fade the toast back out. The reducer never auto-clears
+  /// this field — the badge stays in the DOM but the toast styling
+  /// drops off once the decay window elapses, so a debug surface
+  /// can still inspect the last resolution after the toast fades.
+  lastOverflowResolution: {
+    resolution: string
+    freed_tokens: number | null
+    items_compacted: number | null
+    at: number
+  } | null
 }
 
 export function initialState(): AppState {
@@ -328,6 +343,7 @@ export function initialState(): AppState {
     mentalModel: initialMentalModel(),
     concurrentEditModal: null,
     verificationStatus: initialVerificationStatus(),
+    lastOverflowResolution: null,
   }
 }
 
@@ -487,6 +503,28 @@ export function applyEvent(state: AppState, evt: BridgedEvent): AppState {
         claim_count: p.claim_count ?? 0,
       }
       return { ...state, events, verificationStatus }
+    }
+    case 'ContextOverflowResolved': {
+      // §1 BYOM (v60.9 B1 follow-on) — context-window asymmetry
+      // resolution. Stash the most recent resolution so `MetersPane`
+      // can render a transient toast. `Date.now()` captured here so
+      // the decay window runs against wall-clock; the pane compares it
+      // against its own elapsed-time tick to fade the toast back out.
+      const p = evt.payload as {
+        resolution: string
+        freed_tokens: number | null
+        items_compacted: number | null
+      }
+      return {
+        ...state,
+        events,
+        lastOverflowResolution: {
+          resolution: p.resolution,
+          freed_tokens: p.freed_tokens ?? null,
+          items_compacted: p.items_compacted ?? null,
+          at: Date.now(),
+        },
+      }
     }
     case 'StrategyDegraded': {
       // §1 BYOM — refresh the strategy badge on the model footer.
@@ -698,6 +736,20 @@ export function projectEvent(evt: BridgedEvent): EventLogEntry {
         kind,
         detail: `${verificationTierLabel(tier)} · ${files} files · ${claims} claims`,
       }
+    }
+    case 'ContextOverflowResolved': {
+      const p = evt.payload as {
+        resolution?: string
+        freed_tokens?: number | null
+        items_compacted?: number | null
+      }
+      const resolution = p.resolution ?? '?'
+      const t = p.freed_tokens
+      const n = p.items_compacted
+      if (t != null && n != null) {
+        return { kind, detail: `${resolution} · ${n} items · ${t} tokens` }
+      }
+      return { kind, detail: resolution }
     }
     case 'StrategyDegraded': {
       const p = evt.payload as { from?: string; to?: string; reason?: string }
