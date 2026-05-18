@@ -177,6 +177,15 @@ impl ObservedKind {
     }
 
     fn as_str(self) -> &'static str {
+        self.wire_label()
+    }
+
+    /// Stable wire label for this `ObservedKind`. Mirrors
+    /// [`crate::protocol::ClaimedChangeKind::wire_label`] /
+    /// [`VerificationTier::wire_label`]. Public so cross-crate
+    /// consumers (the GUI bridge, integration tests) don't need to
+    /// re-encode the enum.
+    pub fn wire_label(self) -> &'static str {
         match self {
             Self::Modified => "modified",
             Self::Created => "created",

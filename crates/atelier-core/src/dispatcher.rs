@@ -1372,11 +1372,23 @@ impl SessionDispatcher {
         observed: &[crate::verify::ObservedChange],
     ) -> crate::verify::VerificationRun {
         let run = crate::verify::VerificationRun::tier3_textual(envelope, observed);
-        let _ = self.events.send(Event::VerificationPassed {
-            tier: run.tier,
-            file_count: run.file_count,
-            claim_count: run.claim_count,
-        });
+        // §7 lying-agent / silent-edit gate. Empty discrepancies =>
+        // workspace agrees with the envelope; non-empty => the §7
+        // detector flags the turn. Each verify call emits exactly one
+        // of the two terminal-marker events so consumers can rely on
+        // the per-run contract.
+        if run.discrepancies.is_empty() {
+            let _ = self.events.send(Event::VerificationPassed {
+                tier: run.tier,
+                file_count: run.file_count,
+                claim_count: run.claim_count,
+            });
+        } else {
+            let _ = self.events.send(Event::VerificationFailed {
+                tier: run.tier,
+                discrepancies: run.discrepancies.clone(),
+            });
+        }
         run
     }
 
@@ -3854,8 +3866,12 @@ mod tests {
 
     // ---------- v62: §7 verify-pass tier indicator ----------
 
+    /// Discrepancy case (b.py claimed Create but never observed): the
+    /// §7 lying-agent gate must emit `VerificationFailed`, NOT
+    /// `VerificationPassed`. The Failed variant carries the
+    /// discrepancy list verbatim for downstream consumers.
     #[tokio::test]
-    async fn verify_pass_emits_tier3_event_with_counts() {
+    async fn verify_pass_emits_failed_event_when_discrepancies_present() {
         let (sd, _cm, _ms, _pc, _ledger, mut rx) = build_v55_dispatcher();
         let env = crate::protocol::Envelope {
             claimed_changes: Some(vec![
@@ -3878,12 +3894,54 @@ mod tests {
         }];
 
         let run = sd.verify_pass(&env, &observed);
-        // Producer returns the tier that ran for direct callers.
         assert_eq!(run.tier, crate::verify::VerificationTier::Tier3Textual);
         assert_eq!(run.claim_count, 2);
         assert_eq!(run.file_count, 2); // a.py + b.py
-                                       // b.py claimed Create but unobserved — one Claimed discrepancy.
         assert_eq!(run.discrepancies.len(), 1);
+
+        match next_event(&mut rx).await {
+            Event::VerificationFailed {
+                tier,
+                discrepancies,
+            } => {
+                assert_eq!(tier, crate::verify::VerificationTier::Tier3Textual);
+                assert_eq!(discrepancies.len(), 1);
+                assert!(
+                    matches!(
+                        &discrepancies[0],
+                        crate::verify::Discrepancy::Claimed { path, .. } if path == "b.py"
+                    ),
+                    "expected Claimed{{b.py}}; got {:?}",
+                    discrepancies[0],
+                );
+            }
+            other => panic!("expected VerificationFailed, got {other:?}"),
+        }
+    }
+
+    /// No-discrepancy case (every claim observed, no silent edits):
+    /// the §7 gate emits `VerificationPassed` with file + claim counts.
+    /// Pairs with `verify_pass_emits_failed_event_when_discrepancies_present`
+    /// to pin both arms of the `verify_pass` branch.
+    #[tokio::test]
+    async fn verify_pass_emits_passed_event_when_workspace_agrees() {
+        let (sd, _cm, _ms, _pc, _ledger, mut rx) = build_v55_dispatcher();
+        let env = crate::protocol::Envelope {
+            claimed_changes: Some(vec![crate::protocol::ClaimedChange {
+                path: "a.py".into(),
+                kind: crate::protocol::ClaimedChangeKind::Edit,
+                summary: "tweak fn foo".into(),
+            }]),
+            ..Default::default()
+        };
+        let observed = vec![crate::verify::ObservedChange {
+            path: "a.py".into(),
+            kind: crate::verify::ObservedKind::Modified,
+        }];
+
+        let run = sd.verify_pass(&env, &observed);
+        assert_eq!(run.tier, crate::verify::VerificationTier::Tier3Textual);
+        assert!(run.discrepancies.is_empty());
 
         match next_event(&mut rx).await {
             Event::VerificationPassed {
@@ -3892,8 +3950,8 @@ mod tests {
                 claim_count,
             } => {
                 assert_eq!(tier, crate::verify::VerificationTier::Tier3Textual);
-                assert_eq!(file_count, 2);
-                assert_eq!(claim_count, 2);
+                assert_eq!(file_count, 1);
+                assert_eq!(claim_count, 1);
             }
             other => panic!("expected VerificationPassed, got {other:?}"),
         }

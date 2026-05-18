@@ -1,5 +1,75 @@
 # Atelier Spec — Changelog
 
+## v60.12 — 2026-05-18 (Phase A close: canonical priority subset offline gates + §7 lying-agent E2E)
+
+Phase A's "atelier-core drives canonical priority subset end-to-end via the §2.5 loop" line lands offline against `ProviderChoice::Mock`, and the §7 lying-agent gate (`tasks/todo.md:228`) closes after a real fix in `dispatcher::verify_pass`. Live-API gates (against Anthropic + OpenAI-compat) and the nightly workflow remain for follow-up Track B + Track C. Workspace tests **1018 → 1020** (+1 paired dispatcher unit test for the new branch, +6 new integration tests in atelier-cli, –5 reused slots = +2 net at the suite-level summary).
+
+### A1 — canonical fixture loader
+
+New test-helper module under `crates/atelier-cli/tests/common/` — first Rust consumer of `tests/workload/canonical/`.
+
+- `tests/common/mod.rs` (8 lines) — declares `pub mod canonical` with `#![allow(dead_code)]` so per-integration-test-file unused-warning noise stays quiet.
+- `tests/common/canonical.rs` (~270 lines) — `CanonicalTask::load("t01_…")` reads `meta.json` + `prompt.md` + `checks.json`; resolves the workspace path via `CARGO_MANIFEST_DIR`. Helpers: `copy_fixture_to_tempdir`, `run_checks`, `assert_all_checks_pass`, `python3_pytest_available`. Supports `command` + `exit_code(_ne)` + `stdout/stderr_contains` + `file_unchanged` (the primitives the priority subset uses); `stdout_pattern`/`stderr_pattern` surface as a failing `CheckResult` rather than passing silently (no priority canonical task depends on them today).
+- `run_checks` removes `<workspace>/.atelier/` before running shell-based checks — the Runner writes `.atelier/sessions/<sid>/session.json` (containing the prompt verbatim) during a real run, which trips `grep -r` checks like t02's "no occurrence of `compute_total` remains." The Python rig dodges this with `--dry-run`; the Rust runner is hermetic so it removes the bookkeeping directly. No canonical fixture's expected state includes `.atelier/`, so the cleanup is sound.
+
+### A2 — t01 mock-scripted canonical gate
+
+`mock_drives_t01_canonical_priority_subset_offline_phase_a_gate` in `crates/atelier-cli/tests/run_integration.rs`. Loads `t01_add_pure_function`, scripts one `MockResponse` that writes `utils.py` (the `divisible_by` impl) + `tests/test_utils.py` (four tests) + `mock_envelope_tool_call(envelope_done_claiming_edits(&["utils.py", "tests/test_utils.py"]))`, drives the Runner, asserts `final_state == Done`, asserts `Event::VerificationPassed { tier: Tier3Textual, file_count: 2, .. }` fires, runs all 5 t01 canonical checks (pytest exit 0 + the four `divisible_by(…)` per-call assertions).
+
+Skips cleanly when `python3 -m pytest` is unavailable via the new `python3_pytest_available()` probe (mirrors `mcp_integration.rs::npx_availability_probe`).
+
+### A3 — t02, t05, t06, t10 mock-scripted canonical gates
+
+Four more priority canonical tasks, same shape as A2:
+
+- **t02 `rename_symbol_multi_file`** — nine `write_file` calls in one turn renaming `compute_total` → `compute_grand_total` across `README.md` + 5 `orders/` modules + 3 `tests/` modules. The check `grep -r compute_total` must return non-zero (no match); pytest must still pass.
+- **t05 `fix_bug_from_failing_test`** — patches `format_duration` to handle the `minutes == 0` case (returning `"2h"` not `"2h0m"`). The check `file_unchanged: tests/test_duration.py` mechanically verifies the agent didn't modify the spec.
+- **t06 `add_cli_flag`** — adds `--verbose` to `mycli.py` + new tests in `tests/test_mycli.py`. Both existing-test-passes and new-flag-works are asserted.
+- **t10 `implement_from_spec`** — implements `LRUCache` (OrderedDict-backed, O(1)) against the seven-test spec in `tests/test_lru.py` (which is `file_unchanged`-pinned).
+
+New helper `envelope_done_claiming_edits(&[paths])` mints an honest envelope whose `claimed_changes` cover every modified path as `ClaimedChangeKind::Edit` — the §7 gate's `verify::compare` treats Edit-vs-Modified as agreement, so the loop reaches `VerificationPassed` (rather than `VerificationFailed` for a silent edit, which the lying-agent gate covers separately).
+
+### A4 — §7 lying-agent E2E gate (closes `tasks/todo.md:228`)
+
+Real fix to a latent bug: `dispatcher::verify_pass` previously emitted `Event::VerificationPassed` *regardless* of whether `crate::verify::compare` returned discrepancies — the §7 detector logic existed but its signal never reached the bus. v60.12 wires it.
+
+**Producer-side change** (`crates/atelier-core/src/dispatcher.rs`):
+
+```rust
+if run.discrepancies.is_empty() {
+    let _ = self.events.send(Event::VerificationPassed { tier, file_count, claim_count });
+} else {
+    let _ = self.events.send(Event::VerificationFailed { tier, discrepancies: run.discrepancies.clone() });
+}
+```
+
+**New event variant** (`crates/atelier-core/src/session.rs`): `Event::VerificationFailed { tier, discrepancies: Vec<Discrepancy> }`. The `kind()` arm returns `"VerificationFailed"`.
+
+**Consumer arms**:
+
+- **TUI** (`crates/atelier-tui/src/lib.rs`) — `apply` refreshes `verification_status` with the new tier (so the badge knows verify ran); `project_event` builds a one-line summary `"tier-3 (textual) · 2 discrepancies · a.txt: claimed edit but workspace diff is empty"` for the event log. The red-failed badge variant lands in Phase C.
+- **GUI bridge** (`crates/atelier-gui/src/lib.rs::bridge_event`) — emits a `{"tier": …, "discrepancy_count": N, "discrepancies": [{"kind": "claimed" | "unclaimed" | "kind_mismatch" | "duplicate_claim", "path": …, …}]}` JSON payload to the Svelte side. Wire shape is stable; the GUI badge update lands in Phase C.
+- **`ObservedKind::wire_label`** is now public (previously `as_str` was private), mirroring `VerificationTier::wire_label` and `ClaimedChangeKind::wire_label`, so cross-crate consumers don't need to re-encode the enum.
+
+**End-to-end gate** (`crates/atelier-cli/tests/run_integration.rs`): `mock_lying_agent_fixture_flagged_within_one_turn_phase_a_seven_gate` scripts an envelope claiming `a.txt` while the actual tool call writes `b.txt`. Asserts within one turn: `Event::VerificationFailed { tier: Tier3Textual, discrepancies }` fires, `VerificationPassed` does NOT fire, `discrepancies` carries both `Discrepancy::Claimed { a.txt }` and `Discrepancy::Unclaimed { b.txt }`. Reaches `State::Done` — the §7 gate surfaces the signal but doesn't abort the run (trust budget consumes the discrepancy list downstream).
+
+**Paired unit tests** (`crates/atelier-core/src/dispatcher.rs::tests`) — `verify_pass_emits_failed_event_when_discrepancies_present` + `verify_pass_emits_passed_event_when_workspace_agrees`. Pin both arms of the new branch; replace the previous (buggy) `verify_pass_emits_tier3_event_with_counts` which expected `VerificationPassed` for a discrepancy case.
+
+### A5 — doc updates
+
+- `tasks/todo.md`:228 flipped `[~]` → `[x]` (§7 lying-agent gate closed offline).
+- `tasks/todo.md`:151 / 162 / 174 flipped `[ ]` → `[~]` with offline-landed notes and pointers to the remaining live-API + nightly-CI portions in Track B / C.
+
+### What's *not* in v60.12
+
+Live-API tests against Anthropic + OpenAI-compat (Track B) and the new nightly workflow (Track C `.github/workflows/nightly_phase_a_gate.yml`) are deferred. They need an `ANTHROPIC_API_KEY` secret + maintainer approval for the first run cost. The plan at `/Users/chris.adkin/.claude/plans/fluffy-painting-llama.md` documents them.
+
+The §2 real-model conformance ≥95% gate (`tasks/todo.md:219`) is Phase B work; lands with Track B.
+
+The §7 hallucinating-agent Tier-1 detector (`tasks/todo.md:225, 229`) stays gated on Q3 (LSP auto-install UX). Spec line 132 does not include it under Phase A.
+
+---
+
 ## v60.11 — 2026-05-18 (three-bundle parallel release: §15 wave 2 + polish + B2 recovery)
 
 Three bundles ran in parallel (C1 HTTP/SSE launcher, C2 dispatcher MCP tool registration + resources as §5 context, C3 polish trio). C3 caught an oversight in the v60.10 release: **B2's commit `3209a9e` (mid-session provider swap) was never actually merged into main during v60.10** despite the CHANGELOG claiming it. The orchestrator ran `git merge` for B3 only and skipped B2. v60.11 recovers B2 first, then lands C1+C2+C3 on top. The v60.10 docs entry's B2 claims are now actually deployed. Workspace tests **974 → 1018** (+44, including B2's +6). All gates green.

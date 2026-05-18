@@ -690,6 +690,21 @@ impl AppState {
                     claim_count: u32::try_from(*claim_count).unwrap_or(u32::MAX),
                 };
             }
+            SessionEvent::VerificationFailed { tier, .. } => {
+                // Phase A close (§7 lying-agent gate) — the verify pass
+                // ran but `crate::verify::compare` flagged discrepancies.
+                // Refresh the hint's tier so the badge still reflects
+                // which §7 producer ran; counts default to 0 because
+                // the event carries the discrepancy list rather than
+                // claim/file totals. The red-failed badge variant
+                // lands in Phase C; the discrepancy detail rides
+                // through `project_event` into the event log.
+                self.verification_status = VerificationStatusHint {
+                    tier: *tier,
+                    file_count: 0,
+                    claim_count: 0,
+                };
+            }
             SessionEvent::StrategyDegraded { to, .. } => {
                 // §1 BYOM — refresh the strategy field on the active
                 // model badge so the footer shows the lowered tier.
@@ -984,6 +999,26 @@ pub fn project_event(evt: &SessionEvent) -> EventLine {
             "{} · {file_count} files · {claim_count} claims",
             tier.wire_label()
         ),
+        SessionEvent::VerificationFailed {
+            tier,
+            discrepancies,
+        } => {
+            // Phase A close — one-line event-log summary for the
+            // lying-agent gate. Show the tier + discrepancy count;
+            // the first discrepancy's summary tags the line so the
+            // log skim makes the failure shape obvious without
+            // forcing the user to open a detail pane (Phase C).
+            let head = discrepancies
+                .first()
+                .map(|d| d.summary())
+                .unwrap_or_else(|| "discrepancy".to_string());
+            format!(
+                "{} · {} discrepanc{} · {head}",
+                tier.wire_label(),
+                discrepancies.len(),
+                if discrepancies.len() == 1 { "y" } else { "ies" },
+            )
+        }
         SessionEvent::StrategyDegraded { from, to, reason } => {
             format!("{} → {} ({reason})", from.as_str(), to.as_str())
         }

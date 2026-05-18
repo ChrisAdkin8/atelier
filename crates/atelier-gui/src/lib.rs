@@ -1138,6 +1138,45 @@ pub fn bridge_event(evt: &SessionEvent) -> BridgedEvent {
             "file_count": file_count,
             "claim_count": claim_count,
         }),
+        // Phase A close — §7 lying-agent / silent-edit gate. Discrepancy
+        // list rides as JSON objects keyed by `kind` (`claimed` /
+        // `unclaimed` / `kind_mismatch` / `duplicate_claim`) + payload
+        // fields the Svelte reducer in `state.ts` can switch on. The
+        // red-failed UI badge lands in Phase C; this bridge arm pins
+        // the wire shape so the Svelte side can subscribe today.
+        SessionEvent::VerificationFailed {
+            tier,
+            discrepancies,
+        } => json!({
+            "tier": tier.wire_label(),
+            "discrepancy_count": discrepancies.len(),
+            "discrepancies": discrepancies
+                .iter()
+                .map(|d| match d {
+                    atelier_core::verify::Discrepancy::Claimed { path, claimed } => json!({
+                        "kind": "claimed",
+                        "path": path,
+                        "claimed": claimed.wire_label(),
+                    }),
+                    atelier_core::verify::Discrepancy::Unclaimed { path, observed } => json!({
+                        "kind": "unclaimed",
+                        "path": path,
+                        "observed": observed.wire_label(),
+                    }),
+                    atelier_core::verify::Discrepancy::KindMismatch { path, claimed, observed } => json!({
+                        "kind": "kind_mismatch",
+                        "path": path,
+                        "claimed": claimed.wire_label(),
+                        "observed": observed.wire_label(),
+                    }),
+                    atelier_core::verify::Discrepancy::DuplicateClaim { path, count } => json!({
+                        "kind": "duplicate_claim",
+                        "path": path,
+                        "count": count,
+                    }),
+                })
+                .collect::<Vec<_>>(),
+        }),
         SessionEvent::StrategyDegraded { from, to, reason } => json!({
             // Use the stable `as_str` wire labels (`native_tool` /
             // `json_sentinel` / `regex_prose`) so the Svelte reducer

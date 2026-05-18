@@ -361,6 +361,24 @@ pub enum Event {
         claim_count: usize,
     },
 
+    /// §7 lying-agent / silent-edit gate. Emitted by
+    /// `SessionDispatcher::verify_pass` when `crate::verify::compare`
+    /// returns a non-empty discrepancy list — i.e. the envelope's
+    /// `claimed_changes` don't match the workspace's observed edits.
+    /// Carries the full discrepancy list so consumers (UI red badge,
+    /// trust-budget ledger, post-mortem) don't need to re-run the
+    /// comparison.
+    ///
+    /// The tier mirrors `VerificationPassed` — which §7 producer ran
+    /// (only Tier 3 textual is wired today; Tier 1 LSP + Tier 2
+    /// tree-sitter follow). One verify call emits exactly one of
+    /// `VerificationPassed` / `VerificationFailed`, never both; UIs
+    /// can swap their badge state on either event.
+    VerificationFailed {
+        tier: crate::verify::VerificationTier,
+        discrepancies: Vec<crate::verify::Discrepancy>,
+    },
+
     /// §1 BYOM — conformance-driven degradation fired. The runner's
     /// rolling envelope-parse window crossed the §1/§2 threshold
     /// (PROVISIONAL 3-of-20 default; see
@@ -461,6 +479,7 @@ impl Event {
             Self::FilesChanged { .. } => "FilesChanged",
             Self::FilesChangedAcknowledged { .. } => "FilesChangedAcknowledged",
             Self::VerificationPassed { .. } => "VerificationPassed",
+            Self::VerificationFailed { .. } => "VerificationFailed",
             Self::StrategyDegraded { .. } => "StrategyDegraded",
             Self::ContextOverflowResolved { .. } => "ContextOverflowResolved",
             Self::AdapterSwapped { .. } => "AdapterSwapped",

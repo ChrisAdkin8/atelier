@@ -38,9 +38,41 @@ mod compaction_blob;
 mod runner;
 use runner::{DispatcherHandle, EventSink, MockResponse, ProviderChoice, Runner};
 
+// Phase A close — canonical-fixture loader for the §2.5 priority-subset
+// gates (t01, t02, t05, t06, t10). Mounts the shared `tests/common/`
+// module as a submodule of this integration-test crate.
+mod common;
+
 fn envelope_done() -> Envelope {
     Envelope {
         claimed_done: Some(true),
+        ..Default::default()
+    }
+}
+
+/// Build a `claimed_done` envelope whose `claimed_changes` lists every
+/// path in `edited_paths` as `ClaimedChangeKind::Edit`. The §7 gate's
+/// `verify::compare` treats `Edit` as agreement with an observed
+/// `Modified`, so an honest mock-scripted agent uses this when it
+/// writes to pre-existing files in the canonical fixtures. Without it,
+/// `VerificationFailed { Unclaimed }` fires for every silent write —
+/// which is the correct behaviour for the §7 lying-agent gate but
+/// noise for the canonical priority subset where the agent should be
+/// claiming its work.
+fn envelope_done_claiming_edits(edited_paths: &[&str]) -> Envelope {
+    use atelier_core::protocol::{ClaimedChange, ClaimedChangeKind};
+    Envelope {
+        claimed_done: Some(true),
+        claimed_changes: Some(
+            edited_paths
+                .iter()
+                .map(|p| ClaimedChange {
+                    path: (*p).to_string(),
+                    kind: ClaimedChangeKind::Edit,
+                    summary: format!("edited {p}"),
+                })
+                .collect(),
+        ),
         ..Default::default()
     }
 }
@@ -245,9 +277,25 @@ async fn run_emits_verification_passed_tier3_when_write_file_observed() {
         name: "write_file".into(),
         arguments: serde_json::json!({"path": "verify.txt", "content": "ok"}),
     };
+    // Honest envelope: claims the write as `Create` (the file did not
+    // exist in the fresh workspace, so the §3 staging records
+    // `ObservedKind::Created`; `ClaimedChangeKind::Create` matches it
+    // in `verify::compare`). The dispatcher emits VerificationPassed
+    // — not VerificationFailed, which would fire for an Unclaimed
+    // silent edit or a Create/Edit mismatch.
+    use atelier_core::protocol::{ClaimedChange, ClaimedChangeKind};
+    let honest_envelope = Envelope {
+        claimed_done: Some(true),
+        claimed_changes: Some(vec![ClaimedChange {
+            path: "verify.txt".into(),
+            kind: ClaimedChangeKind::Create,
+            summary: "created verify.txt".into(),
+        }]),
+        ..Default::default()
+    };
     let responses = vec![MockResponse::new(
         "writing then done",
-        vec![write_call, mock_envelope_tool_call(&envelope_done())],
+        vec![write_call, mock_envelope_tool_call(&honest_envelope)],
     )];
 
     let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -283,8 +331,8 @@ async fn run_emits_verification_passed_tier3_when_write_file_observed() {
         "file_count must reflect the one observed write"
     );
     assert_eq!(
-        verify.2, 0,
-        "claim_count must be 0 — the scripted envelope has no claimed_changes"
+        verify.2, 1,
+        "claim_count must be 1 — the honest envelope claims the verify.txt write"
     );
 }
 
@@ -2590,5 +2638,1074 @@ async fn swap_adapter_clears_few_shot_cache() {
         matches!(history[0].role, atelier_core::adapter::Role::User),
         "expected user turn at history[0], not a stale few-shot prefix; got {:?}",
         history[0],
+    );
+}
+
+// ---------------------------------------------------------------------
+// Phase A close — canonical-fixture loader smoke test (A1).
+//
+// Pins the shape of `common::canonical::CanonicalTask::load(...)` so a
+// later change to the loader, the meta/checks JSON schema, or the
+// fixture layout breaks loudly on the first `cargo test` rather than
+// midway through a t01 mock-scripted run.
+// ---------------------------------------------------------------------
+
+#[test]
+fn canonical_loader_reads_t01_priority_fixture() {
+    let task = common::canonical::CanonicalTask::load("t01_add_pure_function")
+        .expect("t01 fixture must load — check tests/workload/canonical/t01_add_pure_function");
+
+    assert_eq!(task.task_id, "t01_add_pure_function");
+    assert!(task.meta.priority, "t01 is a priority canonical task");
+    assert_eq!(task.meta.turn_cap, 20);
+    assert!(
+        !task.prompt.trim().is_empty(),
+        "prompt.md must carry the task description",
+    );
+    assert!(task.fixture_dir.is_dir(), "fixture/ must exist on disk");
+    assert!(
+        task.fixture_dir.join("utils.py").is_file(),
+        "t01's starting fixture seeds utils.py",
+    );
+
+    // checks.json carries the pytest gate plus per-call assertions for
+    // divisible_by; the loader must surface them as CheckSpec entries.
+    assert!(
+        task.checks.len() >= 2,
+        "expected at least the pytest gate + a divisible_by assertion, got {} checks",
+        task.checks.len(),
+    );
+    let pytest_check = task
+        .checks
+        .iter()
+        .find(|c| {
+            c.command
+                .as_deref()
+                .map(|s| s.contains("pytest"))
+                .unwrap_or(false)
+        })
+        .expect("t01 must include the pytest exit-code check");
+    assert_eq!(
+        pytest_check.expect.as_ref().and_then(|e| e.exit_code),
+        Some(0),
+        "pytest check expects exit 0",
+    );
+}
+
+// ---------------------------------------------------------------------
+// Phase A close — t01 mock-scripted canonical gate (A2).
+//
+// First half of the spec line:
+//   "atelier-core drives canonical priority subset end-to-end
+//    via the §2.5 loop"
+// (`coding-harness-spec.md` Phased build plan, mirrored at
+// `tasks/todo.md:151`). One Mock-scripted turn writes the
+// `divisible_by` implementation + four tests; the dispatcher commits
+// both files atomically; the §2.5 loop reaches Verifying; the §7
+// tier-3 textual gate fires; pytest validates the fixture state.
+//
+// Offline / hermetic: no live model call, no network, no rig
+// involvement. CI must install pytest for this to run (skipped
+// cleanly when absent locally — see `python3_pytest_available`).
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn mock_drives_t01_canonical_priority_subset_offline_phase_a_gate() {
+    use atelier_core::verify::VerificationTier;
+
+    let task = common::canonical::CanonicalTask::load("t01_add_pure_function")
+        .expect("t01 fixture must load");
+
+    if !common::canonical::python3_pytest_available() {
+        eprintln!(
+            "skipping mock_drives_t01_canonical_priority_subset_offline_phase_a_gate: \
+             `python3 -m pytest --version` did not succeed. Install rig deps \
+             (`pip install \".[rig]\"`) or run `make install-rig`.",
+        );
+        return;
+    }
+
+    let workspace = task
+        .copy_fixture_to_tempdir()
+        .expect("fixture tempdir copy");
+
+    // Single-turn agent solution. The §2.5 loop sees both writes plus
+    // the harness_meta envelope in the same turn; the dispatcher
+    // commits the two writes atomically before Verifying runs.
+    let utils_py = r#""""Utility functions."""
+
+
+def divisible_by(n: int, m: int) -> bool:
+    """Return True iff n is divisible by m. Raise ValueError when m is 0."""
+    if m == 0:
+        raise ValueError("m must be non-zero")
+    return n % m == 0
+"#;
+
+    let test_utils_py = r#""""Tests for divisible_by."""
+import pytest
+
+from utils import divisible_by
+
+
+def test_six_two_true():
+    assert divisible_by(6, 2) is True
+
+
+def test_seven_two_false():
+    assert divisible_by(7, 2) is False
+
+
+def test_zero_five_true():
+    assert divisible_by(0, 5) is True
+
+
+def test_five_zero_raises():
+    with pytest.raises(ValueError):
+        divisible_by(5, 0)
+"#;
+
+    let write_utils = ToolCallRequest {
+        id: "tc-t01-utils".into(),
+        name: "write_file".into(),
+        arguments: serde_json::json!({"path": "utils.py", "content": utils_py}),
+    };
+    let write_tests = ToolCallRequest {
+        id: "tc-t01-tests".into(),
+        name: "write_file".into(),
+        arguments: serde_json::json!({"path": "tests/test_utils.py", "content": test_utils_py}),
+    };
+
+    let responses = vec![MockResponse::new(
+        "implementing divisible_by + tests",
+        vec![
+            write_utils,
+            write_tests,
+            mock_envelope_tool_call(&envelope_done_claiming_edits(&[
+                "utils.py",
+                "tests/test_utils.py",
+            ])),
+        ],
+    )];
+
+    let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let runner = Runner::new(
+        workspace.path().to_path_buf(),
+        ProviderChoice::Mock { responses },
+        EventSink::Capture(events.clone()),
+    )
+    .expect("mock runner construction is infallible")
+    .with_max_turns(task.meta.turn_cap);
+
+    let report = runner.run(task.prompt.clone()).await.unwrap();
+
+    assert_eq!(report.final_state, State::Done, "must reach Done");
+    assert!(
+        report.turns <= task.meta.turn_cap,
+        "turns {} must respect turn_cap {}",
+        report.turns,
+        task.meta.turn_cap,
+    );
+
+    // §7 tier-3 textual gate ran against the observed writes.
+    let captured = events.lock();
+    let verify = captured
+        .iter()
+        .find_map(|e| match e {
+            Event::VerificationPassed {
+                tier, file_count, ..
+            } => Some((*tier, *file_count)),
+            _ => None,
+        })
+        .expect("VerificationPassed must be emitted before Done");
+    assert_eq!(verify.0, VerificationTier::Tier3Textual);
+    assert_eq!(
+        verify.1, 2,
+        "expected two writes observed (utils.py + tests/test_utils.py); got {}",
+        verify.1,
+    );
+    drop(captured);
+
+    // Now the canonical checks against the post-run workspace —
+    // this is the moment of truth: did the §2.5 loop produce a
+    // fixture state that satisfies the rig's gate?
+    let results = common::canonical::run_checks(&task, workspace.path());
+    common::canonical::assert_all_checks_pass(&results);
+}
+
+// ---------------------------------------------------------------------
+// Phase A close — t02 mock-scripted canonical gate (A3, part 1/4).
+//
+// Renames `compute_total` to `compute_grand_total` across nine files in
+// one scripted turn. Exercises:
+//   - multi-file dispatcher write (9 `write_file` calls in one turn)
+//   - atomic per-turn commit with the in-progress diff stream
+//   - grep-based "no occurrence remains" check from checks.json
+//
+// 9 writes vs the §3 ten-file rename gate's 10: the canonical task is
+// a real-world subset of that mechanical gate, not a duplicate.
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn mock_drives_t02_canonical_rename_priority_subset_offline_phase_a_gate() {
+    use atelier_core::verify::VerificationTier;
+
+    let task = common::canonical::CanonicalTask::load("t02_rename_symbol_multi_file")
+        .expect("t02 fixture must load");
+
+    if !common::canonical::python3_pytest_available() {
+        eprintln!("skipping t02: python3/pytest unavailable");
+        return;
+    }
+
+    let workspace = task
+        .copy_fixture_to_tempdir()
+        .expect("fixture tempdir copy");
+
+    // Each (path, content) pair is one write_file call. The renames
+    // cover the function definition, every import + call site, the
+    // tests, and the README.
+    let writes: &[(&str, &str)] = &[
+        (
+            "README.md",
+            "# Orders package\n\nA minimal ordering module. The central function is `compute_grand_total(items)`, which sums `price * qty` across line items. Downstream helpers:\n\n- `checkout(items, payment_method)` — wraps `compute_grand_total` and records the payment method.\n- `apply_discount(items, discount_pct)` — applies a percentage discount to `compute_grand_total`.\n- `render_receipt(items)` — text output including `compute_grand_total`.\n- `order_summary(items)` — dict containing `compute_grand_total` and item count.\n",
+        ),
+        (
+            "orders/cart.py",
+            "\"\"\"Cart total computation.\"\"\"\n\n\ndef compute_grand_total(items):\n    \"\"\"Return the sum of price * qty for each item.\"\"\"\n    return sum(item.get(\"price\", 0) * item.get(\"qty\", 1) for item in items)\n",
+        ),
+        (
+            "orders/checkout.py",
+            "from orders.cart import compute_grand_total\n\n\ndef checkout(items, payment_method):\n    total = compute_grand_total(items)\n    return {\"total\": total, \"paid_via\": payment_method}\n",
+        ),
+        (
+            "orders/api.py",
+            "from orders.cart import compute_grand_total\n\n\ndef order_summary(items):\n    return {\"total\": compute_grand_total(items), \"count\": len(items)}\n",
+        ),
+        (
+            "orders/discount.py",
+            "from orders.cart import compute_grand_total\n\n\ndef apply_discount(items, discount_pct):\n    base = compute_grand_total(items)\n    return base * (1 - discount_pct / 100)\n",
+        ),
+        (
+            "orders/receipt.py",
+            "from orders.cart import compute_grand_total\n\n\ndef render_receipt(items):\n    total = compute_grand_total(items)\n    lines = [f\"{item['name']}: {item.get('price', 0)}\" for item in items]\n    lines.append(f\"Total: {total}\")\n    return \"\\n\".join(lines)\n",
+        ),
+        (
+            "tests/test_cart.py",
+            "from orders.cart import compute_grand_total\n\n\ndef test_compute_grand_total_empty():\n    assert compute_grand_total([]) == 0\n\n\ndef test_compute_grand_total_single():\n    assert compute_grand_total([{\"price\": 5, \"qty\": 2}]) == 10\n\n\ndef test_compute_grand_total_multi():\n    items = [{\"price\": 3, \"qty\": 2}, {\"price\": 4, \"qty\": 1}]\n    assert compute_grand_total(items) == 10\n",
+        ),
+        (
+            "tests/test_checkout.py",
+            "from orders.cart import compute_grand_total\nfrom orders.checkout import checkout\n\n\ndef test_checkout_total_matches_cart():\n    items = [{\"price\": 3, \"qty\": 1}]\n    result = checkout(items, \"card\")\n    assert result[\"total\"] == compute_grand_total(items)\n\n\ndef test_checkout_payment_method_recorded():\n    result = checkout([{\"price\": 1, \"qty\": 1}], \"cash\")\n    assert result[\"paid_via\"] == \"cash\"\n",
+        ),
+        (
+            "tests/test_integration.py",
+            "from orders.cart import compute_grand_total\nfrom orders.checkout import checkout\nfrom orders.discount import apply_discount\n\n\ndef test_full_flow():\n    items = [{\"price\": 10, \"qty\": 2}]\n    total = compute_grand_total(items)\n    assert total == 20\n    discounted = apply_discount(items, 10)\n    assert discounted == 18\n    result = checkout(items, \"cash\")\n    assert result[\"total\"] == 20\n",
+        ),
+    ];
+
+    let claimed_paths: Vec<&str> = writes.iter().map(|(p, _)| *p).collect();
+    let mut tool_calls: Vec<ToolCallRequest> = writes
+        .iter()
+        .enumerate()
+        .map(|(i, (path, content))| ToolCallRequest {
+            id: format!("tc-t02-{i:02}"),
+            name: "write_file".into(),
+            arguments: serde_json::json!({"path": path, "content": content}),
+        })
+        .collect();
+    tool_calls.push(mock_envelope_tool_call(&envelope_done_claiming_edits(
+        &claimed_paths,
+    )));
+
+    let responses = vec![MockResponse::new(
+        "renaming compute_total across 9 files",
+        tool_calls,
+    )];
+
+    let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let runner = Runner::new(
+        workspace.path().to_path_buf(),
+        ProviderChoice::Mock { responses },
+        EventSink::Capture(events.clone()),
+    )
+    .expect("mock runner construction is infallible")
+    .with_max_turns(task.meta.turn_cap);
+
+    let report = runner.run(task.prompt.clone()).await.unwrap();
+    assert_eq!(report.final_state, State::Done);
+
+    let captured = events.lock();
+    let verify_fired = captured.iter().any(|e| {
+        matches!(e, Event::VerificationPassed { tier, .. } if *tier == VerificationTier::Tier3Textual)
+    });
+    assert!(
+        verify_fired,
+        "VerificationPassed tier-3 must fire before Done"
+    );
+    drop(captured);
+
+    let results = common::canonical::run_checks(&task, workspace.path());
+    common::canonical::assert_all_checks_pass(&results);
+}
+
+// ---------------------------------------------------------------------
+// Phase A close — t05 mock-scripted canonical gate (A3, part 2/4).
+//
+// Fixes a `format_duration` bug (returns "2h0m" instead of "2h" when
+// minutes == 0) without touching the test file. The `file_unchanged`
+// check from checks.json validates that constraint mechanically.
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn mock_drives_t05_canonical_bug_fix_priority_subset_offline_phase_a_gate() {
+    use atelier_core::verify::VerificationTier;
+
+    let task = common::canonical::CanonicalTask::load("t05_fix_bug_from_failing_test")
+        .expect("t05 fixture must load");
+
+    if !common::canonical::python3_pytest_available() {
+        eprintln!("skipping t05: python3/pytest unavailable");
+        return;
+    }
+
+    let workspace = task
+        .copy_fixture_to_tempdir()
+        .expect("fixture tempdir copy");
+
+    // The bug: hours > 0 with minutes == 0 returns "Xh0m" but the
+    // spec demands "Xh". Fix is one branch.
+    let duration_py = r#""""Format an integer number of seconds as a human-readable duration."""
+
+
+def format_duration(seconds):
+    """Format `seconds` as 'XhYm', 'Xm', or 'Xh' depending on magnitude.
+
+    Examples:
+      format_duration(0)      -> "0m"
+      format_duration(1500)   -> "25m"
+      format_duration(7200)   -> "2h"
+      format_duration(5400)   -> "1h30m"
+    """
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    if hours == 0:
+        return f"{minutes}m"
+    if minutes == 0:
+        return f"{hours}h"
+    return f"{hours}h{minutes}m"
+"#;
+
+    let write_duration = ToolCallRequest {
+        id: "tc-t05-duration".into(),
+        name: "write_file".into(),
+        arguments: serde_json::json!({"path": "duration.py", "content": duration_py}),
+    };
+
+    let responses = vec![MockResponse::new(
+        "patching format_duration for the minutes==0 case",
+        vec![
+            write_duration,
+            mock_envelope_tool_call(&envelope_done_claiming_edits(&["duration.py"])),
+        ],
+    )];
+
+    let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let runner = Runner::new(
+        workspace.path().to_path_buf(),
+        ProviderChoice::Mock { responses },
+        EventSink::Capture(events.clone()),
+    )
+    .expect("mock runner construction is infallible")
+    .with_max_turns(task.meta.turn_cap);
+
+    let report = runner.run(task.prompt.clone()).await.unwrap();
+    assert_eq!(report.final_state, State::Done);
+
+    let captured = events.lock();
+    let verify_fired = captured.iter().any(|e| {
+        matches!(e, Event::VerificationPassed { tier, .. } if *tier == VerificationTier::Tier3Textual)
+    });
+    assert!(
+        verify_fired,
+        "VerificationPassed tier-3 must fire before Done"
+    );
+    drop(captured);
+
+    let results = common::canonical::run_checks(&task, workspace.path());
+    common::canonical::assert_all_checks_pass(&results);
+}
+
+// ---------------------------------------------------------------------
+// Phase A close — t06 mock-scripted canonical gate (A3, part 3/4).
+//
+// Adds the `--verbose` flag to mycli.py and adds tests in
+// tests/test_mycli.py. Two-file write; existing tests must still pass.
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn mock_drives_t06_canonical_cli_flag_priority_subset_offline_phase_a_gate() {
+    use atelier_core::verify::VerificationTier;
+
+    let task =
+        common::canonical::CanonicalTask::load("t06_add_cli_flag").expect("t06 fixture must load");
+
+    if !common::canonical::python3_pytest_available() {
+        eprintln!("skipping t06: python3/pytest unavailable");
+        return;
+    }
+
+    let workspace = task
+        .copy_fixture_to_tempdir()
+        .expect("fixture tempdir copy");
+
+    let mycli_py = r#""""Tiny demo CLI."""
+import argparse
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(prog="mycli")
+    parser.add_argument("name", help="Name to greet")
+    parser.add_argument("--greeting", default="Hello", help="Greeting word")
+    parser.add_argument("--verbose", action="store_true", help="Prefix output with [VERBOSE] ")
+    return parser
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    out = f"{args.greeting}, {args.name}!"
+    if args.verbose:
+        return f"[VERBOSE] {out}"
+    return out
+
+
+if __name__ == "__main__":
+    print(main())
+"#;
+
+    let test_mycli_py = r#"from mycli import main, build_parser
+
+
+def test_default_greeting():
+    assert main(["World"]) == "Hello, World!"
+
+
+def test_custom_greeting():
+    assert main(["--greeting", "Hi", "Bob"]) == "Hi, Bob!"
+
+
+def test_help_contains_name():
+    help_text = build_parser().format_help()
+    assert "name" in help_text
+
+
+def test_verbose_flag_prefixes_output():
+    assert main(["--verbose", "World"]) == "[VERBOSE] Hello, World!"
+
+
+def test_help_advertises_verbose():
+    assert "--verbose" in build_parser().format_help()
+"#;
+
+    let responses = vec![MockResponse::new(
+        "adding --verbose flag + tests",
+        vec![
+            ToolCallRequest {
+                id: "tc-t06-mycli".into(),
+                name: "write_file".into(),
+                arguments: serde_json::json!({"path": "mycli.py", "content": mycli_py}),
+            },
+            ToolCallRequest {
+                id: "tc-t06-test".into(),
+                name: "write_file".into(),
+                arguments: serde_json::json!({"path": "tests/test_mycli.py", "content": test_mycli_py}),
+            },
+            mock_envelope_tool_call(&envelope_done_claiming_edits(&[
+                "mycli.py",
+                "tests/test_mycli.py",
+            ])),
+        ],
+    )];
+
+    let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let runner = Runner::new(
+        workspace.path().to_path_buf(),
+        ProviderChoice::Mock { responses },
+        EventSink::Capture(events.clone()),
+    )
+    .expect("mock runner construction is infallible")
+    .with_max_turns(task.meta.turn_cap);
+
+    let report = runner.run(task.prompt.clone()).await.unwrap();
+    assert_eq!(report.final_state, State::Done);
+
+    let captured = events.lock();
+    let verify_fired = captured.iter().any(|e| {
+        matches!(e, Event::VerificationPassed { tier, .. } if *tier == VerificationTier::Tier3Textual)
+    });
+    assert!(
+        verify_fired,
+        "VerificationPassed tier-3 must fire before Done"
+    );
+    drop(captured);
+
+    let results = common::canonical::run_checks(&task, workspace.path());
+    common::canonical::assert_all_checks_pass(&results);
+}
+
+// ---------------------------------------------------------------------
+// Phase A close — t10 mock-scripted canonical gate (A3, part 4/4).
+//
+// Implements LRUCache against the seven-test spec in tests/test_lru.py.
+// Pre-existing test file is `file_unchanged`-pinned; the agent only
+// writes lru.py.
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn mock_drives_t10_canonical_lru_priority_subset_offline_phase_a_gate() {
+    use atelier_core::verify::VerificationTier;
+
+    let task = common::canonical::CanonicalTask::load("t10_implement_from_spec")
+        .expect("t10 fixture must load");
+
+    if !common::canonical::python3_pytest_available() {
+        eprintln!("skipping t10: python3/pytest unavailable");
+        return;
+    }
+
+    let workspace = task
+        .copy_fixture_to_tempdir()
+        .expect("fixture tempdir copy");
+
+    let lru_py = r#""""LRU cache implementation."""
+from collections import OrderedDict
+
+
+class LRUCache:
+    def __init__(self, capacity):
+        if capacity <= 0:
+            raise ValueError("capacity must be a positive integer")
+        self._capacity = capacity
+        self._store: "OrderedDict" = OrderedDict()
+
+    def get(self, key):
+        if key not in self._store:
+            return None
+        self._store.move_to_end(key)
+        return self._store[key]
+
+    def put(self, key, value):
+        if key in self._store:
+            self._store.move_to_end(key)
+            self._store[key] = value
+            return
+        if len(self._store) >= self._capacity:
+            self._store.popitem(last=False)
+        self._store[key] = value
+"#;
+
+    let responses = vec![MockResponse::new(
+        "implementing LRUCache against the test spec",
+        vec![
+            ToolCallRequest {
+                id: "tc-t10-lru".into(),
+                name: "write_file".into(),
+                arguments: serde_json::json!({"path": "lru.py", "content": lru_py}),
+            },
+            mock_envelope_tool_call(&envelope_done_claiming_edits(&["lru.py"])),
+        ],
+    )];
+
+    let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let runner = Runner::new(
+        workspace.path().to_path_buf(),
+        ProviderChoice::Mock { responses },
+        EventSink::Capture(events.clone()),
+    )
+    .expect("mock runner construction is infallible")
+    .with_max_turns(task.meta.turn_cap);
+
+    let report = runner.run(task.prompt.clone()).await.unwrap();
+    assert_eq!(report.final_state, State::Done);
+
+    let captured = events.lock();
+    let verify_fired = captured.iter().any(|e| {
+        matches!(e, Event::VerificationPassed { tier, .. } if *tier == VerificationTier::Tier3Textual)
+    });
+    assert!(
+        verify_fired,
+        "VerificationPassed tier-3 must fire before Done"
+    );
+    drop(captured);
+
+    let results = common::canonical::run_checks(&task, workspace.path());
+    common::canonical::assert_all_checks_pass(&results);
+}
+
+// ---------------------------------------------------------------------
+// Phase A close — §7 lying-agent gate (A4).
+//
+// Scripts an envelope that claims `a.txt` was edited while the actual
+// `write_file` tool call writes to `b.txt`. The §7 detector
+// (`verify::compare`) flags both the claim (no observed change at
+// a.txt) and the silent edit (b.txt observed without a matching
+// claim) within the single turn. `dispatcher::verify_pass` is
+// expected to emit `Event::VerificationFailed` rather than
+// `Event::VerificationPassed`, carrying the discrepancy list verbatim
+// for downstream consumers.
+//
+// This closes `tasks/todo.md:228` — the §7 mechanical gate that's
+// been blocked since v62 wired Tier 3 textual but kept `verify_pass`
+// silent on the failure path.
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn mock_lying_agent_fixture_flagged_within_one_turn_phase_a_seven_gate() {
+    use atelier_core::verify::{Discrepancy, VerificationTier};
+
+    let workspace = tempfile::TempDir::new().unwrap();
+
+    // The "lying" agent: claims a.txt while writing b.txt.
+    let write_b = ToolCallRequest {
+        id: "tc-lie-1".into(),
+        name: "write_file".into(),
+        arguments: serde_json::json!({"path": "b.txt", "content": "silently written"}),
+    };
+    let lying_envelope = envelope_done_claiming_edits(&["a.txt"]);
+
+    let responses = vec![MockResponse::new(
+        "claiming a.txt but writing b.txt — lying-agent fixture",
+        vec![write_b, mock_envelope_tool_call(&lying_envelope)],
+    )];
+
+    let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let runner = Runner::new(
+        workspace.path().to_path_buf(),
+        ProviderChoice::Mock { responses },
+        EventSink::Capture(events.clone()),
+    )
+    .expect("mock runner construction is infallible")
+    .with_max_turns(2);
+
+    let report = runner.run("write a.txt".into()).await.unwrap();
+    // The lying-agent gate does not abort the run — the §7 detector's
+    // job is to surface the signal so trust budget + UI can act.
+    // Reaching `Done` while emitting `VerificationFailed` is the
+    // expected shape.
+    assert_eq!(report.final_state, State::Done);
+    assert_eq!(report.turns, 1, "detector must fire on the very first turn");
+
+    let captured = events.lock();
+
+    // VerificationFailed (not VerificationPassed) is the terminal
+    // verify-marker for this turn.
+    let failed = captured
+        .iter()
+        .find_map(|e| match e {
+            Event::VerificationFailed {
+                tier,
+                discrepancies,
+            } => Some((*tier, discrepancies.clone())),
+            _ => None,
+        })
+        .expect("VerificationFailed must fire when claim/observation disagree");
+
+    let no_passed = !captured
+        .iter()
+        .any(|e| matches!(e, Event::VerificationPassed { .. }));
+    assert!(
+        no_passed,
+        "VerificationPassed must NOT fire alongside Failed — one per turn",
+    );
+
+    assert_eq!(failed.0, VerificationTier::Tier3Textual);
+
+    // Both shapes must be present: the orphan claim AND the silent edit.
+    let saw_claimed_a = failed
+        .1
+        .iter()
+        .any(|d| matches!(d, Discrepancy::Claimed { path, .. } if path == "a.txt"));
+    let saw_unclaimed_b = failed
+        .1
+        .iter()
+        .any(|d| matches!(d, Discrepancy::Unclaimed { path, .. } if path == "b.txt"));
+    assert!(
+        saw_claimed_a,
+        "expected Discrepancy::Claimed for a.txt; got {:?}",
+        failed.1,
+    );
+    assert!(
+        saw_unclaimed_b,
+        "expected Discrepancy::Unclaimed for b.txt; got {:?}",
+        failed.1,
+    );
+}
+
+#[test]
+fn canonical_loader_copies_fixture_to_isolated_tempdir() {
+    let task = common::canonical::CanonicalTask::load("t01_add_pure_function").unwrap();
+    let td = task.copy_fixture_to_tempdir().expect("tempdir copy");
+
+    // Bytes-equal copy: the same path inside the tempdir must carry
+    // identical content to the on-disk fixture. Confirms the recursive
+    // copy threaded through to the leaf.
+    let original = std::fs::read(task.fixture_dir.join("utils.py")).unwrap();
+    let copied = std::fs::read(td.path().join("utils.py")).unwrap();
+    assert_eq!(original, copied, "fixture copy must be byte-equal");
+
+    // The tempdir is *not* the same path as the fixture — hermeticity
+    // requires the runner edit a sandbox copy.
+    assert_ne!(
+        td.path().canonicalize().ok(),
+        task.fixture_dir.canonicalize().ok(),
+        "tempdir must be a distinct directory, not the fixture itself",
+    );
+}
+
+// =====================================================================
+// Phase A close — Track B: live-API canonical gates (`#[ignore]`-gated).
+//
+// Closes the live half of `tasks/todo.md:151, 162, 174` and the §2
+// real-model conformance gate at `tasks/todo.md:219`. The five
+// priority canonical tasks (t01, t02, t05, t06, t10) run end-to-end
+// against real models; the agent (not a Mock script) decides the
+// tool-call sequence. Each test is `#[ignore]`'d so the default
+// `cargo test` run stays offline; the nightly workflow (Track C)
+// invokes them via `--ignored`.
+//
+// Skip discipline: each test calls a `skip_unless_…` helper that
+// inspects the relevant env var (`ANTHROPIC_API_KEY` for B1,
+// `OPENAI_API_KEY` or `ATELIER_LOCAL_LLM_URL` for B2). When absent,
+// the test prints a clear `eprintln!` and early-returns (Ok). This
+// mirrors the `mcp_integration.rs:77-92` `npx_availability_probe`
+// pattern so a maintainer running locally without keys never sees a
+// hard failure for a missing prerequisite.
+//
+// Cost note: Haiku 4.5 at the priority subset is ~$0.10–0.50 per
+// full sweep (B3). Per-task tests are <$0.10 each.
+// =====================================================================
+
+/// Read `ANTHROPIC_API_KEY` from env. `None` triggers a clean skip;
+/// the empty string is treated as unset (matching `from_env`'s
+/// semantics for the `Auth` error surface).
+fn skip_unless_anthropic_key_present(test_name: &str) -> Option<String> {
+    match std::env::var("ANTHROPIC_API_KEY") {
+        Ok(k) if !k.is_empty() => Some(k),
+        _ => {
+            eprintln!(
+                "skipping {test_name}: ANTHROPIC_API_KEY not set. Set the env-var \
+                 to run the live-API canonical gate (≈$0.05–0.10 per task on \
+                 anthropic:claude-haiku-4-5).",
+            );
+            None
+        }
+    }
+}
+
+/// Resolves a runnable `ProviderChoice::OpenAiCompat` from env. Returns
+/// `None` (and skips the test) when neither path is configured.
+///
+/// Precedence:
+/// 1. `ATELIER_LOCAL_LLM_URL` set → local server. `OPENAI_API_KEY` is
+///    optional (most local servers don't authenticate). `ATELIER_LOCAL_MODEL_ID`
+///    overrides the default `local:qwen2.5-coder:7b`.
+/// 2. `OPENAI_API_KEY` set (without local URL) → hosted OpenAI on
+///    `openai:gpt-4o-mini` (cheapest capable cloud option).
+/// 3. Neither → skip.
+fn skip_unless_openai_compat_runnable(test_name: &str) -> Option<(String, String, Option<String>)> {
+    let key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
+    let base_url = std::env::var("ATELIER_LOCAL_LLM_URL").ok();
+    match (base_url, !key.is_empty()) {
+        (Some(url), _) => {
+            let model_id = std::env::var("ATELIER_LOCAL_MODEL_ID")
+                .unwrap_or_else(|_| "local:qwen2.5-coder:7b".into());
+            Some((key, model_id, Some(url)))
+        }
+        (None, true) => Some((key, "openai:gpt-4o-mini".into(), None)),
+        (None, false) => {
+            eprintln!(
+                "skipping {test_name}: neither ATELIER_LOCAL_LLM_URL nor \
+                 OPENAI_API_KEY is set. Set one to run the live-API canonical \
+                 gate against the OpenAI-compat protocol.",
+            );
+            None
+        }
+    }
+}
+
+/// Shared body: load a canonical task, drive the named ProviderChoice
+/// against it, and assert the rig's checks pass. Centralises the
+/// pytest probe + tempdir + Runner shape so each live test is a
+/// 3-line wrapper.
+async fn drive_live_canonical_task(task_dir_name: &str, provider: ProviderChoice, test_name: &str) {
+    let task = match common::canonical::CanonicalTask::load(task_dir_name) {
+        Ok(t) => t,
+        Err(e) => panic!("load {task_dir_name}: {e}"),
+    };
+    if !common::canonical::python3_pytest_available() {
+        eprintln!("skipping {test_name}: python3/pytest unavailable");
+        return;
+    }
+    let workspace = task
+        .copy_fixture_to_tempdir()
+        .expect("fixture tempdir copy");
+
+    let runner = Runner::new(workspace.path().to_path_buf(), provider, EventSink::Null)
+        .expect("live runner construction")
+        .with_max_turns(task.meta.turn_cap);
+
+    let report = runner
+        .run(task.prompt.clone())
+        .await
+        .expect("live run completed");
+    assert_eq!(report.final_state, State::Done, "must reach Done");
+    assert!(
+        report.turns <= task.meta.turn_cap,
+        "{test_name}: turns {} exceeds turn_cap {}",
+        report.turns,
+        task.meta.turn_cap,
+    );
+
+    let results = common::canonical::run_checks(&task, workspace.path());
+    common::canonical::assert_all_checks_pass(&results);
+}
+
+// ----- B1 — Anthropic live tests (one per priority canonical task) -----
+
+#[tokio::test]
+#[ignore = "live API; needs ANTHROPIC_API_KEY"]
+async fn phase_a_live_anthropic_t01_add_pure_function() {
+    let key = match skip_unless_anthropic_key_present("phase_a_live_anthropic_t01") {
+        Some(k) => k,
+        None => return,
+    };
+    // `ProviderChoice::Anthropic` would also work (it reads the env
+    // internally), but constructing the adapter explicitly keeps the
+    // skip-vs-error semantics local to this test.
+    let _ = key; // already validated by the helper
+    drive_live_canonical_task(
+        "t01_add_pure_function",
+        ProviderChoice::Anthropic {
+            model_id: "anthropic:claude-haiku-4-5".into(),
+        },
+        "phase_a_live_anthropic_t01",
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "live API; needs ANTHROPIC_API_KEY"]
+async fn phase_a_live_anthropic_t02_rename_symbol() {
+    if skip_unless_anthropic_key_present("phase_a_live_anthropic_t02").is_none() {
+        return;
+    }
+    drive_live_canonical_task(
+        "t02_rename_symbol_multi_file",
+        ProviderChoice::Anthropic {
+            model_id: "anthropic:claude-haiku-4-5".into(),
+        },
+        "phase_a_live_anthropic_t02",
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "live API; needs ANTHROPIC_API_KEY"]
+async fn phase_a_live_anthropic_t05_bug_fix_resists_test_mod() {
+    if skip_unless_anthropic_key_present("phase_a_live_anthropic_t05").is_none() {
+        return;
+    }
+    drive_live_canonical_task(
+        "t05_fix_bug_from_failing_test",
+        ProviderChoice::Anthropic {
+            model_id: "anthropic:claude-haiku-4-5".into(),
+        },
+        "phase_a_live_anthropic_t05",
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "live API; needs ANTHROPIC_API_KEY"]
+async fn phase_a_live_anthropic_t06_add_cli_flag() {
+    if skip_unless_anthropic_key_present("phase_a_live_anthropic_t06").is_none() {
+        return;
+    }
+    drive_live_canonical_task(
+        "t06_add_cli_flag",
+        ProviderChoice::Anthropic {
+            model_id: "anthropic:claude-haiku-4-5".into(),
+        },
+        "phase_a_live_anthropic_t06",
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "live API; needs ANTHROPIC_API_KEY"]
+async fn phase_a_live_anthropic_t10_lru_cache_from_spec() {
+    if skip_unless_anthropic_key_present("phase_a_live_anthropic_t10").is_none() {
+        return;
+    }
+    drive_live_canonical_task(
+        "t10_implement_from_spec",
+        ProviderChoice::Anthropic {
+            model_id: "anthropic:claude-haiku-4-5".into(),
+        },
+        "phase_a_live_anthropic_t10",
+    )
+    .await;
+}
+
+// ----- B2 — OpenAI-compat live tests (LiteLLM-shaped: hosted OpenAI OR local server) -----
+
+#[tokio::test]
+#[ignore = "live API; needs OPENAI_API_KEY or ATELIER_LOCAL_LLM_URL"]
+async fn phase_a_live_openai_compat_t01_add_pure_function() {
+    let (_key, model_id, base_url) =
+        match skip_unless_openai_compat_runnable("phase_a_live_openai_compat_t01") {
+            Some(c) => c,
+            None => return,
+        };
+    drive_live_canonical_task(
+        "t01_add_pure_function",
+        ProviderChoice::OpenAiCompat { model_id, base_url },
+        "phase_a_live_openai_compat_t01",
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "live API; needs OPENAI_API_KEY or ATELIER_LOCAL_LLM_URL"]
+async fn phase_a_live_openai_compat_t02_rename_symbol() {
+    let (_key, model_id, base_url) =
+        match skip_unless_openai_compat_runnable("phase_a_live_openai_compat_t02") {
+            Some(c) => c,
+            None => return,
+        };
+    drive_live_canonical_task(
+        "t02_rename_symbol_multi_file",
+        ProviderChoice::OpenAiCompat { model_id, base_url },
+        "phase_a_live_openai_compat_t02",
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "live API; needs OPENAI_API_KEY or ATELIER_LOCAL_LLM_URL"]
+async fn phase_a_live_openai_compat_t05_bug_fix_resists_test_mod() {
+    let (_key, model_id, base_url) =
+        match skip_unless_openai_compat_runnable("phase_a_live_openai_compat_t05") {
+            Some(c) => c,
+            None => return,
+        };
+    drive_live_canonical_task(
+        "t05_fix_bug_from_failing_test",
+        ProviderChoice::OpenAiCompat { model_id, base_url },
+        "phase_a_live_openai_compat_t05",
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "live API; needs OPENAI_API_KEY or ATELIER_LOCAL_LLM_URL"]
+async fn phase_a_live_openai_compat_t06_add_cli_flag() {
+    let (_key, model_id, base_url) =
+        match skip_unless_openai_compat_runnable("phase_a_live_openai_compat_t06") {
+            Some(c) => c,
+            None => return,
+        };
+    drive_live_canonical_task(
+        "t06_add_cli_flag",
+        ProviderChoice::OpenAiCompat { model_id, base_url },
+        "phase_a_live_openai_compat_t06",
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "live API; needs OPENAI_API_KEY or ATELIER_LOCAL_LLM_URL"]
+async fn phase_a_live_openai_compat_t10_lru_cache_from_spec() {
+    let (_key, model_id, base_url) =
+        match skip_unless_openai_compat_runnable("phase_a_live_openai_compat_t10") {
+            Some(c) => c,
+            None => return,
+        };
+    drive_live_canonical_task(
+        "t10_implement_from_spec",
+        ProviderChoice::OpenAiCompat { model_id, base_url },
+        "phase_a_live_openai_compat_t10",
+    )
+    .await;
+}
+
+// ----- B3 — real-model conformance rate ≥ 95% across the priority subset -----
+//
+// Closes `tasks/todo.md:219`. Runs the five priority canonical tasks
+// back-to-back against ONE Anthropic adapter instance; the shared
+// `ConformanceRingBuffer` accumulates the per-call malformed/success
+// signal across all five runs. At the end, asserts the snapshot's
+// success rate is at or above the PROVISIONAL 95% target.
+
+#[tokio::test]
+#[ignore = "live API; needs ANTHROPIC_API_KEY"]
+async fn phase_a_live_anthropic_conformance_rate_priority_subset() {
+    use atelier_core::adapter::anthropic::AnthropicAdapter;
+    use atelier_core::adapter::Adapter;
+
+    let key = match skip_unless_anthropic_key_present("phase_a_live_anthropic_conformance_rate") {
+        Some(k) => k,
+        None => return,
+    };
+    if !common::canonical::python3_pytest_available() {
+        eprintln!("skipping conformance: python3/pytest unavailable");
+        return;
+    }
+
+    // Manually construct the adapter so we retain the Arc and can
+    // query `conformance()` after all five runs. The Runner is built
+    // with a no-op Mock then swapped via `with_adapter_for_test`.
+    let adapter: Arc<dyn Adapter> =
+        Arc::new(AnthropicAdapter::new(key, "anthropic:claude-haiku-4-5"));
+
+    for task_id in [
+        "t01_add_pure_function",
+        "t02_rename_symbol_multi_file",
+        "t05_fix_bug_from_failing_test",
+        "t06_add_cli_flag",
+        "t10_implement_from_spec",
+    ] {
+        let task = common::canonical::CanonicalTask::load(task_id).expect("load");
+        let workspace = task
+            .copy_fixture_to_tempdir()
+            .expect("fixture tempdir copy");
+
+        let runner = Runner::new(
+            workspace.path().to_path_buf(),
+            ProviderChoice::Mock { responses: vec![] },
+            EventSink::Null,
+        )
+        .expect("runner construction")
+        .with_max_turns(task.meta.turn_cap)
+        .with_adapter_for_test(adapter.clone());
+
+        // Best-effort per-task: a single task failing shouldn't
+        // mask the conformance signal across the rest of the subset.
+        // The conformance gate is about envelope-parse health, not
+        // task-success — see the per-task B1 tests for the
+        // task-success gate.
+        let _ = runner.run(task.prompt.clone()).await;
+    }
+
+    let snap = adapter.conformance();
+    let rate = snap
+        .rate()
+        .expect("conformance buffer must have evidence after five live runs");
+    assert!(
+        rate >= 0.95,
+        "Conformance rate {rate} below the PROVISIONAL 95% threshold \
+         (samples: {} total, {} failed). See spec §2.",
+        snap.total,
+        snap.failures,
     );
 }
