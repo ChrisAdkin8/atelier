@@ -405,6 +405,27 @@ pub enum Event {
         items_compacted: Option<usize>,
     },
 
+    /// v60.10 §1 BYOM — the active adapter was swapped mid-session.
+    /// Emitted by [`crate::session::Event::AdapterSwapped`]'s producer
+    /// (today: `Runner::swap_adapter` on the next `run()` startup, and
+    /// the GUI's `swap_adapter` Tauri command directly to the webview
+    /// bus). Pairs with an immediately-following
+    /// [`Event::ModelProfileLoaded`] re-emission so the footer's model
+    /// badge + capability tooltip refresh in lockstep.
+    ///
+    /// State-preservation invariant: `ContextManager`, `MemoryStore`,
+    /// `PlanCanvas`, the conversation history, and any in-flight
+    /// `StagingPendingApproval` carry across the swap; the §1/§2
+    /// conformance window resets (new adapter, new behaviour signal)
+    /// and the §2 strategy may re-resolve from the new model's
+    /// `ModelProfile`.
+    AdapterSwapped {
+        from_model_id: String,
+        to_model_id: String,
+        /// RFC 3339 timestamp the swap was requested.
+        swapped_at: String,
+    },
+
     /// The actor is shutting down. No further events will be emitted.
     Shutdown,
 }
@@ -442,6 +463,7 @@ impl Event {
             Self::VerificationPassed { .. } => "VerificationPassed",
             Self::StrategyDegraded { .. } => "StrategyDegraded",
             Self::ContextOverflowResolved { .. } => "ContextOverflowResolved",
+            Self::AdapterSwapped { .. } => "AdapterSwapped",
             Self::Shutdown => "Shutdown",
         }
     }
@@ -808,6 +830,30 @@ mod tests {
         };
         if let Event::ContextOverflowResolved { resolution, .. } = surfaced {
             assert_eq!(resolution, "surfaced");
+        }
+    }
+
+    #[test]
+    fn adapter_swapped_event_carries_expected_kind() {
+        // v60.10 §1 BYOM — `Event::AdapterSwapped.kind()` is the GUI
+        // bridge's routing key + the TUI event log label. Pinned so a
+        // future variant rename forces a deliberate edit on the wire
+        // side.
+        let ev = Event::AdapterSwapped {
+            from_model_id: "anthropic:claude-opus-4-7".into(),
+            to_model_id: "local:qwen2.5-coder:7b".into(),
+            swapped_at: "2026-05-18T12:00:00Z".into(),
+        };
+        assert_eq!(ev.kind(), "AdapterSwapped");
+        if let Event::AdapterSwapped {
+            from_model_id,
+            to_model_id,
+            swapped_at,
+        } = ev
+        {
+            assert_eq!(from_model_id, "anthropic:claude-opus-4-7");
+            assert_eq!(to_model_id, "local:qwen2.5-coder:7b");
+            assert_eq!(swapped_at, "2026-05-18T12:00:00Z");
         }
     }
 

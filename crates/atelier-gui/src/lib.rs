@@ -143,6 +143,8 @@ pub fn run() {
             snapshot_mental_model,
             // v61 §14 concurrent-edit modal resolver.
             resolve_concurrent_edit,
+            // v60.10 §1 BYOM mid-session provider swap.
+            swap_adapter,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -588,6 +590,159 @@ fn snapshot_mental_model(state: tauri::State<'_, SessionState>) -> Result<Mental
     Ok(sd.snapshot_mental_model().into())
 }
 
+/// v60.10 §1 BYOM — wire-format provider selector the webview sends on
+/// `swap_adapter`. Mirrors `ProviderChoice` but stays serde-friendly
+/// (no `Mock` variant — the webview shouldn't be able to swap into a
+/// mock at runtime; that's a test seam).
+#[derive(serde::Deserialize, Debug)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SwapProviderWire {
+    /// In-process test adapter. Accepted at the wire boundary so a
+    /// scripted scenario or a future integration test can drive a
+    /// mock swap through the same surface; production webview code
+    /// should not send this.
+    Mock {
+        model_id: String,
+    },
+    Anthropic {
+        model_id: String,
+    },
+    OpenAiCompat {
+        model_id: String,
+        #[serde(default)]
+        base_url: Option<String>,
+    },
+}
+
+/// v60.10 §1 BYOM — wire-format result returned by the `swap_adapter`
+/// command. Carries the model id pair so the webview can render a
+/// toast ("swapped from X → Y") without round-tripping back through
+/// `currentModel`.
+#[derive(Serialize, Debug)]
+pub struct SwapResult {
+    pub from_model_id: String,
+    pub to_model_id: String,
+    pub swapped_at: String,
+}
+
+/// v60.10 §1 BYOM — build a fresh `Arc<dyn Adapter>` from a
+/// `SwapProviderWire`. Mirrors the per-provider construction logic in
+/// `Runner::new`; lifted here so the swap-from-webview path doesn't
+/// have to go through the full `Runner` constructor. Reads
+/// `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` from the environment, same
+/// as the binary path.
+fn build_swap_adapter(
+    provider: SwapProviderWire,
+) -> Result<std::sync::Arc<dyn atelier_core::adapter::Adapter>, String> {
+    use atelier_core::adapter::{
+        anthropic::AnthropicAdapter, openai_compat::OpenAiCompatAdapter, MockAdapter,
+    };
+    match provider {
+        SwapProviderWire::Mock { model_id } => Ok(std::sync::Arc::new(MockAdapter::new(model_id))),
+        SwapProviderWire::Anthropic { model_id } => {
+            let a = AnthropicAdapter::from_env(model_id).map_err(|e| e.to_string())?;
+            Ok(std::sync::Arc::new(a))
+        }
+        SwapProviderWire::OpenAiCompat { model_id, base_url } => {
+            let api_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
+            let base = base_url.unwrap_or_else(|| {
+                std::env::var("OPENAI_BASE_URL")
+                    .unwrap_or_else(|_| "https://api.openai.com/v1".to_string())
+            });
+            Ok(std::sync::Arc::new(OpenAiCompatAdapter::new(
+                api_key, model_id, base,
+            )))
+        }
+    }
+}
+
+/// v60.10 §1 BYOM — mid-session provider swap. Builds the new adapter
+/// from the wire payload, swaps it into the live `AdapterHandle` slot
+/// (so the §5 compaction Tauri command sees the new adapter on its
+/// next call), and emits an `AdapterSwapped` event directly to the
+/// webview alongside a fresh `ModelProfileLoaded` so the footer
+/// refreshes the model badge + capability tooltip.
+///
+/// In-flight `chat()` futures held by the Runner's run loop are NOT
+/// cancelled — the run loop reads `Runner::adapter` per turn, so a
+/// fully running-loop swap requires the caller to cancel + relaunch
+/// the run via `with_resume`. v60.10 lands the surface; the
+/// run-loop-aware swap is a follow-on bundle.
+#[tauri::command]
+async fn swap_adapter(
+    app: AppHandle,
+    state: tauri::State<'_, SessionState>,
+    provider: SwapProviderWire,
+) -> Result<SwapResult, String> {
+    let new_adapter = build_swap_adapter(provider)?;
+    let to_model_id = new_adapter.model_id().to_string();
+    // Read the pre-swap model id off the live adapter slot. If
+    // nothing is in flight (no active run), use "<none>" so the
+    // event still has a stable from-field.
+    let from_model_id = state
+        .adapter_handle
+        .get()
+        .map(|a| a.model_id().to_string())
+        .unwrap_or_else(|| "<none>".to_string());
+    // Push the new adapter into the slot atomically. `swap` drops
+    // the pre-swap Arc on the slot side — the run loop still
+    // references it via `Runner::adapter` until the next `run()`
+    // re-constructs from `Runner::new`, but the shared slot doesn't
+    // hold both at once.
+    state.adapter_handle.swap(new_adapter.clone());
+    let now = now_rfc3339();
+    // Emit `AdapterSwapped` directly to the webview. The Runner's
+    // pending_swap queue isn't reachable from the Tauri command (the
+    // Runner lives inside the spawned task); emit straight to the
+    // webview bridge so the UI gets the signal without waiting for
+    // the next `run()` startup.
+    emit_event(
+        &app,
+        &SessionEvent::AdapterSwapped {
+            from_model_id: from_model_id.clone(),
+            to_model_id: to_model_id.clone(),
+            swapped_at: now.clone(),
+        },
+    );
+    // Re-emit `ModelProfileLoaded` so the footer's model badge +
+    // capability tooltip refresh. We build a `Skip`-policy stub
+    // profile from the adapter's declared capabilities — the full
+    // probe round-trip is the responsibility of the next `run()`.
+    let caps = new_adapter.capabilities();
+    let strategy = if caps.native_tool_use.is_usable() {
+        atelier_core::protocol_strategy::Strategy::NativeTool
+    } else {
+        atelier_core::protocol_strategy::Strategy::JsonSentinel
+    };
+    let profile = atelier_core::adapter::model_profile::ModelProfile::skipped_for_well_known(
+        new_adapter.model_id(),
+        strategy,
+        caps.context_window_tokens,
+        atelier_core::adapter::model_profile::DEFAULT_PROFILE_MAX_TOKENS,
+        now.clone(),
+    );
+    let capability_row = {
+        let base =
+            atelier_core::adapter::capability_matrix::matrix_row_for(new_adapter.model_id(), &caps);
+        atelier_core::adapter::capability_matrix::crosswalk_with_profile(base, &profile)
+    };
+    emit_event(
+        &app,
+        &SessionEvent::ModelProfileLoaded {
+            model_id: profile.model_id.clone(),
+            base_url: profile.base_url.clone(),
+            strategy: profile.strategy,
+            outcome: atelier_core::adapter::model_profile::ProbeLoadOutcome::CacheHit,
+            capability_row: Some(capability_row),
+        },
+    );
+    Ok(SwapResult {
+        from_model_id,
+        to_model_id,
+        swapped_at: now,
+    })
+}
+
 #[tauri::command]
 async fn expand_memory_card(
     state: tauri::State<'_, SessionState>,
@@ -1007,6 +1162,19 @@ pub fn bridge_event(evt: &SessionEvent) -> BridgedEvent {
             "resolution": resolution,
             "freed_tokens": freed_tokens,
             "items_compacted": items_compacted,
+        }),
+        // v60.10 §1 BYOM — mid-session adapter swap. Pairs with the
+        // immediately-following `ModelProfileLoaded` re-emission;
+        // subscribers fold the swap into a toast / event-log entry and
+        // refresh the model badge off the next `ModelProfileLoaded`.
+        SessionEvent::AdapterSwapped {
+            from_model_id,
+            to_model_id,
+            swapped_at,
+        } => json!({
+            "from_model_id": from_model_id,
+            "to_model_id": to_model_id,
+            "swapped_at": swapped_at,
         }),
     };
     BridgedEvent { kind, payload }
@@ -1451,5 +1619,21 @@ mod tests {
             b.payload["reason"],
             "3 malformed envelopes in last 20 calls"
         );
+    }
+
+    #[test]
+    fn bridge_adapter_swapped_carries_model_id_pair() {
+        // v60.10 §1 BYOM — `AdapterSwapped` ships the from/to model
+        // id pair + timestamp. Pin the wire format so a future enum
+        // rename can't silently drift what the webview consumes.
+        let b = bridge_event(&SessionEvent::AdapterSwapped {
+            from_model_id: "anthropic:claude-opus-4-7".into(),
+            to_model_id: "local:qwen2.5-coder:7b".into(),
+            swapped_at: "2026-05-18T12:00:00Z".into(),
+        });
+        assert_eq!(b.kind, "AdapterSwapped");
+        assert_eq!(b.payload["from_model_id"], "anthropic:claude-opus-4-7");
+        assert_eq!(b.payload["to_model_id"], "local:qwen2.5-coder:7b");
+        assert_eq!(b.payload["swapped_at"], "2026-05-18T12:00:00Z");
     }
 }
