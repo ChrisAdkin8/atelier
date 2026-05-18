@@ -17,7 +17,7 @@ use std::sync::Arc;
 use atelier_core::{
     adapter::{
         anthropic::AnthropicAdapter, Adapter, AdapterError, Message, MockAdapter, Role,
-        ToolCallRequest, ToolSpec,
+        ToolCallRequest,
     },
     context::{
         ContextItem, ContextItemId, ContextManager, Payload, Provenance, TokenCount, TokenSource,
@@ -847,6 +847,12 @@ impl Runner {
         let sandbox = SandboxPolicy::restrictive(&workspace)
             .map_err(|e| RunError::Config(format!("sandbox: {e}")))?;
         let registry = built_in_registry()?;
+        // Snapshot the §15 tool surface for the adapter's native tool-use
+        // channel *before* moving the registry into the dispatcher.
+        // Without this the model only sees an empty `tools` array on the
+        // wire and has nothing to invoke — the §2.5 loop then stalls per
+        // the v60.15 stall guard.
+        let tools_spec = registry.tool_specs();
         let dispatcher = Dispatcher::new(registry, hooks)
             .with_executor(Arc::new(ShellHookExecutor::new(sandbox.clone())));
         let ledger = Arc::new(Ledger::new());
@@ -1202,7 +1208,6 @@ impl Runner {
         });
         let mut turns = 0;
         let mut final_state = State::Idle;
-        let tools_spec = registry_to_tool_specs();
 
         // v60.8 A2 follow-on — accumulate the observed file changes
         // across turns so we can feed them into the §7 verify pass at
@@ -1905,13 +1910,6 @@ fn built_in_registry() -> Result<ToolRegistry, RunError> {
     let mut r = ToolRegistry::new();
     register_builtins(&mut r).map_err(|e| RunError::Config(format!("tool registry: {e}")))?;
     Ok(r)
-}
-
-/// Empty `&[ToolSpec]` for v0 — adapters that need the tool list for
-/// native tool-use mode get it from this. The real list (with each tool's
-/// `input_schema`) lands when the dispatcher's input-schema work expands.
-fn registry_to_tool_specs() -> Vec<ToolSpec> {
-    Vec::new()
 }
 
 /// Pull the §2 envelope out of a native-tool response. The `harness_meta`

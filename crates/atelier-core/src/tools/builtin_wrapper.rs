@@ -151,6 +151,14 @@ impl Tool for BuiltInToolWrapper {
         self.side_effect_class
     }
 
+    fn description(&self) -> &str {
+        &self.description
+    }
+
+    fn input_schema(&self) -> Value {
+        self.input_schema.clone()
+    }
+
     fn validate_args(&self, args: &Value) -> Result<(), String> {
         // First gate: manifest JSONSchema (catches patterns / ranges /
         // oneOf / additionalProperties:false that serde can't always

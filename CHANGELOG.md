@@ -1,5 +1,33 @@
 # Atelier Spec — Changelog
 
+## v60.16 — 2026-05-18 (Tools are actually advertised to the provider; Track B unwedged end-to-end)
+
+Fixes the bug v60.15's stall guard pointed at: the runner's `tools_spec` argument to every `adapter.chat()` call was always `Vec::new()` because the stub `registry_to_tool_specs()` returned `Vec::new()` with a v0 comment that nobody had revisited. With no tools on the wire, Claude (Haiku 4.5 + Sonnet 4.6) had nothing to invoke, every assistant turn was bare prose, the new stall guard tripped on turn 1, and Track B's live gate produced `final_state=AwaitingUser` instead of a real verification. The model wasn't broken; the harness was lying to it about what was available.
+
+### Root cause
+
+`crates/atelier-cli/src/runner.rs`'s `registry_to_tool_specs() -> Vec<ToolSpec>` returned an empty vector with the comment "Empty `&[ToolSpec]` for v0 — adapters that need the tool list for native tool-use mode get it from this. The real list (with each tool's `input_schema`) lands when the dispatcher's input-schema work expands." That dispatcher work landed (v60.13 Track A's `BuiltInToolWrapper` carries name/description/input_schema from the bundled manifest; the §15 `McpToolWrapper` carries the same from the MCP server's advertisement) but the runner never picked it up. The Anthropic adapter's `build_request_body` then guarded `if !tools.is_empty()` and silently omitted the `tools` field from the request, so Claude's tool-use channel was never primed.
+
+### The fix
+
+- **`crates/atelier-core/src/dispatcher.rs`** — `Tool` trait gains two new methods with permissive defaults: `fn description(&self) -> &str { "" }` and `fn input_schema(&self) -> Value { json!({ "type": "object" }) }`. The defaults preserve every existing bare `Tool` impl (test doubles, future MCP-routed tools that don't carry a schema). A new `ToolRegistry::tool_specs() -> Vec<ToolSpec>` walks the `BTreeMap` and projects each tool through these accessors — order matches `names()`, which `BTreeMap` keeps stable.
+- **`crates/atelier-core/src/tools/builtin_wrapper.rs`** — `BuiltInToolWrapper`'s `impl Tool` overrides both: `description()` returns the manifest's `description`, `input_schema()` clones the manifest's `input_schema`. The wrapper already held both fields; we just wire them through the trait.
+- **`crates/atelier-core/src/mcp/mcp_tool.rs`** — `McpToolWrapper` gets the symmetric overrides from its MCP-advertised manifest. Future MCP servers register tools via the same path; no per-server changes needed.
+- **`crates/atelier-cli/src/runner.rs`** — `let tools_spec = registry.tool_specs();` *before* the registry is moved into `Dispatcher::new(...)`, then dropped through `adapter.chat(&messages, &tools_spec)` for every turn. The dead `registry_to_tool_specs()` stub is removed; the unused `ToolSpec` import is cleaned up.
+
+### Verification
+
+- **Unit:** new `registry_tool_specs_carries_name_description_schema_in_sorted_order` in `dispatcher.rs` — pins the trait-default contract (empty description, `{ "type": "object" }` schema) plus the `BTreeMap` ordering on three tools.
+- **Workspace:** `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` all green. atelier-core 794 → 795 (+1 new); total **1042 → 1043** across all crates.
+- **Live (~$0.005 of Anthropic budget):** `phase_a_live_anthropic_t01_add_pure_function` against `anthropic:claude-haiku-4-5`. **Pre-fix:** 1 turn, 12 events, `final_state=AwaitingUser`, 0 tool calls. **Post-fix:** 20 turns, 130+ events, `final_state=Streaming`, **11 successful tool invocations** (8 × `shell`, 2 × `read_file`, 1 × `write_file`). The model is now actively engaging with the canonical task. The test still fails — but on a different axis: the model burns the turn cap trying to run pytest validation against a system Python the MacOS sandbox is blocking (`dyld[…]: Library not loaded: /opt/homebrew/Cellar/python@3.14/…`, "file system sandbox blocked open()"). The remaining work is a sandbox-policy / fixture-environment fix, not a wire-format fix — exactly the next-session work v60.15's CHANGELOG promised.
+
+### Files touched
+
+- `crates/atelier-core/src/dispatcher.rs` — `Tool` trait extension, `ToolRegistry::tool_specs()`, unit test, `ToolSpec` import.
+- `crates/atelier-core/src/tools/builtin_wrapper.rs` — `description()` + `input_schema()` overrides on the wrapper.
+- `crates/atelier-core/src/mcp/mcp_tool.rs` — same overrides on the MCP wrapper.
+- `crates/atelier-cli/src/runner.rs` — snapshot `tools_spec` from the registry, drop the dead stub, prune the import.
+
 ## v60.15 — 2026-05-18 (§2 stall guard + state desync fix; Track B unblocked at the runner level)
 
 Fixes a runner bug that surfaced during the Track B (live-API canonical gate) bring-up: when an assistant turn produced neither real tool calls nor `claimed_done=true`, the runner kept iterating the loop and re-calling the adapter with a conversation array ending on an assistant turn. The Anthropic API rejects that pattern with `400 invalid_request_error` on stricter models (Sonnet 4.6, Opus 4.7); permissive providers (Haiku 4.5) return ~3-token empty completions in a wedge until the turn cap. Both arms collapse to the same diagnosis — the agent has abandoned the §2 contract (every well-formed turn either advances state via tool calls or terminates via `claimed_done`) — and `runner.rs` now treats it that way.

@@ -46,7 +46,7 @@ use async_trait::async_trait;
 use futures::future::join_all;
 use serde::{Deserialize, Serialize};
 
-use crate::adapter::ToolCallRequest;
+use crate::adapter::{ToolCallRequest, ToolSpec};
 use crate::error::ToolError;
 use crate::hooks::{HookEvent, HookManifest, HookSet};
 use crate::ledger::{local_cost_usd, LedgerEntry, DEFAULT_LOCAL_RATE_USD_PER_SEC};
@@ -161,6 +161,25 @@ pub trait Tool: Send + Sync {
     /// trust-budget UI (not this layer).
     fn side_effect_class(&self) -> SideEffectClass;
 
+    /// Human-readable description that's surfaced to the model via the
+    /// adapter's native tool-use channel. Built-in and MCP wrappers source
+    /// this from their bundled / advertised manifest. The default is
+    /// empty — bare `Tool` impls used only in unit tests don't need to
+    /// supply one.
+    fn description(&self) -> &str {
+        ""
+    }
+
+    /// JSON Schema for the tool's `arguments` payload. The Anthropic +
+    /// OpenAI-compat adapters forward this verbatim under the provider's
+    /// native tool-use surface (`input_schema` / `parameters`). The default
+    /// is `{ "type": "object" }` — a permissive object that satisfies both
+    /// providers' minimum-shape requirements when a `Tool` impl (typically
+    /// a test double) doesn't carry its own schema.
+    fn input_schema(&self) -> serde_json::Value {
+        serde_json::json!({ "type": "object" })
+    }
+
     /// Validate the model-emitted arguments before [`Self::execute`] runs.
     /// Spec §15: "the harness validates the model's tool-call arguments
     /// against this before dispatch; SchemaViolation (§2.5) on mismatch."
@@ -226,6 +245,27 @@ impl ToolRegistry {
 
     pub fn is_empty(&self) -> bool {
         self.tools.is_empty()
+    }
+
+    /// Project every registered tool to a `ToolSpec` for the adapter's
+    /// native tool-use channel (`tools: [...]` on Anthropic, `tools: [...]`
+    /// on OpenAI-compat). Order matches `names()` — `BTreeMap` keeps it
+    /// stable.
+    ///
+    /// Built-in and MCP wrappers carry their manifest's description +
+    /// `input_schema`. Bare `Tool` impls used in tests fall through to the
+    /// trait defaults (`""` / `{ "type": "object" }`) and would not be
+    /// advertised meaningfully to a live provider — that's expected; only
+    /// the full wrappers ship to production.
+    pub fn tool_specs(&self) -> Vec<ToolSpec> {
+        self.tools
+            .values()
+            .map(|t| ToolSpec {
+                name: t.name().to_string(),
+                description: t.description().to_string(),
+                input_schema: t.input_schema(),
+            })
+            .collect()
     }
 }
 
@@ -2078,6 +2118,24 @@ mod tests {
         }
         let names: Vec<_> = r.names().collect();
         assert_eq!(names, vec!["alpha", "mu", "zeta"]);
+    }
+
+    #[test]
+    fn registry_tool_specs_carries_name_description_schema_in_sorted_order() {
+        let mut r = ToolRegistry::new();
+        for name in ["zeta", "alpha", "mu"] {
+            r.register(Arc::new(EchoTool::new(name))).unwrap();
+        }
+        let specs = r.tool_specs();
+        let names: Vec<_> = specs.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "mu", "zeta"]);
+        // Bare Tool impls fall through to trait defaults — the runner
+        // never sees them in production, but the spec shape must still
+        // satisfy Anthropic's minimum (object-shaped input_schema).
+        for s in &specs {
+            assert_eq!(s.description, "");
+            assert_eq!(s.input_schema, json!({ "type": "object" }));
+        }
     }
 
     // ---------- Dispatcher: happy path ----------

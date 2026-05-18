@@ -300,7 +300,10 @@ async fn run_stalls_cleanly_when_assistant_turn_has_no_tools_and_no_claimed_done
     // it must exit after the first turn.
     .with_max_turns(10);
 
-    let report = runner.run("anything".into()).await.expect("run must succeed");
+    let report = runner
+        .run("anything".into())
+        .await
+        .expect("run must succeed");
 
     assert_eq!(
         report.final_state,
@@ -357,7 +360,10 @@ async fn run_stalls_cleanly_when_assistant_turn_has_no_tools_and_no_claimed_done
     let transitioned_to_await = captured.iter().any(|e| {
         matches!(
             e,
-            Event::Transitioned { from: State::Streaming, to: State::AwaitingUser }
+            Event::Transitioned {
+                from: State::Streaming,
+                to: State::AwaitingUser
+            }
         )
     });
     assert!(
@@ -402,10 +408,16 @@ async fn run_stalls_on_second_turn_without_replaying_idle_to_streaming() {
     .expect("mock runner construction is infallible")
     .with_max_turns(10);
 
-    let report = runner.run("anything".into()).await.expect("run must succeed");
+    let report = runner
+        .run("anything".into())
+        .await
+        .expect("run must succeed");
 
     assert_eq!(report.final_state, State::AwaitingUser);
-    assert_eq!(report.turns, 2, "must stall on turn 2, not earlier or later");
+    assert_eq!(
+        report.turns, 2,
+        "must stall on turn 2, not earlier or later"
+    );
 
     let captured = events.lock();
 
@@ -439,7 +451,10 @@ async fn run_stalls_on_second_turn_without_replaying_idle_to_streaming() {
         .filter(|e| {
             matches!(
                 e,
-                Event::Transitioned { from: State::Idle, to: State::Streaming }
+                Event::Transitioned {
+                    from: State::Idle,
+                    to: State::Streaming
+                }
             )
         })
         .count();
@@ -3706,9 +3721,8 @@ async fn drive_live_canonical_task(task_dir_name: &str, provider: ProviderChoice
     // neither tool calls nor `claimed_done=true`; the runner terminates
     // via `Streaming → AwaitingUser` and emits `Event::AgentStalled`.
     let stalled = report.final_state == State::AwaitingUser;
-    let turn_cap_hit = report.turns >= task.meta.turn_cap
-        && report.final_state != State::Done
-        && !stalled;
+    let turn_cap_hit =
+        report.turns >= task.meta.turn_cap && report.final_state != State::Done && !stalled;
 
     if stalled {
         dump_live_run_events(test_name, &events.lock(), &report, task.meta.turn_cap);

@@ -151,6 +151,14 @@ impl Tool for McpToolWrapper {
         self.side_effect_class
     }
 
+    fn description(&self) -> &str {
+        &self.description
+    }
+
+    fn input_schema(&self) -> Value {
+        self.input_schema.clone()
+    }
+
     fn validate_args(&self, args: &Value) -> Result<(), String> {
         validate_args_against(&self.validator, args)
     }
