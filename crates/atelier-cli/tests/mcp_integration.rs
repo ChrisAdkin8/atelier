@@ -15,7 +15,10 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use atelier_core::mcp_config::{McpServerManifest, SideEffectClass, Transport};
-use atelier_core::{default_mcp_sandbox, launch_stdio_server, McpLaunchError, McpServerHandle};
+use atelier_core::{
+    default_mcp_sandbox, launch_http_server, launch_stdio_server, McpEgressEvent, McpLaunchError,
+    McpServerHandle,
+};
 
 fn fixture_dir() -> std::path::PathBuf {
     // macOS resolves `/tmp` → `/private/tmp`; canonicalise so the server's
@@ -196,4 +199,148 @@ async fn egress_block_does_not_prevent_spawn() {
         Ok(_) => panic!("/bin/sh sleep should NEVER complete the MCP handshake"),
         Err(other) => panic!("expected Handshake error, got {other:?}"),
     }
+}
+
+// ---------- v60.11 C1: §15 HTTP/SSE launcher ----------
+
+/// Build an `http`/`sse` manifest fixture for the integration-test layer.
+/// Mirrors `filesystem_server_manifest` but for the remote transport.
+fn http_manifest(
+    name: &str,
+    transport: Transport,
+    url: &str,
+    headers: BTreeMap<String, String>,
+    allow_net: bool,
+) -> McpServerManifest {
+    McpServerManifest {
+        name: name.into(),
+        transport,
+        command: None,
+        args: Vec::new(),
+        env: BTreeMap::new(),
+        url: Some(url.into()),
+        headers,
+        side_effect_class: Some(SideEffectClass::SharedState),
+        allow_net,
+        enabled: true,
+    }
+}
+
+/// Always-on smoke test: an `http` manifest with `allow_net: false` must
+/// be refused before any network I/O happens. Mirrors the stdio
+/// launcher's egress posture but at the manifest level — HTTP/SSE
+/// servers have no in-process equivalent of the proxy-to-port-1 block.
+#[tokio::test]
+async fn http_launcher_rejects_allow_net_false_manifest() {
+    let workspace_tmp = tempfile::TempDir::new().unwrap();
+    let policy =
+        default_mcp_sandbox(workspace_tmp.path().to_path_buf(), false).expect("sandbox build");
+    let audit_dir = workspace_tmp.path().join("audit");
+    let manifest = http_manifest(
+        "search-http",
+        Transport::Http,
+        "https://example.invalid/mcp",
+        BTreeMap::new(),
+        false, // <-- the gate
+    );
+    let err = launch_http_server(&manifest, &policy, &audit_dir)
+        .await
+        .expect_err("allow_net=false must refuse to launch http transport");
+    match err {
+        McpLaunchError::Refused { name, message } => {
+            assert_eq!(name, "search-http");
+            assert!(
+                message.contains("allow_net=true"),
+                "message should explain the policy, got {message:?}"
+            );
+        }
+        other => panic!("expected Refused, got {other:?}"),
+    }
+    // §12 egress audit row landed in <audit_dir>/audit.log with the
+    // shape pinned by `schemas/audit/mcp_egress.v1.json`.
+    let log_path = audit_dir.join("audit.log");
+    assert!(log_path.exists(), "audit log was not created");
+    let body = std::fs::read_to_string(&log_path).expect("read audit log");
+    let row: McpEgressEvent = serde_json::from_str(body.lines().next().expect("at least one row"))
+        .expect("audit row parses");
+    assert_eq!(row.kind, "mcp-http-request");
+    assert_eq!(row.provider, "search-http");
+    assert_eq!(row.outcome, "blocked");
+    assert_eq!(row.reason.as_deref(), Some("allow_net=false"));
+    // Defence in depth: serialized row must not carry a `headers` field.
+    let raw: serde_json::Value = serde_json::from_str(body.lines().next().unwrap()).unwrap();
+    assert!(
+        !raw.as_object().unwrap().contains_key("headers"),
+        "audit row must NOT serialize headers; got {raw}"
+    );
+}
+
+/// Same gate but on `Transport::Sse` — the launcher accepts both
+/// variants and refuses both when `allow_net == false`.
+#[tokio::test]
+async fn http_launcher_rejects_sse_allow_net_false_manifest() {
+    let workspace_tmp = tempfile::TempDir::new().unwrap();
+    let policy =
+        default_mcp_sandbox(workspace_tmp.path().to_path_buf(), false).expect("sandbox build");
+    let audit_dir = workspace_tmp.path().join("audit");
+    let manifest = http_manifest(
+        "search-sse",
+        Transport::Sse,
+        "https://example.invalid/mcp",
+        BTreeMap::new(),
+        false,
+    );
+    let err = launch_http_server(&manifest, &policy, &audit_dir)
+        .await
+        .expect_err("allow_net=false must refuse to launch sse transport");
+    assert!(
+        matches!(err, McpLaunchError::Refused { .. }),
+        "expected Refused, got {err:?}"
+    );
+}
+
+/// `#[ignore]`-gated live integration test placeholder for the §15
+/// HTTP/SSE launcher. There is no publicly-running MCP HTTP/SSE echo
+/// server we can rely on, so the live test is a stub the operator runs
+/// manually against a server they spin up locally (e.g. via
+/// `npx @modelcontextprotocol/server-everything --transport sse`).
+///
+/// Run with:
+///   cargo test -p atelier-cli --test mcp_integration \
+///     -- --ignored live_http_launcher
+///
+/// TODO(v60.11+): once a public reference SSE server exists, point the
+/// test at it and drop the env-var gate. The MCP 2025-03-26 spec
+/// introduces a streamable-HTTP transport that should land alongside
+/// the rmcp 0.2.x line.
+#[tokio::test]
+#[ignore = "no public MCP HTTP/SSE echo server; run manually against a local SSE server"]
+async fn live_http_launcher_against_local_sse_server() {
+    let url = match std::env::var("ATELIER_MCP_SSE_URL") {
+        Ok(u) if !u.is_empty() => u,
+        _ => {
+            eprintln!(
+                "ATELIER_MCP_SSE_URL not set; start a local SSE MCP server and re-run with \
+                 ATELIER_MCP_SSE_URL=http://localhost:3001/sse"
+            );
+            return;
+        }
+    };
+    let workspace_tmp = tempfile::TempDir::new().unwrap();
+    let policy =
+        default_mcp_sandbox(workspace_tmp.path().to_path_buf(), true).expect("sandbox build");
+    let audit_dir = workspace_tmp.path().join("audit");
+    let manifest = http_manifest("live-sse", Transport::Sse, &url, BTreeMap::new(), true);
+    let handle: McpServerHandle = launch_http_server(&manifest, &policy, &audit_dir)
+        .await
+        .expect("launch_http_server against local SSE server");
+    assert_eq!(handle.name(), "live-sse");
+    let tools = handle.list_tools().await.expect("list_tools");
+    eprintln!("live SSE server advertised {} tools", tools.len());
+    handle.shutdown().await.expect("shutdown");
+    // Verify the audit log captured at least the handshake + list-tools rows.
+    let log_path = audit_dir.join("audit.log");
+    let body = std::fs::read_to_string(&log_path).expect("read audit log");
+    let row_count = body.lines().count();
+    assert!(row_count >= 2, "expected >= 2 audit rows, got {row_count}");
 }

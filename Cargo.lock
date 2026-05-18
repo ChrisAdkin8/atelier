@@ -3353,14 +3353,17 @@ dependencies = [
  "futures",
  "paste",
  "pin-project-lite",
+ "reqwest 0.12.28",
  "rmcp-macros",
  "schemars 0.8.22",
  "serde",
  "serde_json",
+ "sse-stream",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
  "tracing",
+ "url",
 ]
 
 [[package]]
@@ -3871,6 +3874,19 @@ dependencies = [
  "gobject-sys",
  "libc",
  "system-deps",
+]
+
+[[package]]
+name = "sse-stream"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0baa01c3efebe4050c7bb999ae87d5b17256b7f71391389e5fc08cdcd98ad550"
+dependencies = [
+ "bytes",
+ "futures-util",
+ "http-body",
+ "http-body-util",
+ "pin-project-lite",
 ]
 
 [[package]]

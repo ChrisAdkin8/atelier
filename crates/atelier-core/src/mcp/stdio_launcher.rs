@@ -136,6 +136,22 @@ impl std::fmt::Debug for McpServerHandle {
 }
 
 impl McpServerHandle {
+    /// Crate-internal constructor used by both `launch_stdio_server`
+    /// (this module) and `launch_http_server` (the v60.11 C1 sibling
+    /// `http_launcher.rs`). Kept `pub(crate)` so external callers can
+    /// only obtain a handle via one of the typed launch functions.
+    pub(crate) fn new(
+        name: String,
+        client: RunningService<RoleClient, ()>,
+        server_info: rmcp::model::ServerInfo,
+    ) -> Self {
+        Self {
+            name,
+            client,
+            server_info,
+        }
+    }
+
     pub fn name(&self) -> &str {
         &self.name
     }
