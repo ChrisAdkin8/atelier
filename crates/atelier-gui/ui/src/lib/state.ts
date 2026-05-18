@@ -561,8 +561,19 @@ export function applyEvent(state: AppState, evt: BridgedEvent): AppState {
     case 'IllegalTransitionAttempted':
     case 'Cancelled':
     case 'Shutdown':
-    default:
       return { ...state, events }
+    default: {
+      // v60.30 — surface unknown event variants instead of silently
+      // dropping them. In dev (Vite `import.meta.env.DEV` is `true`)
+      // this throws so CI / local smoke tests fail loud. In a
+      // production build we log and fall through to the event-log
+      // append so the user still sees something happened.
+      console.error('Unknown event variant', evt.kind, evt)
+      if (import.meta.env.DEV) {
+        throw new Error(`Unknown event variant: ${evt.kind}`)
+      }
+      return { ...state, events }
+    }
   }
 }
 

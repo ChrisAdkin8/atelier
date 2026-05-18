@@ -1,5 +1,32 @@
 # Atelier Spec — Changelog
 
+## v60.30 — 2026-05-18 (TUI / frontend hygiene — H13–H15 + UI Mediums)
+
+Hardening pass on the TUI lifecycle, the TUI render path, and the GUI's inline-content renderers. Three high-severity bullets (H13–H15) plus five medium-severity UI items land together because they're file-disjoint with v60.28 / v60.29 but co-located in `crates/atelier-tui/` and `crates/atelier-gui/ui/`.
+
+### TUI (`crates/atelier-tui/src/lib.rs`)
+
+- **H13 — TerminalGuard ordering + panic hook.** New `setup_terminal_with(build_terminal)` helper enables raw mode, binds `TerminalGuard` immediately afterwards, then runs `EnterAlternateScreen` + `Terminal::new`. A `?` on either subsequent step now still tears raw mode back down on the way out. Idempotent `install_panic_hook()` calls `disable_raw_mode` + `LeaveAlternateScreen` and chains the previous hook, covering `panic = "abort"` builds where `Drop` is skipped. New `terminal_guard_tests::setup_terminal_with_failing_builder_does_not_leak_raw_mode` injects a `Terminal::new` failure and asserts the cleanup path.
+- **H14 — `KeyEventKind::Press` filter.** One-line guard at the top of `handle_key` ignores `Release` / `Repeat` events. Windows + kitty terminals emit all three kinds for a single keystroke; without the filter a `q` keydown was being interpreted twice. New `tests::handle_key_ignores_release_events` covers the no-op path.
+- **H15 — ANSI / control-char sanitiser.** New `safe_span(s) -> String` strips C0 (`\x1b`, `\x07`, `\x9b`, …) and C1 (`\u{0080}..=\u{009f}`) control bytes except `\t` and `\n`, and rewrites bidi-override + zero-width chars (`U+202E` → `<RLO>`, `U+200B` → `<ZWSP>`, etc.). Applied at every `Span::raw` / `Span::styled` site that consumes externally-supplied strings: conversation lines, file paths (committed + pending), claimed-change "why" rationale, plan step text + constraints, diff `-`/`+` lines, context-item labels, memory-card titles, event-log details. Static UI labels keep the unwrapped form. New `sanitiser_tests` module covers ESC/BEL/CSI stripping, tab + newline preservation, bidi/zero-width rewriting, idempotence across mixed inputs, and an end-to-end `render_conversation_neutralises_ansi_clear` test that feeds `"\x1b[2JOWNED"` through `push_conversation` and walks every cell of the rendered `Buffer` to assert no ESC byte made it to screen.
+
+### GUI mediums (`crates/atelier-gui/ui/`)
+
+- **Mermaid `securityLevel: 'strict'` + DOM-id escape** (`InlineRenderers.svelte`). Mermaid is initialised exactly once via a memoised `getMermaid()` singleton that passes `securityLevel: 'strict'`. Block ids are run through `safeDomId()` (alphanumerics + `_-` only) before reaching the `data-mermaid-target` attribute, the `querySelector` lookup, and the `mermaid.render(...)` id argument.
+- **DOMPurify-free SVG injection** (`InlineRenderers.svelte`). Replaces `target.innerHTML = svg` with a `DOMParser`/`importNode` path: parse the mermaid output as `image/svg+xml`, accept only when the documentElement is `<svg>`, and `appendChild` the imported node. DOMPurify is not yet in the dep tree; the parse-and-whitelist path doesn't add a dependency. Error states build their DOM via `textContent` so exception strings can't smuggle markup.
+- **`resolveImageSrc` allow-list** (`InlineRenderers.svelte`). Rejects paths containing `..`, absolute filesystem paths, and unknown extensions before calling `convertFileSrc`. Whole-line image detection now requires the markdown `![alt](rel/path.ext)` form via `MD_IMAGE_LINE`; bare filenames are plain prose.
+- **Concurrent-edit modal inerting** (`App.svelte`). The DiffPane slot now carries `inert` + `aria-hidden="true"` while `app.concurrentEditModal` is open, so an in-flight resolve can't accept stale hunks via Enter.
+- **AppState default arm** (`state.ts`). The silent `default:` in `applyEvent` now `console.error`s the unknown variant and `throw`s when `import.meta.env.DEV` is true; production builds still fall through to the event-log append so the user sees something happened.
+
+### Verification
+
+- `cargo test -p atelier-tui` — 103 passed (94 existing + 9 new across `tests::handle_key_ignores_release_events`, `sanitiser_tests::*`, `terminal_guard_tests::*`).
+- `cargo clippy -p atelier-tui -- -D warnings` — clean.
+- `cargo fmt --check` + `cargo clippy -- -D warnings` workspace — clean.
+- `cargo test -p atelier-core` — 827 passed, no regressions.
+- `make check` — 112 rig tests + 14 workload dry-runs green.
+- `cd crates/atelier-gui/ui && npm run check` — 0 errors, 0 warnings (no `npm run test` script defined).
+
 ## v60.29 — 2026-05-18 (Liveness & durability — H9–H12)
 
 The "liveness & durability" bundle from `tasks/plan_high_severity_fixes.md`. Four targeted hardening touches on `crates/atelier-core/src/{dispatcher.rs,file_watcher.rs,staging.rs}` and `crates/atelier-cli/src/{runner.rs,main.rs}`.

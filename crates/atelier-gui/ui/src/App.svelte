@@ -263,7 +263,14 @@
         <MemoryPane cards={app.memoryCards} />
       </div>
     </div>
-    <div class="pane-slot diff-slot">
+    <!-- v60.30 — `inert` while the §14 concurrent-edit modal is open
+         so Enter-handling on a stale hunk can't accept pre-edit
+         content while the user is being asked which side wins. -->
+    <div
+      class="pane-slot diff-slot"
+      inert={app.concurrentEditModal ? true : null}
+      aria-hidden={app.concurrentEditModal ? 'true' : null}
+    >
       <DiffPane
         recentEdits={app.recentEdits}
         pendingApproval={app.pendingApproval}

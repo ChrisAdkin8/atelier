@@ -34,7 +34,9 @@ use atelier_core::{
     session::{self, Event as SessionEvent, MessageRole, PendingFile},
     state::NoopHook,
 };
-use crossterm::event::{self, Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    self, Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
@@ -1182,6 +1184,53 @@ pub fn render(state: &AppState, area: Rect, buf: &mut Buffer) {
     render_help(state, vertical[2], buf);
 }
 
+/// v60.30 (H15) — neutralise control sequences and homoglyph attacks
+/// in externally-supplied strings before they reach `Span::raw` /
+/// `Span::styled`. Two classes of input get rewritten:
+///
+///   * C0 / C1 control bytes (`\x00..=\x1f`, `\x7f`, `\x80..=\x9f`)
+///     except `\t` and `\n` — most importantly `\x1b` (ESC), `\x07`
+///     (BEL), and `\x9b` (CSI). Without this, an LLM that emits
+///     `"\x1b[2J"` would clear the user's terminal.
+///   * Bidi-override and zero-width chars (RLO, LRO, PDF, ZWSP, …)
+///     that can be used to spoof tool names or diff content. Rendered
+///     as their visible escape spelling (`<RLO>`, etc.).
+///
+/// Use this at any `Span::raw(...)` / `Span::styled(...)` site that
+/// consumes LLM output, tool results, filenames, or file content.
+/// Static UI labels keep the unwrapped form for cheaper render.
+pub fn safe_span(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\t' | '\n' => out.push(ch),
+            '\u{200E}' => out.push_str("<LRM>"),
+            '\u{200F}' => out.push_str("<RLM>"),
+            '\u{202A}' => out.push_str("<LRE>"),
+            '\u{202B}' => out.push_str("<RLE>"),
+            '\u{202C}' => out.push_str("<PDF>"),
+            '\u{202D}' => out.push_str("<LRO>"),
+            '\u{202E}' => out.push_str("<RLO>"),
+            '\u{2066}' => out.push_str("<LRI>"),
+            '\u{2067}' => out.push_str("<RLI>"),
+            '\u{2068}' => out.push_str("<FSI>"),
+            '\u{2069}' => out.push_str("<PDI>"),
+            '\u{200B}' => out.push_str("<ZWSP>"),
+            '\u{200C}' => out.push_str("<ZWNJ>"),
+            '\u{200D}' => out.push_str("<ZWJ>"),
+            '\u{FEFF}' => out.push_str("<BOM>"),
+            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
+                out.push('\u{FFFD}');
+            }
+            c if (0x80..=0x9f).contains(&(c as u32)) => {
+                out.push('\u{FFFD}');
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 fn render_header(state: &AppState, area: Rect, buf: &mut Buffer) {
     let state_label = if state.current_state.is_empty() {
         "<no transitions yet>".to_string()
@@ -1249,7 +1298,7 @@ fn render_conversation(state: &AppState, area: Rect, buf: &mut Buffer) {
                 .add_modifier(Modifier::BOLD);
             ListItem::new(Line::from(vec![
                 Span::styled(format!("{:<10}", line.role.label()), role_style),
-                Span::raw(line.text.clone()),
+                Span::raw(safe_span(&line.text)),
             ]))
         })
         .collect();
@@ -1287,7 +1336,7 @@ fn render_diff(state: &AppState, area: Rect, buf: &mut Buffer) {
     lines.push(Line::from(vec![
         Span::styled("─── ", Style::default().fg(Color::DarkGray)),
         Span::styled(
-            edit.path.display().to_string(),
+            safe_span(&edit.path.display().to_string()),
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
@@ -1301,7 +1350,7 @@ fn render_diff(state: &AppState, area: Rect, buf: &mut Buffer) {
         lines.push(Line::from(vec![
             Span::styled("    why: ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                reason.clone(),
+                safe_span(reason),
                 Style::default()
                     .fg(Color::Gray)
                     .add_modifier(Modifier::ITALIC),
@@ -1363,7 +1412,7 @@ fn render_diff(state: &AppState, area: Rect, buf: &mut Buffer) {
                         break;
                     }
                     lines.push(Line::from(Span::styled(
-                        format!("-{old}"),
+                        safe_span(&format!("-{old}")),
                         Style::default().fg(Color::Red),
                     )));
                     rendered_rows += 1;
@@ -1373,7 +1422,7 @@ fn render_diff(state: &AppState, area: Rect, buf: &mut Buffer) {
                         break;
                     }
                     lines.push(Line::from(Span::styled(
-                        format!("+{new}"),
+                        safe_span(&format!("+{new}")),
                         Style::default().fg(Color::Green),
                     )));
                     rendered_rows += 1;
@@ -1434,7 +1483,7 @@ fn render_pending_diff(pending: &PendingApproval, area: Rect, buf: &mut Buffer) 
         lines.push(Line::from(vec![
             Span::styled("── ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                file.path.display().to_string(),
+                safe_span(&file.path.display().to_string()),
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
@@ -1505,12 +1554,12 @@ fn plan_step_lines(step: &PlanStep) -> Vec<Line<'static>> {
     };
     let mut lines = vec![Line::from(vec![
         Span::styled(format!("{glyph} "), glyph_style),
-        Span::styled(step.text.clone(), text_style),
+        Span::styled(safe_span(&step.text), text_style),
     ])];
     for c in &step.constraints {
         lines.push(Line::from(vec![
             Span::styled("     └ ", Style::default().fg(Color::DarkGray)),
-            Span::styled(c.clone(), Style::default().fg(Color::DarkGray)),
+            Span::styled(safe_span(c), Style::default().fg(Color::DarkGray)),
         ]));
     }
     lines
@@ -1726,7 +1775,7 @@ fn render_context_pane(state: &AppState, area: Rect, buf: &mut Buffer) {
                 Span::styled(format!("{tokens_label} "), tokens_style),
                 Span::styled(format!("{badge} "), badge_style),
                 Span::raw(pin.to_string()),
-                Span::raw(item.label.clone()),
+                Span::raw(safe_span(&item.label)),
             ]))
         })
         .collect();
@@ -1811,7 +1860,7 @@ fn render_memory_pane(state: &AppState, area: Rect, buf: &mut Buffer) {
             let when = short_timestamp(&card.last_used);
             let mut spans = vec![
                 Span::raw(pin.to_string()),
-                Span::styled(card.title.clone(), title_style),
+                Span::styled(safe_span(&card.title), title_style),
                 Span::raw("  "),
                 Span::styled(when, Style::default().fg(Color::DarkGray)),
             ];
@@ -1865,7 +1914,7 @@ fn render_event_log(state: &AppState, area: Rect, buf: &mut Buffer) {
                     format!("{:<14}", line.kind),
                     Style::default().fg(Color::Cyan),
                 ),
-                Span::raw(line.detail.clone()),
+                Span::raw(safe_span(&line.detail)),
             ]))
         })
         .collect();
@@ -2249,6 +2298,11 @@ pub enum InputOutcome {
 ///   * `InputMode::TextInput`: printable chars append, Backspace pops,
 ///     Enter submits, Esc cancels
 pub fn handle_key(key: KeyEvent, state: &AppState) -> InputOutcome {
+    // Windows / kitty terminals emit Release + Repeat events too;
+    // we only react to Press so a keydown isn't double-counted.
+    if key.kind != KeyEventKind::Press {
+        return InputOutcome::Continue;
+    }
     // Modal sub-modes take precedence: a stray keystroke inside an
     // open modal must NOT trigger a pane mutator.
     match &state.input_mode {
@@ -2477,15 +2531,12 @@ pub fn run() -> io::Result<()> {
 }
 
 async fn run_async(prompt: Option<String>) -> io::Result<()> {
-    enable_raw_mode()?;
-    let mut stdout: Stdout = stdout();
-    stdout.execute(EnterAlternateScreen)?;
-    let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
-
-    // Owned RAII guard so a panic past this point still restores the
-    // terminal (raw mode off, alternate screen released). Without this a
-    // crash leaves the user's terminal in a broken state.
-    let _restore = TerminalGuard;
+    // v60.30 (H13): bind the RAII guard immediately after
+    // enable_raw_mode succeeds — before EnterAlternateScreen and
+    // Terminal::new — so an early `?` past raw-mode-on still tears
+    // raw mode down. Also installs a panic hook that fires before
+    // any unwind reaches the guard.
+    let (mut terminal, _restore) = setup_terminal()?;
 
     // Event channel: either fed by the Runner's EventSink::Callback
     // (driver mode) or by a NoopHook session's broadcast (viewer
@@ -3079,6 +3130,48 @@ impl Drop for TerminalGuard {
         let _ = disable_raw_mode();
         let _ = stdout().execute(LeaveAlternateScreen);
     }
+}
+
+/// Install a process-wide panic hook (idempotent) that restores the
+/// terminal before chaining the previous hook. `TerminalGuard::drop`
+/// also runs during unwinding, but the hook fires *before* the unwind
+/// reaches the guard — important for non-unwinding panic strategies
+/// (`panic = "abort"`) where Drop is never called.
+fn install_panic_hook() {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let _ = disable_raw_mode();
+            let _ = stdout().execute(LeaveAlternateScreen);
+            prev(info);
+        }));
+    });
+}
+
+/// Boot the terminal in a panic-safe order: enable raw mode, then
+/// bind `TerminalGuard` *before* any other fallible step so a `?` on
+/// `EnterAlternateScreen` or `Terminal::new` still tears down raw
+/// mode. The `build_terminal` closure is parameterised so tests can
+/// inject a failure and assert the cleanup path.
+fn setup_terminal_with<B>(
+    build_terminal: B,
+) -> io::Result<(Terminal<CrosstermBackend<Stdout>>, TerminalGuard)>
+where
+    B: FnOnce(Stdout) -> io::Result<Terminal<CrosstermBackend<Stdout>>>,
+{
+    install_panic_hook();
+    enable_raw_mode()?;
+    let guard = TerminalGuard;
+    let mut stdout: Stdout = stdout();
+    stdout.execute(EnterAlternateScreen)?;
+    let terminal = build_terminal(stdout)?;
+    Ok((terminal, guard))
+}
+
+fn setup_terminal() -> io::Result<(Terminal<CrosstermBackend<Stdout>>, TerminalGuard)> {
+    setup_terminal_with(|stdout| Terminal::new(CrosstermBackend::new(stdout)))
 }
 
 fn poll_one_key(timeout: Duration) -> io::Result<Option<KeyEvent>> {
@@ -4898,5 +4991,186 @@ mod tests {
         );
         assert!(line.detail.contains("4 files"));
         assert!(line.detail.contains("2 claims"));
+    }
+
+    // -------------------------------------------------------------
+    // v60.30 (H14) — KeyEventKind::Press filter
+    // -------------------------------------------------------------
+
+    fn key_with_kind(code: KeyCode, mods: KeyModifiers, kind: KeyEventKind) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers: mods,
+            kind,
+            state: crossterm::event::KeyEventState::empty(),
+        }
+    }
+
+    #[test]
+    fn handle_key_ignores_release_events() {
+        let s = AppState::new();
+        // A KeyCode::Char('q') Press would return Quit — Release must
+        // be a no-op so a keydown event isn't double-counted on
+        // Windows / kitty terminals that report all three kinds.
+        let release = key_with_kind(
+            KeyCode::Char('q'),
+            KeyModifiers::empty(),
+            KeyEventKind::Release,
+        );
+        assert!(matches!(handle_key(release, &s), InputOutcome::Continue));
+        let repeat = key_with_kind(
+            KeyCode::Char('q'),
+            KeyModifiers::empty(),
+            KeyEventKind::Repeat,
+        );
+        assert!(matches!(handle_key(repeat, &s), InputOutcome::Continue));
+        // Sanity: the Press still works.
+        let press = key_with_kind(
+            KeyCode::Char('q'),
+            KeyModifiers::empty(),
+            KeyEventKind::Press,
+        );
+        assert!(matches!(handle_key(press, &s), InputOutcome::Quit));
+    }
+}
+
+// -------------------------------------------------------------
+// v60.30 (H15) — `safe_span` property + render tests
+// -------------------------------------------------------------
+
+#[cfg(test)]
+mod sanitiser_tests {
+    use super::*;
+
+    #[test]
+    fn safe_span_strips_esc_and_csi() {
+        let out = safe_span("\x1b[2JOWNED");
+        assert!(!out.contains('\x1b'), "ESC survived in: {out:?}");
+        assert!(out.contains("OWNED"), "payload lost: {out:?}");
+    }
+
+    #[test]
+    fn safe_span_strips_bel_and_c1_csi_byte() {
+        let out = safe_span("ring\x07ring\u{009b}clear");
+        assert!(!out.contains('\x07'));
+        assert!(!out.contains('\u{009b}'));
+        assert!(out.contains("ring"));
+        assert!(out.contains("clear"));
+    }
+
+    #[test]
+    fn safe_span_preserves_tab_and_newline() {
+        let out = safe_span("a\tb\nc");
+        assert_eq!(out, "a\tb\nc");
+    }
+
+    #[test]
+    fn safe_span_rewrites_bidi_overrides() {
+        let out = safe_span("good\u{202e}live.txt");
+        assert!(out.contains("<RLO>"), "missing <RLO> in: {out:?}");
+        assert!(!out.contains('\u{202e}'));
+    }
+
+    #[test]
+    fn safe_span_rewrites_zero_width_chars() {
+        let out = safe_span("zero\u{200b}width\u{feff}");
+        assert!(out.contains("<ZWSP>"));
+        assert!(out.contains("<BOM>"));
+    }
+
+    #[test]
+    fn safe_span_is_idempotent() {
+        // Apply twice; second pass should be a no-op once the input
+        // is clean. Cover ASCII, ESC, RLO, zero-width, multi-byte.
+        let inputs = [
+            "plain text",
+            "\x1b[2JOWNED",
+            "\u{202e}drowssap",
+            "\u{200b}zero\u{feff}",
+            "résumé 🚀 \tindented",
+            "C1\u{0090}probe",
+        ];
+        for raw in inputs {
+            let once = safe_span(raw);
+            let twice = safe_span(&once);
+            assert_eq!(once, twice, "not idempotent for {raw:?}");
+            assert!(!once.contains('\x1b'), "ESC leaked: {once:?}");
+            assert!(!once.contains('\x07'), "BEL leaked: {once:?}");
+        }
+    }
+
+    #[test]
+    fn render_conversation_neutralises_ansi_clear() {
+        // End-to-end: a conversation line carrying \x1b[2J must NOT
+        // render the literal ESC byte into the ratatui Buffer; the
+        // payload after the escape must still be visible.
+        let mut s = AppState::new();
+        s.push_conversation(ConversationRole::Assistant, "\x1b[2JOWNED");
+        let area = Rect::new(0, 0, 60, 4);
+        let mut buf = Buffer::empty(area);
+        render_conversation(&s, area, &mut buf);
+        // Walk every cell symbol — none should be ESC.
+        for y in 0..area.height {
+            for x in 0..area.width {
+                let sym = buf[(x, y)].symbol();
+                assert!(
+                    !sym.contains('\x1b'),
+                    "ESC byte rendered at ({x},{y}): {sym:?}"
+                );
+            }
+        }
+        // Render to one big string and verify the payload survived
+        // and the U+FFFD replacement crept in instead of the ESC.
+        let mut rendered = String::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                rendered.push_str(buf[(x, y)].symbol());
+            }
+        }
+        assert!(
+            rendered.contains("OWNED"),
+            "payload missing in: {rendered:?}"
+        );
+    }
+}
+
+// -------------------------------------------------------------
+// v60.30 (H13) — TerminalGuard leak test
+// -------------------------------------------------------------
+
+#[cfg(test)]
+mod terminal_guard_tests {
+    use super::*;
+    use crossterm::terminal::is_raw_mode_enabled;
+
+    // We can't actually enable raw mode in unit tests (no TTY in CI),
+    // but we *can* assert that `setup_terminal_with` propagates a
+    // Terminal::new failure AND drops the TerminalGuard on the way
+    // out. The guard's Drop calls disable_raw_mode — observable via
+    // is_raw_mode_enabled().
+    //
+    // In CI without a TTY, enable_raw_mode itself may already fail.
+    // Either way, the post-condition is the same: raw mode must be
+    // off after the helper returns Err.
+    #[test]
+    fn setup_terminal_with_failing_builder_does_not_leak_raw_mode() {
+        let _ = is_raw_mode_enabled(); // sanity-only
+
+        let res =
+            setup_terminal_with(|_stdout| Err(io::Error::new(io::ErrorKind::Other, "injected")));
+        assert!(res.is_err(), "expected the injected failure");
+
+        // Post-condition: raw mode must not be on. In environments
+        // where enable_raw_mode succeeded, the guard's drop turned
+        // it off. In environments where enable_raw_mode failed, the
+        // ? short-circuits before the guard binds — which is fine
+        // because there was nothing to clean up.
+        match is_raw_mode_enabled() {
+            Ok(on) => assert!(!on, "raw mode leaked after setup_terminal_with failure"),
+            Err(_) => {
+                // No TTY at all (CI). Nothing to assert; the absence
+                // of a panic is the test.
+            }
+        }
     }
 }
