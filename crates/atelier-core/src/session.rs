@@ -263,6 +263,16 @@ pub enum Event {
         base_url: String,
         strategy: crate::protocol_strategy::Strategy,
         outcome: crate::adapter::model_profile::ProbeLoadOutcome,
+        /// v60.7 §1 BYOM — the static capability matrix row for this
+        /// model, cross-walked against the probe observations. The
+        /// GUI/TUI surface it as a tooltip on the existing model
+        /// badge in the footer so the user can see at a glance which
+        /// columns are `Supported` / `ClaimedButBroken` / `Unsupported`
+        /// for the active model. `None` is preserved for one cycle
+        /// of backwards-compatibility (UIs that haven't been
+        /// updated still render the model badge without the
+        /// tooltip), but the runner always populates it.
+        capability_row: Option<crate::adapter::capability_matrix::CapabilityMatrixRow>,
     },
 
     /// v60.5 — terminal marker for a successful §5 non-destructive

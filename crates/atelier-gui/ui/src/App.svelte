@@ -16,7 +16,12 @@
   import { onMount, onDestroy } from 'svelte'
   import { listen, type UnlistenFn } from '@tauri-apps/api/event'
   import { invoke } from '@tauri-apps/api/core'
-  import type { BridgedEvent, MentalModel } from './lib/state'
+  import type {
+    BridgedEvent,
+    CapabilityMatrixRow,
+    CurrentModel,
+    MentalModel,
+  } from './lib/state'
   import {
     initialState,
     applyEvent,
@@ -120,6 +125,47 @@
       e.preventDefault()
     }
   }
+
+  // v60.7 §1 BYOM — tooltip and badge helpers for the footer's
+  // model-id span. When the model carries a capability matrix row,
+  // the tooltip lists each capability with its claim (and the row's
+  // provenance — static / adapter / probe) so the user can audit
+  // the §1 matrix without opening a separate panel. Falls back to
+  // the baseUrl-only tooltip when no row is present (pre-v60.7
+  // events, or an unidentified model the static table doesn't cover
+  // *and* the adapter declined to declare capabilities).
+  function modelBadgeTooltip(model: CurrentModel): string {
+    const row = model.capabilityRow
+    if (!row) return model.baseUrl
+    const lines: string[] = []
+    if (model.baseUrl) lines.push(model.baseUrl)
+    if (row.display_label) lines.push(row.display_label)
+    lines.push(`window: ${row.context_window_tokens.toLocaleString()} tokens`)
+    lines.push(`native_tool_use: ${row.native_tool_use}`)
+    lines.push(`streaming: ${row.streaming}`)
+    lines.push(`vision: ${row.vision}`)
+    lines.push(`prompt_cache: ${row.prompt_cache}`)
+    lines.push(`structured_output: ${row.structured_output}`)
+    lines.push(`long_context: ${row.long_context}`)
+    lines.push(`source: ${row.source}`)
+    return lines.join('\n')
+  }
+
+  // Returns a short "broken: <list>" label when any column on the
+  // matrix row is `claimed_but_broken`, or `null` for a healthy
+  // row. Mirrors the TUI's `capability_broken_label` so the two
+  // drivers surface the same degradation hint.
+  function capabilityBrokenLabel(row: CapabilityMatrixRow | null): string | null {
+    if (!row) return null
+    const broken: string[] = []
+    if (row.native_tool_use === 'claimed_but_broken') broken.push('native_tool')
+    if (row.streaming === 'claimed_but_broken') broken.push('streaming')
+    if (row.vision === 'claimed_but_broken') broken.push('vision')
+    if (row.prompt_cache === 'claimed_but_broken') broken.push('prompt_cache')
+    if (row.structured_output === 'claimed_but_broken') broken.push('structured_output')
+    if (row.long_context === 'claimed_but_broken') broken.push('long_context')
+    return broken.length === 0 ? null : `broken: ${broken.join(', ')}`
+  }
 </script>
 
 <div class="app">
@@ -206,10 +252,16 @@
 
     <!-- v52 — active BYOM model on the right side. Empty until the
          Runner emits its one-shot `ModelProfileLoaded` event at session
-         start; populated thereafter for the lifetime of the run. -->
+         start; populated thereafter for the lifetime of the run.
+         v60.7 — when the model carries a §1 capability matrix row
+         (always set once the runner has wired the cross-walk), the
+         `title=` tooltip lists each capability + its claim so the user
+         can see at a glance which columns are broken.  Any
+         `ClaimedButBroken` cell is surfaced inline as a yellow
+         "broken: …" tag so a degraded model is unmissable. -->
     <span class="model-badge" aria-label="active model">
       {#if app.currentModel}
-        <span class="model-id" title={app.currentModel.baseUrl}>
+        <span class="model-id" title={modelBadgeTooltip(app.currentModel)}>
           {app.currentModel.modelId}
         </span>
         <span class="model-sep">·</span>
@@ -220,6 +272,12 @@
         <span class="model-outcome" title="probe outcome">
           {app.currentModel.outcome}
         </span>
+        {#if capabilityBrokenLabel(app.currentModel.capabilityRow)}
+          <span class="model-sep">·</span>
+          <span class="model-broken" title="§1 capability matrix · auto-degraded">
+            {capabilityBrokenLabel(app.currentModel.capabilityRow)}
+          </span>
+        {/if}
       {:else}
         <span class="model-pending">no model</span>
       {/if}
@@ -368,5 +426,12 @@
   .help .model-pending {
     color: var(--fg-dim);
     font-style: italic;
+  }
+  /* v60.7 — yellow "broken: …" suffix when the §1 capability
+     matrix has any `claimed_but_broken` cell. Mirrors the TUI's
+     yellow-bold styling for the same hint. */
+  .help .model-broken {
+    color: var(--accent-yellow, #cc6);
+    font-weight: 600;
   }
 </style>

@@ -281,6 +281,33 @@ pub struct Runner {
     /// than a default-noise artefact. The `driver` field on the
     /// record names the surface (GUI / TUI / headless).
     pane_visibility: Option<(crate::instrumentation::PaneVisibility, String)>,
+    /// v60.7 §1 BYOM ledger discipline — how to attribute
+    /// `cost_usd` to each `ModelCall` ledger entry. Local providers
+    /// (Mock, OpenAI-compat against a self-hosted server) use the
+    /// latency-weighted §1 default rate; cloud providers (Anthropic,
+    /// OpenAI's hosted API) leave `cost_usd = None` until per-provider
+    /// pricing tables land in a later bundle. Surfaces in the §3
+    /// cost meter as the "+ N unknown" suffix.
+    cost_policy: ModelCostPolicy,
+}
+
+/// v60.7 — §1 latency-weighted local-cost selector. Determined once
+/// at [`Runner::new`] time from the [`ProviderChoice`] + base URL;
+/// reused for every `ModelCall` ledger entry emitted across the
+/// run's turns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelCostPolicy {
+    /// Apply [`atelier_core::ledger::local_cost_usd`] with the §1
+    /// default `$0.00028/sec`. Used for the Mock adapter and for
+    /// OpenAI-compatible adapters whose base URL is anything other
+    /// than `api.openai.com` (i.e. local servers — LM Studio,
+    /// llama-server, vLLM, Ollama, sglang).
+    LatencyWeighted,
+    /// Leave `cost_usd = None`; the §3 cost meter renders the entry
+    /// as "+1 unknown". Used for cloud providers whose pricing must
+    /// come from a per-provider table the harness doesn't yet ship
+    /// (Anthropic Messages API, hosted OpenAI).
+    UnknownPending,
 }
 
 impl Runner {
@@ -298,48 +325,75 @@ impl Runner {
         // round-trips on them. OpenAI-compat is the unknown:
         // self-hosted models vary widely, so we cache-and-probe by
         // default. The CLI flips this for `--no-probe` / `--force-probe`.
-        let (adapter, probe_policy, probe_base_url): (Arc<dyn Adapter>, ProbePolicy, String) =
-            match provider {
-                ProviderChoice::Mock { responses } => (
-                    Arc::new(build_mock_adapter(responses)),
-                    ProbePolicy::Skip,
-                    String::new(),
-                ),
-                ProviderChoice::Anthropic { model_id } => (
-                    Arc::new(AnthropicAdapter::from_env(model_id).map_err(adapter_to_run_error)?),
-                    ProbePolicy::Skip,
-                    String::new(),
-                ),
-                ProviderChoice::OpenAiCompat { model_id, base_url } => {
-                    // Empty OPENAI_API_KEY is OK — most local servers
-                    // (LM Studio, llama-server, vLLM, Ollama-compat)
-                    // don't require auth. A 401 from a server that
-                    // *does* require it surfaces as AdapterError::Auth
-                    // at first call.
-                    //
-                    // base_url None → adapter default (OpenAI). Local
-                    // servers must be explicit via --base-url (or
-                    // OPENAI_BASE_URL via from_env), since pointing at
-                    // OpenAI by accident with a `local:` model id would
-                    // 404 in a confusing way.
-                    let api_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
-                    let base = base_url.unwrap_or_else(|| {
-                        std::env::var("OPENAI_BASE_URL")
-                            .unwrap_or_else(|_| "https://api.openai.com/v1".to_string())
-                    });
-                    (
-                        Arc::new(
-                            atelier_core::adapter::openai_compat::OpenAiCompatAdapter::new(
-                                api_key,
-                                model_id,
-                                base.clone(),
-                            ),
+        let (adapter, probe_policy, probe_base_url, cost_policy): (
+            Arc<dyn Adapter>,
+            ProbePolicy,
+            String,
+            ModelCostPolicy,
+        ) = match provider {
+            ProviderChoice::Mock { responses } => (
+                Arc::new(build_mock_adapter(responses)),
+                ProbePolicy::Skip,
+                String::new(),
+                // Mock is a local in-process actor — latency is
+                // ~0ms so the cost ends up ~$0, but emitting it
+                // exercises the same ledger path the real local
+                // adapters take.
+                ModelCostPolicy::LatencyWeighted,
+            ),
+            ProviderChoice::Anthropic { model_id } => (
+                Arc::new(AnthropicAdapter::from_env(model_id).map_err(adapter_to_run_error)?),
+                ProbePolicy::Skip,
+                String::new(),
+                // Anthropic's wire usage tells us the *tokens*;
+                // the *dollars* require a per-model pricing
+                // table we don't yet ship. Leave the row's
+                // `cost_usd` empty so the meter doesn't lie.
+                ModelCostPolicy::UnknownPending,
+            ),
+            ProviderChoice::OpenAiCompat { model_id, base_url } => {
+                // Empty OPENAI_API_KEY is OK — most local servers
+                // (LM Studio, llama-server, vLLM, Ollama-compat)
+                // don't require auth. A 401 from a server that
+                // *does* require it surfaces as AdapterError::Auth
+                // at first call.
+                //
+                // base_url None → adapter default (OpenAI). Local
+                // servers must be explicit via --base-url (or
+                // OPENAI_BASE_URL via from_env), since pointing at
+                // OpenAI by accident with a `local:` model id would
+                // 404 in a confusing way.
+                let api_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
+                let base = base_url.unwrap_or_else(|| {
+                    std::env::var("OPENAI_BASE_URL")
+                        .unwrap_or_else(|_| "https://api.openai.com/v1".to_string())
+                });
+                // §1 BYOM: "Mock + OpenAI-compat (local servers)"
+                // get the latency-weighted local rate.  Hosted
+                // OpenAI is the one openai-compat target that's a
+                // *cloud* provider — pricing comes from a future
+                // per-provider table, so leave `cost_usd = None`
+                // for now. Any base_url other than the canonical
+                // OpenAI host is treated as local.
+                let cost = if is_openai_cloud_base_url(&base) {
+                    ModelCostPolicy::UnknownPending
+                } else {
+                    ModelCostPolicy::LatencyWeighted
+                };
+                (
+                    Arc::new(
+                        atelier_core::adapter::openai_compat::OpenAiCompatAdapter::new(
+                            api_key,
+                            model_id,
+                            base.clone(),
                         ),
-                        ProbePolicy::Auto,
-                        base,
-                    )
-                }
-            };
+                    ),
+                    ProbePolicy::Auto,
+                    base,
+                    cost,
+                )
+            }
+        };
         Ok(Self {
             workspace,
             adapter,
@@ -351,6 +405,7 @@ impl Runner {
             probe_policy,
             probe_base_url,
             pane_visibility: None,
+            cost_policy,
         })
     }
 
@@ -560,11 +615,25 @@ impl Runner {
                 }
             }
         };
+        // v60.7 §1 BYOM — build the capability matrix row for this
+        // model. The static lookup table covers the providers we
+        // already ship; unknown models fall back to the adapter's
+        // runtime `Capabilities` declaration. The probe cross-walk
+        // flips columns to `ClaimedButBroken` if the probe observed
+        // the model failing a capability the table claims.
+        let capability_row = {
+            let base_row = atelier_core::adapter::capability_matrix::matrix_row_for(
+                self.adapter.model_id(),
+                &caps,
+            );
+            atelier_core::adapter::capability_matrix::crosswalk_with_profile(base_row, &profile)
+        };
         let _ = bus.send(Event::ModelProfileLoaded {
             model_id: profile.model_id.clone(),
             base_url: profile.base_url.clone(),
             strategy: profile.strategy,
             outcome,
+            capability_row: Some(capability_row),
         });
         // The profile itself is informational in v51 — the §1
         // conformance tracker still drives runtime strategy
@@ -611,6 +680,40 @@ impl Runner {
                 .chat(&messages, &tools_spec)
                 .await
                 .map_err(|e| RunError::Adapter(format!("{e}")))?;
+
+            // §1 BYOM (v60.7) — append one `ModelCall` ledger entry
+            // per `adapter.chat()` call. `count_source` is the
+            // adapter's own honest claim (Exact iff the provider
+            // returned `usage`; Unavailable otherwise — see the
+            // anthropic / openai_compat assemblers). `cost_usd` is
+            // determined by the runner's [`ModelCostPolicy`]:
+            // latency-weighted local rate for Mock + OpenAI-compat
+            // against a self-hosted server; `None` for cloud
+            // providers whose pricing comes from a per-provider
+            // table that hasn't shipped yet. `latency_ms` is
+            // whatever the adapter measured.
+            let model_call_ts = now_rfc3339();
+            let latency_f64 = response.usage.latency_ms.map(|ms| ms as f64);
+            let cost_usd = match self.cost_policy {
+                ModelCostPolicy::LatencyWeighted => latency_f64.map(|ms| {
+                    atelier_core::ledger::local_cost_usd(
+                        ms,
+                        atelier_core::ledger::DEFAULT_LOCAL_RATE_USD_PER_SEC,
+                    )
+                }),
+                ModelCostPolicy::UnknownPending => None,
+            };
+            session_dispatcher.append_ledger_entry(atelier_core::ledger::LedgerEntry::ModelCall {
+                timestamp: model_call_ts,
+                model_id: self.adapter.model_id().to_string(),
+                prompt_tokens: response.usage.prompt_tokens,
+                completion_tokens: response.usage.completion_tokens,
+                cached_tokens: response.usage.cached_tokens,
+                count_source: response.usage.count_source,
+                cost_usd,
+                latency_ms: latency_f64,
+                note: None,
+            });
 
             // 6. Parse envelope from response per the adapter's chosen
             //    strategy. Native tool calls (if any) take precedence:
@@ -875,6 +978,21 @@ pub enum RunError {
     Adapter(String),
     #[error("session command failed: {0}")]
     Session(String),
+}
+
+/// v60.7 §1 — does this OpenAI-compat base URL point at the hosted
+/// OpenAI service? Used to discriminate cloud OpenAI (pricing via a
+/// future per-provider table; `cost_usd = None` for now) from local
+/// OpenAI-compatible servers (LM Studio / llama-server / vLLM /
+/// Ollama / sglang — latency-weighted local rate).
+///
+/// Match is permissive — both `https://api.openai.com/v1` and any
+/// future `/v2` / regional variant under the same host counts as
+/// cloud. A custom proxy in front of OpenAI must be self-declared
+/// as local (by using a non-`api.openai.com` host).
+fn is_openai_cloud_base_url(base: &str) -> bool {
+    let lower = base.to_ascii_lowercase();
+    lower.starts_with("https://api.openai.com") || lower.starts_with("http://api.openai.com")
 }
 
 /// Lift an `AdapterError` raised at construction time (so far only
@@ -1160,5 +1278,43 @@ mod tests {
         assert_eq!(approx_tokens("abc"), 0);
         assert_eq!(approx_tokens("abcd"), 1);
         assert_eq!(approx_tokens("0123456789"), 2);
+    }
+
+    // ---- v60.7 §1 BYOM: cost-policy URL discriminator ----
+
+    #[test]
+    fn cloud_openai_base_urls_are_classified_unknown_pending() {
+        // Canonical hosted OpenAI endpoint and case variants must
+        // resolve to `UnknownPending` so the runner doesn't apply
+        // the local latency-weighted rate to a cloud bill.
+        for url in [
+            "https://api.openai.com/v1",
+            "https://API.openai.com/v1",
+            "http://api.openai.com",
+        ] {
+            assert!(
+                is_openai_cloud_base_url(url),
+                "{url} should be classified as cloud OpenAI"
+            );
+        }
+    }
+
+    #[test]
+    fn local_base_urls_are_classified_latency_weighted() {
+        // Self-hosted OpenAI-compatible servers — Ollama, LM
+        // Studio, llama-server, vLLM, sglang. None of these
+        // should be classified as cloud OpenAI; the runner uses
+        // the latency-weighted local rate for all of them.
+        for url in [
+            "http://localhost:11434/v1",
+            "http://127.0.0.1:1234/v1",
+            "http://localhost:8080",
+            "https://my-vllm.internal:8000/v1",
+        ] {
+            assert!(
+                !is_openai_cloud_base_url(url),
+                "{url} should be classified as local"
+            );
+        }
     }
 }

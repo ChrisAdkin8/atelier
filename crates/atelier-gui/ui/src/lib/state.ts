@@ -175,6 +175,30 @@ export function initialMentalModel(): MentalModel {
   return { enabled: false, text: '', text_tokens: 0, updated_at: '' }
 }
 
+/// v60.7 §1 BYOM — one cell of the capability matrix. Mirrors
+/// Rust's `CapabilityClaim` (serde rename_all=snake_case).
+export type CapabilityClaim = 'supported' | 'claimed_but_broken' | 'unsupported'
+
+/// v60.7 §1 BYOM — provenance for a capability matrix row. Mirrors
+/// Rust's `CapabilityRowSource`.
+export type CapabilityRowSource = 'static' | 'adapter' | 'probe'
+
+/// v60.7 §1 BYOM — capability matrix row for the active model.
+/// Mirror of `atelier_core::adapter::capability_matrix::CapabilityMatrixRow`.
+/// Surfaced as a tooltip + sublabel on the footer's model badge.
+export type CapabilityMatrixRow = {
+  model_id: string
+  display_label: string
+  native_tool_use: CapabilityClaim
+  streaming: CapabilityClaim
+  vision: CapabilityClaim
+  prompt_cache: CapabilityClaim
+  structured_output: CapabilityClaim
+  long_context: CapabilityClaim
+  context_window_tokens: number
+  source: CapabilityRowSource
+}
+
 /// v52 — the active BYOM model, populated by `ModelProfileLoaded`.
 /// Rendered in the footer (`App.svelte`) on the right-hand side so the
 /// user always knows which model + strategy the run is using.
@@ -192,6 +216,10 @@ export type CurrentModel = {
   /// `cache_hit` / `probed` / `reprobed` / `not_cached`. See
   /// `atelier_core::adapter::model_profile::ProbeLoadOutcome`.
   outcome: string
+  /// v60.7 §1 BYOM — capability matrix row for this model.
+  /// Surfaced as a tooltip on the badge; `null` until the
+  /// Runner emits a `ModelProfileLoaded` carrying it.
+  capabilityRow: CapabilityMatrixRow | null
 }
 
 export type AppState = {
@@ -328,12 +356,14 @@ export function applyEvent(state: AppState, evt: BridgedEvent): AppState {
         base_url: string
         strategy: string
         outcome: string
+        capability_row?: CapabilityMatrixRow | null
       }
       const currentModel: CurrentModel = {
         modelId: p.model_id,
         baseUrl: p.base_url,
         strategy: p.strategy,
         outcome: p.outcome,
+        capabilityRow: p.capability_row ?? null,
       }
       return { ...state, events, currentModel }
     }
