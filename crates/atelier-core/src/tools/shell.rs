@@ -10,16 +10,55 @@
 //! allow-network-egress — agents must request this explicitly per call
 //! (matching the manifest convention: opt-in, surfaces in the §8 trust
 //! budget UI).
+//!
+//! ## §11 egress mechanical gate
+//!
+//! Spec §11 acceptance gate: `curl evil.example` must be blocked and
+//! the attempt logged. The shell tool enforces this in **two layers**:
+//!
+//! 1. **Command-level parse (primary).** Before spawning, we scan the
+//!    command string for URLs / `host:port` targets. When `allow_net`
+//!    is false and we see a non-loopback destination, we (a) append
+//!    an `EgressEvent` to the session's `audit.log`, and (b) return a
+//!    `ToolError::SandboxViolation` without ever running the command.
+//!    This is the layer that gives us a deterministic test surface
+//!    (no dependency on `sandbox-exec` / `bwrap` / a working network)
+//!    and the one the §11 mechanical gate exercises.
+//!
+//! 2. **Proxy env vars (defence-in-depth).** When `allow_net` is
+//!    false, we set `http_proxy` / `https_proxy` / `HTTP_PROXY` /
+//!    `HTTPS_PROXY` / `all_proxy` / `ALL_PROXY` to
+//!    `http://127.0.0.1:1` (port 1 is the TCPmux service, unused on
+//!    every real-world host, so the connect refuses immediately) and
+//!    clear `NO_PROXY` / `no_proxy`. Any HTTP-aware client inside the
+//!    subprocess (`curl`, `wget`, `git`, `pip`, `npm`, anything
+//!    `reqwest`-backed) honours these and connect-refuses. This
+//!    catches egress paths the parser doesn't (a `bash` script that
+//!    builds the URL dynamically, a binary that pulls from `$URL`).
+//!
+//! We pick the proxy approach over Linux network namespaces or macOS
+//! `pf` rules because: (a) namespaces only work on Linux and require
+//! root or unshared user namespaces (not guaranteed in CI); (b) `pf`
+//! requires sudo on macOS, which is a non-starter for a developer
+//! tool. The proxy approach is portable and testable on every dev
+//! machine. The downside is documented honestly: a subprocess that
+//! does raw `connect()` on a numeric IP without consulting proxy env
+//! vars (e.g. `nc 10.0.0.1 22`) defeats layer 2 — but layer 1's
+//! parser catches the case the mechanical gate names (the `curl
+//! evil.example` shape), and a future hardening pass can graft a
+//! Linux-only namespace path under `#[cfg(target_os = "linux")]`.
 
 use async_trait::async_trait;
 use serde::Deserialize;
 
 use super::{ensure_inside_workspace_existing, resolve_repo_path};
+use crate::audit::{append_subprocess_egress, EgressEvent};
 use crate::dispatcher::{SideEffectClass, Tool, ToolContext, ToolResult};
 use crate::error::ToolError;
 #[cfg(test)]
 use crate::sandbox::SandboxPolicy;
 use crate::subprocess::{run as run_subprocess, sandboxed_argv, SubprocessSpec};
+use crate::time::now_rfc3339;
 
 pub const NAME: &str = "shell";
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
@@ -94,8 +133,53 @@ impl Tool for Shell {
         // via `SandboxPolicy::restrictive(ctx.sandbox.repo_root())`,
         // which silently dropped any extras the session had granted.
         let mut policy = ctx.sandbox.clone();
-        if parsed.allow_net || ctx.sandbox.allow_net_flag() {
+        let net_allowed = parsed.allow_net || ctx.sandbox.allow_net_flag();
+        if net_allowed {
             policy = policy.with_net();
+        }
+
+        // §11 layer 1 — command-level parse. When egress is disallowed
+        // and the command names an external destination, append an
+        // audit row + refuse to dispatch. Loopback / link-local
+        // targets (`127.0.0.1`, `::1`, `localhost`) are not considered
+        // egress: tooling commonly hits a local proxy or HTTP fixture
+        // (the canonical workload at `tests/workload/canonical/` has
+        // a few) and blocking those would break legitimate flows.
+        if !net_allowed {
+            if let Some(dest) = first_external_destination(&parsed.command) {
+                // Audit BEFORE returning so the §11 mechanical gate
+                // can observe the row even on the refused path. We
+                // deliberately do not propagate audit-log failure —
+                // the block is the load-bearing guarantee; the row is
+                // a secondary record (see crate::audit module docs).
+                if let Some(audit_path) = ctx.audit_log_path {
+                    let event = EgressEvent::blocked_subprocess_egress(
+                        now_rfc3339(),
+                        ctx.tool_call_id.unwrap_or(""),
+                        NAME,
+                        &dest,
+                    );
+                    if let Err(e) = append_subprocess_egress(audit_path, &event) {
+                        tracing::warn!(
+                            error = %e,
+                            path = ?audit_path,
+                            "shell: failed to append §11 egress audit row; \
+                             egress is still blocked",
+                        );
+                    }
+                } else {
+                    tracing::warn!(
+                        tool_call_id = ?ctx.tool_call_id,
+                        destination = %dest,
+                        "shell: §11 egress block fired without an audit_log_path; \
+                         row dropped",
+                    );
+                }
+                return Err(ToolError::SandboxViolation {
+                    tool: NAME.into(),
+                    attempted: format!("network egress to {dest}"),
+                });
+            }
         }
 
         let user_argv = vec!["sh".to_string(), "-c".to_string(), parsed.command.clone()];
@@ -109,6 +193,35 @@ impl Tool for Shell {
         let mut spec =
             SubprocessSpec::with_budget_ms(parsed.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS));
         spec.working_dir = cwd_abs;
+
+        // §11 layer 2 — proxy env vars. Only set when egress is
+        // disallowed; an `allow_net: true` call must reach the real
+        // network. We deliberately do NOT shadow the user's own
+        // `http_proxy` if they've explicitly opted into network —
+        // the per-call spec.env override below would lose that
+        // signal. Port 1 is TCPmux (RFC 1078), unused on every real
+        // host; connect-refuses immediately so the subprocess fails
+        // fast instead of waiting for a TCP timeout.
+        if !net_allowed {
+            for key in [
+                "http_proxy",
+                "https_proxy",
+                "HTTP_PROXY",
+                "HTTPS_PROXY",
+                "all_proxy",
+                "ALL_PROXY",
+            ] {
+                spec.env
+                    .insert(key.to_string(), "http://127.0.0.1:1".to_string());
+            }
+            // Explicit empty NO_PROXY / no_proxy so a user-side
+            // `NO_PROXY=*` doesn't bypass the closed-port proxy.
+            // The env_clear in `subprocess::run` already drops the
+            // parent's env; this is belt-and-braces for the case
+            // where a caller pre-populated `spec.env` upstream of us.
+            spec.env.insert("NO_PROXY".to_string(), String::new());
+            spec.env.insert("no_proxy".to_string(), String::new());
+        }
 
         let outcome = run_subprocess(&program, &wrapped_args, &spec)
             .await
@@ -140,6 +253,138 @@ impl Tool for Shell {
     }
 }
 
+/// First external host found in a shell command, or `None` when the
+/// command targets only loopback / no network at all.
+///
+/// We deliberately keep the parser narrow: the §11 mechanical gate is
+/// satisfied by catching the `curl evil.example`-shaped commands, and
+/// a parser that tries to handle every possible obfuscation
+/// (`bash -c "$(cat url.txt)"`, environment-variable interpolation,
+/// base64-encoded URLs) would either be too lenient (false positives
+/// on user prose containing dotted strings) or too strict (false
+/// negatives on dynamically-constructed URLs). Layer 2 — the proxy
+/// env vars — is what catches the obfuscated cases at runtime.
+///
+/// Shape:
+///   * `http://host[:port]/...` / `https://host[:port]/...` —
+///     accepted, host extracted (everything between `://` and the
+///     first `/`, `?`, `#`, or whitespace).
+///   * `host.tld[:port]/path` — accepted when `host.tld` looks like
+///     a registered domain (contains a `.`) and the surrounding
+///     context is plausibly a CLI argument (e.g. `curl evil.example`,
+///     `wget evil.example/x`).
+///   * `127.0.0.1`, `::1`, `localhost`, `localhost.localdomain` —
+///     treated as loopback, not egress.
+fn first_external_destination(command: &str) -> Option<String> {
+    // 1. Scheme-prefixed URLs. The cheap-and-correct path; covers
+    //    `curl https://evil.example/foo?x=1` and friends.
+    if let Some(host) = extract_scheme_url_host(command) {
+        if !is_loopback(&host) {
+            return Some(host);
+        }
+    }
+    // 2. Bare-host CLI arguments. Walk whitespace-separated tokens,
+    //    looking for ones that look like `host.tld[:port][/...]`.
+    //    A token must contain a dot and start with an alphanumeric to
+    //    avoid lighting up on prose like `..` or `./script`.
+    for raw in command.split_whitespace() {
+        // Strip surrounding quotes / shell metachars cheaply.
+        let token = raw.trim_matches(['"', '\'', '(', ')', ';', '`']);
+        if token.is_empty() {
+            continue;
+        }
+        if let Some(host) = extract_bare_host(token) {
+            if !is_loopback(&host) {
+                return Some(host);
+            }
+        }
+    }
+    None
+}
+
+fn extract_scheme_url_host(s: &str) -> Option<String> {
+    let lower = s.to_ascii_lowercase();
+    let idx = lower
+        .find("http://")
+        .map(|i| (i, "http://".len()))
+        .or_else(|| lower.find("https://").map(|i| (i, "https://".len())))?;
+    let after = &s[idx.0 + idx.1..];
+    // Stop at the first separator that ends a host[:port] section.
+    let end = after
+        .find(['/', '?', '#', ' ', '\t', '"', '\'', '`', ';'])
+        .unwrap_or(after.len());
+    let host = after[..end].trim_matches('@');
+    // `user:pass@host` — keep what's after the last `@`.
+    let host = host.rsplit('@').next().unwrap_or(host);
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_string())
+    }
+}
+
+fn extract_bare_host(token: &str) -> Option<String> {
+    // Trim a leading path / port / query separator off the end of the
+    // token so `evil.example/x` and `evil.example:443/x` both
+    // collapse to `evil.example` (or `evil.example:443`).
+    let host_end = token.find(['/', '?', '#']).unwrap_or(token.len());
+    let candidate = &token[..host_end];
+    if candidate.is_empty() {
+        return None;
+    }
+    // Must start with an alphanumeric to skip `./foo`, `../foo`,
+    // `-flag`, etc.
+    if !candidate
+        .chars()
+        .next()
+        .map(|c| c.is_ascii_alphanumeric())
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    // Bare hostnames must have at least one `.` to count — keeps
+    // single-token shell commands (`ls`, `pwd`) from being mistaken
+    // for a host. `evil.example`, `host.local`, `1.2.3.4` all qualify.
+    if !candidate.contains('.') {
+        return None;
+    }
+    // Filter out tokens that are clearly not hostnames: file paths
+    // (contain a `/` — already handled above), version strings
+    // (`foo-1.2.3` starts alphanumeric and has dots, but ends with a
+    // digit and contains no letters in the last segment is fine —
+    // however we'd false-positive on things like `package-1.2`). The
+    // call site only fires under `allow_net: false`, where a false
+    // positive returns SandboxViolation and the agent learns to
+    // either flip `allow_net: true` or rephrase. We accept the
+    // conservative side-effect for the mechanical gate's sake.
+    //
+    // Reject tokens whose last segment is purely numeric (looks like
+    // a version) unless it's also a valid IPv4 (4 numeric segments).
+    let segments: Vec<&str> = candidate.split('.').collect();
+    let last = segments.last().copied().unwrap_or("");
+    let last_alpha_or_port = last.contains(':') || last.chars().any(|c| c.is_ascii_alphabetic());
+    let is_ipv4 = segments.len() == 4
+        && segments.iter().all(|seg| {
+            !seg.is_empty()
+                && seg.len() <= 3
+                && seg.chars().all(|c| c.is_ascii_digit())
+                && seg.parse::<u8>().is_ok()
+        });
+    if !last_alpha_or_port && !is_ipv4 {
+        return None;
+    }
+    Some(candidate.to_string())
+}
+
+fn is_loopback(host: &str) -> bool {
+    // Strip an optional `:port` suffix for the comparison.
+    let host_only = host.split(':').next().unwrap_or(host);
+    matches!(
+        host_only,
+        "localhost" | "localhost.localdomain" | "127.0.0.1" | "::1" | "0.0.0.0"
+    ) || host_only.starts_with("127.")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,6 +394,8 @@ mod tests {
         ToolContext {
             workspace_root: root,
             sandbox,
+            tool_call_id: None,
+            audit_log_path: None,
         }
     }
 
@@ -196,6 +443,179 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::PermissionDenied { .. }));
+    }
+
+    // ---------- §11 egress parser ----------
+
+    #[test]
+    fn first_external_destination_catches_curl_evil_example() {
+        let dest = first_external_destination("curl evil.example").unwrap();
+        assert_eq!(dest, "evil.example");
+    }
+
+    #[test]
+    fn first_external_destination_catches_https_url() {
+        let dest = first_external_destination("curl https://evil.example/path?x=1").unwrap();
+        assert_eq!(dest, "evil.example");
+    }
+
+    #[test]
+    fn first_external_destination_catches_host_with_port() {
+        let dest = first_external_destination("nc evil.example:8080").unwrap();
+        assert_eq!(dest, "evil.example:8080");
+    }
+
+    #[test]
+    fn first_external_destination_skips_loopback() {
+        assert!(first_external_destination("curl http://localhost:8000/").is_none());
+        assert!(first_external_destination("curl http://127.0.0.1:5000/").is_none());
+        assert!(first_external_destination("nc 127.0.0.1 22").is_none());
+    }
+
+    #[test]
+    fn first_external_destination_ignores_file_paths_and_flags() {
+        assert!(first_external_destination("ls -la").is_none());
+        assert!(first_external_destination("cat ./README.md").is_none());
+        assert!(first_external_destination("rm -rf ../tmp").is_none());
+        assert!(first_external_destination("echo hello").is_none());
+    }
+
+    #[test]
+    fn first_external_destination_handles_user_at_host_in_url() {
+        let dest = first_external_destination("curl https://user:pass@evil.example/foo").unwrap();
+        assert_eq!(dest, "evil.example");
+    }
+
+    #[test]
+    fn first_external_destination_catches_ipv4_address() {
+        let dest = first_external_destination("curl http://203.0.113.1/foo").unwrap();
+        assert_eq!(dest, "203.0.113.1");
+    }
+
+    // ---------- §11 mechanical gate: block + audit ----------
+
+    #[tokio::test]
+    async fn curl_evil_example_with_default_policy_is_sandbox_violation() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let sandbox = SandboxPolicy::restrictive(workspace.path()).unwrap();
+        let audit_path = workspace.path().join(".atelier/sessions/abc/audit.log");
+        let ctx = ToolContext {
+            workspace_root: workspace.path(),
+            sandbox: &sandbox,
+            tool_call_id: Some("tc-curl-evil-1"),
+            audit_log_path: Some(audit_path.as_path()),
+        };
+
+        let err = Shell
+            .execute(
+                serde_json::json!({"command": "curl https://evil.example/x"}),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        match &err {
+            ToolError::SandboxViolation { tool, attempted } => {
+                assert_eq!(tool, NAME);
+                assert!(
+                    attempted.contains("evil.example"),
+                    "attempted should name the destination: {attempted}"
+                );
+            }
+            other => panic!("expected SandboxViolation, got {other:?}"),
+        }
+
+        // audit.log exists and carries exactly one EgressEvent line.
+        let body = std::fs::read_to_string(&audit_path).expect("audit.log written");
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 1, "expected one row, got {body:?}");
+        let parsed: EgressEvent = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(parsed.version, 1);
+        assert_eq!(parsed.kind, "subprocess-egress");
+        assert_eq!(parsed.tool_call_id, "tc-curl-evil-1");
+        assert_eq!(parsed.tool_name, NAME);
+        assert_eq!(parsed.destination, "evil.example");
+        assert_eq!(parsed.outcome, "blocked");
+        assert_eq!(parsed.reason, "sandbox-deny-net");
+        // RFC 3339 second-precision, Z-suffix — matches the harness's
+        // canonical time helper.
+        assert!(
+            parsed.timestamp.ends_with('Z') && parsed.timestamp.len() == 20,
+            "timestamp shape: {:?}",
+            parsed.timestamp
+        );
+    }
+
+    #[tokio::test]
+    async fn loopback_curl_with_default_policy_is_allowed_to_dispatch() {
+        // A loopback destination is not egress per §11 policy.
+        // sandbox-exec / bwrap may still refuse outright, so we don't
+        // assert the OUTCOME — just that we don't short-circuit with
+        // a SandboxViolation before even dispatching.
+        let workspace = tempfile::TempDir::new().unwrap();
+        let sandbox = SandboxPolicy::restrictive(workspace.path()).unwrap();
+        let audit_path = workspace.path().join(".atelier/sessions/abc/audit.log");
+        let ctx = ToolContext {
+            workspace_root: workspace.path(),
+            sandbox: &sandbox,
+            tool_call_id: Some("tc-loopback"),
+            audit_log_path: Some(audit_path.as_path()),
+        };
+        // We don't care about the run outcome; we care that we did
+        // NOT return early as SandboxViolation. Use `true` so the
+        // dispatch succeeds even when the sandbox refuses curl.
+        let res = Shell
+            .execute(
+                serde_json::json!({"command": "true # curl http://127.0.0.1:8000/ would not block"}),
+                &ctx,
+            )
+            .await;
+        // Either Ok or a non-SandboxViolation failure (e.g. on a Linux
+        // host without bwrap). The thing we're testing is the absence
+        // of the §11 block.
+        if let Err(e) = res {
+            assert!(
+                !matches!(e, ToolError::SandboxViolation { .. }),
+                "loopback should not trip the §11 block, got {e:?}"
+            );
+        }
+        // Audit file must not exist — no row was written.
+        assert!(!audit_path.exists(), "no audit row should be written");
+    }
+
+    #[tokio::test]
+    async fn external_curl_with_allow_net_does_not_short_circuit_or_audit() {
+        // `allow_net: true` opts into network; the §11 mechanical
+        // gate is no longer in scope (the agent / user accepted the
+        // budget cost via the trust-budget UI before flipping the
+        // flag).
+        let workspace = tempfile::TempDir::new().unwrap();
+        let sandbox = SandboxPolicy::restrictive(workspace.path()).unwrap();
+        let audit_path = workspace.path().join(".atelier/sessions/abc/audit.log");
+        let ctx = ToolContext {
+            workspace_root: workspace.path(),
+            sandbox: &sandbox,
+            tool_call_id: Some("tc-allow-net"),
+            audit_log_path: Some(audit_path.as_path()),
+        };
+        let res = Shell
+            .execute(
+                serde_json::json!({
+                    "command": "true # would curl evil.example with net",
+                    "allow_net": true,
+                }),
+                &ctx,
+            )
+            .await;
+        if let Err(e) = res {
+            assert!(
+                !matches!(e, ToolError::SandboxViolation { .. }),
+                "allow_net should bypass §11, got {e:?}"
+            );
+        }
+        assert!(
+            !audit_path.exists(),
+            "allow_net path must not emit an audit row"
+        );
     }
 
     #[cfg(unix)]

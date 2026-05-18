@@ -746,6 +746,16 @@ impl Runner {
         //    empty). On a fresh run we keep the pre-v61 single-prompt
         //    bootstrap.
         let session_id = session_handle.id();
+        // §11 / §12 — pre-compute the per-session audit-log path so
+        // every dispatched tool call sees the same destination via
+        // `ToolContext::audit_log_path`. The path lives alongside
+        // `session.json` in the per-repo session dir; the directory
+        // is created lazily on first append (see `audit::append_*`).
+        // On a resume run we keep the prior session uuid so the audit
+        // trail accumulates in one place across the resume boundary.
+        let audit_session_uuid = self.resume_from.unwrap_or(session_id.0);
+        let audit_log_path =
+            OnDiskSession::session_dir(&workspace, audit_session_uuid).join("audit.log");
         let mut messages: Vec<Message> = Vec::new();
         let mut resumed_session: Option<OnDiskSession> = None;
         let prompt_now = now_rfc3339();
@@ -984,6 +994,10 @@ impl Runner {
                 let ctx = ToolContext {
                     workspace_root: &workspace,
                     sandbox: &sandbox,
+                    // tool_call_id is set per-call by Dispatcher::dispatch;
+                    // the value here is ignored.
+                    tool_call_id: None,
+                    audit_log_path: Some(audit_log_path.as_path()),
                 };
                 for call in real_tool_calls {
                     let outcome = session_dispatcher.dispatch(&call, &ctx, now_rfc3339).await;
