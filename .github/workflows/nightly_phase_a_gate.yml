@@ -13,10 +13,12 @@ name: nightly_phase_a_gate
 # (crates/atelier-cli/src/bin/phase_a_gate_status.rs) reads the
 # committed artifact for downstream consumers.
 #
-# Live-API gates against Anthropic + LiteLLM (Track B) live in a
-# separate workflow once a credentialed secret lands; the maintainer
-# wires `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` into repo secrets and
-# extends this file with one more job, gated on the secret being set.
+# Live-API gate against Anthropic (Track B / Phase A close, v60.19)
+# is one step below. It records `skipped` when `ANTHROPIC_API_KEY` is
+# absent so the workflow stays green for forks / before the maintainer
+# wires the secret in. The OpenAI-compat half of Track B is still
+# deferred (the local OSS models we'd test against don't reliably
+# claim_done on the canonical workload; hosted OpenAI is paid-tier).
 
 on:
   schedule:
@@ -161,6 +163,42 @@ jobs:
           echo "duration=$((end - start))" >> "$GITHUB_OUTPUT"
           exit $ec
 
+      # Phase A live-API gate. Runs the five priority canonical tasks
+      # (t01, t02, t05, t06, t10) against `anthropic:claude-haiku-4-5`
+      # — the spec text's "the §2.5 state machine drives t01/t02/t05/t06/t10
+      # end-to-end against the Anthropic adapter without bypassing any
+      # transition." Costs ~$0.20 of API credit per nightly. When
+      # `ANTHROPIC_API_KEY` is absent (forks, pre-maintainer-setup) the
+      # gate records `status: skipped` rather than `failed` — see the
+      # `is_skipped` branch in the compose step below.
+      - name: Gate — phase A live (Anthropic)
+        id: phase_a_live
+        continue-on-error: true
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          set +e
+          start=$(date +%s)
+          if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+            echo "ANTHROPIC_API_KEY not set; live gate will be recorded as skipped."
+            end=$(date +%s)
+            echo "exit_code=0" >> "$GITHUB_OUTPUT"
+            echo "duration=$((end - start))" >> "$GITHUB_OUTPUT"
+            echo "is_skipped=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # The five priority tests share the `phase_a_live_anthropic_` prefix.
+          # `--include-ignored` opts them in; the pattern keeps the run scoped
+          # to this gate.
+          cargo test -p atelier-cli --test run_integration \
+            phase_a_live_anthropic_ -- --include-ignored
+          ec=$?
+          end=$(date +%s)
+          echo "exit_code=$ec" >> "$GITHUB_OUTPUT"
+          echo "duration=$((end - start))" >> "$GITHUB_OUTPUT"
+          echo "is_skipped=false" >> "$GITHUB_OUTPUT"
+          exit $ec
+
       # Build the JSON artifact + commit + push.
       - name: Compose phase_a_gate/last_run.json
         id: compose
@@ -183,12 +221,23 @@ jobs:
           cargo_status=$(status_for "${{ steps.cargo_test.outputs.exit_code }}")
           rig_status=$(status_for "${{ steps.rig.outputs.exit_code }}")
           mcp_status=$(status_for "${{ steps.mcp.outputs.exit_code }}")
+          # Live-API gate: `skipped` when the secret isn't set, otherwise
+          # the normal pass/fail mapping. The is_skipped flag was emitted
+          # by the gate step above.
+          if [ "${{ steps.phase_a_live.outputs.is_skipped }}" = "true" ]; then
+            phase_a_live_status="skipped"
+          else
+            phase_a_live_status=$(status_for "${{ steps.phase_a_live.outputs.exit_code }}")
+          fi
 
-          # The MCP gate is non-fatal — see note above.
+          # The MCP gate is non-fatal — see note above. The live-API gate
+          # is fatal when it runs (`failed` flips all_passed) but neutral
+          # when `skipped` (forks / pre-maintainer-setup).
           if [ "$fmt_status" = "passed" ] && \
              [ "$clippy_status" = "passed" ] && \
              [ "$cargo_status" = "passed" ] && \
-             [ "$rig_status" = "passed" ]; then
+             [ "$rig_status" = "passed" ] && \
+             [ "$phase_a_live_status" != "failed" ]; then
             all_passed=true
           else
             all_passed=false
@@ -208,7 +257,8 @@ jobs:
               {"name": "clippy", "status": "$clippy_status", "duration_secs": ${{ steps.clippy.outputs.duration }}},
               {"name": "cargo_test_workspace", "status": "$cargo_status", "duration_secs": ${{ steps.cargo_test.outputs.duration }}},
               {"name": "rig_check", "status": "$rig_status", "duration_secs": ${{ steps.rig.outputs.duration }}},
-              {"name": "mcp_integration_npx", "status": "$mcp_status", "duration_secs": ${{ steps.mcp.outputs.duration }}}
+              {"name": "mcp_integration_npx", "status": "$mcp_status", "duration_secs": ${{ steps.mcp.outputs.duration }}},
+              {"name": "phase_a_live_anthropic", "status": "$phase_a_live_status", "duration_secs": ${{ steps.phase_a_live.outputs.duration }}}
             ]
           }
           EOF
@@ -237,5 +287,5 @@ jobs:
       - name: Surface failure
         if: steps.compose.outputs.all_passed != 'true'
         run: |
-          echo "::error::Phase A gate red — at least one of fmt/clippy/cargo_test/rig failed. See per-step logs above and tests/phase_a_gate/last_run.json on main."
+          echo "::error::Phase A gate red — at least one of fmt/clippy/cargo_test/rig/phase_a_live_anthropic failed. See per-step logs above and tests/phase_a_gate/last_run.json on main."
           exit 1

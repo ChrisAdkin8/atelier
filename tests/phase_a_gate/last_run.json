@@ -32,6 +32,11 @@
       "name": "mcp_integration_npx",
       "status": "skipped",
       "details": "seed run — workflow first lands this nightly; npx-gated MCP integration runs from the next firing"
+    },
+    {
+      "name": "phase_a_live_anthropic",
+      "status": "skipped",
+      "details": "seed run — v60.19 lands this gate; runs from the next firing once ANTHROPIC_API_KEY is wired into repo secrets"
     }
   ]
 }

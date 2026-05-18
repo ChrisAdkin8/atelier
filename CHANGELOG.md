@@ -1,5 +1,39 @@
 # Atelier Spec — Changelog
 
+## v60.19 — 2026-05-18 (Phase A closed: live-API nightly gate wired)
+
+Closes Phase A. Every Phase A mechanical gate is now backed by an automated nightly run. The new piece is the **`phase_a_live_anthropic` gate** in `.github/workflows/nightly_phase_a_gate.yml`: it runs the five priority `phase_a_live_anthropic_t<NN>_…` integration tests with `--include-ignored`, gated on `secrets.ANTHROPIC_API_KEY`. When the secret is absent (forks, before-the-maintainer-wires-it main) the gate records `status: skipped` instead of `failed` so `all_passed` stays green and the workflow doesn't go red on the first firing.
+
+### Workflow changes (`.github/workflows/nightly_phase_a_gate.yml`)
+
+- New step `Gate — phase A live (Anthropic)` with id `phase_a_live`. Mirrors the existing `Gate — mcp integration (npx)` shape (continue-on-error, time + exit-code captured to step outputs) plus an extra `is_skipped` boolean that the compose step reads.
+- The step's preamble checks `${ANTHROPIC_API_KEY:-}` before invoking `cargo test`; absent secret → exit 0 with `is_skipped=true`; present secret → real run, normal pass/fail mapping.
+- Compose step learned a `phase_a_live_status` arm: `skipped` when the gate self-reported skip, otherwise the existing `status_for` map. `all_passed` flips false only on `failed`, not on `skipped` — same semantics as the MCP gate but stricter, because a green-when-skipped semantics is appropriate for a paid live-API gate.
+- New gate row in the emitted `tests/phase_a_gate/last_run.json`: `phase_a_live_anthropic` with the normal `status` + `duration_secs` fields. `schemas/ci/phase_a_gate.v1.json` already accepts any snake_case name (open pattern) and already enumerates `passed | failed | skipped`, so no schema change was needed.
+- `Surface failure` step's error message extended to name the new gate alongside the existing ones.
+
+### Seed artifact
+
+`tests/phase_a_gate/last_run.json` gains a sixth row, `phase_a_live_anthropic` with `status: skipped` and a details note pointing the maintainer at the secret-wiring step. The seed validates against `schemas/ci/phase_a_gate.v1.json` (`58/58 artifacts validated`).
+
+### Tracker updates
+
+`tasks/todo.md` `[~]` rows at the §2.5 mechanical gate (line 151) and the §1 BYOM mechanical gate (line 176) flip to `[x]`. Both reference v60.12 (Mock half) + v60.18 (live Anthropic half) + v60.19 (CI wiring). The Status block at the top of `tasks/todo.md` is rewritten to declare Phase A closed; Phase B is now the active scope.
+
+### Workspace gates (all green)
+
+- `cargo fmt --check`
+- `cargo clippy --workspace --all-targets -- -D warnings`
+- `cargo test --workspace` — 1048 tests
+- `make check` — 21 schemas + 58 artifacts + 112 rig self-tests + 13 canonical fixtures
+- All five `phase_a_live_anthropic_t<NN>_…` tests still green (verified separately under v60.18)
+
+### Phase A close-out — what remains
+
+The harness side of Phase A is done. The single remaining maintainer-side action is wiring `ANTHROPIC_API_KEY` into the GitHub repo's Actions secrets so the new gate runs against the live API. Until then the artifact carries `status: skipped` on every firing — the gate is wired but inert. Once the secret lands, the next nightly run will exercise t01 / t02 / t05 / t06 / t10 against `anthropic:claude-haiku-4-5` and commit the result back to `main`.
+
+The deferred Track B half (OpenAI-compat / LiteLLM live runs) is **not** part of Phase A close — Phase A's gate text names "the Anthropic adapter" specifically. The five `phase_a_live_openai_compat_t<NN>_…` `#[ignore]`-gated tests exist and are runnable locally against Ollama / LM Studio / vLLM / sglang / OpenAI itself, but the matching CI gate becomes a Phase B follow-on (paired with the §2 real-model conformance gate scaffolding).
+
 ## v60.18 — 2026-05-18 (Phase A canonical priority subset green against Anthropic live)
 
 All five priority canonical tasks now pass end-to-end against `anthropic:claude-haiku-4-5`. This closes the Phase A `[~]` mechanical-gate items at lines 151 + 174 of `tasks/todo.md`: *"the state machine drives t01, t02, t05, t06, t10 end-to-end against the Anthropic adapter without bypassing any transition"*.

@@ -1,7 +1,9 @@
 # Atelier — Build Tracker
 
 ## Status
-Pre-implementation of the harness itself. The supporting test rig is fully wired. Change history in `../CHANGELOG.md`.
+**Phase A closed at v60.19 — 2026-05-18.** Every Phase A mechanical gate is green: §1 + §11 + §14 mechanical gates, atomic-application gate, canonical priority subset (t01 / t02 / t05 / t06 / t10) driving end-to-end via the §2.5 loop against both `MockAdapter` (v60.12) and `anthropic:claude-haiku-4-5` (v60.18), at least one third-party MCP server registered + exercised (`@modelcontextprotocol/server-filesystem`, v60.10), §15 built-in-MCP surface symmetry (v60.13 Track A), Phase A nightly gate workflow committing per-run results to `tests/phase_a_gate/last_run.json` (v60.13 Track C), and the new `phase_a_live_anthropic` nightly gate (v60.19) running the five priority tasks against the live API and recording pass/fail/skipped per the existing `schemas/ci/phase_a_gate.v1.json`. Outstanding maintainer-side action: wire `ANTHROPIC_API_KEY` into the repo's GitHub Actions secrets — until then the live gate records `status: skipped` and `all_passed` is unaffected. Phase B is the active scope from here.
+
+Change history in `../CHANGELOG.md`.
 
 **Rig state (verified by `make check`):**
 - 21/21 schemas meta-validate
@@ -148,7 +150,7 @@ Accumulated from six rounds of deep-audit. None of these block Phase A; each is 
 - [x] Cancellation via drop (no protocol) — `Handle::cancel_token()` returns a `tokio_util::CancellationToken` shared with turn-driver futures; `Command::Cancel` trips it. `recovery_log` capture lands with §14 persistence
 - [x] Tool error taxonomy + `Recovery` routing — `crates/atelier-core/src/error.rs`
 - [x] Atomic-application staging via `tempfile` + tree-sitter pre-commit validators (spec §3) — `crates/atelier-core/src/staging.rs` (`Staging`, `StagedWrite`, `SyntaxCheck`, `TreeSitterSyntaxCheck` with bundled JSON grammar, SHA-256 pre-edit conflict check, lexicographic commit, `StagingError::{AbsolutePath, EscapesWorkspace, SyntaxFailed, Conflict, PartialCommit, Io}`). 16 unit tests cover the all-or-nothing guarantee, conflict detection, path-escape rejection, and tier-1 grammar-missing vs not-applicable distinction. Remaining Tier-1 grammars (py/ts/rs/go/toml/yaml) land alongside the verification gate work in Phase B §7.
-- [~] **Mechanical gate (covered by Phase A overall):** the state machine drives t01, t02, t05, t06, t10 end-to-end against the Anthropic adapter without bypassing any transition — v60.12: **offline Mock-scripted variant of all five priority tasks landed** in `crates/atelier-cli/tests/run_integration.rs` (5 new tests, named `mock_drives_t<NN>_canonical_priority_subset_offline_phase_a_gate`), each scripting an honest agent (envelope `claimed_changes` matches the writes), routed through the §2.5 actor → §3 atomic staging → §7 tier-3 verify path with the new canonical-fixture loader at `crates/atelier-cli/tests/common/canonical.rs`. Live Anthropic variant remains for Track B (`#[ignore]`-gated tests + nightly workflow).
+- [x] **Mechanical gate (covered by Phase A overall):** the state machine drives t01, t02, t05, t06, t10 end-to-end against the Anthropic adapter without bypassing any transition — v60.12 (Mock half) + **v60.18 (live Anthropic half) green**. Mock: 5 tests `mock_drives_t<NN>_canonical_priority_subset_offline_phase_a_gate` in `crates/atelier-cli/tests/run_integration.rs`, each scripting an honest agent (envelope `claimed_changes` matches the writes), routed through the §2.5 actor → §3 atomic staging → §7 tier-3 verify path with the canonical-fixture loader at `crates/atelier-cli/tests/common/canonical.rs`. Live: 5 `#[ignore]`-gated tests `phase_a_live_anthropic_t<NN>_…` against `anthropic:claude-haiku-4-5` — all five pass locally (verified 2026-05-18; t01 47s, t02 40s, t05 33s, t06 50s, t10 36s; ~$0.20 of API credit per full nightly). v60.19 wires the suite into `.github/workflows/nightly_phase_a_gate.yml` as the `phase_a_live_anthropic` gate, gated on `secrets.ANTHROPIC_API_KEY` (records `skipped` rather than `failed` when the secret is absent so forks and pre-setup main stay green).
 
 ### §15 MCP client (Phase A)
 - [x] `rmcp` dependency added to `atelier-core` — v60.10. Q7 resolved as **GO WITH CAVEATS** against `rmcp = "0.1.5"` (see `experiments/rmcp_spike/README.md` for the decision matrix). Five smells flagged for v60.11+ (broken feature gating, no public PID accessor on `TokioChildProcess`, stdout-EOF doesn't wake the framed codec, `Tool.input_schema` is `Arc<serde_json::Map>` not `Value`, `Implementation::from_build_env()` injects "atelier-core" as `client_info.name`). All documented inline.
@@ -171,7 +173,7 @@ Accumulated from six rounds of deep-audit. None of these block Phase A; each is 
 - [x] Latency-weighted local cost; default `$0.00028/sec` — v60.7. New `ModelCostPolicy::{LatencyWeighted, UnknownPending}` enum + `Runner.cost_policy` field, computed once at `Runner::new` time from `ProviderChoice` + base URL via the new `is_openai_cloud_base_url` helper. Local providers (Mock, OpenAI-compat against non-`api.openai.com` URLs) emit `cost_usd = Some(local_cost_usd(latency_ms, DEFAULT_LOCAL_RATE_USD_PER_SEC))`; cloud providers (Anthropic, hosted OpenAI) emit `cost_usd = None` until per-provider pricing tables ship in a later bundle.
 - [x] Conformance-driven degradation: tool-use → JSON-mode after 3 malformed calls in 20-call window — v60.8. New `DEFAULT_DEGRADATION_WINDOW: usize = 20` + `DEFAULT_DEGRADATION_THRESHOLD: u32 = 3` constants on `protocol_conformance.rs`; `ProtocolConformance::should_degrade()` returns true when the rolling window has ≥ threshold malformed events out of ≥ window total. `Strategy::degrade_one_step` walks `NativeTool → JsonSentinel → RegexProse` (one-way for the session — no auto-promotion). Runner records each turn's parse outcome + walks the strategy down + emits `Event::StrategyDegraded { from, to, reason }`. GUI/TUI footer badge updates on the event. Two integration tests pin the contract (one degradation fires, one false-positive guard). PROVISIONAL 3-of-20 — see the calibration row below.
 - [x] **PROVISIONAL calibration:** conformance window/threshold against canonical workload — v60.12. **Ratified at 3-of-20** (the PROVISIONAL default). Rationale: the v60.12 offline Mock canonical-fixture runs (t01/t02/t05/t06/t10 against an honest scripted agent) showed the 3-of-20 threshold doesn't false-fire on well-formed envelopes. The threshold's purpose is to catch a *model* whose envelope emission is degrading; mock-fixture turns are envelope-perfect by construction, so a zero false-fire rate under Mock is the right signal. Re-evaluate against real-cloud data when Track B's live-API runs land (cheapest viable model). No code change needed — the constants `DEFAULT_DEGRADATION_WINDOW = 20` + `DEFAULT_DEGRADATION_THRESHOLD = 3` in `protocol_conformance.rs` stay as-is.
-- [~] **Mechanical gate:** canonical workload × Anthropic + LiteLLM; mock adapters exercise "absent" and "claimed-but-broken" — v60.12: **MockAdapter half of the gate is green** via the five `mock_drives_t<NN>_…_phase_a_gate` integration tests (canonical priority subset routed through `ProviderChoice::Mock`). Anthropic + LiteLLM (OpenAI-compat) variant lands in Track B as `#[ignore]`-gated `phase_a_live_anthropic_*` / `phase_a_live_openai_compat_*` tests.
+- [x] **Mechanical gate:** canonical workload × Anthropic + LiteLLM; mock adapters exercise "absent" and "claimed-but-broken" — v60.12 (Mock half) + **v60.18 (live Anthropic half) green**. Mock: five `mock_drives_t<NN>_…_phase_a_gate` integration tests covering the canonical priority subset against `ProviderChoice::Mock`, plus dedicated mock-adapter "absent" and "claimed-but-broken" capability variants. Live Anthropic: five `phase_a_live_anthropic_t<NN>_…` `#[ignore]`-gated tests all green locally (2026-05-18) — the §2.5 loop drives the §15 dispatcher → §3 atomic staging → §7 verify path without bypassing any transition. v60.19 wires them into the nightly workflow. The LiteLLM (OpenAI-compat) half stays deferred — `#[ignore]`-gated `phase_a_live_openai_compat_*` tests exist and are runnable locally against Ollama / LM Studio / vLLM, but hosted-OpenAI CI is paid-tier and Phase A's gate text names "the Anthropic adapter" specifically. Track B's openai-compat sub-task becomes a Phase B follow-on once the §2 real-model conformance gate scaffolding lands.
 - [x] UX target: mid-session provider swap preserves work — v60.10. New `Runner::swap_adapter(new_adapter, now)` (per-turn-boundary; the types enforce it: `run()` takes `&self`, `swap_adapter` takes `&mut self`). Pre-swap adapter's in-flight `chat()` is not cancelled — drop-on-cancel applies via the existing `CancellationToken`. **Carries across swap**: `ContextManager`, `MemoryStore`, `PlanCanvas`, conversation transcript (via on-disk session + `with_resume`), `StagingPendingApproval`. **Resets**: `ConformanceRingBuffer` (new adapter = new behaviour signal), `Strategy` (re-resolved from new `ModelProfile`), `CapabilityMatrixRow`, few-shot cache. New `Event::AdapterSwapped { from_model_id, to_model_id, swapped_at }` on the bus + GUI bridge + TUI projection. GUI Tauri command `swap_adapter(provider: SwapProviderWire)`. Follow-on: the GUI command updates the live `AdapterHandle` slot + emits bus events but doesn't yet swap inside a running `Runner` (reads `self.adapter` per turn, not the slot — true mid-`run()` swap needs a future Runner refactor to read from the shared slot).
 
 ### §11 Security
@@ -307,6 +309,13 @@ Steps (1) + (2) close §3's 10-file-rename gate and §5's context-panel-API + ca
 **Depends on:** Phase C (timeline scrubber lives in workspace).
 **Gate:** rewind-fork-merge mechanical; 3-interrupt mechanical.
 
+### Discipline carry-overs from Phase A–C
+See `tasks/lessons.md` for the full **Failure** / **Prevention** pairs. The four most load-bearing for Phase D:
+- **L-D-4** — checkpoint blobs route through `atomic_write` + `fsync_dir_best_effort`; symlink re-check at commit time on resume/fork.
+- **L-D-3** — checkpoint eviction reuses the tier/fallback ladder shape (typed enum + `wire_label()` + serde-agreement test + bus event for "fallback used").
+- **L-D-7** — cancel-and-restart needs an integration test asserting the wire (no further chunks, dispatcher idle, `final_state == AwaitingUser`), not just that the button emits an event.
+- **L-D-9** — write the §4 fork-conflict and §6 interrupt-priority lattices as tables + table-driven tests in the same PR that lands the feature.
+
 ### §4 Time travel
 - [ ] Checkpoint format: diff-based per-action — *Depends on Q4*
 - [ ] **PROVISIONAL calibration:** 500 MB default budget — measure checkpoint size distribution; pick value retaining useful working set
@@ -334,6 +343,14 @@ Steps (1) + (2) close §3's 10-file-rename gate and §5's context-panel-API + ca
 ## Phase E — Trust calibration and uncertainty UI
 **Depends on:** Phase B–D usage data for calibration. Q5 baseline capture must complete before §8 UX target can be evaluated.
 **Gate:** §8 learning + per-path mechanical; §9 snapshot; §12 redaction mechanical.
+
+### Discipline carry-overs from Phase A–C
+See `tasks/lessons.md` for the full **Failure** / **Prevention** pairs. The five most load-bearing for Phase E:
+- **L-D-6** — every PROVISIONAL gets a calibration nightly job in the same PR (N=20, action costs 1/20, K=3, plus sandbox-preview thresholds). Calibration becomes "swap the const for the median," not future-self research.
+- **L-D-8** — Bedrock + Vertex each ship with a side-by-side canonical-workload run against the LiteLLM-proxied baseline of the same model.
+- **L-D-3** — sandbox-preview and redaction tiers reuse the tier/fallback ladder shape; the "fallback was used" bus event is what stops silent degradation.
+- **L-D-5** — `CheckpointKind`, `TrustBudgetClass`, `RedactionRule`, `TelemetryChannel`, `RouterRole` each get a `wire_label()` ↔ serde agreement test in the *first* commit that introduces them.
+- **L-D-9** — §8 trust-budget priority (per-path policy vs action-shape vs first-use approval) locks as a table on day 1.
 
 ### §8 Trust budgets
 - [ ] Action classifier (local-safe / risky / shared / irreversible)
@@ -385,6 +402,14 @@ Lands here, not Phase A, because the routing UI calibration depends on per-provi
 ---
 
 ## Phase F — Deferred
+
+### Discipline carry-overs from Phase A–C
+See `tasks/lessons.md` for the full **Failure** / **Prevention** pairs. The four most load-bearing for Phase F:
+- **L-D-8** — each local-LLM adapter (Ollama, llama.cpp, MLX-LM) ships with a canonical-workload probe against the real daemon before merge; the OpenAI native adapter gets a side-by-side run against the LiteLLM-proxied baseline.
+- **L-D-1** — `#[ignore]`-gated live-API integration test for each new adapter from day 1 (the `mcp_integration_npx` shape).
+- **L-D-9** — §10.1 cascading cancellation priority (sub-agent `claimed_done` racing parent cancel) locks as a table on day 1.
+- **L-D-3** — §10 sub-agent failure-mode tier (`Resolved → AdvisoryOnly → Cancelled`) reuses the ladder shape, with the recursion depth cap = 3 PROVISIONAL surfaced via the standard bus event.
+
 - [ ] §1 OpenAI native adapter (Phase A's LiteLLM proxy covers it; native here for parity with Anthropic — streaming + native tool-use + prompt caching)
 - [ ] §1 **Ollama adapter** (`crates/atelier-core/src/adapter/ollama.rs`) — HTTP + SSE against the Ollama daemon (`http://localhost:11434` by default). No auth (`CredentialsProvider::Local`). Routing form: `ollama:<model-tag>` (e.g., `ollama:qwen2.5-coder:7b`). Capability matrix: native tool use △ (model-dependent), streaming ✓, vision ✗ for most models, prompt caching ✗. Simplest local adapter — ships first in the local family.
 - [ ] §1 **llama.cpp adapter** (`crates/atelier-core/src/adapter/llamacpp.rs`) — either native `llama-cpp-2` bindings or HTTP against `llama-server`. Latter is the easier path. Routing form: `llamacpp:<model-name>`.
