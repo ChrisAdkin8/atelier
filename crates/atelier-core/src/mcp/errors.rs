@@ -86,6 +86,32 @@ pub enum McpLaunchError {
     /// Wraps `crate::mcp_config::McpConfigError`'s display.
     #[error("MCP server {name:?} env interpolation failed: {reason}")]
     Interpolation { name: String, reason: String },
+
+    /// The remote HTTP/SSE server returned a non-success status during the
+    /// initial endpoint negotiation (before any JSON-RPC handshake). Status
+    /// captured for the trust-budget UI; the body is intentionally NOT
+    /// preserved (it may carry an error payload the caller doesn't expect
+    /// to inspect, and rmcp doesn't surface it cleanly).
+    #[error("MCP server {name:?} returned HTTP status {status}")]
+    HttpStatus { name: String, status: u16 },
+
+    /// The SSE stream errored before the launcher could complete its
+    /// handshake. Covers reqwest-level failures (DNS, TLS, network) and
+    /// SSE-stream-level failures (malformed event, premature EOF).
+    #[error("MCP server {name:?} SSE stream failed: {message}")]
+    SseStream { name: String, message: String },
+
+    /// Header value resolution produced an invalid HTTP header (e.g. the
+    /// resolved env var contains a CRLF or non-ASCII byte that violates
+    /// `reqwest::header::HeaderValue::from_str`). Surfaces separately from
+    /// `Interpolation` so the UI can prompt the user to inspect the env
+    /// var value rather than just the manifest text.
+    #[error("MCP server {name:?} header {header:?} is invalid: {reason}")]
+    InvalidHeader {
+        name: String,
+        header: String,
+        reason: String,
+    },
 }
 
 impl McpLaunchError {
@@ -99,6 +125,7 @@ impl McpLaunchError {
                 | Self::InvalidManifest { .. }
                 | Self::Interpolation { .. }
                 | Self::ProtocolMismatch { .. }
+                | Self::InvalidHeader { .. }
         )
     }
 }

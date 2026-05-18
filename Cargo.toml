@@ -40,10 +40,14 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 # v60.10 (`experiments/rmcp_spike`): pinned to the 0.1.x line; 1.x on crates.io
 # is a separate fork at the time of writing. Feature set: `client` enables the
 # `serve_client` path + `Peer<RoleClient>` API; `transport-child-process` brings
-# `TokioChildProcess` (stdio subprocess). Default features stay on because
-# rmcp 0.1.5 has a feature-gating bug where `macros` (which pulls `paste`) is
-# required even when not using `#[tool]` — see the spike Cargo.toml comment.
-rmcp = { version = "0.1", features = ["client", "transport-child-process"] }
+# `TokioChildProcess` (stdio subprocess); `transport-sse` (v60.11 C1) brings
+# `SseTransport` for `http`/`sse` MCP servers — under the hood reqwest + the
+# `sse-stream` crate. rmcp 0.1.5 has no separate "HTTP-only" transport, so
+# `Transport::Http` and `Transport::Sse` manifests both route through SSE.
+# Default features stay on because rmcp 0.1.5 has a feature-gating bug where
+# `macros` (which pulls `paste`) is required even when not using `#[tool]` —
+# see the spike Cargo.toml comment.
+rmcp = { version = "0.1", features = ["client", "transport-child-process", "transport-sse"] }
 
 # Secrets / credentials (§11 credential storage)
 keyring = "3"

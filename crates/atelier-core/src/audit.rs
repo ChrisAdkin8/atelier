@@ -101,6 +101,113 @@ impl EgressEvent {
     }
 }
 
+/// One row of `audit.log` describing an outbound HTTP/SSE request to a
+/// remote MCP server. Conforms to `schemas/audit/mcp_egress.v1.json`. A
+/// sibling of [`EgressEvent`]: same file, different `kind`. Spec §12 line
+/// 656: *"MCP HTTP/SSE servers count as egress targets and are logged the
+/// same way as LLM providers."*
+///
+/// Header redaction posture: the *caller* is responsible for never
+/// constructing this struct with a header-bearing field. The shape itself
+/// has no `headers` member — there is no on-disk representation of the
+/// `Authorization` value, full stop. URLs are recorded verbatim because
+/// they are routing data; secrets-in-URL is an anti-pattern handled by the
+/// §12 redaction layer (out of scope here).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpEgressEvent {
+    /// Schema version. Locked to `1`.
+    pub version: u32,
+    /// Discriminator shared with `EgressEvent`'s `kind` field. Always
+    /// `"mcp-http-request"` for instances built by this module.
+    pub kind: String,
+    /// RFC 3339 timestamp at the moment the request was initiated.
+    pub timestamp: String,
+    /// MCP server name (`manifest.name`). Per spec §12, "the `provider`
+    /// field on the audit record carries the MCP server name."
+    pub provider: String,
+    /// Full endpoint URL. Query strings + fragments retained.
+    pub url: String,
+    /// Lifecycle phase that produced the request (handshake / list-tools /
+    /// call-tool / shutdown).
+    pub phase: String,
+    /// Outcome from the harness's perspective.
+    pub outcome: String,
+    /// Free-form diagnostic note; omitted for `success` rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Tool name for `phase == "call-tool"` rows. Omitted otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+}
+
+/// Lifecycle phase enum surfaced as a string in the `phase` audit field.
+/// Kept as an enum (rather than free `&str`) so the producer can't drift
+/// the wire-label set from the schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpEgressPhase {
+    Handshake,
+    ListTools,
+    CallTool,
+    Shutdown,
+}
+
+impl McpEgressPhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Handshake => "handshake",
+            Self::ListTools => "list-tools",
+            Self::CallTool => "call-tool",
+            Self::Shutdown => "shutdown",
+        }
+    }
+}
+
+/// Outcome enum surfaced as the `outcome` audit field. Schema-pinned to
+/// `success | failure | blocked`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpEgressOutcome {
+    Success,
+    Failure,
+    Blocked,
+}
+
+impl McpEgressOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Failure => "failure",
+            Self::Blocked => "blocked",
+        }
+    }
+}
+
+impl McpEgressEvent {
+    /// Helper for the common builder shape: phase + outcome enums, optional
+    /// reason + tool name. Callers in production code construct via this
+    /// to guarantee a schema-conformant `kind` / `version`.
+    pub fn new(
+        timestamp: impl Into<String>,
+        provider: impl Into<String>,
+        url: impl Into<String>,
+        phase: McpEgressPhase,
+        outcome: McpEgressOutcome,
+        reason: Option<String>,
+        tool_name: Option<String>,
+    ) -> Self {
+        Self {
+            version: 1,
+            kind: "mcp-http-request".to_string(),
+            timestamp: timestamp.into(),
+            provider: provider.into(),
+            url: url.into(),
+            phase: phase.as_str().to_string(),
+            outcome: outcome.as_str().to_string(),
+            reason,
+            tool_name,
+        }
+    }
+}
+
 /// Audit-log error surface. Today only `Io` is reachable; reserved for a
 /// future JSON-encoding failure if the event struct grows a fallible
 /// field. Callers don't propagate — see module docs — but the typed
@@ -133,6 +240,49 @@ static APPEND_LOCK: Mutex<()> = Mutex::new(());
 /// continue (the egress is still blocked); the typed return is for the
 /// integration test which asserts the on-disk shape.
 pub fn append_subprocess_egress(path: &Path, event: &EgressEvent) -> Result<(), AuditError> {
+    let mut line =
+        serde_json::to_string(event).map_err(|e| AuditError::Serialize(e.to_string()))?;
+    line.push('\n');
+
+    let _guard = APPEND_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|e| AuditError::Io {
+                path: parent.to_path_buf(),
+                source: e,
+            })?;
+        }
+    }
+
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| AuditError::Io {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+    f.write_all(line.as_bytes()).map_err(|e| AuditError::Io {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
+    f.flush().map_err(|e| AuditError::Io {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
+    Ok(())
+}
+
+/// Append one [`McpEgressEvent`] as a single `\n`-terminated JSON line to
+/// `path`. Same on-disk contract as [`append_subprocess_egress`] —
+/// NDJSON, append-mode, parent dirs created on demand. Producer is the
+/// §15 HTTP/SSE MCP launcher; rows for stdio launches are NOT emitted
+/// (stdio is the local-only path, no egress).
+pub fn append_mcp_egress(path: &Path, event: &McpEgressEvent) -> Result<(), AuditError> {
     let mut line =
         serde_json::to_string(event).map_err(|e| AuditError::Serialize(e.to_string()))?;
     line.push('\n');
@@ -256,5 +406,108 @@ mod tests {
         let e = EgressEvent::blocked_subprocess_egress("t", "tc", "shell", "host");
         append_subprocess_egress(&path, &e).unwrap();
         assert!(path.exists());
+    }
+
+    #[test]
+    fn mcp_egress_event_has_locked_version_and_kind() {
+        let e = McpEgressEvent::new(
+            "2026-05-17T10:00:00Z",
+            "search-mcp",
+            "https://search.example/mcp",
+            McpEgressPhase::Handshake,
+            McpEgressOutcome::Success,
+            None,
+            None,
+        );
+        assert_eq!(e.version, 1);
+        assert_eq!(e.kind, "mcp-http-request");
+        assert_eq!(e.phase, "handshake");
+        assert_eq!(e.outcome, "success");
+        assert_eq!(e.provider, "search-mcp");
+    }
+
+    #[test]
+    fn mcp_egress_event_round_trip_schema_field_set() {
+        // Pin the wire shape: `headers` MUST NOT appear on the value
+        // (the launcher strips it before construction). Round-trip
+        // ensures serde drops `None`-typed optional fields.
+        let e = McpEgressEvent::new(
+            "2026-05-17T10:00:00Z",
+            "search-mcp",
+            "https://search.example/mcp",
+            McpEgressPhase::CallTool,
+            McpEgressOutcome::Failure,
+            Some("http-status".into()),
+            Some("search".into()),
+        );
+        let v = serde_json::to_value(&e).unwrap();
+        let obj = v.as_object().unwrap();
+        assert!(!obj.contains_key("headers"), "headers must never appear");
+        // sanity check: required keys all present
+        for k in [
+            "version",
+            "kind",
+            "timestamp",
+            "provider",
+            "url",
+            "phase",
+            "outcome",
+        ] {
+            assert!(obj.contains_key(k), "missing required key {k}");
+        }
+        // optional keys included when populated
+        assert!(obj.contains_key("reason"));
+        assert!(obj.contains_key("tool_name"));
+    }
+
+    #[test]
+    fn mcp_egress_omits_optional_fields_when_none() {
+        let e = McpEgressEvent::new(
+            "2026-05-17T10:00:00Z",
+            "search-mcp",
+            "https://search.example/mcp",
+            McpEgressPhase::ListTools,
+            McpEgressOutcome::Success,
+            None,
+            None,
+        );
+        let v = serde_json::to_value(&e).unwrap();
+        let obj = v.as_object().unwrap();
+        assert!(!obj.contains_key("reason"));
+        assert!(!obj.contains_key("tool_name"));
+    }
+
+    #[test]
+    fn append_mcp_egress_writes_ndjson_lines() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("audit.log");
+        let e1 = McpEgressEvent::new(
+            "2026-05-17T10:00:00Z",
+            "search-mcp",
+            "https://search.example/mcp",
+            McpEgressPhase::Handshake,
+            McpEgressOutcome::Success,
+            None,
+            None,
+        );
+        let e2 = McpEgressEvent::new(
+            "2026-05-17T10:00:01Z",
+            "search-mcp",
+            "https://search.example/mcp",
+            McpEgressPhase::ListTools,
+            McpEgressOutcome::Failure,
+            Some("http-status".into()),
+            None,
+        );
+        append_mcp_egress(&path, &e1).unwrap();
+        append_mcp_egress(&path, &e2).unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 2);
+        let parsed1: McpEgressEvent = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(parsed1.phase, "handshake");
+        let parsed2: McpEgressEvent = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(parsed2.phase, "list-tools");
+        assert_eq!(parsed2.outcome, "failure");
     }
 }

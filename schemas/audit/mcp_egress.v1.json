@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://atelier.example/schemas/audit/mcp_egress.v1.json",
+  "title": "Atelier MCP HTTP/SSE egress audit record",
+  "description": "One record per outbound HTTP request to a remote MCP server (transport: http|sse). Spec §12 line 656: 'MCP HTTP/SSE servers count as egress targets and are logged the same way as LLM providers — `provider` field on the audit record carries the MCP server name.' Lives in the same on-disk `audit.log` as `subprocess_egress.v1.json` and `egress.v1.json`, discriminated by `kind`. Authorization-bearing headers are never written: the launcher strips them before serialization (see `crates/atelier-core/src/mcp/http_launcher.rs`).",
+  "type": "object",
+  "required": [
+    "version",
+    "kind",
+    "timestamp",
+    "provider",
+    "url",
+    "phase",
+    "outcome"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "version": {"const": 1, "description": "Schema version."},
+    "kind": {
+      "const": "mcp-http-request",
+      "description": "Discriminator. Distinct from `subprocess-egress` and `model-call` rows sharing the same `audit.log`."
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "RFC 3339 timestamp at the moment the harness initiated the request."
+    },
+    "provider": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Name of the MCP server (`manifest.name`). Matches the `name` regex from `mcp_servers.v1.json` so a row is traceable to a single registration."
+    },
+    "url": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Full endpoint URL the request was directed at. Query strings + fragments are kept (they're routing data — secrets-in-URL is an anti-pattern the redaction layer flags separately)."
+    },
+    "phase": {
+      "type": "string",
+      "enum": ["handshake", "list-tools", "call-tool", "shutdown"],
+      "description": "Which step of the launcher lifecycle produced this request. `handshake` is the initial SSE endpoint negotiation; `list-tools` is the post-handshake probe; `call-tool` is any subsequent tool invocation; `shutdown` is the cancellation roundtrip if the server requires it."
+    },
+    "outcome": {
+      "type": "string",
+      "enum": ["success", "failure", "blocked"],
+      "description": "Outcome from the harness's perspective. `success` = request completed with a 2xx response (or, for SSE, the stream stayed open); `failure` = transport / status error; `blocked` = the launcher refused to dispatch (today: `allow_net=false` on an http/sse manifest)."
+    },
+    "reason": {
+      "type": "string",
+      "description": "Free-form diagnostic note. For `blocked`, names the policy (`allow_net=false`). For `failure`, a short error category (`http-status`, `sse-stream`, `transport-io`). Omitted for `success`."
+    },
+    "tool_name": {
+      "type": "string",
+      "description": "When `phase == call-tool`, the name of the invoked tool. Omitted otherwise."
+    }
+  }
+}

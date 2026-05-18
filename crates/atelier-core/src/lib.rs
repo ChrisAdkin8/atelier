@@ -44,7 +44,10 @@ pub use adapter::{
     Adapter, AdapterError, Capabilities, CapabilityClaim, ChatResponse, ChunkStream, Message,
     MockAdapter, Role, StreamChunk, ToolCallRequest, ToolSpec, Usage,
 };
-pub use audit::{append_subprocess_egress, AuditError, EgressEvent};
+pub use audit::{
+    append_mcp_egress, append_subprocess_egress, AuditError, EgressEvent, McpEgressEvent,
+    McpEgressOutcome, McpEgressPhase,
+};
 pub use context::{
     CacheBustEvent, ContextError, ContextItem, ContextItemId, ContextManager, Payload, Provenance,
     TokenCount, TokenSnapshot, TokenSource,
@@ -69,8 +72,8 @@ pub use ledger::{
     local_cost_usd, Kind as LedgerKind, Ledger, LedgerEntry, DEFAULT_LOCAL_RATE_USD_PER_SEC,
 };
 pub use mcp::{
-    default_sandbox_for_workspace as default_mcp_sandbox, launch_stdio_server, McpLaunchError,
-    McpServerHandle, McpTool, FIRST_LIST_TIMEOUT_MS as MCP_FIRST_LIST_TIMEOUT_MS,
+    default_sandbox_for_workspace as default_mcp_sandbox, launch_http_server, launch_stdio_server,
+    McpLaunchError, McpServerHandle, McpTool, FIRST_LIST_TIMEOUT_MS as MCP_FIRST_LIST_TIMEOUT_MS,
     HANDSHAKE_TIMEOUT_MS as MCP_HANDSHAKE_TIMEOUT_MS,
     SUPPORTED_PROTOCOL_VERSION as MCP_SUPPORTED_PROTOCOL_VERSION,
 };
