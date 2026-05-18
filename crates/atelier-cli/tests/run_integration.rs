@@ -2234,3 +2234,300 @@ async fn few_shot_override_is_cached_across_turns_not_recomputed() {
         );
     }
 }
+
+// ---------- v60.10 §1 BYOM: mid-session adapter swap preserves work ----------
+
+/// Recording mock adapter that scripts a single happy-path turn and
+/// captures every message vec it sees. Used by the swap test to assert
+/// the post-swap adapter receives the pre-swap conversation history.
+///
+/// Emits via the JsonSentinel strategy (envelope rides inline in the
+/// assistant text, no `tool_calls`) so the persisted conversation has
+/// no orphan tool-call ids — `OnDiskSession::resume_conversation_prefix`
+/// would otherwise truncate at the last quiescent boundary, hiding the
+/// assistant turn we want adapter B to see on its first chat().
+struct RecordingMockAdapter {
+    inner: atelier_core::adapter::MockAdapter,
+    received: Arc<parking_lot::Mutex<Vec<Vec<atelier_core::adapter::Message>>>>,
+}
+
+impl RecordingMockAdapter {
+    fn new(model_id: &str) -> Self {
+        use atelier_core::adapter::{Capabilities, CapabilityClaim};
+        // Force JsonSentinel by declaring native_tool_use as
+        // Unsupported. The runner's `ProbePolicy::Skip` path picks
+        // JsonSentinel iff native_tool_use is not Usable.
+        let inner =
+            atelier_core::adapter::MockAdapter::new(model_id).with_capabilities(Capabilities {
+                native_tool_use: CapabilityClaim::Unsupported,
+                streaming: CapabilityClaim::Supported,
+                vision: CapabilityClaim::Unsupported,
+                prompt_cache: CapabilityClaim::Unsupported,
+                structured_output: CapabilityClaim::Supported,
+                long_context: CapabilityClaim::Supported,
+                context_window_tokens: 200_000,
+            });
+        Self {
+            inner,
+            received: Arc::new(parking_lot::Mutex::new(Vec::new())),
+        }
+    }
+
+    fn queue_envelope_done(&self) {
+        use atelier_core::adapter::{ChatResponse, StreamChunk, Usage};
+        use atelier_core::context::TokenSource;
+        use atelier_core::protocol_strategy::{Strategy, SENTINEL_CLOSE, SENTINEL_OPEN};
+        let env = envelope_done();
+        let env_json = serde_json::to_string(&env).unwrap();
+        // JsonSentinel emission: the envelope rides inline at the end
+        // of the assistant text between the sentinel markers. No
+        // `tool_calls` — keeps the persisted conversation orphan-free
+        // so the resume prefix preserves the full assistant turn.
+        let text = format!("done\n{SENTINEL_OPEN}{env_json}{SENTINEL_CLOSE}");
+        self.inner.queue_stream(vec![StreamChunk::Complete {
+            response: ChatResponse {
+                text,
+                tool_calls: vec![],
+                usage: Usage {
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                    cached_tokens: None,
+                    count_source: TokenSource::Approx,
+                    latency_ms: Some(0),
+                },
+                strategy: Strategy::JsonSentinel,
+                stop_reason: Some(atelier_core::adapter::StopReason::EndTurn),
+            },
+        }]);
+    }
+}
+
+#[async_trait::async_trait]
+impl atelier_core::adapter::Adapter for RecordingMockAdapter {
+    fn model_id(&self) -> &str {
+        self.inner.model_id()
+    }
+    fn capabilities(&self) -> atelier_core::adapter::Capabilities {
+        self.inner.capabilities()
+    }
+    fn conformance(&self) -> atelier_core::protocol_conformance::ConformanceSnapshot {
+        self.inner.conformance()
+    }
+    async fn count_tokens(
+        &self,
+        messages: &[atelier_core::adapter::Message],
+    ) -> Result<atelier_core::adapter::TokenCount, atelier_core::adapter::AdapterError> {
+        self.inner.count_tokens(messages).await
+    }
+    async fn chat(
+        &self,
+        messages: &[atelier_core::adapter::Message],
+        tools: &[atelier_core::adapter::ToolSpec],
+    ) -> Result<atelier_core::adapter::ChatResponse, atelier_core::adapter::AdapterError> {
+        self.received.lock().push(messages.to_vec());
+        self.inner.chat(messages, tools).await
+    }
+    async fn stream(
+        &self,
+        messages: &[atelier_core::adapter::Message],
+        tools: &[atelier_core::adapter::ToolSpec],
+    ) -> Result<atelier_core::adapter::ChunkStream, atelier_core::adapter::AdapterError> {
+        self.received.lock().push(messages.to_vec());
+        self.inner.stream(messages, tools).await
+    }
+}
+
+/// v60.10 §1 BYOM round-trip: a mid-session provider swap preserves
+/// the conversation history across the boundary. The new adapter's
+/// first `chat()` call sees the user prompt + assistant turn from the
+/// pre-swap run, and `Event::AdapterSwapped` + a fresh
+/// `Event::ModelProfileLoaded` land on the bus.
+#[tokio::test]
+async fn swap_adapter_preserves_conversation_history_across_provider_boundary() {
+    let workspace = tempfile::TempDir::new().unwrap();
+
+    // Adapter A: drives turn 1 of the session. Records the
+    // messages it saw — used as a baseline so we can assert
+    // adapter B's first message vec extends adapter A's.
+    let adapter_a = Arc::new(RecordingMockAdapter::new("mock:provider-a"));
+    adapter_a.queue_envelope_done();
+    let received_a = adapter_a.received.clone();
+
+    // Capture every bus event from both runs into one Vec so the
+    // post-swap assertions see the union.
+    let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+
+    let mut runner = Runner::new(
+        workspace.path().to_path_buf(),
+        ProviderChoice::Mock { responses: vec![] },
+        EventSink::Capture(events.clone()),
+    )
+    .expect("mock runner construction is infallible")
+    .with_adapter_for_test(adapter_a.clone() as Arc<dyn atelier_core::adapter::Adapter>)
+    .with_max_turns(2);
+
+    let report = runner
+        .run("turn 1 prompt: rename foo to bar".into())
+        .await
+        .expect("first run must succeed");
+    assert_eq!(report.final_state, State::Done);
+    let session_uuid = report.session_id.0;
+
+    // Sanity check: adapter A saw exactly one `chat()` call carrying
+    // the user prompt.
+    {
+        let calls_a = received_a.lock();
+        assert_eq!(calls_a.len(), 1, "adapter A should have seen one chat()");
+        let history_a = &calls_a[0];
+        let has_user_prompt = history_a.iter().any(|m| {
+            matches!(m.role, atelier_core::adapter::Role::User)
+                && m.content.contains("turn 1 prompt")
+        });
+        assert!(
+            has_user_prompt,
+            "adapter A's first chat() must carry the user prompt; got {history_a:?}"
+        );
+    }
+
+    // Adapter B: drives turn 2 (the post-swap turn). Same shape as
+    // adapter A but a different model id so the AdapterSwapped event
+    // pair carries a real transition.
+    let adapter_b = Arc::new(RecordingMockAdapter::new("mock:provider-b"));
+    adapter_b.queue_envelope_done();
+    let received_b = adapter_b.received.clone();
+
+    // Perform the mid-session swap. After this call:
+    //   * Runner::adapter == adapter_b
+    //   * Runner's few-shot cache cleared
+    //   * Runner has a pending swap announcement queued for the
+    //     next run() to emit on the new bus
+    runner
+        .swap_adapter(
+            adapter_b.clone() as Arc<dyn atelier_core::adapter::Adapter>,
+            "2026-05-18T12:00:00Z",
+        )
+        .await
+        .expect("swap_adapter must succeed");
+
+    // Second run: with_resume reads the persisted session, replays
+    // the conversation prefix, and the new adapter gets the
+    // pre-swap conversation history on its first chat() call.
+    runner = runner.with_resume(session_uuid).with_max_turns(2);
+    let report2 = runner
+        .run(String::new())
+        .await
+        .expect("second run must succeed");
+    assert_eq!(report2.final_state, State::Done);
+
+    // Assert: adapter B's first chat() saw the user prompt from
+    // turn 1 (preserved by the resume prefix) AND the assistant
+    // turn from turn 1 ("done" with the harness_meta tool call).
+    {
+        let calls_b = received_b.lock();
+        assert_eq!(calls_b.len(), 1, "adapter B should have seen one chat()");
+        let history_b = &calls_b[0];
+        let has_user_prompt = history_b.iter().any(|m| {
+            matches!(m.role, atelier_core::adapter::Role::User)
+                && m.content.contains("turn 1 prompt")
+        });
+        assert!(
+            has_user_prompt,
+            "adapter B's first chat() must carry the pre-swap user prompt; got {history_b:?}"
+        );
+        let has_assistant_done = history_b.iter().any(|m| {
+            matches!(m.role, atelier_core::adapter::Role::Assistant) && m.content.contains("done")
+        });
+        assert!(
+            has_assistant_done,
+            "adapter B's first chat() must carry the pre-swap assistant turn; got {history_b:?}"
+        );
+    }
+
+    // Bus assertion: Event::AdapterSwapped fired (carried via the
+    // pending_swap queue at the start of the second run).
+    let captured = events.lock();
+    let swapped = captured.iter().find_map(|e| match e {
+        Event::AdapterSwapped {
+            from_model_id,
+            to_model_id,
+            swapped_at,
+        } => Some((
+            from_model_id.clone(),
+            to_model_id.clone(),
+            swapped_at.clone(),
+        )),
+        _ => None,
+    });
+    let swapped = swapped.expect("AdapterSwapped event must land on the bus");
+    assert_eq!(swapped.0, "mock:provider-a");
+    assert_eq!(swapped.1, "mock:provider-b");
+    assert_eq!(swapped.2, "2026-05-18T12:00:00Z");
+
+    // Bus assertion: ModelProfileLoaded re-emitted on the second
+    // run's startup carrying adapter B's model id. Multiple
+    // ModelProfileLoaded events may land (one per `run()`); the
+    // last one is for adapter B.
+    let last_profile = captured.iter().rev().find_map(|e| match e {
+        Event::ModelProfileLoaded { model_id, .. } => Some(model_id.clone()),
+        _ => None,
+    });
+    assert_eq!(
+        last_profile.as_deref(),
+        Some("mock:provider-b"),
+        "the most-recent ModelProfileLoaded must carry adapter B's model id"
+    );
+}
+
+/// v60.10 §1 BYOM — `swap_adapter` flushes the per-session few-shot
+/// cache so the new adapter's `few_shot_override` is consulted on the
+/// next run. Without this, two adapters with different few-shot
+/// quirks would surface each other's primers and confuse the model.
+#[tokio::test]
+async fn swap_adapter_clears_few_shot_cache() {
+    let workspace = tempfile::TempDir::new().unwrap();
+
+    let adapter_a = Arc::new(RecordingMockAdapter::new("mock:few-shot-a"));
+    adapter_a.queue_envelope_done();
+
+    let mut runner = Runner::new(
+        workspace.path().to_path_buf(),
+        ProviderChoice::Mock { responses: vec![] },
+        EventSink::Null,
+    )
+    .expect("mock runner construction is infallible")
+    .with_adapter_for_test(adapter_a as Arc<dyn atelier_core::adapter::Adapter>)
+    .with_max_turns(2);
+
+    let _ = runner.run("warm the cache".into()).await.unwrap();
+
+    let adapter_b = Arc::new(RecordingMockAdapter::new("mock:few-shot-b"));
+    adapter_b.queue_envelope_done();
+    let received_b = adapter_b.received.clone();
+    runner
+        .swap_adapter(
+            adapter_b as Arc<dyn atelier_core::adapter::Adapter>,
+            "2026-05-18T12:34:56Z",
+        )
+        .await
+        .expect("swap must succeed");
+
+    // Second fresh run (not resuming — the few-shot cache is the
+    // independent variable here). Adapter B's chat() should fire.
+    // `with_resume` is not chained because we want to exercise the
+    // post-swap `few_shot_override` query path; `RecordingMockAdapter`
+    // returns `None` for the override (default trait impl), so the
+    // resulting message vec carries no few-shot prefix from the
+    // pre-swap adapter.
+    let _ = runner.run("fresh prompt".into()).await.unwrap();
+
+    let calls = received_b.lock();
+    assert_eq!(calls.len(), 1);
+    let history = &calls[0];
+    // The history should start with a user turn (no orphan
+    // few-shot from adapter A leaked through the cache).
+    assert!(
+        matches!(history[0].role, atelier_core::adapter::Role::User),
+        "expected user turn at history[0], not a stale few-shot prefix; got {:?}",
+        history[0],
+    );
+}

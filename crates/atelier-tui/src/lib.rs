@@ -675,6 +675,10 @@ impl AppState {
             // rendering surface is a follow-on bundle so the AppState
             // mutation here is a deliberate no-op.
             | SessionEvent::ContextOverflowResolved { .. }
+            // §1 BYOM (v60.10) — `AdapterSwapped` lands as a log line;
+            // the paired `ModelProfileLoaded` that follows refreshes
+            // the model badge. No AppState mutation needed here.
+            | SessionEvent::AdapterSwapped { .. }
             | SessionEvent::Shutdown => {}
         }
         self.events.push(line);
@@ -948,6 +952,15 @@ pub fn project_event(evt: &SessionEvent) -> EventLine {
             (Some(t), Some(n)) => format!("{resolution} · {n} items · {t} tokens"),
             _ => (*resolution).to_string(),
         },
+        // §1 BYOM (v60.10) — mid-session adapter swap. One-line summary
+        // in the event log so the user can see "from → to" alongside
+        // the paired `ModelProfileLoaded` that refreshes the model
+        // badge.
+        SessionEvent::AdapterSwapped {
+            from_model_id,
+            to_model_id,
+            ..
+        } => format!("{from_model_id} → {to_model_id}"),
         SessionEvent::Shutdown => String::new(),
     };
     EventLine { kind, detail }
@@ -3152,6 +3165,47 @@ mod tests {
             reason: "early".into(),
         });
         assert!(s.current_model.is_none());
+    }
+
+    #[test]
+    fn project_event_adapter_swapped_carries_model_id_transition() {
+        // v60.10 §1 BYOM — `AdapterSwapped` lands as a log line. Pin
+        // the wire format so the GUI's projectEvent + the TUI's
+        // project_event stay in sync ("from → to").
+        let line = project_event(&SessionEvent::AdapterSwapped {
+            from_model_id: "anthropic:claude-opus-4-7".into(),
+            to_model_id: "local:qwen2.5-coder:7b".into(),
+            swapped_at: "2026-05-18T12:00:00Z".into(),
+        });
+        assert_eq!(line.kind, "AdapterSwapped");
+        assert!(
+            line.detail.contains("anthropic:claude-opus-4-7"),
+            "got detail: {}",
+            line.detail
+        );
+        assert!(
+            line.detail.contains("local:qwen2.5-coder:7b"),
+            "got detail: {}",
+            line.detail
+        );
+    }
+
+    #[test]
+    fn apply_adapter_swapped_is_a_noop_on_app_state() {
+        // v60.10 — AdapterSwapped is a log-only signal; the paired
+        // `ModelProfileLoaded` is what refreshes the model badge. The
+        // apply arm here must not crash and must not mutate any panel
+        // state.
+        let mut s = AppState::new();
+        let baseline = s.current_model.clone();
+        s.apply(&SessionEvent::AdapterSwapped {
+            from_model_id: "a".into(),
+            to_model_id: "b".into(),
+            swapped_at: "2026-05-18T12:00:00Z".into(),
+        });
+        assert_eq!(s.current_model, baseline);
+        // The log line landed.
+        assert!(s.events.iter().any(|l| l.kind == "AdapterSwapped"));
     }
 
     #[test]

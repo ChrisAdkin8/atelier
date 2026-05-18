@@ -230,6 +230,21 @@ impl AdapterHandle {
     fn clear(&self) {
         *self.inner.lock() = None;
     }
+
+    /// v60.10 §1 BYOM — external swap: replace the slot's adapter from
+    /// outside the running `Runner`. Used by the GUI's `swap_adapter`
+    /// Tauri command so a mid-session provider swap atomically updates
+    /// the slot that `compact_context_items` reads from — the slot's
+    /// Arc doesn't keep the pre-swap adapter alive past this call.
+    ///
+    /// `None` if the slot was empty (no active run). The caller decides
+    /// whether to treat that as an error.
+    pub fn swap(&self, new_adapter: Arc<dyn Adapter>) -> Option<Arc<dyn Adapter>> {
+        let mut guard = self.inner.lock();
+        let previous = guard.take();
+        *guard = Some(new_adapter);
+        previous
+    }
 }
 
 /// Drop-guard that clears the caller's `DispatcherHandle` slot when
@@ -378,6 +393,29 @@ pub struct Runner {
     /// sequential runs with the same adapter each pay one
     /// `few_shot_override` call.
     few_shot_cache: parking_lot::Mutex<Option<Vec<Message>>>,
+    /// v60.10 §1 BYOM — pending mid-session adapter-swap announcement.
+    /// Populated by [`Self::swap_adapter`]; consumed at the start of
+    /// the next [`Self::run`] which emits an `Event::AdapterSwapped`
+    /// (carrying `from_model_id` → `to_model_id` + the swap timestamp)
+    /// alongside the regular `ModelProfileLoaded` for the new
+    /// adapter. Cleared after the next run reads it so a third run
+    /// without a fresh swap doesn't re-announce.
+    pending_swap: parking_lot::Mutex<Option<PendingAdapterSwap>>,
+}
+
+/// v60.10 §1 BYOM — record of a pending mid-session adapter swap that
+/// the next [`Runner::run`] should announce on the bus. Kept on
+/// [`Runner`] (not the bus directly) because `swap_adapter` may run
+/// between two `run()` invocations — at that point no bus exists. The
+/// next run's startup consults this field and emits the announcement
+/// pair (`AdapterSwapped` + a fresh `ModelProfileLoaded`) before the
+/// first turn so a UI subscribed via `EventSink::Capture` /
+/// `EventSink::Callback` always sees both events.
+#[derive(Debug, Clone)]
+struct PendingAdapterSwap {
+    from_model_id: String,
+    to_model_id: String,
+    swapped_at: String,
 }
 
 /// §1 BYOM — context-window asymmetry policy. Chosen at
@@ -558,6 +596,7 @@ impl Runner {
                 atelier_core::protocol_conformance::DEFAULT_DEGRADATION_THRESHOLD,
             overflow_policy: ContextOverflowPolicy::Compact,
             few_shot_cache: parking_lot::Mutex::new(None),
+            pending_swap: parking_lot::Mutex::new(None),
         })
     }
 
@@ -613,6 +652,84 @@ impl Runner {
         // production, plausible in tests.
         *self.few_shot_cache.lock() = None;
         self
+    }
+
+    /// v60.10 §1 BYOM — swap the active adapter mid-session. Preserves
+    /// conversation context, plan state, memory, and any in-flight
+    /// approval pending. Resets the conformance window (new adapter,
+    /// new behaviour signal) and re-emits `ModelProfileLoaded` on the
+    /// next `run()` so the GUI/TUI footer refreshes the model badge +
+    /// capability tooltip.
+    ///
+    /// The pre-swap adapter is dropped (returned `Arc`'s strong count
+    /// falls to zero unless another reference is held — the
+    /// `AdapterHandle` slot is updated to the new adapter in the same
+    /// call so the slot doesn't keep the old one alive).
+    ///
+    /// This is a per-turn-boundary operation — the caller should
+    /// invoke it between turns, not mid-stream. The pre-swap adapter's
+    /// in-flight `chat()` future is NOT cancelled (drop-on-cancel
+    /// applies via the existing CancellationToken; the caller decides
+    /// whether to cancel first).
+    ///
+    /// State-preservation invariants:
+    ///   * `ContextManager` — unchanged.
+    ///   * `MemoryStore` — unchanged.
+    ///   * `PlanCanvas` — unchanged.
+    ///   * `Conversation` — unchanged (the next `run()` resumes via
+    ///     `with_resume`, and the new adapter sees the same prefix on
+    ///     its first chat call).
+    ///   * `ConformanceWindow` — RESET. New adapter, no carryover.
+    ///   * `Strategy` — re-resolved from the new adapter's
+    ///     `ModelProfile` on the next run.
+    ///   * `CapabilityMatrixRow` — refreshed via the new model's
+    ///     matrix entry on the next run.
+    ///   * `CostPolicy` — recomputed on `Runner::new` time; on a swap
+    ///     we keep the existing policy because the swap goes through
+    ///     a pre-built adapter (the caller decides policy).
+    ///   * Pending approval — unchanged (lives on `SessionDispatcher`,
+    ///     not on `Runner`; the user keeps accept/reject options).
+    pub async fn swap_adapter(
+        &mut self,
+        new_adapter: Arc<dyn Adapter>,
+        now: &str,
+    ) -> Result<(), RunError> {
+        let from_model_id = self.adapter.model_id().to_string();
+        let to_model_id = new_adapter.model_id().to_string();
+        // Update the live adapter slot. The two-pass "swap then drop
+        // the old Arc" pattern guarantees the slot doesn't hold both
+        // adapters at once — important if a downstream consumer is
+        // counting strong references to detect leaked adapters.
+        self.adapter = new_adapter.clone();
+        // Clear the per-session few-shot cache so the next `run()`
+        // re-queries `few_shot_override` against the new adapter. A
+        // stale cache would feed the new adapter's `chat()` an example
+        // tailored for the previous adapter's quirks.
+        *self.few_shot_cache.lock() = None;
+        // Update the externally-visible `AdapterHandle` slot if one
+        // was registered. Same Arc-replacement discipline: the slot
+        // drops its previous adapter so the old Arc's strong count
+        // can fall to zero. The slot is otherwise cleared at the end
+        // of every `run()` via `AdapterHandleGuard` — so an external
+        // call after `run()` exits is a no-op until the next `run()`
+        // re-populates it.
+        if let Some(handle) = &self.adapter_handle {
+            let _ = handle.swap(new_adapter);
+        }
+        // Stash the announcement so the next `run()` emits
+        // `Event::AdapterSwapped` + a fresh `Event::ModelProfileLoaded`
+        // pair on the new bus. We can't emit here because between two
+        // `run()` invocations no broadcast::Sender exists; queueing
+        // also covers the rare case where two swaps happen
+        // back-to-back without an intervening run (the second
+        // overwrites the first — only the most-recent transition is
+        // relevant to the UI).
+        *self.pending_swap.lock() = Some(PendingAdapterSwap {
+            from_model_id,
+            to_model_id,
+            swapped_at: now.to_string(),
+        });
+        Ok(())
     }
 
     /// Phase C close — record which UI panes the driver had visible
@@ -912,6 +1029,21 @@ impl Runner {
             outcome,
             capability_row: Some(capability_row),
         });
+        // v60.10 §1 BYOM — consume the swap announcement queued by an
+        // earlier `swap_adapter` call (if any). Emit
+        // `Event::AdapterSwapped` AFTER the initial
+        // `ModelProfileLoaded` so subscribers see "profile resolved,
+        // swap announced" in temporal order — a UI rendering a toast
+        // for the swap can then read the latest `currentModel` it
+        // just folded in. The pair is followed by no further bus
+        // events until the first turn proper.
+        if let Some(swap) = self.pending_swap.lock().take() {
+            let _ = bus.send(Event::AdapterSwapped {
+                from_model_id: swap.from_model_id,
+                to_model_id: swap.to_model_id,
+                swapped_at: swap.swapped_at,
+            });
+        }
         // The profile recommends the starting §2 strategy; the
         // runtime conformance tracker downshifts it (one-way) if the
         // model emits malformed envelopes past the threshold. The

@@ -504,6 +504,13 @@ export function applyEvent(state: AppState, evt: BridgedEvent): AppState {
       }
       return { ...state, events, currentModel }
     }
+    case 'AdapterSwapped': {
+      // v60.10 §1 BYOM — log the swap. The paired `ModelProfileLoaded`
+      // (which arrives next) carries the fresh model id + capability
+      // row that the footer renders; this arm just refreshes the
+      // event log so the user can see the transition in-stream.
+      return { ...state, events }
+    }
     // Variants we don't fold into pane state — just the event log.
     case 'IllegalTransitionAttempted':
     case 'Cancelled':
@@ -704,6 +711,20 @@ export function projectEvent(evt: BridgedEvent): EventLogEntry {
       return {
         kind,
         detail: `${p.from ?? '?'} → ${p.to ?? '?'} (${p.reason ?? ''})`,
+      }
+    }
+    case 'AdapterSwapped': {
+      // v60.10 §1 BYOM — render the swap pair in the event log so the
+      // user can see "anthropic:x → local:y" alongside the paired
+      // `ModelProfileLoaded` that refreshes the model badge.
+      const p = evt.payload as {
+        from_model_id?: string
+        to_model_id?: string
+        swapped_at?: string
+      }
+      return {
+        kind,
+        detail: `${p.from_model_id ?? '?'} → ${p.to_model_id ?? '?'}`,
       }
     }
     default:
