@@ -127,6 +127,103 @@ pub struct NativeToolCall {
     pub arguments: serde_json::Value,
 }
 
+/// Build the synthetic [`crate::adapter::ToolSpec`] that advertises the
+/// `harness_meta` envelope channel to the model under [`Strategy::NativeTool`].
+///
+/// The runner prepends this to the real tool list (read_file, write_file, …)
+/// when the active strategy is `NativeTool`, so the model knows the channel
+/// exists. Without it, providers like Claude have no idea the harness
+/// expects an envelope and stall trying to communicate "I'm done" via
+/// prose alone — surfaced first by the t01 live re-probe where the model
+/// completed the task, ran tests successfully, and then burned the
+/// remaining turn budget describing the result with no way to signal
+/// completion.
+///
+/// The schema mirrors `schemas/model_protocol/envelope.v1.json` so an
+/// envelope round-trips cleanly through the provider's tool-use channel.
+pub fn harness_meta_tool_spec() -> crate::adapter::ToolSpec {
+    crate::adapter::ToolSpec {
+        name: HARNESS_META_NAME.into(),
+        description: "Atelier §2 protocol envelope. Call this tool to signal \
+                      structured progress alongside your natural-language reply: \
+                      `claimed_done: true` when the user's task is complete, \
+                      `claimed_changes` listing every file you created / edited / \
+                      deleted, and optionally `plan_update` / `uncertainty` / \
+                      `grounding`. The harness consumes the envelope; it is not \
+                      shown to the user. Always invoke `harness_meta` on the turn \
+                      that completes the task, even if you also speak in prose."
+            .into(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "claimed_changes": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["path", "kind", "summary"],
+                        "properties": {
+                            "path": {"type": "string"},
+                            "kind": {"enum": ["edit", "create", "delete"]},
+                            "summary": {"type": "string", "maxLength": 500}
+                        }
+                    }
+                },
+                "claimed_done": {"type": "boolean"},
+                "uncertainty": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["about", "kind", "asks"],
+                        "properties": {
+                            "about": {"type": "string"},
+                            "kind": {"enum": ["missing-context", "ambiguous-spec", "untestable-claim"]},
+                            "asks": {"type": "string"}
+                        }
+                    }
+                },
+                "plan_update": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["ops"],
+                    "properties": {
+                        "ops": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": ["op", "step"],
+                                "properties": {
+                                    "op": {"enum": ["add", "remove", "reorder", "complete"]},
+                                    "step": {"type": "string"}
+                                }
+                            }
+                        }
+                    }
+                },
+                "grounding": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["text_span", "source"],
+                        "properties": {
+                            "text_span": {"type": "string"},
+                            "source": {"enum": ["tool:read", "tool:grep", "context:file", "guess"]}
+                        }
+                    }
+                },
+                "constraints_acknowledged": {
+                    "type": "array",
+                    "items": {"type": "string"}
+                }
+            }
+        }),
+    }
+}
+
 // ---------- json-sentinel ----------
 
 /// Encode an envelope as JSON wrapped in sentinels. The text returned here is
@@ -641,6 +738,24 @@ mod tests {
     }
 
     // ---------- strategy registry ----------
+
+    #[test]
+    fn harness_meta_tool_spec_round_trips_a_real_envelope_through_its_schema() {
+        let spec = harness_meta_tool_spec();
+        assert_eq!(spec.name, HARNESS_META_NAME);
+        assert!(!spec.description.is_empty(), "schema needs a description");
+        // The schema must validate a real envelope (including the
+        // `kind` enum lowercase serialisation) so the model's tool
+        // call round-trips into `Envelope::from_value` without rejection.
+        let envelope_json = serde_json::to_value(example_envelope()).unwrap();
+        let validator =
+            jsonschema::validator_for(&spec.input_schema).expect("input_schema compiles");
+        let errs: Vec<_> = validator.iter_errors(&envelope_json).collect();
+        assert!(errs.is_empty(), "envelope must validate: {errs:?}");
+        // Unknown top-level fields are rejected (additionalProperties: false).
+        let bad = serde_json::json!({"claimed_done": true, "surprise": 1});
+        assert!(validator.iter_errors(&bad).next().is_some());
+    }
 
     #[test]
     fn downshift_walks_native_to_sentinel_to_prose_then_stops() {

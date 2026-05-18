@@ -348,6 +348,19 @@ fn extract_bare_host(token: &str) -> Option<String> {
     if !candidate.contains('.') {
         return None;
     }
+    // RFC 1035 hostnames use `[A-Za-z0-9-]` per label and `.` between
+    // labels. Allow an optional `:port` suffix where port is digits.
+    // Anything else (parens, commas, equals, brackets, slashes — the
+    // shape of an embedded `python -c "sys.path.insert(0, '.')"`
+    // argument) is not a hostname and must not be treated as egress.
+    // Without this guard the canonical t01 workload's pytest validation
+    // step false-positives on the `python -c` style fixture commands.
+    if !candidate
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == ':')
+    {
+        return None;
+    }
     // Filter out tokens that are clearly not hostnames: file paths
     // (contain a `/` — already handled above), version strings
     // (`foo-1.2.3` starts alphanumeric and has dots, but ends with a
@@ -490,6 +503,26 @@ mod tests {
     fn first_external_destination_catches_ipv4_address() {
         let dest = first_external_destination("curl http://203.0.113.1/foo").unwrap();
         assert_eq!(dest, "203.0.113.1");
+    }
+
+    #[test]
+    fn first_external_destination_ignores_python_dash_c_dotted_identifiers() {
+        // Surfaced by the live t01 re-probe: the model invoked
+        //   python3 -c "import sys; sys.path.insert(0, '.'); from utils import …"
+        // and the bare-host parser flagged `sys.path.insert(0,` as a
+        // hostname (starts alphanumeric, contains a dot, last segment
+        // has letters). DNS hostnames are `[A-Za-z0-9.-]` (plus
+        // optional `:port`); embedded shell-quoted code that drops a
+        // `(`, `,`, `'`, or `[` into a whitespace-split token must be
+        // rejected.
+        assert!(first_external_destination(
+            "python3 -c \"import sys; sys.path.insert(0, '.'); from utils import divisible_by\""
+        )
+        .is_none());
+        // Variants that should also stay clean.
+        assert!(first_external_destination("python -c 'a.b.c(1)'").is_none());
+        assert!(first_external_destination("foo --opt=a.b.c").is_none());
+        assert!(first_external_destination("bar [a.b]").is_none());
     }
 
     // ---------- §11 mechanical gate: block + audit ----------

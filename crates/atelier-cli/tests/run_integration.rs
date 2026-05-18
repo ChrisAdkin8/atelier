@@ -2504,25 +2504,41 @@ async fn few_shot_override_prepends_adapter_messages_to_per_turn_history() {
         !calls.is_empty(),
         "the runner must have invoked adapter.chat() at least once"
     );
-    // First turn's message history: override messages must lead.
+    // First turn's message history: a leading atelier system prompt
+    // (v60.17), then the adapter's few-shot override, then the user
+    // prompt. The system message names the workspace and explains the
+    // §2 protocol carrier for the active strategy.
     let first = &calls[0];
+    assert_eq!(
+        first[0].role,
+        atelier_core::adapter::Role::System,
+        "atelier system prompt must lead",
+    );
+    assert!(first[0]
+        .content
+        .contains("autonomous coding agent running inside the Atelier harness"));
+    let body_start = 1;
     assert!(
-        first.len() > expected_override.len(),
-        "expected >{} messages (override + user prompt), got {}",
-        expected_override.len(),
+        first.len() > body_start + expected_override.len(),
+        "expected >{} messages (system + override + user prompt), got {}",
+        body_start + expected_override.len(),
         first.len(),
     );
     for (i, m) in expected_override.iter().enumerate() {
         assert_eq!(
-            &first[i], m,
+            &first[body_start + i],
+            m,
             "few-shot override message {i} mismatch:\n  expected: {m:?}\n  got: {:?}",
-            first[i],
+            first[body_start + i],
         );
     }
     // The user prompt is appended right after the override pair.
-    assert_eq!(first[expected_override.len()].content, "user prompt body");
     assert_eq!(
-        first[expected_override.len()].role,
+        first[body_start + expected_override.len()].content,
+        "user prompt body"
+    );
+    assert_eq!(
+        first[body_start + expected_override.len()].role,
         atelier_core::adapter::Role::User,
     );
 }
@@ -2574,11 +2590,17 @@ async fn few_shot_override_is_cached_across_turns_not_recomputed() {
         "expected ≥2 chat() calls, got {}",
         calls.len()
     );
-    // Override messages persist at the head of every turn's history.
+    // Override messages persist at the head of every turn's history,
+    // immediately after the v60.17 atelier system prompt at slot 0.
     for (turn_ix, history) in calls.iter().enumerate() {
         assert_eq!(
-            history[0], expected_first,
-            "turn {turn_ix} must still carry the override at position 0; \
+            history[0].role,
+            atelier_core::adapter::Role::System,
+            "turn {turn_ix} must still carry the atelier system prompt at position 0",
+        );
+        assert_eq!(
+            history[1], expected_first,
+            "turn {turn_ix} must still carry the override at position 1; \
              a per-turn re-query would break the cache contract",
         );
     }
@@ -2872,12 +2894,18 @@ async fn swap_adapter_clears_few_shot_cache() {
     let calls = received_b.lock();
     assert_eq!(calls.len(), 1);
     let history = &calls[0];
-    // The history should start with a user turn (no orphan
-    // few-shot from adapter A leaked through the cache).
+    // The history starts with the v60.17 atelier system prompt and
+    // then jumps to a user turn — no orphan few-shot from adapter A
+    // leaked through the cache.
     assert!(
-        matches!(history[0].role, atelier_core::adapter::Role::User),
-        "expected user turn at history[0], not a stale few-shot prefix; got {:?}",
+        matches!(history[0].role, atelier_core::adapter::Role::System),
+        "expected atelier system prompt at history[0]; got {:?}",
         history[0],
+    );
+    assert!(
+        matches!(history[1].role, atelier_core::adapter::Role::User),
+        "expected user turn at history[1] (no stale few-shot prefix); got {:?}",
+        history[1],
     );
 }
 

@@ -1,5 +1,58 @@
 # Atelier Spec — Changelog
 
+## v60.17 — 2026-05-18 (Track B green for t01: §11 sandbox fixes + §2 envelope tool advertised + atelier system prompt)
+
+`phase_a_live_anthropic_t01_add_pure_function` now passes end-to-end against `anthropic:claude-haiku-4-5`. Four layered fixes resolved successive blockers surfaced by the live re-probe after v60.16:
+
+### 1. §11 — `extract_bare_host` false-positive on `python -c` arguments (`crates/atelier-core/src/tools/shell.rs`)
+
+The bare-host parser flagged `sys.path.insert(0,` as a network destination — first character alphanumeric, contains a dot, last segment has letters. It then rejected every `shell` call that contained an embedded `python -c "..."` payload as `SandboxViolation: network egress to sys.path.insert(0,`. DNS hostnames are `[A-Za-z0-9.-]` (plus optional `:port`); the parser now rejects any candidate containing characters outside that charset. Regression test `first_external_destination_ignores_python_dash_c_dotted_identifiers` pins the bug + three nearby false-positive shapes.
+
+### 2. §11 — macOS sandbox profile missing homebrew prefixes (`crates/atelier-core/src/sandbox.rs`)
+
+`MACOS_SYSTEM_READ_SUBPATHS` listed only `/usr/lib`, `/usr/share`, `/usr/libexec`, `/usr/bin`, `/bin`, `/System/Library`, `/Library/Frameworks`, `/private/var/db/dyld`. Homebrew installs to `/opt/homebrew/` (Apple Silicon) and `/usr/local/` (Intel); without read access there, any homebrew-installed runtime fails dyld with "file system sandbox blocked open()" trying to load its own framework files. Added both prefixes — read-only grants; the existing write-deny still applies, so a sandboxed process can use the toolchain but not modify it. Without this, any macOS developer on Apple Silicon ran into the same wall the t01 probe did.
+
+### 3. §2 — `harness_meta` tool was never advertised to the model (`crates/atelier-core/src/protocol_strategy.rs`, `crates/atelier-cli/src/runner.rs`)
+
+The spec line 4 reads "Native tool call (`harness_meta` tool). Cleanest." but the runner only passed the §15 built-in tools (read_file, write_file, …) to `adapter.chat()`. The model had no idea the §2 envelope channel existed. New `protocol_strategy::harness_meta_tool_spec()` returns a `ToolSpec` whose `input_schema` mirrors `schemas/model_protocol/envelope.v1.json`; the runner builds a per-turn `turn_tools_spec` that conditionally prepends it when `active_strategy == NativeTool`. The list is recomputed per turn because the §1 conformance tracker can degrade strategy mid-run. Unit test `harness_meta_tool_spec_round_trips_a_real_envelope_through_its_schema` pins the schema by validating a real `Envelope` against it (including `additionalProperties: false`).
+
+### 4. §2 — runner emitted no system prompt at all (`crates/atelier-cli/src/runner.rs`)
+
+Advertising `harness_meta` wasn't enough — across 23 tool calls in the post-fix-3 live probe the model never invoked it. Tool descriptions alone don't communicate "this is **the** way you signal completion." New `build_atelier_system_prompt(workspace, strategy)` produces a strategy-aware system message that teaches:
+1. The workspace root (repo-relative paths).
+2. The §2 completion contract — under `NativeTool` it names `harness_meta` by name; under `JsonSentinel` it describes the `<<<harness_meta>>>{...}<<<end>>>` carrier; under `RegexProse` it describes the `DONE:` + `CHANGED-FILES:` tags.
+3. Terse-execution etiquette ("do not ask the user for confirmation between steps").
+
+The system message is injected at `messages[0]` on fresh runs only; resumed runs re-hydrate the original from the on-disk session prefix.
+
+### Live verification — t01 actually green
+
+| stage | turns | tool calls | final_state |
+|-------|------:|----------:|:------------|
+| pre-v60.15 (Track B bring-up) | 20 | 0 | Streaming (silent wedge) |
+| v60.15 (stall guard) | 1 | 0 | AwaitingUser (stall surfaced) |
+| v60.16 (tools advertised) | 20 | 11 | Streaming (model engaged, couldn't claim done) |
+| v60.17 fix 1+2 (sandbox) | 18 | 11 | AwaitingUser (task done, no envelope) |
+| **v60.17 fix 3+4 (envelope + system prompt)** | **<20** | **19** | **Done** ✓ |
+
+Total live-API budget burned across the v60.15 → v60.17 investigation: ~$0.03 of Anthropic credit. The next live tests (t02, t05, t06, t10) are still gated and skipped by default; the green t01 path proves the harness contract end-to-end without needing live-API exercise of every fixture.
+
+### Tests touched
+
+- **NEW** unit: `first_external_destination_ignores_python_dash_c_dotted_identifiers` (`shell.rs`) — pins the §11 fix.
+- **NEW** unit: `harness_meta_tool_spec_round_trips_a_real_envelope_through_its_schema` (`protocol_strategy.rs`) — pins the schema.
+- **UPDATED**: `few_shot_override_prepends_adapter_messages_to_per_turn_history`, `few_shot_override_is_cached_across_turns_not_recomputed`, `swap_adapter_clears_few_shot_cache` — all shift expectations by one to accept the leading atelier system prompt at `messages[0]`.
+
+Workspace test count **1043 → 1045** (atelier-core 795 → 797). `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, and the gated live `phase_a_live_anthropic_t01_add_pure_function` all green.
+
+### Files touched
+
+- `crates/atelier-core/src/sandbox.rs` — homebrew prefix grants.
+- `crates/atelier-core/src/tools/shell.rs` — hostname-charset guard + regression test.
+- `crates/atelier-core/src/protocol_strategy.rs` — `harness_meta_tool_spec()` + unit test.
+- `crates/atelier-cli/src/runner.rs` — per-turn `turn_tools_spec`, `build_atelier_system_prompt(...)`, fresh-run injection at `messages[0]`.
+- `crates/atelier-cli/tests/run_integration.rs` — three message-index shifts.
+
 ## v60.16 — 2026-05-18 (Tools are actually advertised to the provider; Track B unwedged end-to-end)
 
 Fixes the bug v60.15's stall guard pointed at: the runner's `tools_spec` argument to every `adapter.chat()` call was always `Vec::new()` because the stub `registry_to_tool_specs()` returned `Vec::new()` with a v0 comment that nobody had revisited. With no tools on the wire, Claude (Haiku 4.5 + Sonnet 4.6) had nothing to invoke, every assistant turn was bare prose, the new stall guard tripped on turn 1, and Track B's live gate produced `final_state=AwaitingUser` instead of a real verification. The model wasn't broken; the harness was lying to it about what was available.

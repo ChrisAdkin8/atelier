@@ -1077,6 +1077,21 @@ impl Runner {
             OnDiskSession::session_dir(&workspace, audit_session_uuid).join("audit.log");
         let mut messages: Vec<Message> = Vec::new();
 
+        // v60.17 §2 — atelier-flavoured system prompt. Without this, the
+        // model gets the user task verbatim with no instruction that the
+        // harness expects an envelope to signal completion. Surfaced by
+        // the t01 live re-probe where Claude completed the task, ran
+        // tests, then burned the turn budget describing the outcome with
+        // no way to claim done. Only fired on fresh runs — a resumed
+        // conversation already carries the original system message in
+        // its on-disk prefix (re-hydrated below).
+        if self.resume_from.is_none() {
+            messages.push(Message::text(
+                Role::System,
+                build_atelier_system_prompt(&workspace, active_strategy),
+            ));
+        }
+
         // v60.9 §2 — consult the adapter's per-strategy few-shot override
         // once per session (the cache below ensures it's not recomputed
         // per turn). `None` means "use the shared baseline"; the runner's
@@ -1248,10 +1263,29 @@ impl Runner {
             // [`MAX_OVERFLOW_RETRIES`] consecutive attempts; after that
             // the runner drops to Surface behaviour rather than
             // looping forever.
+            // v60.17 §2 — advertise the synthetic `harness_meta` tool to
+            // the model when the active strategy is `NativeTool`. Without
+            // this, the model has no way to signal `claimed_done` /
+            // `claimed_changes` and the loop stalls after the task is
+            // really done (surfaced by the t01 live re-probe where Claude
+            // completed the task, ran tests, then burned the remaining
+            // turn budget describing the result in prose). The list is
+            // recomputed per turn because `active_strategy` can degrade
+            // mid-run via the §1 conformance tracker.
+            let turn_tools_spec: Vec<atelier_core::adapter::ToolSpec> = match active_strategy {
+                atelier_core::protocol_strategy::Strategy::NativeTool => {
+                    let mut v = Vec::with_capacity(tools_spec.len() + 1);
+                    v.push(atelier_core::protocol_strategy::harness_meta_tool_spec());
+                    v.extend(tools_spec.iter().cloned());
+                    v
+                }
+                atelier_core::protocol_strategy::Strategy::JsonSentinel
+                | atelier_core::protocol_strategy::Strategy::RegexProse => tools_spec.clone(),
+            };
             let response = {
                 let mut overflow_retries: usize = 0;
                 loop {
-                    match self.adapter.chat(&messages, &tools_spec).await {
+                    match self.adapter.chat(&messages, &turn_tools_spec).await {
                         Ok(r) => break r,
                         Err(AdapterError::ContextOverflow {
                             needed_tokens,
@@ -1878,6 +1912,60 @@ pub enum RunError {
         needed_tokens: u32,
         limit_tokens: u32,
     },
+}
+
+/// v60.17 §2 — atelier-flavoured system prompt. The model needs to know
+/// two things the spec doesn't currently teach via tool-spec alone:
+/// 1. The workspace root and how to express paths (repo-relative).
+/// 2. That signalling completion happens through the `harness_meta` tool
+///    (or, under degraded strategies, the matching carrier).
+///
+/// Strategy-aware wording: under [`Strategy::NativeTool`] the model is
+/// pointed at the `harness_meta` tool by name; under sentinel/prose
+/// strategies the carrier shape is described in plain English.
+fn build_atelier_system_prompt(
+    workspace: &Path,
+    strategy: atelier_core::protocol_strategy::Strategy,
+) -> String {
+    use atelier_core::protocol_strategy::Strategy;
+    let workspace_display = workspace.display();
+    let completion_clause = match strategy {
+        Strategy::NativeTool => {
+            "When you finish the user's task, you MUST invoke the `harness_meta` \
+             tool with `claimed_done: true` and a `claimed_changes` array listing \
+             every file you created, edited, or deleted. The harness consumes \
+             that envelope to recognise completion; without it the loop keeps \
+             running and burns tokens. Invoke `harness_meta` on the same turn \
+             you communicate completion in prose."
+        }
+        Strategy::JsonSentinel => {
+            "When you finish the user's task, append a §2 protocol envelope to \
+             your final reply, bracketed exactly as `<<<harness_meta>>>{...}<<<end>>>`. \
+             The envelope is a JSON object with `claimed_done: true` and a \
+             `claimed_changes` array listing every file you created, edited, or \
+             deleted. The harness consumes the envelope; the user sees only your \
+             prose."
+        }
+        Strategy::RegexProse => {
+            "When you finish the user's task, end your reply with tagged sections: \
+             `DONE: yes` on its own line, followed by `CHANGED-FILES:` and a \
+             newline-separated list of paths you created, edited, or deleted. \
+             The harness consumes those tags; the user sees only your prose."
+        }
+    };
+    format!(
+        "You are an autonomous coding agent running inside the Atelier harness.\n\
+         \n\
+         Workspace root: {workspace_display}\n\
+         All file paths you pass to tools (read_file, write_file, edit_file, …) \
+         must be repo-relative (no leading `/`, no `..`). The shell tool runs \
+         with the workspace as cwd.\n\
+         \n\
+         {completion_clause}\n\
+         \n\
+         Be concise. Use tools to make changes and verify them; do not ask the \
+         user for confirmation between steps."
+    )
 }
 
 /// v60.7 §1 — does this OpenAI-compat base URL point at the hosted

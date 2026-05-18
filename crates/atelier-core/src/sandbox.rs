@@ -156,12 +156,25 @@ fn has_unsafe_path_chars(p: &Path) -> bool {
 /// Per spec §11 paths that any sandboxed subprocess needs read access to in
 /// order to function (resolving libraries, locating system files). The repo
 /// itself and any per-path approvals are added on top.
+///
+/// `/opt/homebrew` and `/usr/local` are the canonical homebrew install
+/// prefixes (Apple Silicon and Intel respectively). Without them, any
+/// homebrew-installed runtime (python, node, ruby) fails the dyld stage
+/// with "file system sandbox blocked open()" trying to load its own
+/// framework / library files — surfaced first by the t01 live re-probe
+/// where Claude invoked `python3 -m pytest` and homebrew python couldn't
+/// load `/opt/homebrew/Cellar/python@3.14/.../Python`. These are
+/// read-only grants; the existing default-deny on writes still applies,
+/// so a sandboxed process can only *use* what homebrew installed, not
+/// modify or replace it.
 const MACOS_SYSTEM_READ_SUBPATHS: &[&str] = &[
     "/usr/lib",
     "/usr/share",
     "/usr/libexec",
     "/usr/bin",
+    "/usr/local",
     "/bin",
+    "/opt/homebrew",
     "/System/Library",
     "/Library/Frameworks",
     "/private/var/db/dyld",
