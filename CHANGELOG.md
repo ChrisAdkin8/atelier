@@ -1,5 +1,62 @@
 # Atelier Spec — Changelog
 
+## v60.9 — 2026-05-18 (two-bundle parallel release: §1 context-window asymmetry + §2 per-adapter few-shot override)
+
+Two-bundle parallel release. B1 + B4 ran in isolated worktrees, then merged sequentially into main (B1 first because its `MockResponse::overflow` field change had wider workspace blast radius). Workspace tests **928 → 963** (+35). All gates green.
+
+### B1 — §1 BYOM context-window asymmetry (Compact / Reroute / Surface)
+
+Closes the spec promise on what happens when an adapter returns `AdapterError::ContextOverflow`. Three policies, runner-side, configurable per-session.
+
+- New `ContextOverflowPolicy::{Compact, Reroute, Surface}` enum + `Runner::with_overflow_policy(policy)` builder (default = `Compact`).
+- **Compact**: auto-selects unpinned context items (token-count-descending) via the new pure `pick_overflow_compaction_targets(summaries, needed, limit, current_total)` helper, feeds them to the v60.5 compaction orchestrator, then retries the turn. Drops down to `Surface` after `MAX_OVERFLOW_RETRIES = 2` consecutive overflows (defends against runaway compaction loops).
+- **Reroute**: wireable stub for the v60.10+ routing-dispatcher work — returns `RunError::Config("reroute not yet implemented")`.
+- **Surface**: propagates `RunError::ContextOverflow { needed_tokens, limit_tokens }` as a typed error.
+- New `Event::ContextOverflowResolved { resolution: "compacted" | "rerouted" | "surfaced", freed_tokens: Option<u32>, items_compacted: Option<usize> }` on the bus. GUI `bridge_event` + TUI `project_event` arms wire-projected; no GUI/TUI rendering arm in this bundle (the bus event lands but no toast/panel renders it — follow-on).
+- Auto-selector heuristic: filter unpinned → sort token-count-descending → compute `raw_target = needed - (limit - current_total)` (saturating) → floor at the smallest unpinned candidate's tokens → pad by `OVERFLOW_SAFETY_MARGIN_PCT = 25%` → greedy accumulate. `MAX_OVERFLOW_RETRIES = 2` and the 25% margin are PROVISIONAL pending Q1 calibration.
+- `MockResponse::{new, context_overflow}` constructors + new `MockResponse.overflow: Option<(u32, u32)>` field for test seam. The struct-literal MockResponse pattern now requires `overflow: None`; ~30 existing call sites updated.
+- 7 new tests: 6 unit tests on the policy match + auto-selector heuristic (extracted as pure helpers), 1 integration test scripts MockAdapter overflow on turn 1, asserts compaction fires + retry succeeds + `Event::ContextOverflowResolved { resolution: "compacted", .. }` lands.
+
+### B4 — §2 model protocol per-adapter few-shot override
+
+Closes the spec promise on per-adapter few-shot customisation. Each adapter can override the shared baseline for a given `Strategy`.
+
+- New trait method on `Adapter`:
+  ```rust
+  fn few_shot_override(&self, strategy: Strategy) -> Option<Vec<Message>> { None }
+  ```
+  Default returns `None` (fall back to baseline). MockAdapter keeps the default.
+- **AnthropicAdapter**: returns `Some(messages)` for `JsonSentinel` — a Claude-flavoured user/assistant pair with the literal `<<<harness_meta>>>{...}<<<end>>>` sentinel inline so Claude sees the carrier shape. `NativeTool` + `RegexProse` return `None`.
+- **OpenAiCompatAdapter**: returns `Some(messages)` for `JsonSentinel` — assistant turn starts with `<<<harness_meta>>>` (no prose preface) and contains only strict JSON between sentinels, biasing local OSS models toward strict-JSON emission without narration.
+- Runner wiring: new `Runner.few_shot_cache: parking_lot::Mutex<Option<Vec<Message>>>` field. The override is computed once per session (cached) on first turn. If `Some`, those messages are prepended before the resume/fresh-run bootstrap; if `None`, the existing baseline path runs unchanged.
+- New `Runner::with_adapter_for_test(adapter)` test-only builder (`#[doc(hidden)]` + `#[allow(dead_code)]`) for swapping in custom adapter impls in integration tests.
+- `async-trait` added as a dev-dep of `atelier-cli` (it's already a normal dep of `atelier-core`) so test adapters can implement the trait directly.
+- 9 new tests: per-adapter unit tests (Mock `none-by-default`; Anthropic 3 strategies; OpenAI-compat 3 strategies); 2 integration round-trip tests via `MockAdapterWithOverride`.
+
+### Workspace test count delta
+
+- atelier-core unit: 729 → 737 (+8: B4 adapter overrides)
+- atelier-cli unit (lib): 39 → 45 (+6: B1 policy + auto-selector)
+- atelier-cli integration: 40 → 61 (+21: B1 1 integration + 20 from B1's `#[path]`-mounted compaction tests; B4 2 round-trips)
+- atelier-gui: 28 → 28 (unchanged)
+- atelier-tui: 92 → 92 (unchanged)
+- Total: **928 → 963**
+
+### Cross-bundle merge resolution
+
+Branches forked from `109fc62`-then-merged-into-`6763c0a` (v60.8 docs). Merge order: B1 → B4. Single conflict on `crates/atelier-cli/src/runner.rs`:
+- Both bundles added a new field to the `Runner` struct (`overflow_policy` from B1, `few_shot_cache` from B4) — resolved as additive "keep both."
+- Both bundles added a new initialiser line in `Runner::new` — additive "keep both."
+
+No other conflicts. B4 explicitly avoided `session.rs` (B1's territory); B1 explicitly avoided `adapter/*` and `protocol_strategy.rs` (B4's territory). The discipline-driven brief paid off — minimal merge cost vs the v60.8 batch where the agents stepped on each other's `session.rs::Event::kind()` match.
+
+### Deferred to follow-on bundles
+
+- §15 rmcp foundation (B3): blocked behind this release per the user's "B1 + B4 in parallel, then B3" plan. Picked up next.
+- §1 mid-session provider swap: defer to a sequential pass (would conflict heavily with B1's overflow handler in `runner.rs`).
+- GUI/TUI rendering of `Event::ContextOverflowResolved`: a small follow-on toast on the GUI + footer hint on the TUI.
+- `--overflow-policy` CLI flag on the binary: deferred (binary defaults to `Compact`).
+
 ## v60.8 — 2026-05-18 (four-bundle release: §11 egress gate, §7 tier indicator, §15 mcp_servers loader, §1 conformance degradation)
 
 Second four-bundle parallel release in two days. Four sub-agent worktrees → four merges into main → one docs commit. Workspace tests **861 → 928** (+67). All gates green: `cargo fmt --check`, `cargo clippy --workspace -D warnings`, `cargo test --workspace`, `npm run check`, `make check` (112 rig tests, 13 canonical fixtures).
