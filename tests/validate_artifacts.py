@@ -10,6 +10,7 @@ Currently validates:
   - Every baseline file under tests/baselines/ (when present) vs schemas/baselines/permission_prompts.v1.json
   - Every protocol overhead file under tests/protocol/ (when present) vs schemas/protocol/overhead.v1.json
   - Every runner result file under tests/results/ (when present) vs schemas/workload/runner_result.v1.json
+  - Every Phase A nightly gate result under tests/phase_a_gate/ vs schemas/ci/phase_a_gate.v1.json
   - Fenced ```json blocks inside prompts/protocol_fewshot/*.md vs schemas/model_protocol/envelope.v1.json
 
 Exit code 0 if all artifacts pass. Non-zero otherwise.
@@ -49,6 +50,7 @@ JSON_RULES = [
     ("tests/baselines/*.json", "schemas/baselines/permission_prompts.v1.json", "baseline data"),
     ("tests/protocol/*.json", "schemas/protocol/overhead.v1.json", "protocol overhead"),
     ("tests/results/*.json", "schemas/workload/runner_result.v1.json", "runner result"),
+    ("tests/phase_a_gate/*.json", "schemas/ci/phase_a_gate.v1.json", "phase A gate result"),
 ]
 
 # Markdown files whose fenced ```json blocks should validate against an envelope schema.

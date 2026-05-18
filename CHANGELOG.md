@@ -1,8 +1,44 @@
 # Atelier Spec — Changelog
 
-## v60.13 — 2026-05-18 (Track A: §15 built-ins-as-MCP surface-symmetry refactor)
+## v60.13 — 2026-05-18 (Track A: §15 built-ins-as-MCP surface-symmetry refactor + Track C: Phase A nightly gate workflow)
 
-Closes Track A from the Phase A close-out plan: a sibling `BuiltInToolWrapper` mirrors `McpToolWrapper`'s exact shape so the two registration paths converge at the dispatcher boundary. Track C (CI nightly workflow) is deferred to a separate landing once org quota clears. Workspace tests **1020 → 1031** (+11 tests; +8 wrapper construction, +3 registration).
+Closes Tracks A and C from the Phase A close-out plan. A sibling `BuiltInToolWrapper` mirrors `McpToolWrapper`'s exact shape so the two registration paths converge at the dispatcher boundary (Track A). A new `.github/workflows/nightly_phase_a_gate.yml` runs the mechanical Phase A gates every night, records pass/fail to `tests/phase_a_gate/last_run.json` per a new `schemas/ci/phase_a_gate.v1.json`, commits the artifact back, and surfaces a one-line digest via the new `phase_a_gate_status` binary (Track C). Workspace tests **1020 → 1038** (+18; +11 wrapper/register from A, +7 status binary from C).
+
+### Track C — Phase A nightly gate workflow
+
+The nightly fires at 06:30 UTC (30 minutes after `nightly_protocol_overhead.yml` so the two `git push origin HEAD:main` calls don't race) and walks five gates with `continue-on-error: true` so one failure doesn't short-circuit the rest:
+
+1. **`fmt`** — `cargo fmt --all -- --check`
+2. **`clippy`** — `cargo clippy --workspace --all-targets -- -D warnings`
+3. **`cargo_test_workspace`** — `cargo test --workspace`
+4. **`rig_check`** — `make check` (schema meta-validation + artifact validation + 112 rig tests + 13 canonical workloads)
+5. **`mcp_integration_npx`** — `cargo test -p atelier-cli --test mcp_integration -- --include-ignored` (the npx-gated MCP integration suite). **Informational, not red** — npm-registry flakiness shouldn't flip Phase A; the digest surfaces a failure but `all_passed` stays true.
+
+Each step captures its exit code + wall-clock duration into a step output; a final `compose` step assembles `tests/phase_a_gate/last_run.json` against the schema, validates the fresh artifact via `tests/validate_artifacts.py`, commits + pushes to `main`, and uploads the `phase_a_gate_status` binary's one-line digest into the run's `GITHUB_STEP_SUMMARY`. A red gate also surfaces as a `::error::` annotation on the workflow run so it's visible on the actions tab without drilling into per-step logs.
+
+### `schemas/ci/phase_a_gate.v1.json`
+
+New schema family (`schemas/ci/` directory is new — sits alongside `schemas/protocol/` and `schemas/audit/`). Required fields: `version`, `run_id` (RFC 3339), `git_sha` (7-40 hex), `all_passed` (boolean — separately stored from the gate array so a reader can short-circuit), `gates: array of {name, status, ?duration_secs, ?details}`. `status` is one of `passed | failed | skipped`. `name` must be `^[a-z][a-z0-9_]*$` so a future analytics tooling can rely on the snake_case shape. `details` capped at 1 KiB so a malformed gate can't bloat the artifact.
+
+Wired into `tests/validate_artifacts.py`'s `JSON_RULES` table so every PR's `make check` validates the file against the schema — a schema break is caught synchronously, not only on the next nightly firing.
+
+### `crates/atelier-cli/src/bin/phase_a_gate_status.rs` (new binary)
+
+Single-purpose reader, ~250 lines including tests:
+
+- Accepts an optional positional path argument; defaults to `tests/phase_a_gate/last_run.json` resolved relative to `CARGO_MANIFEST_DIR` at build time.
+- Prints two lines: a per-gate digest (`<run_id> <git_sha> <name>:<status> …`) plus a `Phase A: GREEN | RED  (N gates: P passed, F failed, S skipped)` digest.
+- Exit codes: **0** = green, **1** = red (≥1 `failed`), **2** = artifact missing / malformed / unsupported version.
+- A `failed` gate's `details` field is surfaced on stderr so a CI summary picks it up without parsing the JSON.
+- 7 new unit tests via `tempfile`: `green_run_exits_zero`, `red_run_exits_one`, `missing_file_exits_two`, `malformed_json_exits_two`, `unsupported_version_exits_two`, `tally_counts_each_status`, `bundled_seed_artifact_parses` (drift gate against the in-tree seed).
+
+Why a separate binary rather than an `atelier <subcommand>`: the nightly runs it with no harness state in scope (no session, no adapter); building a full `atelier` invocation for what is a 30-line JSON read would be wasteful. Cargo auto-discovers `src/bin/*.rs` so no `Cargo.toml` change is needed.
+
+### Seed `tests/phase_a_gate/last_run.json`
+
+One row per gate at `passed` status (with the `mcp_integration_npx` row marked `skipped` because the seed predates the first nightly firing). Subsequent nightly runs overwrite this file in place; the seed is committed so the workflow has something to validate against on its first run and so the `phase_a_gate_status` binary doesn't 404 in a fresh clone.
+
+### Track A — surface symmetry — same shape as `McpToolWrapper`
 
 ### Surface symmetry — same shape as `McpToolWrapper`
 

@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "run_id": "2026-05-18T00:00:00Z",
+  "git_sha": "8b96991",
+  "all_passed": true,
+  "gates": [
+    {
+      "name": "fmt",
+      "status": "passed",
+      "duration_secs": 1.0,
+      "details": "cargo fmt --check"
+    },
+    {
+      "name": "clippy",
+      "status": "passed",
+      "duration_secs": 30.0,
+      "details": "cargo clippy --workspace --all-targets -- -D warnings"
+    },
+    {
+      "name": "cargo_test_workspace",
+      "status": "passed",
+      "duration_secs": 60.0,
+      "details": "cargo test --workspace — 1038 passed, 0 failed"
+    },
+    {
+      "name": "rig_check",
+      "status": "passed",
+      "duration_secs": 90.0,
+      "details": "make check — 112 rig tests + 13 canonical workloads + 58 artifacts"
+    },
+    {
+      "name": "mcp_integration_npx",
+      "status": "skipped",
+      "details": "seed run — workflow first lands this nightly; npx-gated MCP integration runs from the next firing"
+    }
+  ]
+}

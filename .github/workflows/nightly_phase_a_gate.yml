@@ -1,0 +1,241 @@
+name: nightly_phase_a_gate
+
+# Phase A mechanical gate. Runs the workspace-level checks the Phase A
+# scope hangs on (fmt, clippy, workspace tests, rig + canonical
+# workloads, npx-gated MCP integration), records each gate's outcome
+# to tests/phase_a_gate/last_run.json per schemas/ci/phase_a_gate.v1.json,
+# commits the refreshed artifact back to main, and validates it against
+# its schema before exit.
+#
+# Distinct from `nightly_protocol_overhead.yml`, which only measures the
+# §2 overhead surface. This workflow is the "are Phase A's mechanical
+# gates green" probe; the `atelier-phase-a-gate-status` binary
+# (crates/atelier-cli/src/bin/phase_a_gate_status.rs) reads the
+# committed artifact for downstream consumers.
+#
+# Live-API gates against Anthropic + LiteLLM (Track B) live in a
+# separate workflow once a credentialed secret lands; the maintainer
+# wires `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` into repo secrets and
+# extends this file with one more job, gated on the secret being set.
+
+on:
+  schedule:
+    # 06:30 UTC — 30 minutes after nightly_protocol_overhead so the
+    # two nightly commits don't race the same git ref.
+    - cron: "30 6 * * *"
+  workflow_dispatch:
+
+# Write permission so the refreshed last_run.json gets committed.
+permissions:
+  contents: write
+
+jobs:
+  phase_a_gate:
+    name: phase A gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: "1.85.0"
+          components: rustfmt, clippy
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node (for npx + the MCP integration gate)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # Tauri 2 (atelier-gui) pulls glib-sys / webkit2gtk-4.1-sys via
+      # build.rs; those need GTK + WebKit system libraries that
+      # ubuntu-latest doesn't ship. Tracking the per-PR check.yml's
+      # package list — bump together when ubuntu-latest moves past 24.04.
+      - name: Install Tauri Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev
+
+      - name: Install rig dependencies
+        run: pip install ".[rig]"
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: nightly-phase-a-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', '**/Cargo.toml') }}
+
+      # The per-gate steps below run with `set +e` + `continue-on-error`
+      # so a failure in one doesn't short-circuit the others — the
+      # nightly is most useful when it tells you EVERY broken gate, not
+      # the first one. Each step captures its exit code into a step
+      # output that the JSON-build step reads.
+
+      - name: Gate — fmt
+        id: fmt
+        continue-on-error: true
+        run: |
+          set +e
+          start=$(date +%s)
+          cargo fmt --all -- --check
+          ec=$?
+          end=$(date +%s)
+          echo "exit_code=$ec" >> "$GITHUB_OUTPUT"
+          echo "duration=$((end - start))" >> "$GITHUB_OUTPUT"
+          exit $ec
+
+      - name: Gate — clippy
+        id: clippy
+        continue-on-error: true
+        run: |
+          set +e
+          start=$(date +%s)
+          cargo clippy --workspace --all-targets -- -D warnings
+          ec=$?
+          end=$(date +%s)
+          echo "exit_code=$ec" >> "$GITHUB_OUTPUT"
+          echo "duration=$((end - start))" >> "$GITHUB_OUTPUT"
+          exit $ec
+
+      - name: Gate — cargo test workspace
+        id: cargo_test
+        continue-on-error: true
+        run: |
+          set +e
+          start=$(date +%s)
+          cargo test --workspace
+          ec=$?
+          end=$(date +%s)
+          echo "exit_code=$ec" >> "$GITHUB_OUTPUT"
+          echo "duration=$((end - start))" >> "$GITHUB_OUTPUT"
+          exit $ec
+
+      - name: Gate — make check (rig)
+        id: rig
+        continue-on-error: true
+        run: |
+          set +e
+          start=$(date +%s)
+          make check
+          ec=$?
+          end=$(date +%s)
+          echo "exit_code=$ec" >> "$GITHUB_OUTPUT"
+          echo "duration=$((end - start))" >> "$GITHUB_OUTPUT"
+          exit $ec
+
+      # The MCP integration tests are gated #[ignore] (they spawn
+      # `npx @modelcontextprotocol/server-filesystem`). The nightly
+      # opts them in with --include-ignored. A failure here is
+      # informational, not red — the network/registry can be flaky
+      # in a way that's not the harness's fault — so we still flag
+      # it but do NOT flip `all_passed` to false.
+      - name: Gate — mcp integration (npx)
+        id: mcp
+        continue-on-error: true
+        run: |
+          set +e
+          start=$(date +%s)
+          cargo test -p atelier-cli --test mcp_integration -- --include-ignored
+          ec=$?
+          end=$(date +%s)
+          echo "exit_code=$ec" >> "$GITHUB_OUTPUT"
+          echo "duration=$((end - start))" >> "$GITHUB_OUTPUT"
+          exit $ec
+
+      # Build the JSON artifact + commit + push.
+      - name: Compose phase_a_gate/last_run.json
+        id: compose
+        run: |
+          set -e
+          run_id=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          git_sha=$(git rev-parse --short HEAD)
+
+          # Map step exit codes → status strings. 0 = passed, anything
+          # else = failed. We don't emit `skipped` from the workflow
+          # because every gate above actually runs; `skipped` is reserved
+          # for prerequisite-missing situations (e.g. local runs without
+          # a Python venv).
+          status_for() {
+            if [ "$1" = "0" ]; then echo "passed"; else echo "failed"; fi
+          }
+
+          fmt_status=$(status_for "${{ steps.fmt.outputs.exit_code }}")
+          clippy_status=$(status_for "${{ steps.clippy.outputs.exit_code }}")
+          cargo_status=$(status_for "${{ steps.cargo_test.outputs.exit_code }}")
+          rig_status=$(status_for "${{ steps.rig.outputs.exit_code }}")
+          mcp_status=$(status_for "${{ steps.mcp.outputs.exit_code }}")
+
+          # The MCP gate is non-fatal — see note above.
+          if [ "$fmt_status" = "passed" ] && \
+             [ "$clippy_status" = "passed" ] && \
+             [ "$cargo_status" = "passed" ] && \
+             [ "$rig_status" = "passed" ]; then
+            all_passed=true
+          else
+            all_passed=false
+          fi
+
+          run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          cat > tests/phase_a_gate/last_run.json <<EOF
+          {
+            "version": 1,
+            "run_id": "$run_id",
+            "git_sha": "$git_sha",
+            "workflow_run_url": "$run_url",
+            "all_passed": $all_passed,
+            "gates": [
+              {"name": "fmt", "status": "$fmt_status", "duration_secs": ${{ steps.fmt.outputs.duration }}},
+              {"name": "clippy", "status": "$clippy_status", "duration_secs": ${{ steps.clippy.outputs.duration }}},
+              {"name": "cargo_test_workspace", "status": "$cargo_status", "duration_secs": ${{ steps.cargo_test.outputs.duration }}},
+              {"name": "rig_check", "status": "$rig_status", "duration_secs": ${{ steps.rig.outputs.duration }}},
+              {"name": "mcp_integration_npx", "status": "$mcp_status", "duration_secs": ${{ steps.mcp.outputs.duration }}}
+            ]
+          }
+          EOF
+
+          # Surface the binary's digest in the job summary.
+          cargo build --release -p atelier-cli --bin phase_a_gate_status
+          ./target/release/phase_a_gate_status >> "$GITHUB_STEP_SUMMARY" || true
+
+          echo "all_passed=$all_passed" >> "$GITHUB_OUTPUT"
+
+      - name: Validate fresh artifact against schema
+        run: python tests/validate_artifacts.py
+
+      - name: Commit refreshed last_run.json
+        run: |
+          if git diff --quiet tests/phase_a_gate/last_run.json; then
+            echo "No change to tests/phase_a_gate/last_run.json; skipping commit."
+            exit 0
+          fi
+          git config user.name  "atelier-nightly[bot]"
+          git config user.email "atelier-nightly@users.noreply.github.com"
+          git add tests/phase_a_gate/last_run.json
+          git commit -m "nightly: refresh Phase A gate result"
+          git push origin HEAD:main
+
+      - name: Surface failure
+        if: steps.compose.outputs.all_passed != 'true'
+        run: |
+          echo "::error::Phase A gate red — at least one of fmt/clippy/cargo_test/rig failed. See per-step logs above and tests/phase_a_gate/last_run.json on main."
+          exit 1
