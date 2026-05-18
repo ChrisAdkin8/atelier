@@ -1,5 +1,39 @@
 # Atelier Spec — Changelog
 
+## v60.21 — 2026-05-18 (DoD checklist: spec becomes authoritative; todo.md mirror collapsed)
+
+Docs-only follow-on to v60.20. Closes a bookkeeping debt surfaced when the user asked "are phases A, B and C fully closed out?" the day after v60.20 shipped: the DoD checklist existed in **two copies** — one in `coding-harness-spec.md:927` as `## Definition of done`, one in `tasks/todo.md:428` as `## DoD checklist mirror` — both with every line `[ ]` despite Phase A green (v60.19), §3 GUI 10-file rename green (v56), §5 context-panel API assertions green (v53), and crash-and-recover green (v60.7). Discharges **L-D-2 / L-D-7** against the project's own bookkeeping: two-copy registries drift; the symptom looked like nothing was done.
+
+### Reality reconciliation against the spec's `## Definition of done`
+
+Each line moved from `[ ]` to its true state with a terse evidence pointer (commit ref, changelog entry, or closeout-plan section):
+
+- `[x]` Phase A gate green — v60.19
+- `[ ]` Phase B gate green — five open items; closeout plan at `tasks/phase_b_closeout.md`
+- `[x]` Schema validation passing — `make check`: 58/58 artifacts as of v60.20
+- `[~]` Canonical workload priority subset Anthropic + LiteLLM via API — Anthropic half green v60.18; LiteLLM half deferred to Phase B Track B
+- `[x]` Crash-and-recover preserves state — v60.7 `sigkill_then_resume_*` integration test
+- `[x]` §3 GUI 10-file rename gate green — v56
+- `[x]` §5 context-panel API assertions green — v53 + v44 cache-bust ledger
+- `[ ]` Backend milestone met — blocked on Phase B
+- `[ ]` Cold start GUI <4 s — never formally measured against the reference machine
+- Full-v1 lines (5×) — all remain `[ ]` (Phase B/D/E gates still open; only Anthropic in adapter trio; §8 / perf budgets / PROVISIONAL calibration are downstream)
+
+### `tasks/todo.md` mirror collapsed to a pointer
+
+The "mirror" pattern was the bug. Two checklists with identical content drift by default; v60.20 was the day the gap got loud enough to notice. The mirror is replaced with a 2-line note pointing at `coding-harness-spec.md:927` as authoritative, plus an explicit instruction not to re-introduce it. The spec is the contract; the build tracker references it. Single source of truth, no copies to keep in sync.
+
+This is a worked example of the lessons-as-discipline pattern from v60.20: **L-D-2** says shared registries drift if you fork them, and the DoD checklist was exactly such a fork. **L-D-7** says claimed-but-broken surfaces are half a bug — the all-`[ ]` mirror was a "claimed nothing's done" surface against a half-shipped product.
+
+### Files touched
+
+- **`coding-harness-spec.md`** — `## Definition of done` lines updated against reality with evidence pointers; section preamble clarifies that this is authoritative and `tasks/todo.md` no longer carries a copy.
+- **`tasks/todo.md`** — `## DoD checklist mirror` retitled `## Definition of done` and collapsed to a 2-line pointer at the spec section.
+
+### Verification
+
+`make check` green (no rig structure changes; the spec is a markdown file, not validated against a schema). No Rust changes, so `cargo fmt --check` / `cargo clippy` / `cargo test --workspace` unchanged from v60.20's green baseline.
+
 ## v60.20 — 2026-05-18 (`atelier find` ships + §5 mental-model goes live + Phase B closeout plan)
 
 Three bundles land together. First, the deferred `atelier find --path <P>` CLI subcommand from v60.7's §5 UX-target row (`tasks/todo.md:304`) — the `FindProbe` + `FindProbeLog` instrumentation has been on disk since v60.7, but the user-facing entry point was punted. v60.20 closes it. Second, the §5 mental-model panel flips from "off in v0" (text editable but never injected) to live: when `enabled && text.trim() != ""` the runner prepends a second System message on every per-turn `adapter.chat` call carrying the user's text. Third, this revision's process work — ten Phase-A close-out lessons promoted into `tasks/lessons.md` with stable IDs `L-D-1` … `L-D-10`, Phase D/E/F sections of `tasks/todo.md` carrying `### Discipline carry-overs from Phase A–C` references at phase entry, and a new `tasks/phase_b_closeout.md` plan with five tracks (A/B/C1/C2/C3/D), ratified pre-work decisions, and a risk register.

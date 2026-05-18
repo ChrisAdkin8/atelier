@@ -926,25 +926,27 @@ The MCP client (`rmcp`) and the LiteLLM adapter follow once Q7 (rmcp spike) and 
 
 ## Definition of done
 
+Authoritative checklist. The `tasks/todo.md` build tracker references this section rather than duplicating it, so the two cannot drift.
+
 ### Backend milestone — Phase A + B (internal; not user-facing)
-- [ ] Phase A gate green
-- [ ] Phase B gate green
-- [ ] Schema validation passing for every Phase A/B artifact
-- [ ] Canonical workload priority subset (t01, t02, t05, t06, t10) completes against Anthropic + LiteLLM adapters via API
-- [ ] Crash-and-recover preserves state
+- [x] Phase A gate green — v60.19
+- [ ] Phase B gate green — five open items; closeout plan at `tasks/phase_b_closeout.md`
+- [x] Schema validation passing for every Phase A/B artifact — `make check`: 58/58 artifacts validated as of v60.20
+- [~] Canonical workload priority subset (t01, t02, t05, t06, t10) completes against Anthropic + LiteLLM adapters via API — Anthropic half green v60.18 (`phase_a_live_anthropic_t<NN>_*`); LiteLLM/openai-compat half deferred to Phase B Track B per `tasks/phase_b_closeout.md`
+- [x] Crash-and-recover preserves state — v60.7 `sigkill_then_resume_recovers_partial_state_and_advances_to_done` integration test
 
 ### First user-facing release — Phase A + B + C
-- [ ] Backend milestone met
-- [ ] §3 GUI 10-file rename gate green
-- [ ] §5 context-panel API assertions green
-- [ ] Cold start GUI <4 s
+- [ ] Backend milestone met — blocked on Phase B
+- [x] §3 GUI 10-file rename gate green — v56 `v56_phase_c_mechanical_gate_at_ten_files_lines_up_live_diff_and_final_state`
+- [x] §5 context-panel API assertions green — v53 (per-item `tokens`/`token_source`/`provenance` on `Event::ContextItems`) + v44 cache-bust ledger path
+- [ ] Cold start GUI <4 s — not formally measured against reference machine
 
 ### Full v1
-- [ ] Every pillar's mechanical gate green
-- [ ] Canonical workload completes against Anthropic, OpenAI, local Qwen
-- [ ] §8 ≤30% UX target met against captured baseline
-- [ ] Performance budgets met on reference machine
-- [ ] All PROVISIONAL parameters replaced with calibrated values + recorded calibration data
+- [ ] Every pillar's mechanical gate green — Phase B/D/E gates still open
+- [ ] Canonical workload completes against Anthropic, OpenAI, local Qwen — only Anthropic green so far
+- [ ] §8 ≤30% UX target met against captured baseline — §8 is Phase E; baseline capture (Q5) open
+- [ ] Performance budgets met on reference machine — no formal measurement run yet
+- [ ] All PROVISIONAL parameters replaced with calibrated values + recorded calibration data — only the §1 conformance window+threshold has been ratified (v60.12); ~10 other PROVISIONAL constants still flagged in source
 
 ### UX targets (measured; non-blocking)
 - New user, non-trivial task, 30 min — user study; reported.

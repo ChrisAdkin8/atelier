@@ -425,27 +425,11 @@ See `tasks/lessons.md` for the full **Failure** / **Prevention** pairs. The four
 
 ---
 
-## DoD checklist mirror
+## Definition of done
 
-### Backend milestone — Phase A + B (internal; not user-facing)
-- [ ] Phase A gate green
-- [ ] Phase B gate green
-- [ ] Schema validation passing for every Phase A/B artifact
-- [ ] Canonical workload priority subset (t01, t02, t05, t06, t10) completes against Anthropic + LiteLLM via API
-- [ ] Crash-and-recover preserves state
+The authoritative checklist lives in `coding-harness-spec.md` under `## Definition of done`. This used to be a mirror copy; v60.21 collapsed it to a pointer because two copies guaranteed drift (caught the day after v60.20 shipped: every line was `[ ]` despite Phase A green, §3 GUI 10-file rename green, §5 context-panel API green, and crash-and-recover green).
 
-### First user-facing release — Phase A + B + C
-- [ ] Backend milestone met
-- [ ] §3 GUI 10-file rename gate green
-- [ ] §5 context-panel API assertions green
-- [ ] Cold start GUI <4 s
-
-### Full v1
-- [ ] All pillar mechanical gates green
-- [ ] Canonical workload completes against Anthropic, OpenAI, local Qwen
-- [ ] §8 ≤30% UX target met
-- [ ] Performance budgets met
-- [ ] All PROVISIONAL parameters replaced with calibrated values
+When a DoD line moves, edit the spec; do not re-introduce a mirror here.
 
 ---
 
