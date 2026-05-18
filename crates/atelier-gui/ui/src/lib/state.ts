@@ -175,6 +175,38 @@ export function initialMentalModel(): MentalModel {
   return { enabled: false, text: '', text_tokens: 0, updated_at: '' }
 }
 
+/// v62 — §7 verify-pass tier label. Mirror of Rust's
+/// `VerificationTier` (serde `rename_all = "snake_case"` /
+/// `wire_label()` agree by construction; pinned by the Rust test
+/// `verification_tier_wire_labels_agree_with_serde`).
+///
+///   * `tier1_lsp` — LSP-driven hallucination detector (Tier 1).
+///     Gated on Q3; no producer wired yet. Future-reserved.
+///   * `tier2_tree_sitter` — tree-sitter syntactic checks (Tier 2).
+///   * `tier3_textual` — textual lying-agent detector (Tier 3).
+///     The fallback; always available.
+///   * `not_run` — no verify pass ran this turn.
+export type VerificationTier =
+  | 'tier1_lsp'
+  | 'tier2_tree_sitter'
+  | 'tier3_textual'
+  | 'not_run'
+
+/// v62 — §7 verify-pass terminal state. Rendered by `MetersPane`
+/// as a small badge so the user can see which tier (and therefore
+/// how much hallucination coverage) ran on the last verify pass.
+/// Populated by `VerificationPassed` events; defaults to `not_run`
+/// before any verify pass happens.
+export type VerificationStatus = {
+  tier: VerificationTier
+  file_count: number
+  claim_count: number
+}
+
+export function initialVerificationStatus(): VerificationStatus {
+  return { tier: 'not_run', file_count: 0, claim_count: 0 }
+}
+
 /// v60.7 §1 BYOM — one cell of the capability matrix. Mirrors
 /// Rust's `CapabilityClaim` (serde rename_all=snake_case).
 export type CapabilityClaim = 'supported' | 'claimed_but_broken' | 'unsupported'
@@ -268,6 +300,12 @@ export type AppState = {
   /// `FilesChangedAcknowledged`. The webview renders
   /// `ConcurrentEditModal.svelte` when this is non-null.
   concurrentEditModal: { paths: string[]; observedAt: string } | null
+  /// v62 — §7 verify-pass tier indicator. Populated by
+  /// `VerificationPassed` events from the dispatcher; the
+  /// `MetersPane` renders a small badge so the user can see which
+  /// tier (and therefore the hallucination coverage level) ran on
+  /// the last verify pass. Defaults to `not_run`.
+  verificationStatus: VerificationStatus
 }
 
 export function initialState(): AppState {
@@ -289,6 +327,7 @@ export function initialState(): AppState {
     claimedChanges: {},
     mentalModel: initialMentalModel(),
     concurrentEditModal: null,
+    verificationStatus: initialVerificationStatus(),
   }
 }
 
@@ -432,6 +471,23 @@ export function applyEvent(state: AppState, evt: BridgedEvent): AppState {
       // (Reload / Wait / Pause / AutoReload / PauseTimedOut).
       return { ...state, events, concurrentEditModal: null }
     }
+    case 'VerificationPassed': {
+      // v62 — §7 verify-pass tier badge. Wholesale-replace the
+      // verification status so the MetersPane badge reflects the
+      // most recent verify pass.
+      const p = evt.payload as {
+        tier: string
+        file_count: number
+        claim_count: number
+      }
+      const tier = isVerificationTier(p.tier) ? p.tier : 'not_run'
+      const verificationStatus: VerificationStatus = {
+        tier,
+        file_count: p.file_count ?? 0,
+        claim_count: p.claim_count ?? 0,
+      }
+      return { ...state, events, verificationStatus }
+    }
     // Variants we don't fold into pane state — just the event log.
     case 'IllegalTransitionAttempted':
     case 'Cancelled':
@@ -488,6 +544,34 @@ function ledgerEntryCost(entry: LedgerEntry): number | null {
 
 function isConversationRole(s: string): s is ConversationRole {
   return s === 'user' || s === 'assistant' || s === 'tool' || s === 'system'
+}
+
+/// v62 — type-guard for the wire label of a `VerificationTier`.
+/// Matches the Rust serde labels (`rename_all = "snake_case"`).
+function isVerificationTier(s: string): s is VerificationTier {
+  return (
+    s === 'tier1_lsp' ||
+    s === 'tier2_tree_sitter' ||
+    s === 'tier3_textual' ||
+    s === 'not_run'
+  )
+}
+
+/// v62 — human-readable label for the verify-pass badge. Mirrors
+/// the TUI's badge text so the two surfaces stay in sync. Exported
+/// so `MetersPane.svelte` and any future verify-pass UI render
+/// identical copy.
+export function verificationTierLabel(tier: VerificationTier): string {
+  switch (tier) {
+    case 'tier1_lsp':
+      return 'tier-1 (lsp)'
+    case 'tier2_tree_sitter':
+      return 'tier-2 (tree-sitter)'
+    case 'tier3_textual':
+      return 'tier-3 (textual)'
+    case 'not_run':
+      return 'verify off'
+  }
 }
 
 export function projectEvent(evt: BridgedEvent): EventLogEntry {
@@ -584,6 +668,20 @@ export function projectEvent(evt: BridgedEvent): EventLogEntry {
     case 'FilesChangedAcknowledged': {
       const p = evt.payload as { outcome?: string }
       return { kind, detail: p.outcome ?? '' }
+    }
+    case 'VerificationPassed': {
+      const p = evt.payload as {
+        tier?: string
+        file_count?: number
+        claim_count?: number
+      }
+      const tier = isVerificationTier(p.tier ?? '') ? (p.tier as VerificationTier) : 'not_run'
+      const files = p.file_count ?? 0
+      const claims = p.claim_count ?? 0
+      return {
+        kind,
+        detail: `${verificationTierLabel(tier)} · ${files} files · ${claims} claims`,
+      }
     }
     default:
       return { kind, detail: '' }

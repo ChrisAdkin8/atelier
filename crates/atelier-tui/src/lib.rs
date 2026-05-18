@@ -161,6 +161,13 @@ pub struct AppState {
     /// (modal text editor + keybind to flip the toggle) lands when
     /// the harness actually injects the text into the prompt.
     pub mental_model: MentalModelHint,
+    /// v62 — §7 verify-pass tier indicator. Populated by
+    /// `VerificationPassed` events from the dispatcher;
+    /// `render_cost_meter` renders a small badge above the cost
+    /// line so the user can see which §7 tier (Tier 1 LSP / Tier 2
+    /// tree-sitter / Tier 3 textual / NotRun) ran on the last
+    /// verify pass. Defaults to `NotRun` (gray) before any pass.
+    pub verification_status: VerificationStatusHint,
 }
 
 /// Phase C close — TUI's projection of
@@ -171,6 +178,57 @@ pub struct AppState {
 pub struct MentalModelHint {
     pub enabled: bool,
     pub text_tokens: u32,
+}
+
+/// v62 — TUI's projection of the §7 verify-pass terminal state. Off
+/// (`NotRun`) by default until the dispatcher emits its first
+/// `Event::VerificationPassed`. Stored on `AppState` and rendered by
+/// `render_cost_meter` as a small badge above the cost line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VerificationStatusHint {
+    pub tier: atelier_core::verify::VerificationTier,
+    pub file_count: u32,
+    pub claim_count: u32,
+}
+
+impl Default for VerificationStatusHint {
+    fn default() -> Self {
+        Self {
+            tier: atelier_core::verify::VerificationTier::NotRun,
+            file_count: 0,
+            claim_count: 0,
+        }
+    }
+}
+
+impl VerificationStatusHint {
+    /// v62 — human-readable badge label. Mirrors the GUI's
+    /// `verificationTierLabel` so the two surfaces render identical
+    /// copy; pinned by `verification_status_hint_badge_label_matches_gui`.
+    pub fn badge_label(&self) -> &'static str {
+        match self.tier {
+            atelier_core::verify::VerificationTier::Tier1Lsp => "tier-1 (lsp)",
+            atelier_core::verify::VerificationTier::Tier2TreeSitter => "tier-2 (tree-sitter)",
+            atelier_core::verify::VerificationTier::Tier3Textual => "tier-3 (textual)",
+            atelier_core::verify::VerificationTier::NotRun => "verify off",
+        }
+    }
+
+    /// v62 — ratatui colour for the badge. Matches the GUI's CSS
+    /// classes (green / yellow / orange / dim-gray) so the two
+    /// surfaces stay semantically aligned.
+    pub fn badge_colour(&self) -> Color {
+        match self.tier {
+            atelier_core::verify::VerificationTier::Tier1Lsp => Color::Green,
+            atelier_core::verify::VerificationTier::Tier2TreeSitter => Color::Yellow,
+            // ratatui has no `Color::Orange`; use `LightRed` which
+            // renders as a warm orange-ish tone in 256-colour terminals
+            // and degrades to red on 8-colour ones. The semantic
+            // remains: Tier 3 is the lowest non-zero coverage tier.
+            atelier_core::verify::VerificationTier::Tier3Textual => Color::LightRed,
+            atelier_core::verify::VerificationTier::NotRun => Color::DarkGray,
+        }
+    }
 }
 
 /// v55 — which pane has keyboard focus. Tab cycles forward.
@@ -583,6 +641,22 @@ impl AppState {
                     self.input_mode = InputMode::Normal;
                 }
             }
+            SessionEvent::VerificationPassed {
+                tier,
+                file_count,
+                claim_count,
+            } => {
+                // v62 — wholesale-replace the verify-pass hint so the
+                // meters pane badge reflects the most recent pass.
+                // Counts come back as `usize`; the hint stores them
+                // as `u32` to mirror the other meter fields and keep
+                // the ratatui render path allocation-light.
+                self.verification_status = VerificationStatusHint {
+                    tier: *tier,
+                    file_count: u32::try_from(*file_count).unwrap_or(u32::MAX),
+                    claim_count: u32::try_from(*claim_count).unwrap_or(u32::MAX),
+                };
+            }
             SessionEvent::IllegalTransitionAttempted { .. }
             | SessionEvent::Cancelled
             | SessionEvent::Shutdown => {}
@@ -836,6 +910,14 @@ pub fn project_event(evt: &SessionEvent) -> EventLine {
         SessionEvent::FilesChangedAcknowledged { outcome } => {
             outcome.wire_label().to_string()
         }
+        SessionEvent::VerificationPassed {
+            tier,
+            file_count,
+            claim_count,
+        } => format!(
+            "{} · {file_count} files · {claim_count} claims",
+            tier.wire_label()
+        ),
         SessionEvent::Shutdown => String::new(),
     };
     EventLine { kind, detail }
@@ -912,10 +994,14 @@ pub fn render(state: &AppState, area: Rect, buf: &mut Buffer) {
     // Lengths total 8 rows; the §5 panel takes whatever's left
     // (with a soft floor of 2 rows so the empty-state line is
     // visible).
+    //
+    // v62 — the cost meter row carries the §7 verify-pass badge on
+    // the same line (right-aligned in the cost paragraph) so the
+    // overall row allocation is unchanged.
     let right = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(2), // cost gauge
+            Constraint::Length(2), // cost gauge + v62 verify badge (right-aligned)
             Constraint::Length(2), // context gauge (aggregate)
             Constraint::Min(2),    // §5 context items (per-row, flex)
             Constraint::Length(4), // bounded event log tail
@@ -1265,8 +1351,39 @@ fn plan_step_lines(step: &PlanStep) -> Vec<Line<'static>> {
 
 /// Cost meter — single-line label + USD figure. We deliberately don't
 /// render a gauge for cost (no upper bound to scale against).
+///
+/// v62 — the cost line also carries the §7 verify-pass badge on the
+/// right-hand side so the user can see which verification tier
+/// (Tier 1 LSP / Tier 2 tree-sitter / Tier 3 textual / NotRun) ran
+/// on the last pass. The badge is rendered in its own column so a
+/// width-tight terminal degrades gracefully (the cost label always
+/// fits, the badge gets clipped before the cost number does).
 fn render_cost_meter(state: &AppState, area: Rect, buf: &mut Buffer) {
-    let line = Line::from(vec![
+    // Reserve a top border row by reusing the existing block; the
+    // inner area is the row below.
+    let block = Block::default().borders(Borders::TOP);
+    let inner = block.inner(area);
+    Widget::render(block, area, buf);
+
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let badge = &state.verification_status;
+    let verify_label = badge.badge_label();
+    // "verify " prefix + the label itself. Floor at 0 so a tight
+    // terminal collapses the badge column instead of underflowing.
+    let badge_width = ("verify ".len() + verify_label.len()) as u16;
+    let cost_width = inner.width.saturating_sub(badge_width);
+
+    // Left column: cost label + USD figure.
+    let cost_area = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: cost_width,
+        height: 1,
+    };
+    let cost_line = Line::from(vec![
         Span::styled("cost ", Style::default().fg(Color::DarkGray)),
         Span::styled(
             format!("${:.4}", state.total_cost_usd),
@@ -1275,11 +1392,29 @@ fn render_cost_meter(state: &AppState, area: Rect, buf: &mut Buffer) {
                 .add_modifier(Modifier::BOLD),
         ),
     ]);
-    Widget::render(
-        Paragraph::new(line).block(Block::default().borders(Borders::TOP)),
-        area,
-        buf,
-    );
+    Widget::render(Paragraph::new(cost_line), cost_area, buf);
+
+    // Right column: verify-pass badge. Skipped when the badge column
+    // collapsed to zero (very narrow terminal).
+    if badge_width == 0 || cost_width >= inner.width {
+        return;
+    }
+    let badge_area = Rect {
+        x: inner.x + cost_width,
+        y: inner.y,
+        width: badge_width.min(inner.width.saturating_sub(cost_width)),
+        height: 1,
+    };
+    let verify_line = Line::from(vec![
+        Span::styled("verify ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            verify_label,
+            Style::default()
+                .fg(badge.badge_colour())
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]);
+    Widget::render(Paragraph::new(verify_line), badge_area, buf);
 }
 
 /// Context-token meter — ratatui Gauge with the known fraction filled;
@@ -4297,5 +4432,128 @@ mod tests {
             "missing banner in:\n{rendered}"
         );
         assert!(rendered.contains("~320 cache tokens"));
+    }
+
+    // ---------- v62: §7 verify-pass tier indicator ----------
+
+    #[test]
+    fn apply_verification_passed_replaces_status_hint() {
+        let mut s = AppState::new();
+        // Default is NotRun.
+        assert_eq!(
+            s.verification_status.tier,
+            atelier_core::verify::VerificationTier::NotRun
+        );
+        s.apply(&SessionEvent::VerificationPassed {
+            tier: atelier_core::verify::VerificationTier::Tier3Textual,
+            file_count: 5,
+            claim_count: 3,
+        });
+        assert_eq!(
+            s.verification_status.tier,
+            atelier_core::verify::VerificationTier::Tier3Textual
+        );
+        assert_eq!(s.verification_status.file_count, 5);
+        assert_eq!(s.verification_status.claim_count, 3);
+        // Event log got an entry too.
+        assert_eq!(s.events.last().map(|e| e.kind), Some("VerificationPassed"));
+    }
+
+    #[test]
+    fn verification_status_hint_badge_label_matches_gui() {
+        // Pinned: the GUI's `verificationTierLabel` (state.ts) and the
+        // TUI's `VerificationStatusHint::badge_label` must produce
+        // identical user-facing copy. A drift here would mean the GUI
+        // shows "tier-2 (tree-sitter)" while the TUI shows something
+        // else for the same tier.
+        for (tier, expected) in [
+            (
+                atelier_core::verify::VerificationTier::Tier1Lsp,
+                "tier-1 (lsp)",
+            ),
+            (
+                atelier_core::verify::VerificationTier::Tier2TreeSitter,
+                "tier-2 (tree-sitter)",
+            ),
+            (
+                atelier_core::verify::VerificationTier::Tier3Textual,
+                "tier-3 (textual)",
+            ),
+            (atelier_core::verify::VerificationTier::NotRun, "verify off"),
+        ] {
+            let hint = VerificationStatusHint {
+                tier,
+                file_count: 0,
+                claim_count: 0,
+            };
+            assert_eq!(hint.badge_label(), expected);
+        }
+    }
+
+    #[test]
+    fn render_cost_meter_includes_verify_badge_for_tier3() {
+        // Render the cost meter directly into a small buffer so the
+        // verify badge string is substring-matchable without competing
+        // with the rest of the layout.
+        let s = AppState {
+            verification_status: VerificationStatusHint {
+                tier: atelier_core::verify::VerificationTier::Tier3Textual,
+                file_count: 2,
+                claim_count: 1,
+            },
+            ..AppState::new()
+        };
+        // 2 rows: top border + the cost-and-badge row. Width must be
+        // wide enough that both the cost figure and the "tier-3
+        // (textual)" badge fit side-by-side without truncation.
+        let area = Rect::new(0, 0, 60, 2);
+        let mut buf = Buffer::empty(area);
+        render_cost_meter(&s, area, &mut buf);
+        let rendered = buffer_to_string(&buf, area);
+        assert!(
+            rendered.contains("verify"),
+            "missing verify label in:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("tier-3 (textual)"),
+            "missing tier-3 badge in:\n{rendered}"
+        );
+        // Cost line still rendered on the same row.
+        assert!(
+            rendered.contains("cost"),
+            "missing cost label in:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn render_cost_meter_shows_verify_off_for_not_run_default() {
+        let s = AppState::new();
+        let area = Rect::new(0, 0, 60, 2);
+        let mut buf = Buffer::empty(area);
+        render_cost_meter(&s, area, &mut buf);
+        let rendered = buffer_to_string(&buf, area);
+        assert!(
+            rendered.contains("verify off"),
+            "missing verify off badge in:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn project_event_for_verification_passed_carries_tier_and_counts() {
+        let line = project_event(&SessionEvent::VerificationPassed {
+            tier: atelier_core::verify::VerificationTier::Tier3Textual,
+            file_count: 4,
+            claim_count: 2,
+        });
+        assert_eq!(line.kind, "VerificationPassed");
+        // Detail string surfaces the tier wire label + counts so the
+        // event log row is self-describing.
+        assert!(
+            line.detail.contains("tier3_textual"),
+            "missing tier label in detail: {}",
+            line.detail
+        );
+        assert!(line.detail.contains("4 files"));
+        assert!(line.detail.contains("2 claims"));
     }
 }

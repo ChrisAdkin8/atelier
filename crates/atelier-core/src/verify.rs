@@ -16,10 +16,137 @@
 //! The §7 hallucination detector (LSP shell-out, tiered language coverage)
 //! lands in its own module once `tower-lsp` is wired and Q3 (LSP auto-install
 //! UX) is resolved.
+//!
+//! # Verification tiers
+//!
+//! Spec §7 lays out three tiers of verification coverage. A given verify
+//! pass picks the *highest* tier whose producer is available; the UI
+//! surfaces the chosen tier so the user can see when a higher-tier
+//! check fell back to a coarser one.
+//!
+//!   * **Tier 1 — LSP** (`Tier1Lsp`). Gated on Q3 (LSP auto-install UX);
+//!     not yet wired. The variant exists so the producer-side wiring is
+//!     a one-line change when the LSP shell-out lands.
+//!   * **Tier 2 — tree-sitter** (`Tier2TreeSitter`). Syntactic checks
+//!     run in [`crate::staging::SyntaxCheck`] (the real impl is
+//!     `TreeSitterSyntaxCheck`). When that check ran for at least one
+//!     file in this turn, the verify pass reports Tier 2.
+//!   * **Tier 3 — textual** (`Tier3Textual`). The pure
+//!     [`compare`] lying-agent detector below. Always available; this
+//!     is the fallback when no higher tier ran.
+//!   * **NotRun** — the harness did not run a verify pass this turn
+//!     (e.g. the envelope didn't declare `claimed_done`). UIs render
+//!     a "verify off" badge so absence is unambiguous.
 
 use std::collections::BTreeMap;
 
 use crate::protocol::{ClaimedChange, ClaimedChangeKind, Envelope};
+
+/// Which tier of §7 verification actually ran this turn. The producer
+/// picks the highest tier whose check executed; consumers surface it
+/// so the user can see the active hallucination-coverage level.
+///
+/// Wire form is the snake-case variant name; serde and
+/// [`Self::wire_label`] agree by construction (pinned by
+/// `verification_tier_wire_labels_agree_with_serde`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationTier {
+    /// Spec §7 Tier 1 — LSP-driven hallucination detector. Gated on
+    /// Q3 (LSP auto-install UX); no producer is wired yet. The
+    /// variant exists so a future producer can flip to this tier
+    /// without a wire-format change.
+    Tier1Lsp,
+    /// Spec §7 Tier 2 — tree-sitter syntactic checks. Producer:
+    /// [`crate::staging::TreeSitterSyntaxCheck`]. Reported when at
+    /// least one staged file ran the syntax check this turn.
+    Tier2TreeSitter,
+    /// Spec §7 Tier 3 — textual lying-agent detector. Producer:
+    /// [`compare`] in this module. Always available; the fallback
+    /// when no higher tier ran for any file in the turn.
+    Tier3Textual,
+    /// No verify pass ran this turn. Emitted so the UI can render a
+    /// "verify off" badge unambiguously rather than inferring absence.
+    NotRun,
+}
+
+impl VerificationTier {
+    /// Stable wire label used by the GUI bridge and TUI projection.
+    /// Pinned by `verification_tier_wire_labels_agree_with_serde` so
+    /// a future variant rename forces a deliberate edit.
+    pub fn wire_label(self) -> &'static str {
+        match self {
+            Self::Tier1Lsp => "tier1_lsp",
+            Self::Tier2TreeSitter => "tier2_tree_sitter",
+            Self::Tier3Textual => "tier3_textual",
+            Self::NotRun => "not_run",
+        }
+    }
+}
+
+/// One §7 verify pass's summary. The `tier` says which producer ran;
+/// `file_count` is the number of files the pass considered (the union
+/// of claimed paths + observed paths); `claim_count` is the number of
+/// envelope `claimed_changes` entries it weighed. `discrepancies` is
+/// the [`compare`] output, retained so the dispatcher can ledger or
+/// otherwise act on the lying-agent signal without re-running the
+/// comparison.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerificationRun {
+    pub tier: VerificationTier,
+    pub file_count: usize,
+    pub claim_count: usize,
+    pub discrepancies: Vec<Discrepancy>,
+}
+
+impl VerificationRun {
+    /// Run the §7 textual (Tier 3) pass and bundle the result with
+    /// the tier label. Convenience for callers (the dispatcher's
+    /// `verify_pass`) that don't need to thread `compare` and the
+    /// tier badge through their own state. Tier 1 / Tier 2 producers
+    /// aren't wired yet (see [`VerificationTier`]); when they land,
+    /// add sibling constructors here.
+    pub fn tier3_textual(envelope: &Envelope, observed: &[ObservedChange]) -> Self {
+        let discrepancies = compare(envelope, observed);
+        let claim_count = envelope
+            .claimed_changes
+            .as_ref()
+            .map(|c| c.len())
+            .unwrap_or(0);
+
+        // file_count is the union of claimed paths + observed paths.
+        // BTreeSet keeps it O(n log n) deterministic without pulling
+        // in a HashSet allocation.
+        let mut paths = std::collections::BTreeSet::new();
+        if let Some(claims) = envelope.claimed_changes.as_ref() {
+            for c in claims {
+                paths.insert(c.path.as_str());
+            }
+        }
+        for o in observed {
+            paths.insert(o.path.as_str());
+        }
+
+        Self {
+            tier: VerificationTier::Tier3Textual,
+            file_count: paths.len(),
+            claim_count,
+            discrepancies,
+        }
+    }
+
+    /// Sentinel for "the harness did not run a verify pass this turn".
+    /// Distinct from a zero-discrepancy Tier 3 run — the UI renders a
+    /// different badge so absence is unambiguous.
+    pub fn not_run() -> Self {
+        Self {
+            tier: VerificationTier::NotRun,
+            file_count: 0,
+            claim_count: 0,
+            discrepancies: Vec::new(),
+        }
+    }
+}
 
 /// Observed change to a single path produced by §3 staging. Built by
 /// diffing the post-commit workspace against the pre-turn baseline.
@@ -413,5 +540,73 @@ mod tests {
         let s = d.summary();
         assert!(s.contains("delete"));
         assert!(s.contains("modified"));
+    }
+
+    // ---------- §7 verification tier indicator ----------
+
+    #[test]
+    fn verification_tier_wire_labels_agree_with_serde() {
+        // v62 (wire-vs-serde discipline) — `VerificationTier` is
+        // bridged onto the GUI via serde and into the TUI footer via
+        // `wire_label()`. Pin both surfaces so a future variant
+        // rename forces a deliberate edit on each path. The serde
+        // form is the snake_case variant name (from `rename_all`);
+        // the helper returns the same string.
+        for (variant, label) in [
+            (VerificationTier::Tier1Lsp, "tier1_lsp"),
+            (VerificationTier::Tier2TreeSitter, "tier2_tree_sitter"),
+            (VerificationTier::Tier3Textual, "tier3_textual"),
+            (VerificationTier::NotRun, "not_run"),
+        ] {
+            assert_eq!(variant.wire_label(), label);
+            // Serde round-trip: serialise → string → deserialise → eq.
+            let s = serde_json::to_string(&variant).unwrap();
+            // Stringified JSON value is wrapped in quotes.
+            assert_eq!(s, format!("\"{label}\""));
+            let back: VerificationTier = serde_json::from_str(&s).unwrap();
+            assert_eq!(back, variant);
+        }
+    }
+
+    #[test]
+    fn verification_run_tier3_textual_carries_compare_output() {
+        let env = envelope_with(vec![
+            claim("a.py", ClaimedChangeKind::Edit),
+            claim("b.py", ClaimedChangeKind::Create),
+        ]);
+        let obs = vec![
+            observed("a.py", ObservedKind::Modified),
+            // b.py claimed Create but workspace shows nothing — flags.
+            observed("c.py", ObservedKind::Modified),
+        ];
+        let run = VerificationRun::tier3_textual(&env, &obs);
+        assert_eq!(run.tier, VerificationTier::Tier3Textual);
+        // claim_count is the envelope's claim list length (independent of
+        // discrepancies).
+        assert_eq!(run.claim_count, 2);
+        // file_count is the union of claimed + observed paths: {a, b, c}.
+        assert_eq!(run.file_count, 3);
+        // compare() output is preserved verbatim.
+        assert_eq!(run.discrepancies.len(), 2);
+    }
+
+    #[test]
+    fn verification_run_tier3_textual_clean_run() {
+        let env = envelope_with(vec![claim("a.py", ClaimedChangeKind::Edit)]);
+        let obs = vec![observed("a.py", ObservedKind::Modified)];
+        let run = VerificationRun::tier3_textual(&env, &obs);
+        assert_eq!(run.tier, VerificationTier::Tier3Textual);
+        assert_eq!(run.file_count, 1);
+        assert_eq!(run.claim_count, 1);
+        assert!(run.discrepancies.is_empty());
+    }
+
+    #[test]
+    fn verification_run_not_run_sentinel_is_zeroed() {
+        let run = VerificationRun::not_run();
+        assert_eq!(run.tier, VerificationTier::NotRun);
+        assert_eq!(run.file_count, 0);
+        assert_eq!(run.claim_count, 0);
+        assert!(run.discrepancies.is_empty());
     }
 }

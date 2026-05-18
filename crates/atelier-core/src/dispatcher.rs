@@ -1345,6 +1345,54 @@ impl SessionDispatcher {
         self.mental_model.lock().snapshot()
     }
 
+    /// v62 — §7 verify pass. Runs [`crate::verify::compare`] against
+    /// the envelope's `claimed_changes` and the workspace
+    /// [`crate::verify::ObservedChange`] list, then broadcasts the
+    /// [`Event::VerificationPassed`] terminal marker with the tier
+    /// that actually ran so the GUI/TUI badge converges.
+    ///
+    /// Returns the [`crate::verify::VerificationRun`] so the caller
+    /// (the Runner today, a future audit-grade DoD pass tomorrow)
+    /// can ledger the discrepancies without re-running the
+    /// comparison.
+    ///
+    /// **Tier selection.** v0 always runs Tier 3 (the pure textual
+    /// `compare`). Tier 1 (LSP) is gated on Q3 and has no producer
+    /// wired yet — the [`crate::verify::VerificationTier::Tier1Lsp`]
+    /// variant exists so flipping the producer in is a one-line
+    /// change here. Tier 2 (tree-sitter syntactic) already runs
+    /// inside `staging::SyntaxCheck` at commit time; the verify pass
+    /// will surface Tier 2 once we thread the per-file syntax
+    /// outcomes back into this call (Phase D follow-on). Until
+    /// then the explicit "Tier 3 ran" badge is more honest than
+    /// silently degrading.
+    pub fn verify_pass(
+        &self,
+        envelope: &crate::protocol::Envelope,
+        observed: &[crate::verify::ObservedChange],
+    ) -> crate::verify::VerificationRun {
+        let run = crate::verify::VerificationRun::tier3_textual(envelope, observed);
+        let _ = self.events.send(Event::VerificationPassed {
+            tier: run.tier,
+            file_count: run.file_count,
+            claim_count: run.claim_count,
+        });
+        run
+    }
+
+    /// v62 — explicit "no verify pass ran this turn" signal. Emitted
+    /// when the harness skips the §7 gate (envelope didn't claim
+    /// done, or the run aborted early). UIs render a "verify off"
+    /// gray badge so absence is unambiguous rather than the user
+    /// inferring it from a missing event.
+    pub fn emit_verify_not_run(&self) {
+        let _ = self.events.send(Event::VerificationPassed {
+            tier: crate::verify::VerificationTier::NotRun,
+            file_count: 0,
+            claim_count: 0,
+        });
+    }
+
     /// v60.5 — append a single ledger entry and broadcast the matching
     /// `LedgerAppended` event. Public so callers outside the dispatcher
     /// (`atelier_cli::compaction`, which records the `ModelCall` for the
@@ -3802,5 +3850,70 @@ mod tests {
             }
         }
         assert!(saw, "resolve_concurrent_edit must publish on the bus");
+    }
+
+    // ---------- v62: §7 verify-pass tier indicator ----------
+
+    #[tokio::test]
+    async fn verify_pass_emits_tier3_event_with_counts() {
+        let (sd, _cm, _ms, _pc, _ledger, mut rx) = build_v55_dispatcher();
+        let env = crate::protocol::Envelope {
+            claimed_changes: Some(vec![
+                crate::protocol::ClaimedChange {
+                    path: "a.py".into(),
+                    kind: crate::protocol::ClaimedChangeKind::Edit,
+                    summary: "tweak fn foo".into(),
+                },
+                crate::protocol::ClaimedChange {
+                    path: "b.py".into(),
+                    kind: crate::protocol::ClaimedChangeKind::Create,
+                    summary: "new helper".into(),
+                },
+            ]),
+            ..Default::default()
+        };
+        let observed = vec![crate::verify::ObservedChange {
+            path: "a.py".into(),
+            kind: crate::verify::ObservedKind::Modified,
+        }];
+
+        let run = sd.verify_pass(&env, &observed);
+        // Producer returns the tier that ran for direct callers.
+        assert_eq!(run.tier, crate::verify::VerificationTier::Tier3Textual);
+        assert_eq!(run.claim_count, 2);
+        assert_eq!(run.file_count, 2); // a.py + b.py
+                                       // b.py claimed Create but unobserved — one Claimed discrepancy.
+        assert_eq!(run.discrepancies.len(), 1);
+
+        match next_event(&mut rx).await {
+            Event::VerificationPassed {
+                tier,
+                file_count,
+                claim_count,
+            } => {
+                assert_eq!(tier, crate::verify::VerificationTier::Tier3Textual);
+                assert_eq!(file_count, 2);
+                assert_eq!(claim_count, 2);
+            }
+            other => panic!("expected VerificationPassed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn emit_verify_not_run_publishes_not_run_tier() {
+        let (sd, _cm, _ms, _pc, _ledger, mut rx) = build_v55_dispatcher();
+        sd.emit_verify_not_run();
+        match next_event(&mut rx).await {
+            Event::VerificationPassed {
+                tier,
+                file_count,
+                claim_count,
+            } => {
+                assert_eq!(tier, crate::verify::VerificationTier::NotRun);
+                assert_eq!(file_count, 0);
+                assert_eq!(claim_count, 0);
+            }
+            other => panic!("expected VerificationPassed(NotRun), got {other:?}"),
+        }
     }
 }
