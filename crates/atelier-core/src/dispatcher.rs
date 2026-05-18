@@ -890,6 +890,13 @@ pub struct SessionDispatcher {
     context_manager: Arc<parking_lot::Mutex<crate::context::ContextManager>>,
     memory_store: Arc<parking_lot::Mutex<crate::memory::MemoryStore>>,
     plan_canvas: Arc<parking_lot::Mutex<crate::plan::PlanCanvas>>,
+    /// Phase C close — §5 mental-model state. Off by default; the
+    /// runner does **not** inject this into the prompt in v0. UI
+    /// mutators land here via [`Self::set_mental_model`]; the
+    /// resulting [`Event::MentalModelSnapshot`] re-emits the
+    /// enabled flag + approximate token count so subscribed UIs
+    /// converge.
+    mental_model: Arc<parking_lot::Mutex<crate::mental_model::MentalModel>>,
 }
 
 impl SessionDispatcher {
@@ -908,6 +915,9 @@ impl SessionDispatcher {
             )),
             memory_store: Arc::new(parking_lot::Mutex::new(crate::memory::MemoryStore::new())),
             plan_canvas: Arc::new(parking_lot::Mutex::new(crate::plan::PlanCanvas::new())),
+            mental_model: Arc::new(parking_lot::Mutex::new(
+                crate::mental_model::MentalModel::new(),
+            )),
         }
     }
 
@@ -1168,6 +1178,37 @@ impl SessionDispatcher {
         self.plan_canvas.lock().reorder(new_order)?;
         self.emit_plan_snapshot();
         Ok(())
+    }
+
+    /// Phase C close — §5 mental-model mutator. Updates the toggle +
+    /// free-form text and broadcasts the snapshot. Off by default; v0
+    /// does **not** inject the text into the prompt. Returns the
+    /// projection so callers (CLI / Tauri / TUI) can render the
+    /// cost-disclosure label inline without a follow-up read.
+    pub fn set_mental_model(
+        &self,
+        text: String,
+        enabled: bool,
+        now: &str,
+    ) -> Result<crate::mental_model::MentalModelSnapshot, crate::mental_model::MentalModelError>
+    {
+        let mut m = self.mental_model.lock();
+        m.set(text, enabled, now)?;
+        let snap = m.snapshot();
+        drop(m);
+        let _ = self.events.send(Event::MentalModelSnapshot {
+            enabled: snap.enabled,
+            text_tokens: snap.text_tokens,
+        });
+        Ok(snap)
+    }
+
+    /// Phase C close — read-only snapshot of the §5 mental-model.
+    /// Lets a CLI subcommand or a Tauri command surface the current
+    /// text without a re-emit (or, for the snapshot bus consumers,
+    /// without waiting for an event).
+    pub fn snapshot_mental_model(&self) -> crate::mental_model::MentalModelSnapshot {
+        self.mental_model.lock().snapshot()
     }
 
     /// v60.5 — append a single ledger entry and broadcast the matching
@@ -3473,5 +3514,75 @@ mod tests {
         ));
         // Card still present (atomicity).
         assert_eq!(ms.lock().len(), 1);
+    }
+
+    // ---------- Phase C close: set_mental_model ----------
+
+    #[tokio::test]
+    async fn set_mental_model_round_trips_through_dispatcher() {
+        let (sd, _cm, _ms, _pc, _ledger, mut rx) = build_v55_dispatcher();
+        let snap = sd
+            .set_mental_model(
+                "the user wants brevity".into(),
+                true,
+                "2026-05-17T12:00:00Z",
+            )
+            .unwrap();
+        assert!(snap.enabled);
+        assert_eq!(snap.text, "the user wants brevity");
+        assert!(snap.text_tokens > 0);
+        match next_event(&mut rx).await {
+            Event::MentalModelSnapshot {
+                enabled,
+                text_tokens,
+            } => {
+                assert!(enabled);
+                assert_eq!(text_tokens, snap.text_tokens);
+            }
+            other => panic!("expected MentalModelSnapshot, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn set_mental_model_can_toggle_off_without_clearing_text() {
+        let (sd, _cm, _ms, _pc, _ledger, mut rx) = build_v55_dispatcher();
+        sd.set_mental_model("notes".into(), true, "t1").unwrap();
+        let _ = next_event(&mut rx).await;
+        let snap = sd.set_mental_model("notes".into(), false, "t2").unwrap();
+        assert!(!snap.enabled);
+        assert_eq!(snap.text, "notes");
+        match next_event(&mut rx).await {
+            Event::MentalModelSnapshot { enabled, .. } => assert!(!enabled),
+            other => panic!("expected MentalModelSnapshot, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn set_mental_model_rejects_invalid_text_atomically() {
+        let (sd, _cm, _ms, _pc, _ledger, mut rx) = build_v55_dispatcher();
+        // Seed a valid snapshot first so we can prove state stays put on the
+        // rejected call below.
+        sd.set_mental_model("baseline".into(), true, "t1").unwrap();
+        let _ = next_event(&mut rx).await;
+        let err = sd
+            .set_mental_model("contains\0nul".into(), true, "t2")
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::mental_model::MentalModelError::InvalidText(_)
+        ));
+        // State unchanged on error.
+        let snap = sd.snapshot_mental_model();
+        assert_eq!(snap.text, "baseline");
+        assert_eq!(snap.updated_at, "t1");
+    }
+
+    #[test]
+    fn snapshot_mental_model_defaults_to_disabled_empty() {
+        let (sd, _cm, _ms, _pc, _ledger, _rx) = build_v55_dispatcher();
+        let snap = sd.snapshot_mental_model();
+        assert!(!snap.enabled);
+        assert!(snap.text.is_empty());
+        assert_eq!(snap.text_tokens, 0);
     }
 }

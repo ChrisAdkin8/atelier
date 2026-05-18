@@ -15,7 +15,8 @@
 
   import { onMount, onDestroy } from 'svelte'
   import { listen, type UnlistenFn } from '@tauri-apps/api/event'
-  import type { BridgedEvent } from './lib/state'
+  import { invoke } from '@tauri-apps/api/core'
+  import type { BridgedEvent, MentalModel } from './lib/state'
   import {
     initialState,
     applyEvent,
@@ -29,6 +30,7 @@
   import MetersPane from './lib/components/MetersPane.svelte'
   import ContextPane from './lib/components/ContextPane.svelte'
   import MemoryPane from './lib/components/MemoryPane.svelte'
+  import MentalModelPane from './lib/components/MentalModelPane.svelte'
   import Composer from './lib/components/Composer.svelte'
 
   // NOTE (v49): named `app` rather than `state` because svelte-check
@@ -39,6 +41,12 @@
   // rename, but verify `npm run check` stays clean.
   let app = $state(initialState())
   let unlisten: UnlistenFn | null = null
+
+  // Phase C close — §5 mental-model panel visibility. Off by default;
+  // the header toggle flips it. Pure UI state (not part of the
+  // dispatcher's MentalModel) — a user can show the panel without
+  // enabling mental-model injection, and vice versa.
+  let showMentalModel: boolean = $state(false)
 
   // v49 FIX-9: the bus listener is awaited inside `onMount`, so the
   // Composer must be disabled until `listen()` resolves — otherwise a
@@ -67,6 +75,24 @@
     listenerReady = true
     window.addEventListener('keydown', onKeyDown)
   })
+
+  // Phase C close — hydrate the mental-model panel on demand. The
+  // dispatcher seeds an empty `MentalModel` per session; we read it
+  // the first time the user opens the panel so the textarea
+  // reflects any prior value (e.g. from a swap-driver round-trip).
+  async function hydrateMentalModel() {
+    try {
+      const m = await invoke<MentalModel>('snapshot_mental_model')
+      app = { ...app, mentalModel: m }
+    } catch {
+      // No active dispatcher yet — the empty default is fine.
+    }
+  }
+
+  async function toggleMentalModelPanel() {
+    showMentalModel = !showMentalModel
+    if (showMentalModel) await hydrateMentalModel()
+  }
 
   onDestroy(() => {
     unlisten?.()
@@ -102,6 +128,30 @@
     editStagedCount={app.editStagedCount}
     scrubOffset={app.scrubOffset}
   />
+
+  <!-- Phase C close — mental-model panel toggle. Lives in its own
+       row above the grid so the four-pane layout below is unchanged
+       (off-by-default contract). -->
+  <div class="mental-model-toggle">
+    <button
+      type="button"
+      class="toggle-btn"
+      onclick={() => void toggleMentalModelPanel()}
+      aria-expanded={showMentalModel}
+      aria-controls="mental-model-panel"
+      title="show / hide the §5 mental-model panel (off by default)"
+    >
+      §5 mental model {showMentalModel ? '▾' : '▸'}
+      {#if app.mentalModel.enabled}
+        <span class="enabled-dot" aria-label="enabled">●</span>
+      {/if}
+    </button>
+  </div>
+  {#if showMentalModel}
+    <div class="mental-model-row" id="mental-model-panel">
+      <MentalModelPane mentalModel={app.mentalModel} />
+    </div>
+  {/if}
 
   <main class="grid">
     <div class="pane-slot conversation-slot">
@@ -180,10 +230,46 @@
 <style>
   .app {
     display: grid;
-    /* Header / panes / Composer / help footer. */
-    grid-template-rows: auto 1fr auto auto;
+    /* Header / mental-model toggle / [optional mental-model panel]
+       / main grid / Composer / help footer. The mental-model rows
+       collapse to `auto` height so the layout stays compact when
+       the panel is hidden. */
+    grid-template-rows: auto auto auto 1fr auto auto;
     height: 100vh;
     min-height: 0;
+  }
+  .mental-model-toggle {
+    display: flex;
+    justify-content: flex-end;
+    padding: 0.25rem 0.75rem 0 0.75rem;
+  }
+  .toggle-btn {
+    background: transparent;
+    border: 1px solid var(--border-pane);
+    border-radius: 3px;
+    color: var(--fg-dim);
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    padding: 0.15rem 0.55rem;
+    cursor: pointer;
+  }
+  .toggle-btn:hover {
+    background: var(--bg-hover, rgba(255, 255, 255, 0.06));
+    color: var(--fg-default);
+  }
+  .toggle-btn .enabled-dot {
+    margin-left: 0.3rem;
+    color: var(--accent-green, #9c9);
+    font-size: 0.6rem;
+  }
+  .mental-model-row {
+    padding: 0.25rem 0.75rem 0 0.75rem;
+    min-height: 0;
+    display: flex;
+  }
+  .mental-model-row > :global(*) {
+    flex: 1;
+    min-width: 0;
   }
   .grid {
     display: grid;

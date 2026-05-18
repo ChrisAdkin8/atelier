@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "checks": [
+    {
+      "name": "pytest passes (all 3 tests still pass)",
+      "command": "python3 -m pytest -q",
+      "expect": {
+        "exit_code": 0
+      }
+    },
+    {
+      "name": "test file untouched",
+      "file_unchanged": "tests/test_pipeline.py"
+    },
+    {
+      "name": "at least 4 callables in pipeline.py (top-level + 3 helpers)",
+      "command": "python3 -c \"import ast; tree = ast.parse(open('pipeline.py').read()); n = sum(1 for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))); assert n >= 4, f'only {n} callables, want >= 4'\"",
+      "expect": {
+        "exit_code": 0
+      }
+    },
+    {
+      "name": "pipeline still callable with original signature + shape",
+      "command": "python3 -c \"import sys; sys.path.insert(0, '.'); from pipeline import pipeline; r = pipeline('alice, 92\\nbob, 75'); assert r['rows'][0] == {'name': 'alice', 'score': 92, 'grade': 'A'}; assert 'bob: 75 (C)' in r['report']\"",
+      "expect": {
+        "exit_code": 0
+      }
+    }
+  ]
+}

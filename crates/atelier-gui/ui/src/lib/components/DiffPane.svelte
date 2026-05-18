@@ -10,7 +10,29 @@
   // to the live `SessionDispatcher::submit_approval` (wired in v47).
 
   import type { StagedEdit, Hunk, PendingApproval } from '../state'
-  import { invoke } from '@tauri-apps/api/core'
+  import { invoke, convertFileSrc } from '@tauri-apps/api/core'
+  import InlineRenderers from './InlineRenderers.svelte'
+
+  // Phase C close — image extensions we'll render inline next to a
+  // staged-edit when the file path is an image. Matches the
+  // `looksLikeImage` discipline in InlineRenderers.
+  function pathLooksLikeImage(path: string): boolean {
+    return /\.(png|jpe?g|gif|svg|webp)$/i.test(path)
+  }
+
+  function rationaleHasRenderable(s: string): boolean {
+    if (!s) return false
+    if (s.includes('```mermaid') || s.includes('```d2')) return true
+    return /\.(png|jpe?g|gif|svg|webp)\b/i.test(s)
+  }
+
+  function imagePreviewSrc(path: string): string {
+    try {
+      return convertFileSrc(path)
+    } catch {
+      return path
+    }
+  }
 
   type Props = {
     recentEdits: StagedEdit[]
@@ -232,10 +254,31 @@
     {:else}
       <div class="path">─── <strong>{head.path}</strong></div>
       {#if claimedChanges[head.path]}
-        <p class="why">
-          <span class="why-label">why:</span>
-          {claimedChanges[head.path]}
-        </p>
+        {#if rationaleHasRenderable(claimedChanges[head.path])}
+          <div class="why rich">
+            <span class="why-label">why:</span>
+            <InlineRenderers
+              text={claimedChanges[head.path]}
+              blockId={`why-${head.path}`}
+            />
+          </div>
+        {:else}
+          <p class="why">
+            <span class="why-label">why:</span>
+            {claimedChanges[head.path]}
+          </p>
+        {/if}
+      {/if}
+
+      {#if pathLooksLikeImage(head.path)}
+        <div class="image-preview">
+          <img
+            src={imagePreviewSrc(head.path)}
+            alt={head.path}
+            loading="lazy"
+          />
+          <span class="caption">staged image: {head.path}</span>
+        </div>
       {/if}
 
       {#if head.hunks.kind === 'same'}
@@ -477,5 +520,30 @@
   }
   .line.remove {
     color: var(--diff-remove);
+  }
+  /* Phase C close — inline rationale + image preview. */
+  .why.rich {
+    margin: 0.1rem 0 0.4rem 1.6rem;
+    color: var(--fg-muted);
+    font-size: 0.78rem;
+  }
+  .image-preview {
+    margin: 0.4rem 0;
+    padding: 0.4rem;
+    border: 1px dotted var(--border-pane);
+    border-radius: 3px;
+    background: rgba(255, 255, 255, 0.02);
+  }
+  .image-preview img {
+    max-width: 100%;
+    height: auto;
+    display: block;
+  }
+  .image-preview .caption {
+    display: block;
+    margin-top: 0.2rem;
+    color: var(--fg-dim);
+    font-size: 0.68rem;
+    font-style: italic;
   }
 </style>

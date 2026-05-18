@@ -274,6 +274,13 @@ pub struct Runner {
     /// v51 — base URL used as part of the probe cache key. Empty
     /// for adapters that don't speak HTTP (Mock, Anthropic).
     probe_base_url: String,
+    /// Phase C close — pane-visibility instrumentation. `None`
+    /// means the driver didn't supply one; the runner skips writing
+    /// `pane_visibility.json` in that case so the file's presence
+    /// is a positive signal ("this run was instrumented") rather
+    /// than a default-noise artefact. The `driver` field on the
+    /// record names the surface (GUI / TUI / headless).
+    pane_visibility: Option<(crate::instrumentation::PaneVisibility, String)>,
 }
 
 impl Runner {
@@ -343,6 +350,7 @@ impl Runner {
             adapter_handle: None,
             probe_policy,
             probe_base_url,
+            pane_visibility: None,
         })
     }
 
@@ -376,6 +384,19 @@ impl Runner {
     /// from a UI thread without re-constructing the adapter.
     pub fn with_adapter_handle(mut self, handle: AdapterHandle) -> Self {
         self.adapter_handle = Some(handle);
+        self
+    }
+
+    /// Phase C close — record which UI panes the driver had visible
+    /// for this run. The Runner writes a sibling
+    /// `pane_visibility.json` next to `session.json` at end-of-run.
+    /// `driver` is a free-form label ("gui", "tui", "headless").
+    pub fn with_pane_visibility(
+        mut self,
+        panes: crate::instrumentation::PaneVisibility,
+        driver: impl Into<String>,
+    ) -> Self {
+        self.pane_visibility = Some((panes, driver.into()));
         self
     }
 
@@ -802,6 +823,23 @@ impl Runner {
         );
         if let Err(e) = snapshot.save_to(&session_dir) {
             tracing::warn!(error = %e, "atelier run: session snapshot save failed");
+        }
+
+        // Phase C close — write the pane-visibility record next to
+        // `session.json` if the driver supplied one. Best-effort: a
+        // failure here logs but does not fail the run (the spec
+        // measurement subsystem reads this file lazily and falls
+        // back to "all visible" when it's absent).
+        if let Some((panes, driver)) = &self.pane_visibility {
+            let rec = crate::instrumentation::PaneVisibilityRecord::new(
+                session_id.0.to_string(),
+                now_rfc3339(),
+                panes.clone(),
+                driver.clone(),
+            );
+            if let Err(e) = rec.save_to(&session_dir) {
+                tracing::warn!(error = %e, "pane_visibility.json write failed");
+            }
         }
 
         // 12. Shutdown. The broadcast channel only closes when *every*

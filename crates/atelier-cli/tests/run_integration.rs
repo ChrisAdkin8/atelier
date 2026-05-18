@@ -19,6 +19,13 @@ use atelier_core::State;
 // dev-velocity we duplicate the path here via `#[path]` so the runner is
 // available without restructuring the crate. If the runner grows enough
 // to warrant a sibling `atelier-core-runner` crate, this is the seam.
+// Phase C close — `runner.rs` references `crate::instrumentation` (which
+// resolves to `atelier_cli::instrumentation` in the library build); the
+// integration test crate is a separate crate, so we also `#[path]`-include
+// `instrumentation.rs` here so `crate::instrumentation::…` resolves
+// inside the included `runner` module.
+#[path = "../src/instrumentation.rs"]
+mod instrumentation;
 #[path = "../src/runner.rs"]
 mod runner;
 use runner::{DispatcherHandle, EventSink, MockResponse, ProviderChoice, Runner};
@@ -1339,4 +1346,81 @@ async fn v60_6_expand_memory_card_round_trips_through_dispatcher() {
     .await;
 
     let _ = runner_task.await;
+}
+
+// ---------- Phase C close: pane visibility instrumentation ----------
+
+#[tokio::test]
+async fn run_writes_pane_visibility_when_driver_supplies_record() {
+    use instrumentation::{PaneVisibility, PaneVisibilityRecord};
+
+    let workspace = tempfile::TempDir::new().unwrap();
+
+    let responses = vec![MockResponse {
+        assistant_text: "ack".into(),
+        tool_calls: vec![mock_envelope_tool_call(&envelope_done())],
+    }];
+
+    let panes = PaneVisibility {
+        conversation: false,
+        diff: true,
+        plan: true,
+        memory: false,
+        context: true,
+        mental_model: false,
+    };
+    let runner = Runner::new(
+        workspace.path().to_path_buf(),
+        ProviderChoice::Mock { responses },
+        EventSink::Stdout,
+    )
+    .expect("mock runner construction is infallible")
+    .with_max_turns(1)
+    .with_pane_visibility(panes.clone(), "headless");
+
+    let report = runner.run("hello".into()).await.unwrap();
+    assert_eq!(report.final_state, State::Done);
+
+    // session dir lives under <workspace>/.atelier/sessions/<sid>/
+    let sessions_root = workspace.path().join(".atelier").join("sessions");
+    let entries: Vec<_> = std::fs::read_dir(&sessions_root)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .collect();
+    assert_eq!(entries.len(), 1, "expected exactly one session dir");
+    let rec = PaneVisibilityRecord::load_from(&entries[0])
+        .expect("pane_visibility.json should be present");
+    assert_eq!(rec.panes, panes);
+    assert_eq!(rec.driver, "headless");
+}
+
+#[tokio::test]
+async fn run_skips_pane_visibility_when_driver_does_not_supply_record() {
+    let workspace = tempfile::TempDir::new().unwrap();
+
+    let responses = vec![MockResponse {
+        assistant_text: "ack".into(),
+        tool_calls: vec![mock_envelope_tool_call(&envelope_done())],
+    }];
+
+    let runner = Runner::new(
+        workspace.path().to_path_buf(),
+        ProviderChoice::Mock { responses },
+        EventSink::Stdout,
+    )
+    .expect("mock runner construction is infallible")
+    .with_max_turns(1);
+
+    let _ = runner.run("hello".into()).await.unwrap();
+
+    let sessions_root = workspace.path().join(".atelier").join("sessions");
+    let entries: Vec<_> = std::fs::read_dir(&sessions_root)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .collect();
+    assert_eq!(entries.len(), 1);
+    let pv = entries[0].join("pane_visibility.json");
+    assert!(!pv.exists(), "no pane_visibility.json expected by default");
 }

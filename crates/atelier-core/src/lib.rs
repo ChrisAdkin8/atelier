@@ -19,6 +19,7 @@ pub mod hooks;
 pub mod init;
 pub mod ledger;
 pub mod memory;
+pub mod mental_model;
 pub mod path_safety;
 pub mod persistence;
 pub mod plan;
@@ -60,6 +61,7 @@ pub use ledger::{
     local_cost_usd, Kind as LedgerKind, Ledger, LedgerEntry, DEFAULT_LOCAL_RATE_USD_PER_SEC,
 };
 pub use memory::{MemoryCard, MemoryError, MemoryStore, PromoteOutput};
+pub use mental_model::{MentalModel, MentalModelError, MentalModelSnapshot};
 pub use persistence::{
     Checkpoints, OnDiskSession, PersistenceError, Plan, RecoveryEntry, RecoveryReason, Registry,
     RegistryEntry, DIFFS_SUBDIR, HARNESS_SESSION_VERSION, SESSION_FILE,
