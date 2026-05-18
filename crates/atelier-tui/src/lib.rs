@@ -740,6 +740,10 @@ impl AppState {
             // the paired `ModelProfileLoaded` that follows refreshes
             // the model badge. No AppState mutation needed here.
             | SessionEvent::AdapterSwapped { .. }
+            // §2 — `AgentStalled` lands as a log line; the paired
+            // `Transitioned { Streaming → AwaitingUser }` updates the
+            // state badge through the standard transition path.
+            | SessionEvent::AgentStalled { .. }
             | SessionEvent::Shutdown => {}
         }
         self.events.push(line);
@@ -1042,6 +1046,13 @@ pub fn project_event(evt: &SessionEvent) -> EventLine {
             to_model_id,
             ..
         } => format!("{from_model_id} → {to_model_id}"),
+        // §2 — agent abandoned the turn-protocol contract (see
+        // `Event::AgentStalled`). One-line summary in the event log;
+        // the paired `Transitioned { Streaming → AwaitingUser }`
+        // updates the state badge through the standard path.
+        SessionEvent::AgentStalled { turn, reason } => {
+            format!("turn {turn}: {reason}")
+        }
         SessionEvent::Shutdown => String::new(),
     };
     EventLine { kind, detail }

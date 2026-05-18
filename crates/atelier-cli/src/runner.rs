@@ -1219,8 +1219,19 @@ impl Runner {
         let mut last_envelope: Envelope = Envelope::default();
 
         for turn in 0..self.max_turns {
-            advance(&session_handle, State::Idle, State::Streaming).await?;
-            final_state = State::Streaming;
+            // v60.15 (M-bug-state-desync) — only fire the `Idle → Streaming`
+            // edge once at the start of the run. After turn 0 the state
+            // is already `Streaming` (or `ToolExecuting → Streaming` after
+            // a tool dispatch), and unconditionally re-advancing was
+            // emitting an `IllegalTransitionAttempted{Streaming, Streaming}`
+            // bus event on every turn beyond the first. The spec §2.5
+            // table has no `Streaming → Idle` edge — multi-turn iteration
+            // stays inside `Streaming` modulo the `Streaming ↔ Tool*`
+            // sub-cycle.
+            if final_state == State::Idle {
+                advance(&session_handle, State::Idle, State::Streaming).await?;
+                final_state = State::Streaming;
+            }
 
             // §1 BYOM context-window asymmetry — wrap `adapter.chat()`
             // in a small retry loop that consults
@@ -1537,6 +1548,10 @@ impl Runner {
                 .into_iter()
                 .filter(|c| c.name != atelier_core::protocol_strategy::HARNESS_META_NAME)
                 .collect();
+            // v60.15 — capture before the `Vec` is consumed by the
+            // dispatch loop below; needed for the end-of-turn stall
+            // guard that detects "no tool calls AND no claimed_done".
+            let made_tool_calls = !real_tool_calls.is_empty();
 
             if !real_tool_calls.is_empty() {
                 advance(&session_handle, State::Streaming, State::ToolDispatching).await?;
@@ -1660,6 +1675,32 @@ impl Runner {
             if envelope.claimed_done == Some(true) {
                 advance(&session_handle, State::Streaming, State::Verifying).await?;
                 final_state = State::Verifying;
+                break;
+            }
+
+            // v60.15 (M-bug-stall) — stall guard. A turn that produced
+            // neither real tool calls nor `claimed_done=true` leaves
+            // the `messages` array ending on an assistant turn. The
+            // Anthropic API rejects "conversation ends with assistant"
+            // with a 400 `invalid_request_error` on stricter models
+            // (Sonnet, Opus); permissive providers (Haiku 4.5) return
+            // near-empty completions in a wedge until the turn cap.
+            // Both arms collapse to the same diagnosis: the agent has
+            // abandoned the §2 contract (every well-formed turn either
+            // makes progress via tool calls or terminates via
+            // `claimed_done`). Transition `Streaming → AwaitingUser`
+            // so the driver can decide whether to nudge, swap adapter,
+            // or abort — there's nothing the loop alone can do.
+            if !made_tool_calls {
+                let _ = bus.send(Event::AgentStalled {
+                    turn: turn + 1,
+                    reason: "assistant turn produced no tool calls and no \
+                             claimed_done=true; conversation cannot advance \
+                             without a §2 protocol violation"
+                        .to_string(),
+                });
+                advance(&session_handle, State::Streaming, State::AwaitingUser).await?;
+                final_state = State::AwaitingUser;
                 break;
             }
         }

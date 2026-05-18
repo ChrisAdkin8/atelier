@@ -1,5 +1,46 @@
 # Atelier Spec — Changelog
 
+## v60.15 — 2026-05-18 (§2 stall guard + state desync fix; Track B unblocked at the runner level)
+
+Fixes a runner bug that surfaced during the Track B (live-API canonical gate) bring-up: when an assistant turn produced neither real tool calls nor `claimed_done=true`, the runner kept iterating the loop and re-calling the adapter with a conversation array ending on an assistant turn. The Anthropic API rejects that pattern with `400 invalid_request_error` on stricter models (Sonnet 4.6, Opus 4.7); permissive providers (Haiku 4.5) return ~3-token empty completions in a wedge until the turn cap. Both arms collapse to the same diagnosis — the agent has abandoned the §2 contract (every well-formed turn either advances state via tool calls or terminates via `claimed_done`) — and `runner.rs` now treats it that way.
+
+Bug surfaced during an A/B probe of `phase_a_live_anthropic_t01_add_pure_function`: Haiku produced 21 turns × 3 completion tokens (looks like "weak model") while Sonnet 4.6 surfaced the same root cause as an explicit 400 ("This model does not support assistant message prefill. The conversation must end with a user message."). Pre-fix the offline mock tests never caught this because every mock script reliably emits tool calls + `claimed_done=true` on turn 0, so the loop exits before the stall pattern can manifest.
+
+### Two layered fixes
+
+- **Stall guard** (`runner.rs:1660+`). After per-turn telemetry and before the next iteration, check `made_tool_calls && envelope.claimed_done == Some(true)`. When both are absent, emit a new `Event::AgentStalled { turn, reason }`, advance `Streaming → AwaitingUser`, and break the loop. `final_state = AwaitingUser` is the spec's signal for "the user must intervene to make progress." Operators (TUI, GUI, `--non-interactive` driver) decide whether to nudge, swap adapter, or abort — there's nothing the loop alone can do to recover from a model that's stopped using tools.
+- **State-desync fix** (`runner.rs:1222`). Pre-fix the top-of-iteration `advance(Idle → Streaming)` ran unconditionally, but after turn 0 the actor is already at `Streaming` (or oscillating `Streaming ↔ Tool*`). Every iteration past the first was emitting an `IllegalTransitionAttempted{Streaming, Streaming}` to the bus. Post-fix the advance is guarded by `if final_state == State::Idle`, so it fires exactly once per run. The spec §2.5 transition table has no `Streaming → Idle` edge — multi-turn iteration stays inside `Streaming` modulo the `Streaming ↔ Tool*` sub-cycle, which is what the actor's existing transitions already model.
+
+### New event variant + driver projections
+
+- `Event::AgentStalled { turn: usize, reason: String }` lives next to `StrategyDegraded` in `crates/atelier-core/src/session.rs` (both are §1/§2 model-behaviour signals, both transition state and announce on the bus). `turn` is 1-indexed so it matches `RunReport.turns`. `kind()` returns `"AgentStalled"`.
+- GUI bridge (`crates/atelier-gui/src/lib.rs`) projects `{ turn, reason }` for the Svelte toast surface.
+- TUI (`crates/atelier-tui/src/lib.rs`) renders `"turn N: <reason>"` in the event log and folds the state transition into the existing badge path (the paired `Transitioned { Streaming → AwaitingUser }` updates the state pill).
+
+### Tests — 2 new regressions + 3 updated to the new contract
+
+- **NEW** `run_stalls_cleanly_when_assistant_turn_has_no_tools_and_no_claimed_done` — single-turn stall scenario. Pins `final_state == AwaitingUser`, `turns == 1` (not the full `max_turns=10` budget), exactly one `Event::AgentStalled` emitted with a non-empty `reason`, zero `Event::IllegalTransitionAttempted`, and the `Streaming → AwaitingUser` transition itself on the bus.
+- **NEW** `run_stalls_on_second_turn_without_replaying_idle_to_streaming` — pins Bug B specifically. Turn 0 makes a benign `list_dir` call (loop continues into turn 1); turn 1 stalls. Asserts `turns == 2`, zero `IllegalTransitionAttempted{Streaming, Streaming}`, and `Idle → Streaming` firing exactly once across the whole run.
+- **UPDATED** `run_bails_after_max_turns_without_claimed_done` — pre-fix the test was asserting the wedge behaviour. Post-fix the responses include benign `list_dir` calls so the loop iterates without stalling and hits `max_turns=2` naturally; the contract pinned is now the max-turns boundary alone (`final_state != Done && final_state != AwaitingUser` — the latter assertion specifically guards against the test silently degenerating into a stall-guard test).
+- **UPDATED** `run_degrades_strategy_after_three_malformed_envelopes_in_window` — each malformed turn now also makes a `list_dir` call so the stall guard doesn't fire before the conformance buffer can accumulate three failures. The conformance buffer's `record_failure` predicate is "envelope parse failed", independent of tool-call presence; the test exercises that distinction directly now.
+- **UPDATED** `few_shot_override_is_cached_across_turns_not_recomputed` — `MockAdapterWithOverride::queue_text_only` renamed to `queue_continuing_turn` and now queues a `list_dir` tool call alongside the text. The method's role was always "queue a turn that doesn't terminate the loop"; the rename makes that intent explicit.
+
+### Live A/B probe — what we learned and what's still broken
+
+The bug was found by burning ~$0.012 of Anthropic API budget across two t01 probes (one Haiku pre-fix, one Sonnet pre-fix, one Haiku post-fix). The post-fix Haiku probe terminates after **1** turn / 12 events / 8.65s — vs the pre-fix **20** turns / 124 events / 22.78s — and the panic message tells the operator "agent stalled on turn 1 (final_state=AwaitingUser). The model produced an assistant turn with neither tool calls nor claimed_done=true." That's the unblocking signal Track B's `EventSink::Capture` instrumentation (also in this revision) was always going to need.
+
+**Track B is unblocked at the runner level but not yet green.** The live B1 tests still fail because `anthropic:claude-haiku-4-5` (and Sonnet 4.6, which we A/B'd to confirm) isn't invoking tools for atelier's canonical workload prompt. The stall guard surfaces that cleanly instead of wedging silently, but doesn't make the model use tools. Next session's work: inspect the adapter's request payload (`RUST_LOG=atelier_core::adapter::anthropic=trace`), compare atelier's system prompt + tool-spec wire format against a known-working tool-use harness, and decide whether the fix is at the prompt layer, the tool-spec serialisation layer, or both. Workspace tests **1040 → 1042** (+2 stall regressions; the three updated tests didn't change the count).
+
+### Files touched
+
+- `crates/atelier-core/src/session.rs` — `Event::AgentStalled` variant + `kind()` arm.
+- `crates/atelier-cli/src/runner.rs` — conditional `Idle → Streaming` advance, captured `made_tool_calls`, stall guard at end-of-turn.
+- `crates/atelier-gui/src/lib.rs` — `bridge_event` arm for the new variant.
+- `crates/atelier-tui/src/lib.rs` — `AppState` log arm + event-log formatter arm.
+- `crates/atelier-cli/tests/run_integration.rs` — 2 new stall tests, 3 updated tests, `queue_continuing_turn` rename + body, `drive_live_canonical_task` stall-vs-turn-cap diagnostic split.
+
+`cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` (1042 tests across all crates), and `make quality-cheap` all green post-change.
+
 ## v60.14 — 2026-05-18 (Supply-chain + dead-dep gate via `make quality-cheap`)
 
 Adds a cheap, offline supply-chain hygiene gate. `make quality-cheap` runs `cargo-audit` against `Cargo.lock` and `cargo-machete` against `crates/`. Wired into `.github/workflows/check.yml` as a third job alongside `rust` and `rig` so a fresh advisory or a forgotten dep fails a PR. Caught and removed three genuinely unused workspace deps in `atelier-gui` (`tokio`, `tokio-stream`, `parking_lot`) plus `tokio-stream` in `atelier-tui` — Tauri provides the async runtime, and the `parking_lot` line carried a misleading "DispatcherHandle Mutex" comment despite zero symbol uses. Total: 4 deps dropped, 0 source-code changes required (the deletions are pure Cargo.toml work that the compiler confirms is sound via `cargo clippy --workspace --all-targets`).

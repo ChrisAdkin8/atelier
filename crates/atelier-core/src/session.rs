@@ -423,6 +423,22 @@ pub enum Event {
         items_compacted: Option<usize>,
     },
 
+    /// §2 agent-protocol — the most recent assistant turn produced
+    /// neither real tool calls nor `claimed_done=true`, leaving the
+    /// conversation in a state where another `adapter.chat()` would
+    /// re-send a transcript ending on an assistant message. Strict
+    /// providers (Anthropic Sonnet/Opus) reject that pattern with a
+    /// 400 `invalid_request_error`; permissive providers (Anthropic
+    /// Haiku) return near-empty completions until the turn cap. Both
+    /// arms collapse to the same diagnosis: the agent has abandoned
+    /// the §2 contract (every well-formed turn either advances state
+    /// via tool calls or terminates via `claimed_done`). The Runner
+    /// emits this once and transitions `Streaming → AwaitingUser` so
+    /// the driver can decide whether to nudge, swap adapters, or
+    /// give up — there's nothing the loop alone can do to recover.
+    /// `turn` is 1-indexed (matches `RunReport.turns`).
+    AgentStalled { turn: usize, reason: String },
+
     /// v60.10 §1 BYOM — the active adapter was swapped mid-session.
     /// Emitted by [`crate::session::Event::AdapterSwapped`]'s producer
     /// (today: `Runner::swap_adapter` on the next `run()` startup, and
@@ -482,6 +498,7 @@ impl Event {
             Self::VerificationFailed { .. } => "VerificationFailed",
             Self::StrategyDegraded { .. } => "StrategyDegraded",
             Self::ContextOverflowResolved { .. } => "ContextOverflowResolved",
+            Self::AgentStalled { .. } => "AgentStalled",
             Self::AdapterSwapped { .. } => "AdapterSwapped",
             Self::Shutdown => "Shutdown",
         }

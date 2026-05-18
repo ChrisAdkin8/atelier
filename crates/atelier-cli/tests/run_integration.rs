@@ -259,6 +259,196 @@ async fn run_recovers_from_context_overflow_via_compact_policy() {
     );
 }
 
+// v60.15 — §2 stall guard regression.
+//
+// Pre-fix, an assistant turn with neither real tool calls nor an
+// envelope claiming done would leave the conversation array ending
+// on an assistant message. Anthropic's API rejects that pattern
+// with a 400 on stricter models (Sonnet 4.6, Opus 4.7); Haiku 4.5
+// silently returns 3-token empty completions in a wedge until the
+// turn cap. Either way the run is hosed and the live-API canonical
+// gate (B1) couldn't pass.
+//
+// This test pins the contract: when the mock returns ONE response
+// with no tool calls and no harness_meta envelope, the runner must
+// (a) detect the stall on turn 1, (b) advance Streaming → AwaitingUser,
+// (c) emit exactly one `Event::AgentStalled` with a non-empty reason,
+// (d) NOT burn the remaining `max_turns` budget, and (e) NOT emit
+// the legacy `IllegalTransitionAttempted{Streaming, Streaming}`
+// that the pre-fix unconditional Idle→Streaming was tripping on
+// every iteration past the first.
+#[tokio::test]
+async fn run_stalls_cleanly_when_assistant_turn_has_no_tools_and_no_claimed_done() {
+    let workspace = tempfile::TempDir::new().unwrap();
+
+    // Single response: assistant text only, no tool calls, no
+    // harness_meta envelope. Models claimed_done stays `None`.
+    let responses = vec![MockResponse::new(
+        "I'll think about this, but I'm not going to use any tools.",
+        vec![],
+    )];
+
+    let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let runner = Runner::new(
+        workspace.path().to_path_buf(),
+        ProviderChoice::Mock { responses },
+        EventSink::Capture(events.clone()),
+    )
+    .expect("mock runner construction is infallible")
+    // max_turns deliberately > 1: pre-fix the runner would burn all
+    // 10 of these against a Haiku-like permissive provider. Post-fix
+    // it must exit after the first turn.
+    .with_max_turns(10);
+
+    let report = runner.run("anything".into()).await.expect("run must succeed");
+
+    assert_eq!(
+        report.final_state,
+        State::AwaitingUser,
+        "stalled run must terminate in AwaitingUser, not {:?}",
+        report.final_state,
+    );
+    assert_eq!(
+        report.turns, 1,
+        "stall must trigger on turn 1; pre-fix this burned the full budget. got turns={}",
+        report.turns,
+    );
+
+    let captured = events.lock();
+    let stall_events: Vec<_> = captured
+        .iter()
+        .filter_map(|e| match e {
+            Event::AgentStalled { turn, reason } => Some((*turn, reason.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        stall_events.len(),
+        1,
+        "expected exactly one AgentStalled event; got {}",
+        stall_events.len(),
+    );
+    assert_eq!(stall_events[0].0, 1);
+    assert!(
+        !stall_events[0].1.is_empty(),
+        "AgentStalled.reason must carry a non-empty diagnostic string",
+    );
+
+    // Bug B regression: pre-fix the loop's unconditional
+    // `advance(Idle → Streaming)` would emit one
+    // `IllegalTransitionAttempted{Streaming, Streaming}` per turn
+    // beyond the first. Even though the stall guard limits the loop
+    // to one iteration in this test, pin the absence of that event
+    // so a future regression that re-introduces the unconditional
+    // advance gets caught when paired with a tools-but-no-done agent.
+    let illegal_count = captured
+        .iter()
+        .filter(|e| matches!(e, Event::IllegalTransitionAttempted { .. }))
+        .count();
+    assert_eq!(
+        illegal_count, 0,
+        "no IllegalTransitionAttempted should be emitted in a single-turn \
+         stall; got {illegal_count}",
+    );
+
+    // The Streaming → AwaitingUser transition itself must be present
+    // on the bus so consumers (TUI state badge, GUI status pill) can
+    // converge without polling the report.
+    let transitioned_to_await = captured.iter().any(|e| {
+        matches!(
+            e,
+            Event::Transitioned { from: State::Streaming, to: State::AwaitingUser }
+        )
+    });
+    assert!(
+        transitioned_to_await,
+        "Streaming → AwaitingUser transition must be on the bus",
+    );
+}
+
+// v60.15 — §2 stall guard, multi-turn variant.
+//
+// Pre-fix Bug B (state desync) only manifested when the loop
+// iterated more than once. Mock a two-turn flow where turn 0 makes
+// a tool call (so the loop CONTINUES) and turn 1 stalls (no tool
+// calls, no done). The fix must:
+//   (a) allow turn 0 to complete its Streaming → Tool* → Streaming cycle,
+//   (b) NOT re-emit `advance(Idle → Streaming)` at the top of turn 1,
+//   (c) detect the stall on turn 1 and terminate cleanly,
+//   (d) report turns=2.
+#[tokio::test]
+async fn run_stalls_on_second_turn_without_replaying_idle_to_streaming() {
+    let workspace = tempfile::TempDir::new().unwrap();
+
+    // Turn 0: makes a benign tool call (list_dir on the workspace
+    // root — always succeeds, no envelope claiming done).
+    // Turn 1: empty assistant turn, no tools, no envelope. Stall.
+    let list_dir_call = ToolCallRequest {
+        id: "tc-stall-listdir".into(),
+        name: "list_dir".into(),
+        arguments: serde_json::json!({"path": "."}),
+    };
+    let responses = vec![
+        MockResponse::new("Let me look around first.", vec![list_dir_call]),
+        MockResponse::new("Hmm.", vec![]),
+    ];
+
+    let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let runner = Runner::new(
+        workspace.path().to_path_buf(),
+        ProviderChoice::Mock { responses },
+        EventSink::Capture(events.clone()),
+    )
+    .expect("mock runner construction is infallible")
+    .with_max_turns(10);
+
+    let report = runner.run("anything".into()).await.expect("run must succeed");
+
+    assert_eq!(report.final_state, State::AwaitingUser);
+    assert_eq!(report.turns, 2, "must stall on turn 2, not earlier or later");
+
+    let captured = events.lock();
+
+    // Bug B specifically: an unconditional `advance(Idle → Streaming)`
+    // at the top of turn 1 would emit
+    // `IllegalTransitionAttempted { from: Streaming, to: Streaming }`
+    // because the state machine is at Streaming after turn 0's
+    // ToolExecuting → Streaming. Post-fix the conditional advance
+    // skips this case.
+    let illegal_streaming_streaming = captured
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                Event::IllegalTransitionAttempted {
+                    from: State::Streaming,
+                    to: State::Streaming
+                }
+            )
+        })
+        .count();
+    assert_eq!(
+        illegal_streaming_streaming, 0,
+        "Bug B regression: unconditional Idle→Streaming at top of turn 1 \
+         emitted IllegalTransitionAttempted{{Streaming, Streaming}}. Count: {illegal_streaming_streaming}",
+    );
+
+    // Idle → Streaming should land exactly once (turn 0 only).
+    let idle_to_streaming = captured
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                Event::Transitioned { from: State::Idle, to: State::Streaming }
+            )
+        })
+        .count();
+    assert_eq!(
+        idle_to_streaming, 1,
+        "Idle → Streaming must fire exactly once per run; got {idle_to_streaming}",
+    );
+}
+
 // v60.8 A2 follow-on: the Runner now invokes
 // `SessionDispatcher::verify_pass` when the loop exits in
 // `State::Verifying`. A scripted Mock run with a `write_file` tool
@@ -413,17 +603,26 @@ async fn run_dispatches_real_tool_calls_and_loops() {
 async fn run_bails_after_max_turns_without_claimed_done() {
     let workspace = tempfile::TempDir::new().unwrap();
 
-    // Three responses, none claim done → loop should hit max_turns=2 and
-    // exit with final_state = Streaming (didn't reach Verifying).
+    // Two responses, both make a benign tool call so the v60.15 stall
+    // guard doesn't fire (the loop continues across turns instead of
+    // bailing on turn 1), but neither emits `claimed_done` → loop hits
+    // max_turns=2 and exits with final_state = Streaming (didn't reach
+    // Verifying). This pins the max_turns boundary as a separate
+    // contract from the stall guard.
+    let list_dir_call = || ToolCallRequest {
+        id: "tc-listdir".into(),
+        name: "list_dir".into(),
+        arguments: serde_json::json!({"path": "."}),
+    };
     let responses = vec![
         MockResponse {
-            assistant_text: "..".into(),
-            tool_calls: vec![],
+            assistant_text: "checking layout".into(),
+            tool_calls: vec![list_dir_call()],
             overflow: None,
         },
         MockResponse {
-            assistant_text: "..".into(),
-            tool_calls: vec![],
+            assistant_text: "still checking".into(),
+            tool_calls: vec![list_dir_call()],
             overflow: None,
         },
     ];
@@ -439,6 +638,14 @@ async fn run_bails_after_max_turns_without_claimed_done() {
     let report = runner.run("never done".into()).await.unwrap();
     assert_eq!(report.turns, 2);
     assert_ne!(report.final_state, State::Done);
+    // Specifically NOT AwaitingUser — that's the v60.15 stall signal.
+    // Reaching max_turns with progress (tool calls every turn) leaves
+    // the runner in `Streaming` per the pre-stall-guard contract.
+    assert_ne!(
+        report.final_state,
+        State::AwaitingUser,
+        "tool-call-bearing turns must NOT trigger the stall guard"
+    );
     assert_eq!(report.dod_passed, None); // no DoD configured
 }
 
@@ -1966,29 +2173,37 @@ async fn run_degrades_strategy_after_three_malformed_envelopes_in_window() {
 
     let workspace = tempfile::TempDir::new().unwrap();
 
-    // 1..3: malformed — text-only response, no harness_meta tool call.
-    //       The runner parses on the active strategy (NativeTool, from
-    //       the Mock capability defaults), `extract_native_envelope`
-    //       returns `None`, the conformance buffer records a failure.
+    // 1..3: malformed — a benign list_dir tool call (so the v60.15
+    //       stall guard does NOT fire and the loop continues) BUT no
+    //       `harness_meta` tool call. The runner parses on the active
+    //       strategy (NativeTool, from the Mock capability defaults),
+    //       `extract_native_envelope` finds no harness_meta in the
+    //       call set and returns `None`, so the conformance buffer
+    //       records a failure for that turn.
     // 4   : sentinel-wrapped envelope with claimed_done = true. By
     //       turn 4 the runner has already degraded to JsonSentinel,
     //       so the parser walks `parse_json_sentinel` and recovers a
     //       clean envelope. The loop sees `claimed_done` and exits.
     let sentinel_payload = encode_json_sentinel(&envelope_done()).unwrap();
+    let list_dir_call = || ToolCallRequest {
+        id: "tc-listdir".into(),
+        name: "list_dir".into(),
+        arguments: serde_json::json!({"path": "."}),
+    };
     let responses = vec![
         MockResponse {
             assistant_text: "no envelope here".into(),
-            tool_calls: vec![],
+            tool_calls: vec![list_dir_call()],
             overflow: None,
         },
         MockResponse {
             assistant_text: "still no envelope".into(),
-            tool_calls: vec![],
+            tool_calls: vec![list_dir_call()],
             overflow: None,
         },
         MockResponse {
             assistant_text: "one more bad turn".into(),
-            tool_calls: vec![],
+            tool_calls: vec![list_dir_call()],
             overflow: None,
         },
         MockResponse {
@@ -2144,14 +2359,24 @@ impl MockAdapterWithOverride {
         }]);
     }
 
-    fn queue_text_only(&self, text: &str) {
+    /// Queue a turn that produces text plus a benign `list_dir` tool
+    /// call. The tool call is what keeps the runner's v60.15 stall
+    /// guard from firing — pre-stall-guard the method just queued
+    /// `tool_calls: vec![]`, but that pattern now (correctly)
+    /// terminates the loop. Cache-across-turns tests need the loop
+    /// to keep iterating; this method delivers that.
+    fn queue_continuing_turn(&self, text: &str) {
         use atelier_core::adapter::{ChatResponse, StreamChunk, Usage};
         use atelier_core::context::TokenSource;
         use atelier_core::protocol_strategy::Strategy;
         self.inner.queue_stream(vec![StreamChunk::Complete {
             response: ChatResponse {
                 text: text.into(),
-                tool_calls: vec![],
+                tool_calls: vec![ToolCallRequest {
+                    id: "tc-continuing-listdir".into(),
+                    name: "list_dir".into(),
+                    arguments: serde_json::json!({"path": "."}),
+                }],
                 usage: Usage {
                     prompt_tokens: 1,
                     completion_tokens: 1,
@@ -2311,7 +2536,7 @@ async fn few_shot_override_is_cached_across_turns_not_recomputed() {
         });
     // Two turns: a no-envelope turn (continues loop) followed
     // by a claimed_done turn carrying the envelope via sentinel.
-    wrapped.queue_text_only("thinking...");
+    wrapped.queue_continuing_turn("thinking...");
     wrapped.queue_envelope_done_sentinel();
     let received = wrapped.received.clone();
     let expected_first = wrapped.override_messages[0].clone();
@@ -3437,6 +3662,17 @@ fn skip_unless_openai_compat_runnable(test_name: &str) -> Option<(String, String
 /// against it, and assert the rig's checks pass. Centralises the
 /// pytest probe + tempdir + Runner shape so each live test is a
 /// 3-line wrapper.
+///
+/// Success contract (intentionally looser than the mock equivalents):
+/// the rig's `assert_all_checks_pass` is the authoritative gate. Real
+/// models have no protocol-level obligation to emit
+/// `claimed_done=true`, so we accept any non-error terminal state
+/// that ALSO finished before the turn cap. A run that exhausts the
+/// turn cap without claiming done is treated as a failure regardless
+/// of file-level outcome — that's the "agent gave up" signal, and the
+/// captured events get dumped to stderr to make the next iteration
+/// debuggable. Mock-script tests keep the stricter `final_state==Done`
+/// assertion because they control the envelope deterministically.
 async fn drive_live_canonical_task(task_dir_name: &str, provider: ProviderChoice, test_name: &str) {
     let task = match common::canonical::CanonicalTask::load(task_dir_name) {
         Ok(t) => t,
@@ -3450,24 +3686,87 @@ async fn drive_live_canonical_task(task_dir_name: &str, provider: ProviderChoice
         .copy_fixture_to_tempdir()
         .expect("fixture tempdir copy");
 
-    let runner = Runner::new(workspace.path().to_path_buf(), provider, EventSink::Null)
-        .expect("live runner construction")
-        .with_max_turns(task.meta.turn_cap);
+    let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let runner = Runner::new(
+        workspace.path().to_path_buf(),
+        provider,
+        EventSink::Capture(events.clone()),
+    )
+    .expect("live runner construction")
+    .with_max_turns(task.meta.turn_cap);
 
     let report = runner
         .run(task.prompt.clone())
         .await
         .expect("live run completed");
-    assert_eq!(report.final_state, State::Done, "must reach Done");
-    assert!(
-        report.turns <= task.meta.turn_cap,
-        "{test_name}: turns {} exceeds turn_cap {}",
-        report.turns,
-        task.meta.turn_cap,
-    );
 
+    // v60.15 — distinguish stalls (agent abandoned the §2 contract on
+    // turn N) from turn-cap exhaustion (agent kept making progress but
+    // never claimed done). Stalls fire when an assistant turn produces
+    // neither tool calls nor `claimed_done=true`; the runner terminates
+    // via `Streaming → AwaitingUser` and emits `Event::AgentStalled`.
+    let stalled = report.final_state == State::AwaitingUser;
+    let turn_cap_hit = report.turns >= task.meta.turn_cap
+        && report.final_state != State::Done
+        && !stalled;
+
+    if stalled {
+        dump_live_run_events(test_name, &events.lock(), &report, task.meta.turn_cap);
+        panic!(
+            "{test_name}: agent stalled on turn {} (final_state=AwaitingUser). \
+             The model produced an assistant turn with neither tool calls nor \
+             claimed_done=true. See captured event dump above for the \
+             AgentStalled event with diagnostic reason; the stall typically \
+             means the model is too weak for the prompt or its tool-use \
+             posture isn't being activated by the §1 strategy.",
+            report.turns,
+        );
+    }
+
+    if turn_cap_hit {
+        dump_live_run_events(test_name, &events.lock(), &report, task.meta.turn_cap);
+        panic!(
+            "{test_name}: agent exhausted turn cap {} without claiming done \
+             (final_state={:?}). Live agents are not contractually obliged to \
+             emit claimed_done=true, but burning the entire turn budget without \
+             ever doing so is a real failure signal. See captured event dump above.",
+            task.meta.turn_cap, report.final_state,
+        );
+    }
+
+    // The rig checks are the authoritative task-success gate. Run them
+    // regardless of `final_state`: a model that produced a correct
+    // patch but forgot to set `claimed_done=true` still solved the
+    // task. On failure, dump events first so the panic message has
+    // diagnostic context attached.
     let results = common::canonical::run_checks(&task, workspace.path());
+    if results.iter().any(|r| !r.passed) {
+        dump_live_run_events(test_name, &events.lock(), &report, task.meta.turn_cap);
+    }
     common::canonical::assert_all_checks_pass(&results);
+}
+
+/// Dump every captured `Event` to stderr with a short header. Used
+/// only on the failure paths in `drive_live_canonical_task` — a green
+/// run stays quiet so `--nocapture` output isn't drowned in noise.
+fn dump_live_run_events(
+    test_name: &str,
+    events: &[Event],
+    report: &runner::RunReport,
+    turn_cap: usize,
+) {
+    eprintln!("---- {test_name}: live-run telemetry ----");
+    eprintln!(
+        "  final_state={:?}  turns={}/{}  events_captured={}",
+        report.final_state,
+        report.turns,
+        turn_cap,
+        events.len(),
+    );
+    for (i, evt) in events.iter().enumerate() {
+        eprintln!("  [{i:03}] {evt:?}");
+    }
+    eprintln!("---- end {test_name} telemetry ----");
 }
 
 // ----- B1 — Anthropic live tests (one per priority canonical task) -----

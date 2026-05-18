@@ -1215,6 +1215,14 @@ pub fn bridge_event(evt: &SessionEvent) -> BridgedEvent {
             "to_model_id": to_model_id,
             "swapped_at": swapped_at,
         }),
+        // §2 — agent abandoned the turn-protocol contract (no tool
+        // calls and no claimed_done). Runner has already transitioned
+        // Streaming → AwaitingUser; the toast surface in the Svelte
+        // reducer prompts the user to nudge / swap / abort.
+        SessionEvent::AgentStalled { turn, reason } => json!({
+            "turn": turn,
+            "reason": reason,
+        }),
     };
     BridgedEvent { kind, payload }
 }
