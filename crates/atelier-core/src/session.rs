@@ -293,6 +293,35 @@ pub enum Event {
         cache_rewarm_tokens: u32,
     },
 
+    /// v61 — §14 concurrent-edit detection. The per-session file
+    /// watcher (`atelier_core::file_watcher`) observed an external
+    /// edit to one or more files in the agent's read-set. The runner
+    /// queues the *next* tool dispatch (does not cancel the current
+    /// stream, per spec §14) and surfaces a modal to the user with
+    /// Reload / Wait / Pause options; the GUI's
+    /// `ConcurrentEditModal` and the TUI's
+    /// `InputMode::ConcurrentEditModal` consume this variant.
+    ///
+    /// `observed_at` is RFC 3339; the runner records it on the
+    /// session-resume `recovery_log` entry when the modal flow elects
+    /// to pause.
+    FilesChanged {
+        paths: Vec<PathBuf>,
+        observed_at: String,
+    },
+
+    /// v61 — companion to [`Self::FilesChanged`]. Emitted when the
+    /// user clears the modal (chooses Reload, Wait, or after a Pause
+    /// timer fires). Drives two consumers:
+    ///
+    ///   * The runner's auto-pause timer cancels on receipt — the
+    ///     5-minute deadline only fires if the user does *nothing*.
+    ///   * UI consumers hide the modal.
+    ///
+    /// `outcome` records which choice resolved the modal. Useful for
+    /// the ledger trail + post-mortem.
+    FilesChangedAcknowledged { outcome: ConcurrentEditOutcome },
+
     /// The actor is shutting down. No further events will be emitted.
     Shutdown,
 }
@@ -324,6 +353,8 @@ impl Event {
             Self::ModelProfileLoaded { .. } => "ModelProfileLoaded",
             Self::CompactionExecuted { .. } => "CompactionExecuted",
             Self::ExpansionExecuted { .. } => "ExpansionExecuted",
+            Self::FilesChanged { .. } => "FilesChanged",
+            Self::FilesChangedAcknowledged { .. } => "FilesChangedAcknowledged",
             Self::Shutdown => "Shutdown",
         }
     }
@@ -336,6 +367,46 @@ impl Event {
 pub struct PendingFile {
     pub path: PathBuf,
     pub hunks: Hunks,
+}
+
+/// v61 — outcome the user chose on the §14 concurrent-edit modal,
+/// carried on [`Event::FilesChangedAcknowledged`]. Wire labels stay
+/// stable across renames via [`Self::wire_label`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConcurrentEditOutcome {
+    /// User chose Reload: drop the queued tool-call dispatch and
+    /// re-read the changed files into context at the next turn.
+    Reload,
+    /// User chose Wait: dispatch stays queued; the user owns
+    /// re-entry by clearing the modal.
+    Wait,
+    /// User chose Pause: same as Wait but a 5-minute (PROVISIONAL,
+    /// spec §14) timer auto-fires Reload semantics if the user
+    /// doesn't intervene.
+    Pause,
+    /// `--non-interactive` mode: auto-applied Reload without a user
+    /// in the loop. Logged distinctly so the recovery_log can show
+    /// "no human resolved this — headless auto-reload".
+    AutoReload,
+    /// The 5-minute pause timer fired without user intervention.
+    /// Semantically equivalent to AutoReload but distinct in the
+    /// audit log.
+    PauseTimedOut,
+}
+
+impl ConcurrentEditOutcome {
+    /// Stable wire label used by the GUI bridge and TUI projection.
+    /// Pinned by `concurrent_edit_outcome_wire_labels_are_stable` so a
+    /// future variant rename forces a deliberate edit.
+    pub fn wire_label(self) -> &'static str {
+        match self {
+            Self::Reload => "reload",
+            Self::Wait => "wait",
+            Self::Pause => "pause",
+            Self::AutoReload => "auto_reload",
+            Self::PauseTimedOut => "pause_timed_out",
+        }
+    }
 }
 
 /// v56 — one entry in [`Event::ClaimedChanges`]. Mirrors the envelope's
@@ -567,6 +638,41 @@ mod tests {
             cache_rewarm_tokens: 240,
         };
         assert_eq!(ev.kind(), "ExpansionExecuted");
+    }
+
+    #[test]
+    fn files_changed_event_carries_expected_kind() {
+        let ev = Event::FilesChanged {
+            paths: vec![PathBuf::from("/repo/src/main.rs")],
+            observed_at: "2026-05-17T10:00:00Z".into(),
+        };
+        assert_eq!(ev.kind(), "FilesChanged");
+    }
+
+    #[test]
+    fn files_changed_acknowledged_event_carries_expected_kind() {
+        let ev = Event::FilesChangedAcknowledged {
+            outcome: ConcurrentEditOutcome::Reload,
+        };
+        assert_eq!(ev.kind(), "FilesChangedAcknowledged");
+    }
+
+    #[test]
+    fn concurrent_edit_outcome_wire_labels_are_stable() {
+        // Pinned so a variant rename forces a deliberate change — the
+        // GUI / TUI consume these strings and would silently mis-render
+        // otherwise.
+        assert_eq!(ConcurrentEditOutcome::Reload.wire_label(), "reload");
+        assert_eq!(ConcurrentEditOutcome::Wait.wire_label(), "wait");
+        assert_eq!(ConcurrentEditOutcome::Pause.wire_label(), "pause");
+        assert_eq!(
+            ConcurrentEditOutcome::AutoReload.wire_label(),
+            "auto_reload"
+        );
+        assert_eq!(
+            ConcurrentEditOutcome::PauseTimedOut.wire_label(),
+            "pause_timed_out"
+        );
     }
 
     /// Hook impl that counts invocations — lets tests assert that hooks fired

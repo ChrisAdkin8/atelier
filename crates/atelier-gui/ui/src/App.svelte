@@ -30,6 +30,7 @@
   import ContextPane from './lib/components/ContextPane.svelte'
   import MemoryPane from './lib/components/MemoryPane.svelte'
   import Composer from './lib/components/Composer.svelte'
+  import ConcurrentEditModal from './lib/components/ConcurrentEditModal.svelte'
 
   // NOTE (v49): named `app` rather than `state` because svelte-check
   // 4.x's TS-mode treats `let state = $state(...)` as the Svelte-3-era
@@ -175,6 +176,13 @@
       {/if}
     </span>
   </footer>
+
+  {#if app.concurrentEditModal}
+    <ConcurrentEditModal
+      paths={app.concurrentEditModal.paths}
+      observedAt={app.concurrentEditModal.observedAt}
+    />
+  {/if}
 </div>
 
 <style>

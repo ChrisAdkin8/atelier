@@ -33,6 +33,8 @@ walkdir = { workspace = true }
 parking_lot = { workspace = true }
 reqwest = { workspace = true }
 bytes = { workspace = true }
+# §14 concurrent-edit detection — per-session filesystem watcher.
+notify = { workspace = true }
 
 # §11 subprocess hardening: kill the timed-out child's process group, not just
 # the immediate child. Unix-only — Windows isn't a v1 target.

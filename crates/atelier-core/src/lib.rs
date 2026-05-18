@@ -15,6 +15,7 @@ pub mod diff;
 pub mod dispatcher;
 pub mod dod;
 pub mod error;
+pub mod file_watcher;
 pub mod hooks;
 pub mod init;
 pub mod ledger;
@@ -45,12 +46,15 @@ pub use context::{
 };
 pub use diff::{hunks_for, hunks_for_created, hunks_for_deleted, Hunk, Hunks, LineRange};
 pub use dispatcher::{
-    DispatchOutcome, Dispatcher, HookExecutor, HookPhases, NoopHookExecutor, RegisterError,
-    SessionDispatcher, ShellHookExecutor, SideEffectClass, Tool, ToolContext, ToolRegistry,
-    ToolResult,
+    ConcurrentEditPolicy, DispatchOutcome, Dispatcher, HookExecutor, HookPhases, NoopHookExecutor,
+    RegisterError, SessionDispatcher, ShellHookExecutor, SideEffectClass, Tool, ToolContext,
+    ToolRegistry, ToolResult,
 };
 pub use dod::{DodCheck, DodConfig, DodError, DodTier, ExpectClause, DOD_FILE, DOD_VERSION};
 pub use error::{Recovery, ToolError};
+pub use file_watcher::{
+    spawn as spawn_file_watcher, FileWatcherError, FileWatcherHandle, FILE_WATCH_DEBOUNCE,
+};
 pub use hooks::{
     HookApprovals, HookError, HookEvent, HookImplementation, HookManifest, HookSet, APPROVALS_FILE,
     HOOK_MANIFEST_VERSION,
@@ -61,8 +65,8 @@ pub use ledger::{
 };
 pub use memory::{MemoryCard, MemoryError, MemoryStore, PromoteOutput};
 pub use persistence::{
-    Checkpoints, OnDiskSession, PersistenceError, Plan, RecoveryEntry, RecoveryReason, Registry,
-    RegistryEntry, DIFFS_SUBDIR, HARNESS_SESSION_VERSION, SESSION_FILE,
+    Checkpoints, ConversationEntry, OnDiskSession, PersistenceError, Plan, RecoveryEntry,
+    RecoveryReason, Registry, RegistryEntry, DIFFS_SUBDIR, HARNESS_SESSION_VERSION, SESSION_FILE,
 };
 pub use plan::{ApplyReport, PlanCanvas, PlanError, PlanStatus, PlanStep};
 pub use protocol::{
@@ -82,8 +86,8 @@ pub use protocol_strategy::{
 pub use sandbox::{linux_bwrap_argv, macos_profile, SandboxError, SandboxPolicy};
 pub use session::{
     edit_staged_events, spawn as spawn_session, spawn_with_capacity as spawn_session_with_capacity,
-    Command, Event, Handle as SessionHandle, SessionId, EVENT_BUFFER, INBOX_CAPACITY,
-    TOOL_PARALLELISM_CAP,
+    Command, ConcurrentEditOutcome, Event, Handle as SessionHandle, SessionId, EVENT_BUFFER,
+    INBOX_CAPACITY, TOOL_PARALLELISM_CAP,
 };
 pub use staging::{
     sha256, CommitReport, FileOutcome, NoopSyntaxCheck, StagedWrite, Staging, StagingError,

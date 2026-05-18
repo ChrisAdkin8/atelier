@@ -210,6 +210,11 @@ export type AppState = {
   /// the file header so the user can see the agent's stated "why".
   /// Wholesale-replaced on each `ClaimedChanges` event.
   claimedChanges: Record<string, string>
+  /// v61 — §14 concurrent-edit modal state. `null` when no external
+  /// edit is pending; populated by `FilesChanged`, cleared by
+  /// `FilesChangedAcknowledged`. The webview renders
+  /// `ConcurrentEditModal.svelte` when this is non-null.
+  concurrentEditModal: { paths: string[]; observedAt: string } | null
 }
 
 export function initialState(): AppState {
@@ -229,6 +234,7 @@ export function initialState(): AppState {
     contextItems: [],
     memoryCards: [],
     claimedChanges: {},
+    concurrentEditModal: null,
   }
 }
 
@@ -335,6 +341,26 @@ export function applyEvent(state: AppState, evt: BridgedEvent): AppState {
         map[c.path] = c.summary
       }
       return { ...state, events, claimedChanges: map }
+    }
+    case 'FilesChanged': {
+      // v61 — §14 concurrent-edit modal opens. The dispatcher has
+      // already queued the next tool call; we just surface the
+      // user-decision modal. Subsequent FilesChanged bursts replace
+      // the snapshot (debouncing is the watcher's job).
+      const p = evt.payload as { paths: string[]; observed_at: string }
+      return {
+        ...state,
+        events,
+        concurrentEditModal: {
+          paths: p.paths ?? [],
+          observedAt: p.observed_at ?? '',
+        },
+      }
+    }
+    case 'FilesChangedAcknowledged': {
+      // v61 — close the modal regardless of which arm resolved it
+      // (Reload / Wait / Pause / AutoReload / PauseTimedOut).
+      return { ...state, events, concurrentEditModal: null }
     }
     // Variants we don't fold into pane state — just the event log.
     case 'IllegalTransitionAttempted':
@@ -473,6 +499,15 @@ export function projectEvent(evt: BridgedEvent): EventLogEntry {
       return { kind, detail: '' }
     case 'Shutdown':
       return { kind, detail: '' }
+    case 'FilesChanged': {
+      const p = evt.payload as { paths?: unknown[]; observed_at?: string }
+      const n = Array.isArray(p.paths) ? p.paths.length : 0
+      return { kind, detail: `${n} path(s) changed at ${p.observed_at ?? ''}` }
+    }
+    case 'FilesChangedAcknowledged': {
+      const p = evt.payload as { outcome?: string }
+      return { kind, detail: p.outcome ?? '' }
+    }
     default:
       return { kind, detail: '' }
   }
