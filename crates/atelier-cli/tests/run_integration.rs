@@ -227,6 +227,67 @@ async fn run_recovers_from_context_overflow_via_compact_policy() {
     );
 }
 
+// v60.8 A2 follow-on: the Runner now invokes
+// `SessionDispatcher::verify_pass` when the loop exits in
+// `State::Verifying`. A scripted Mock run with a `write_file` tool
+// call must land an `Event::VerificationPassed { tier: Tier3Textual,
+// .. }` on the bus before the session transitions to `Done`. Pre-fix
+// the Runner walked straight from Verifying → Done without firing
+// the §7 gate so the GUI/TUI verify badge stayed stuck at `NotRun`.
+#[tokio::test]
+async fn run_emits_verification_passed_tier3_when_write_file_observed() {
+    use atelier_core::verify::VerificationTier;
+
+    let workspace = tempfile::TempDir::new().unwrap();
+
+    let write_call = ToolCallRequest {
+        id: "tc-verify".into(),
+        name: "write_file".into(),
+        arguments: serde_json::json!({"path": "verify.txt", "content": "ok"}),
+    };
+    let responses = vec![MockResponse::new(
+        "writing then done",
+        vec![write_call, mock_envelope_tool_call(&envelope_done())],
+    )];
+
+    let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let runner = Runner::new(
+        workspace.path().to_path_buf(),
+        ProviderChoice::Mock { responses },
+        EventSink::Capture(events.clone()),
+    )
+    .expect("mock runner construction is infallible")
+    .with_max_turns(2);
+
+    let report = runner.run("write verify.txt".into()).await.unwrap();
+    assert_eq!(report.final_state, State::Done);
+
+    let captured = events.lock();
+    let verify = captured
+        .iter()
+        .find_map(|e| match e {
+            Event::VerificationPassed {
+                tier,
+                file_count,
+                claim_count,
+            } => Some((*tier, *file_count, *claim_count)),
+            _ => None,
+        })
+        .expect("VerificationPassed must be emitted before State::Done");
+    // Tier 3 textual is the only producer wired in v62; the observed
+    // `write_file` lands as exactly one `ObservedChange::Created`, so
+    // `file_count` reflects that single path.
+    assert_eq!(verify.0, VerificationTier::Tier3Textual);
+    assert_eq!(
+        verify.1, 1,
+        "file_count must reflect the one observed write"
+    );
+    assert_eq!(
+        verify.2, 0,
+        "claim_count must be 0 — the scripted envelope has no claimed_changes"
+    );
+}
+
 #[tokio::test]
 async fn run_loops_until_claimed_done_and_reaches_terminal_state() {
     let workspace = tempfile::TempDir::new().unwrap();

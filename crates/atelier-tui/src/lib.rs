@@ -25,7 +25,7 @@ use std::collections::VecDeque;
 use std::io::{self, stdout, Stdout};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use atelier_core::{
     diff::Hunks,
@@ -168,6 +168,16 @@ pub struct AppState {
     /// tree-sitter / Tier 3 textual / NotRun) ran on the last
     /// verify pass. Defaults to `NotRun` (gray) before any pass.
     pub verification_status: VerificationStatusHint,
+    /// v60.9 B1 follow-on — most recent §1 context-overflow
+    /// resolution. Populated by `ContextOverflowResolved`; `None`
+    /// before any overflow has been resolved. `render_cost_meter`
+    /// renders a transient one-line hint keyed off `recorded_at`;
+    /// callers can compare `recorded_at.elapsed()` against the
+    /// 5s decay window (see [`OVERFLOW_HINT_TTL`]) to suppress the
+    /// hint once it's stale. The field stays populated past the
+    /// decay window so a debug surface can still inspect the
+    /// last resolution.
+    pub last_overflow_resolution: Option<OverflowResolutionHint>,
 }
 
 /// Phase C close — TUI's projection of
@@ -178,6 +188,29 @@ pub struct AppState {
 pub struct MentalModelHint {
     pub enabled: bool,
     pub text_tokens: u32,
+}
+
+/// v60.9 B1 follow-on — how long the overflow-resolution hint stays
+/// visible in the cost-meter row. Mirrors the GUI's
+/// `OVERFLOW_TOAST_MS` (5s) so the two surfaces fade out together.
+pub const OVERFLOW_HINT_TTL: Duration = Duration::from_secs(5);
+
+/// v60.9 B1 follow-on — TUI's projection of the most recent
+/// `Event::ContextOverflowResolved`. Stored on `AppState`;
+/// `render_cost_meter` renders a one-line hint while
+/// `recorded_at.elapsed() < OVERFLOW_HINT_TTL`. After the decay
+/// window the hint is suppressed but the field stays populated so
+/// a debug surface (or the event log) can still inspect the last
+/// resolution.
+#[derive(Debug, Clone)]
+pub struct OverflowResolutionHint {
+    /// Stable wire label of the policy arm that fired. Matches the
+    /// `&'static str` carried on the event (`"compacted"` /
+    /// `"rerouted"` / `"surfaced"`).
+    pub resolution: &'static str,
+    pub freed_tokens: Option<u32>,
+    pub items_compacted: Option<usize>,
+    pub recorded_at: Instant,
 }
 
 /// v62 — TUI's projection of the §7 verify-pass terminal state. Off
@@ -668,13 +701,26 @@ impl AppState {
                     model.strategy = to.as_str();
                 }
             }
+            // v60.9 B1 follow-on — capture the most recent §1
+            // context-overflow resolution so `render_cost_meter` can
+            // surface a short toast in the meter row for the next
+            // [`OVERFLOW_HINT_TTL`]. The decay is render-time only;
+            // the field itself stays populated past the window so
+            // a debug surface can still inspect the last resolution.
+            SessionEvent::ContextOverflowResolved {
+                resolution,
+                freed_tokens,
+                items_compacted,
+            } => {
+                self.last_overflow_resolution = Some(OverflowResolutionHint {
+                    resolution,
+                    freed_tokens: *freed_tokens,
+                    items_compacted: *items_compacted,
+                    recorded_at: Instant::now(),
+                });
+            }
             SessionEvent::IllegalTransitionAttempted { .. }
             | SessionEvent::Cancelled
-            // §1 BYOM (v60.9) — `ContextOverflowResolved` lands as a
-            // log line via `project_event`; the toast / panel
-            // rendering surface is a follow-on bundle so the AppState
-            // mutation here is a deliberate no-op.
-            | SessionEvent::ContextOverflowResolved { .. }
             // §1 BYOM (v60.10) — `AdapterSwapped` lands as a log line;
             // the paired `ModelProfileLoaded` that follows refreshes
             // the model badge. No AppState mutation needed here.
@@ -1417,7 +1463,30 @@ fn render_cost_meter(state: &AppState, area: Rect, buf: &mut Buffer) {
     // "verify " prefix + the label itself. Floor at 0 so a tight
     // terminal collapses the badge column instead of underflowing.
     let badge_width = ("verify ".len() + verify_label.len()) as u16;
-    let cost_width = inner.width.saturating_sub(badge_width);
+
+    // v60.9 B1 follow-on — inline the most recent §1
+    // context-overflow resolution as a short hint between the cost
+    // figure and the verify badge for the next
+    // [`OVERFLOW_HINT_TTL`]. Once the decay window elapses, the hint
+    // collapses to zero width so the cost row reverts to its
+    // pre-v60.9 layout. The `AppState` field stays populated past the
+    // window so a debug surface can still inspect the last resolution.
+    let overflow_hint = state.last_overflow_resolution.as_ref().and_then(|h| {
+        if h.recorded_at.elapsed() < OVERFLOW_HINT_TTL {
+            Some(format_overflow_hint(h))
+        } else {
+            None
+        }
+    });
+    let hint_width = overflow_hint
+        .as_ref()
+        .map(|s| s.len() as u16 + 1) // +1 for the leading space separator
+        .unwrap_or(0);
+
+    // Width allocation: cost takes whatever's left after badge + hint.
+    let remaining = inner.width.saturating_sub(badge_width);
+    let hint_actual = hint_width.min(remaining);
+    let cost_width = remaining.saturating_sub(hint_actual);
 
     // Left column: cost label + USD figure.
     let cost_area = Rect {
@@ -1437,15 +1506,38 @@ fn render_cost_meter(state: &AppState, area: Rect, buf: &mut Buffer) {
     ]);
     Widget::render(Paragraph::new(cost_line), cost_area, buf);
 
+    // Middle column: overflow hint (only while the decay window is
+    // active). Cyan colour family matches the GUI's toast accent.
+    if hint_actual > 0 {
+        if let Some(hint_text) = overflow_hint {
+            let hint_area = Rect {
+                x: inner.x + cost_width,
+                y: inner.y,
+                width: hint_actual,
+                height: 1,
+            };
+            let hint_line = Line::from(vec![
+                Span::raw(" "),
+                Span::styled(
+                    hint_text,
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]);
+            Widget::render(Paragraph::new(hint_line), hint_area, buf);
+        }
+    }
+
     // Right column: verify-pass badge. Skipped when the badge column
     // collapsed to zero (very narrow terminal).
-    if badge_width == 0 || cost_width >= inner.width {
+    if badge_width == 0 || cost_width + hint_actual >= inner.width {
         return;
     }
     let badge_area = Rect {
-        x: inner.x + cost_width,
+        x: inner.x + cost_width + hint_actual,
         y: inner.y,
-        width: badge_width.min(inner.width.saturating_sub(cost_width)),
+        width: badge_width.min(inner.width.saturating_sub(cost_width + hint_actual)),
         height: 1,
     };
     let verify_line = Line::from(vec![
@@ -1458,6 +1550,18 @@ fn render_cost_meter(state: &AppState, area: Rect, buf: &mut Buffer) {
         ),
     ]);
     Widget::render(Paragraph::new(verify_line), badge_area, buf);
+}
+
+/// v60.9 B1 follow-on — render a one-line summary of an overflow
+/// resolution for the cost-meter hint slot. Format mirrors the GUI's
+/// `overflowLabel`: `"<resolution> · <n> items · <t> tokens"` when
+/// both counters are populated, just the resolution otherwise (the
+/// `"surfaced"` arm doesn't carry the counters).
+fn format_overflow_hint(hint: &OverflowResolutionHint) -> String {
+    match (hint.freed_tokens, hint.items_compacted) {
+        (Some(t), Some(n)) => format!("overflow {} · {n} items · {t} tokens", hint.resolution),
+        _ => format!("overflow {}", hint.resolution),
+    }
 }
 
 /// Context-token meter — ratatui Gauge with the known fraction filled;

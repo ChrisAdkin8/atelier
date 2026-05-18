@@ -14,10 +14,25 @@
   //     hallucination coverage when a higher-tier producer is
   //     unavailable.
 
+  import { onDestroy } from 'svelte'
   import {
     verificationTierLabel,
     type VerificationStatus,
   } from '../state'
+
+  // v60.9 B1 follow-on — overflow toast decay window. Toast renders
+  // for this many milliseconds after a `ContextOverflowResolved`
+  // event lands, then fades out (the state field itself stays
+  // populated so a debug surface can still inspect the most recent
+  // resolution after the toast disappears).
+  const OVERFLOW_TOAST_MS = 5000
+
+  type OverflowResolution = {
+    resolution: string
+    freed_tokens: number | null
+    items_compacted: number | null
+    at: number
+  }
 
   type Props = {
     totalCostUsd: number
@@ -25,6 +40,7 @@
     unknownTokens: number
     contextWindowTokens: number
     verificationStatus: VerificationStatus
+    lastOverflowResolution: OverflowResolution | null
   }
 
   let {
@@ -33,7 +49,32 @@
     unknownTokens,
     contextWindowTokens,
     verificationStatus,
+    lastOverflowResolution,
   }: Props = $props()
+
+  // v60.9 B1 follow-on — re-render `nowMs` on a 500ms tick so the
+  // derived `overflowToastVisible` flips off ~5s after the last
+  // overflow without the caller having to push a separate "decay
+  // expired" event. Cheap: one setInterval, no DOM thrash; the
+  // interval is cleared on component destroy.
+  let nowMs = $state(Date.now())
+  const tick = setInterval(() => {
+    nowMs = Date.now()
+  }, 500)
+  onDestroy(() => clearInterval(tick))
+
+  let overflowToastVisible = $derived(
+    lastOverflowResolution != null &&
+      nowMs - lastOverflowResolution.at < OVERFLOW_TOAST_MS,
+  )
+  let overflowLabel = $derived.by(() => {
+    if (!lastOverflowResolution) return ''
+    const { resolution, freed_tokens, items_compacted } = lastOverflowResolution
+    if (freed_tokens != null && items_compacted != null) {
+      return `${resolution} · ${items_compacted} items · ${freed_tokens} tokens`
+    }
+    return resolution
+  })
 
   // Floor the denominator at 1 so the percentage is well-defined even
   // before the host publishes the real context window.
@@ -92,6 +133,25 @@
           {verifyLabel}
         </span>
       </div>
+    </div>
+
+    <!-- v60.9 B1 follow-on — §1 BYOM context-overflow resolution
+         toast. Visible for ~5s after a `ContextOverflowResolved`
+         event; fades back out via the `nowMs` tick. The toast still
+         renders as a structural element when hidden so the meter
+         column doesn't reflow on every resolve; the `hidden` class
+         drops opacity to zero. -->
+    <div
+      class="overflow-toast"
+      class:hidden={!overflowToastVisible}
+      role="status"
+      aria-live="polite"
+      data-testid="overflow-toast"
+    >
+      {#if lastOverflowResolution}
+        <span class="meter-label">overflow</span>
+        <span class="overflow-label">{overflowLabel}</span>
+      {/if}
     </div>
   </div>
 </section>
@@ -181,5 +241,30 @@
   }
   .badge.verify-not_run {
     color: var(--fg-dim);
+  }
+  /* v60.9 B1 follow-on — context-overflow resolution toast. Renders
+     under the meters row; fades out via the `.hidden` class once
+     `nowMs - at` exceeds the decay window. Border + accent colour
+     match the cyan family used elsewhere in the meters column. */
+  .overflow-toast {
+    display: flex;
+    gap: 0.4rem;
+    align-items: baseline;
+    padding: 0.2rem 0.5rem;
+    border: 1px solid var(--accent-cyan, #6cc);
+    border-radius: 4px;
+    background: var(--bg-pane-alt);
+    color: var(--accent-cyan, #6cc);
+    font-size: 0.7rem;
+    opacity: 1;
+    transition: opacity 400ms ease;
+  }
+  .overflow-toast.hidden {
+    opacity: 0;
+    pointer-events: none;
+  }
+  .overflow-toast .overflow-label {
+    color: var(--fg-default);
+    font-weight: 600;
   }
 </style>

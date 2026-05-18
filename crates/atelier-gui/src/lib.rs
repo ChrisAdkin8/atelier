@@ -143,7 +143,7 @@ pub fn run() {
             snapshot_mental_model,
             // v61 §14 concurrent-edit modal resolver.
             resolve_concurrent_edit,
-            // v60.10 §1 BYOM mid-session provider swap.
+            // v60.10 §1 BYOM mid-session provider swap (B2 real impl + C3 dropdown UI).
             swap_adapter,
         ])
         .run(tauri::generate_context!())
