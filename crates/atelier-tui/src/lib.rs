@@ -670,6 +670,11 @@ impl AppState {
             }
             SessionEvent::IllegalTransitionAttempted { .. }
             | SessionEvent::Cancelled
+            // §1 BYOM (v60.9) — `ContextOverflowResolved` lands as a
+            // log line via `project_event`; the toast / panel
+            // rendering surface is a follow-on bundle so the AppState
+            // mutation here is a deliberate no-op.
+            | SessionEvent::ContextOverflowResolved { .. }
             | SessionEvent::Shutdown => {}
         }
         self.events.push(line);
@@ -932,6 +937,17 @@ pub fn project_event(evt: &SessionEvent) -> EventLine {
         SessionEvent::StrategyDegraded { from, to, reason } => {
             format!("{} → {} ({reason})", from.as_str(), to.as_str())
         }
+        // §1 BYOM (v60.9) — context-window asymmetry resolution.
+        // Renders one-line summary in the TUI event log; the toast /
+        // panel surface is a follow-on bundle.
+        SessionEvent::ContextOverflowResolved {
+            resolution,
+            freed_tokens,
+            items_compacted,
+        } => match (freed_tokens, items_compacted) {
+            (Some(t), Some(n)) => format!("{resolution} · {n} items · {t} tokens"),
+            _ => (*resolution).to_string(),
+        },
         SessionEvent::Shutdown => String::new(),
     };
     EventLine { kind, detail }
@@ -2609,6 +2625,7 @@ fn spawn_driver_run(
     let responses = vec![MockResponse {
         assistant_text: format!("Acknowledging: {prompt}"),
         tool_calls: vec![write_call, envelope_call],
+        overflow: None,
     }];
 
     let handle = DispatcherHandle::new();
