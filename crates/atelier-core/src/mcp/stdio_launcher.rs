@@ -75,6 +75,38 @@ pub const FIRST_LIST_TIMEOUT_MS: u64 = 5_000;
 /// a typed error instead of silently mis-talking.
 pub const SUPPORTED_PROTOCOL_VERSION: &str = "2024-11-05";
 
+/// v60.11 (§15) — atelier-side projection of `rmcp::model::Resource`
+/// (which is `Annotated<RawResource>`). Owned `String` fields so the
+/// dispatcher's `register_mcp_resources_as_context` helper can build
+/// `ContextItem`s without holding the rmcp running-service lock past
+/// the `list_resources` call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpResourceDescriptor {
+    /// Stable URI as advertised by the server (e.g. `file:///etc/hosts`).
+    /// Becomes the `resource_uri` field on
+    /// [`crate::context::Provenance::McpResource`].
+    pub uri: String,
+    /// Server-supplied human-readable name. Used as the §5 panel row
+    /// label when no description is provided.
+    pub name: String,
+    /// Optional MIME type ("text/plain", "application/json", …). Empty
+    /// when the server didn't advertise one.
+    pub mime_type: Option<String>,
+    /// Optional long-form description.
+    pub description: Option<String>,
+}
+
+impl From<&rmcp::model::Resource> for McpResourceDescriptor {
+    fn from(r: &rmcp::model::Resource) -> Self {
+        Self {
+            uri: r.raw.uri.clone(),
+            name: r.raw.name.clone(),
+            mime_type: r.raw.mime_type.clone(),
+            description: r.raw.description.clone(),
+        }
+    }
+}
+
 /// Atelier-side projection of `rmcp::model::Tool`. Owned `String` fields so
 /// callers don't carry an `Arc<JsonObject>` around (and so the dispatcher
 /// integration in v60.11+ can map this onto its own `ToolSpec` shape without
@@ -169,6 +201,25 @@ impl McpServerHandle {
     /// `call_tool` internally via the typed wrappers.
     pub fn peer(&self) -> &rmcp::service::Peer<RoleClient> {
         self.client.peer()
+    }
+
+    /// v60.11 (§15) — list the server's resources, with rmcp's built-in
+    /// pagination wrapper. Servers that don't expose resources will
+    /// typically return an empty list or a method-not-found error;
+    /// both map onto an `Err(McpLaunchError::Refused)` here so callers
+    /// can distinguish "this server has no resources" (empty `Ok`) from
+    /// "this server doesn't speak the resources protocol" (`Refused`).
+    pub async fn list_resources(&self) -> Result<Vec<McpResourceDescriptor>, McpLaunchError> {
+        let resources =
+            self.client
+                .peer()
+                .list_all_resources()
+                .await
+                .map_err(|e| McpLaunchError::Refused {
+                    name: self.name.clone(),
+                    message: format!("list_resources: {e}"),
+                })?;
+        Ok(resources.iter().map(McpResourceDescriptor::from).collect())
     }
 
     /// List the server's tools, with rmcp's built-in pagination wrapper.
@@ -606,6 +657,25 @@ mod tests {
             Err(other) => panic!("expected Handshake error, got {other:?}"),
             Ok(_) => panic!("a /bin/cat 'server' should NEVER complete the handshake"),
         }
+    }
+
+    #[test]
+    fn mcp_resource_descriptor_from_rmcp_resource() {
+        use rmcp::model::{Annotated, RawResource};
+
+        let raw = RawResource {
+            uri: "file:///tmp/x".into(),
+            name: "fixture".into(),
+            description: Some("d".into()),
+            mime_type: Some("text/plain".into()),
+            size: None,
+        };
+        let r: rmcp::model::Resource = Annotated::new(raw, None);
+        let d = McpResourceDescriptor::from(&r);
+        assert_eq!(d.uri, "file:///tmp/x");
+        assert_eq!(d.name, "fixture");
+        assert_eq!(d.mime_type.as_deref(), Some("text/plain"));
+        assert_eq!(d.description.as_deref(), Some("d"));
     }
 
     #[test]

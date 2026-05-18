@@ -97,6 +97,16 @@ pub enum Provenance {
     /// (you don't pin your own output), but counts toward the context
     /// window and so appears in the §5 panel for honest token attribution.
     AssistantTurn,
+    /// v60.11 (§15) — sourced from an MCP server's `resources/list`
+    /// projection. Carries the originating server name (matches
+    /// [`crate::mcp_config::McpServerManifest::name`]) and the resource
+    /// URI as advertised by the server, so a click-through can read
+    /// the resource (via `resources/read`) and the §5 panel can label
+    /// the row with the server it came from.
+    McpResource {
+        server_name: String,
+        resource_uri: String,
+    },
 }
 
 impl Provenance {
@@ -112,6 +122,7 @@ impl Provenance {
             Self::MemoryPromoted { .. } => "memory_promoted",
             Self::PinnedByUser { .. } => "pinned_by_user",
             Self::AssistantTurn => "assistant_turn",
+            Self::McpResource { .. } => "mcp_resource",
         }
     }
 }
@@ -240,6 +251,12 @@ impl ContextItemSummary {
             Provenance::UserAttached { note } | Provenance::PinnedByUser { note } => note.clone(),
             Provenance::ToolResult { tool_call_id } => Some(tool_call_id.clone()),
             Provenance::MemoryPromoted { card_id } => Some(card_id.clone()),
+            // v60.11 (§15) — for MCP resources, surface "<server>:<uri>"
+            // so the §5 panel row labels the originating server inline.
+            Provenance::McpResource {
+                server_name,
+                resource_uri,
+            } => Some(format!("{server_name}:{resource_uri}")),
         };
         let token_source = item.tokens.source.wire_label().to_string();
         Self {
@@ -837,6 +854,11 @@ mod tests {
             },
             Provenance::PinnedByUser { note: None },
             Provenance::AssistantTurn,
+            // v60.11 (§15) — McpResource carries server_name + URI.
+            Provenance::McpResource {
+                server_name: "fs".into(),
+                resource_uri: "file:///tmp/x".into(),
+            },
         ] {
             let json = serde_json::to_string(&prov).unwrap();
             let back: Provenance = serde_json::from_str(&json).unwrap();
@@ -862,6 +884,10 @@ mod tests {
             },
             Provenance::PinnedByUser { note: None },
             Provenance::AssistantTurn,
+            Provenance::McpResource {
+                server_name: "fs".into(),
+                resource_uri: "file:///tmp/x".into(),
+            },
         ] {
             let json = serde_json::to_value(&prov).unwrap();
             let source = json
