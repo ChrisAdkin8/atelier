@@ -406,6 +406,13 @@ pub struct Runner {
     /// adapter. Cleared after the next run reads it so a third run
     /// without a fresh swap doesn't re-announce.
     pending_swap: parking_lot::Mutex<Option<PendingAdapterSwap>>,
+    /// Phase B Track D — test-only override for the starting §2 strategy.
+    /// When set, pins `active_strategy` regardless of the profile's
+    /// recommendation. Lets the Phase B mechanical gate exercise
+    /// `JsonSentinel` and `RegexProse` parse arms end-to-end against the
+    /// `MockAdapter` (whose `Capabilities` always resolve to
+    /// `NativeTool`). Production callers leave this `None`.
+    starting_strategy_override: Option<Strategy>,
 }
 
 /// v60.10 §1 BYOM — record of a pending mid-session adapter swap that
@@ -603,6 +610,7 @@ impl Runner {
             overflow_policy: ContextOverflowPolicy::Compact,
             few_shot_cache: parking_lot::Mutex::new(None),
             pending_swap: parking_lot::Mutex::new(None),
+            starting_strategy_override: None,
         })
     }
 
@@ -853,6 +861,19 @@ impl Runner {
         self
     }
 
+    /// Phase B Track D — pin the starting §2 strategy regardless of the
+    /// model profile's recommendation. Lets the Phase B mechanical gate
+    /// exercise the `JsonSentinel` and `RegexProse` parse arms end-to-end
+    /// against the `MockAdapter` (whose declared capabilities always
+    /// resolve to `NativeTool`). Production callers should not set this —
+    /// the probe-on-first-use + conformance tracker pair owns strategy
+    /// selection in real runs.
+    #[allow(dead_code)]
+    pub fn with_starting_strategy_override(mut self, strategy: Strategy) -> Self {
+        self.starting_strategy_override = Some(strategy);
+        self
+    }
+
     /// Drive the loop until `claims_done` or `max_turns`. Returns when:
     ///   * a turn carried `claims_done: true` (success path; runs DoD next),
     ///   * `max_turns` reached (timeout; `final_state = AwaitingUser`),
@@ -1087,7 +1108,12 @@ impl Runner {
         // model emits malformed envelopes past the threshold. The
         // active strategy lives in `active_strategy`; degrade events
         // emit on every transition so UIs refresh the footer badge.
-        let mut active_strategy = profile.strategy;
+        //
+        // Phase B Track D — `starting_strategy_override` (test-only)
+        // wins over `profile.strategy` so the mechanical gate can drive
+        // the `JsonSentinel` / `RegexProse` parse arms end-to-end
+        // through `MockAdapter`. Production callers leave it `None`.
+        let mut active_strategy = self.starting_strategy_override.unwrap_or(profile.strategy);
         // Rolling envelope-parse window. Successes / failures recorded
         // by the parse arm of the turn loop drive
         // `should_degrade` — see protocol_conformance::ConformanceRingBuffer.

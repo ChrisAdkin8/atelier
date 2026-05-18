@@ -1,5 +1,44 @@
 # Atelier Spec — Changelog
 
+## v60.23 — 2026-05-18 (Phase B Track D: §2 mechanical gate green across all three strategies)
+
+Closes `tasks/todo.md:220` (§2 mechanical gate snapshot tests across all three strategies). Pure-function encode/parse round-trip tests for `NativeTool` / `JsonSentinel` / `RegexProse` had been green since v60.7 (mock-model fixtures), but the end-to-end half — a runner driving the §2.5 loop through each carrier — was the missing piece. v60.23 lands it. Acceptance criterion #1 from `tasks/phase_b_closeout.md` flips green.
+
+### New `Runner::with_starting_strategy_override(Strategy)` builder
+
+The `MockAdapter`'s declared capabilities always resolve to `Strategy::NativeTool` (its `Capabilities::native_tool_use` is `Supported`), so `JsonSentinel` and `RegexProse` are unreachable through normal profile resolution. The new builder pins `active_strategy` after the profile loads — explicitly tagged as a test seam, `#[allow(dead_code)]` for the binary build, with doc comments stating production callers should not set it (probe-on-first-use + conformance tracker own strategy selection in real runs).
+
+### Three new end-to-end tests
+
+In `crates/atelier-cli/tests/run_integration.rs`:
+
+- `mock_drives_t01_via_strategy_native_tool_phase_b_two_gate` — envelope rides as a `harness_meta` tool call alongside the two real writes.
+- `mock_drives_t01_via_strategy_json_sentinel_phase_b_two_gate` — envelope rides in `assistant_text` between the `<<<harness_meta>>>` / `<<<end>>>` sentinel tags (via `encode_json_sentinel`); `tool_calls` carry only the real writes.
+- `mock_drives_t01_via_strategy_regex_prose_phase_b_two_gate` — envelope rides in `assistant_text` as tagged sections (via `encode_regex_prose`); `tool_calls` carry only the real writes. `claimed_done` + `claimed_changes` are both representable in RegexProse (the lossy strategy drops only `plan_update` / `constraints_acknowledged`, neither of which the t01 envelope carries).
+
+Each test scripts a single-turn agent solving t01 honestly (write `utils.py` + `tests/test_utils.py`), copies the canonical fixture to a tempdir, drives the §2.5 loop via the named strategy, and asserts `final_state == Done` + exactly one `Event::VerificationPassed { Tier3Textual, file_count = 2 }` + zero `VerificationFailed`. Tests share a `t01_honest_writes()` helper for the file contents, a `run_t01_with_strategy()` runner-setup helper, and an `assert_phase_b_two_gate_pass()` post-condition so a future spec revision tightening the gate is a one-line change.
+
+### Lesson applied
+
+**L-D-7** — *claimed-but-broken surfaces are half a bug; integration-test the actual wire.* Pre-v60.23 the encode/parse pair tests proved the round-trip *in isolation*; the runner's parse arm walking the envelope back out of each carrier was untested end-to-end. The new tests prove the integration, not just the unit.
+
+### Verification
+
+- `cargo test -p atelier-cli --test run_integration mock_drives_t01_via_strategy` — 3/3 pass.
+- `cargo test -p atelier-core --lib` — 802 pass (no regression from v60.22's 802 baseline).
+- `cargo fmt --check` clean.
+- `cargo clippy --workspace --all-targets -- -D warnings` clean.
+
+### Phase B closeout progress
+
+Of the five Phase B closeout acceptance criteria:
+- **#1** `todo.md:220` `[~]` → `[x]` — **done** ✅ (this release).
+- #2 measured real-model conformance — pending Track A.
+- #3 §7 Tier-1 + hallucinating-agent — pending Tracks C1/C2/C3.
+- #4 DoD checklist reconciliation — done at v60.21.
+- #5 `cargo fmt` / `clippy` / `test --workspace` / `make check` all green — preserved.
+- #6 `phase_b_gate_status` binary emits `Phase B: GREEN` — pending Track A.
+
 ## v60.22 — 2026-05-18 (Phase B Day-0 prep: `Event::RequestLspInstall` + `LspInstallResolved` variants)
 
 Day-0 sequential prep commit for the Phase B closeout per `tasks/phase_b_closeout.md`. Per **L-D-2** any PR that introduces a new `Event::*` variant lands in its own commit with empty match arms in all four sinks, so the four parallel Phase B bundles (Tracks A / B / C1 / D) don't collide on `crates/atelier-core/src/session.rs::Event`, the GUI `bridge_event`, the Svelte `state.ts applyEvent` / `projectEvent`, or the TUI `apply` / `project_event`. This commit pins the wire shapes for the §7 Tier-1 LSP first-use install flow that Track C1 will fill in.

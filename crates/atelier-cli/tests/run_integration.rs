@@ -3760,6 +3760,191 @@ async fn mock_lying_agent_fixture_flagged_within_one_turn_phase_a_seven_gate() {
     );
 }
 
+// =====================================================================
+// Phase B Track D — §2 mechanical-gate completion.
+//
+// Three end-to-end tests covering each of the three §2 emission
+// strategies (NativeTool / JsonSentinel / RegexProse) driving t01
+// through the §2.5 loop. Closes `tasks/todo.md:220` (§2 mechanical
+// gate end-to-end snapshot tests green across all three strategies
+// against MockAdapter).
+//
+// Each test scripts a single-turn MockResponse that writes
+// `utils.py` + `tests/test_utils.py` (the t01 honest solution) and
+// emits the envelope via the named strategy. The new
+// `Runner::with_starting_strategy_override` builder pins
+// `active_strategy` so the runner's parse arm matches the carrier
+// the mock emits — without it, the MockAdapter's declared
+// capabilities always resolve to `NativeTool` and the
+// `JsonSentinel` / `RegexProse` arms would never run end-to-end.
+//
+// Lesson applied: L-D-7 — three strategies × end-to-end run, not
+// just round-trip on the encoder. Pure-function tests for the
+// encoder/parser pair already exist; what was missing was the
+// integration coverage proving the runner's parse arm walks the
+// envelope back out of each carrier.
+// =====================================================================
+
+/// Shape of a one-turn t01 honest solution — exists once so the three
+/// strategy tests below stay focused on the carrier shape, not the
+/// fixture body.
+fn t01_honest_writes() -> Vec<ToolCallRequest> {
+    let utils_py = r#""""Utility functions."""
+
+
+def divisible_by(n: int, m: int) -> bool:
+    """Return True iff n is divisible by m. Raise ValueError when m is 0."""
+    if m == 0:
+        raise ValueError("m must be non-zero")
+    return n % m == 0
+"#;
+    let test_utils_py = r#""""Tests for divisible_by."""
+import pytest
+
+from utils import divisible_by
+
+
+def test_six_two_true():
+    assert divisible_by(6, 2) is True
+"#;
+    vec![
+        ToolCallRequest {
+            id: "tc-track-d-utils".into(),
+            name: "write_file".into(),
+            arguments: serde_json::json!({"path": "utils.py", "content": utils_py}),
+        },
+        ToolCallRequest {
+            id: "tc-track-d-tests".into(),
+            name: "write_file".into(),
+            arguments: serde_json::json!({"path": "tests/test_utils.py", "content": test_utils_py}),
+        },
+    ]
+}
+
+/// Run the §2.5 loop against t01 with the named strategy pinned via
+/// `with_starting_strategy_override`. Returns the captured event
+/// stream so each test can assert on the strategy-specific
+/// expectations (e.g. `VerificationPassed`).
+async fn run_t01_with_strategy(
+    strategy: atelier_core::protocol_strategy::Strategy,
+    response: MockResponse,
+) -> (
+    runner::RunReport,
+    Arc<parking_lot::Mutex<Vec<Event>>>,
+    tempfile::TempDir,
+) {
+    let task = common::canonical::CanonicalTask::load("t01_add_pure_function")
+        .expect("t01 fixture must load");
+    let workspace = task
+        .copy_fixture_to_tempdir()
+        .expect("fixture tempdir copy");
+
+    let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let runner = Runner::new(
+        workspace.path().to_path_buf(),
+        ProviderChoice::Mock {
+            responses: vec![response],
+        },
+        EventSink::Capture(events.clone()),
+    )
+    .expect("mock runner construction is infallible")
+    .with_max_turns(task.meta.turn_cap)
+    .with_starting_strategy_override(strategy);
+
+    let report = runner.run(task.prompt.clone()).await.unwrap();
+    (report, events, workspace)
+}
+
+/// Assert the §2 mechanical-gate shape: `Done` reached, exactly one
+/// `VerificationPassed { Tier3Textual }` covering the two observed
+/// writes. Shared across the three strategy tests so a future spec
+/// revision that tightens the post-condition is a one-line change.
+fn assert_phase_b_two_gate_pass(report: &runner::RunReport, events: &[Event]) {
+    use atelier_core::verify::VerificationTier;
+    assert_eq!(report.final_state, State::Done, "must reach Done");
+    assert_eq!(
+        report.turns, 1,
+        "scripted one-turn solution; got {} turns",
+        report.turns
+    );
+    let verify = events
+        .iter()
+        .find_map(|e| match e {
+            Event::VerificationPassed {
+                tier, file_count, ..
+            } => Some((*tier, *file_count)),
+            _ => None,
+        })
+        .expect("VerificationPassed must be emitted before Done");
+    assert_eq!(verify.0, VerificationTier::Tier3Textual);
+    assert_eq!(
+        verify.1, 2,
+        "expected two writes observed (utils.py + tests/test_utils.py); got {}",
+        verify.1,
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, Event::VerificationFailed { .. })),
+        "VerificationFailed must NOT fire alongside Passed",
+    );
+}
+
+#[tokio::test]
+async fn mock_drives_t01_via_strategy_native_tool_phase_b_two_gate() {
+    use atelier_core::protocol_strategy::Strategy;
+    let mut tool_calls = t01_honest_writes();
+    // NativeTool: envelope rides as a `harness_meta` tool call.
+    tool_calls.push(mock_envelope_tool_call(&envelope_done_claiming_edits(&[
+        "utils.py",
+        "tests/test_utils.py",
+    ])));
+    let response = MockResponse::new(
+        "implementing divisible_by + tests (NativeTool carrier)",
+        tool_calls,
+    );
+
+    let (report, events, _workspace) = run_t01_with_strategy(Strategy::NativeTool, response).await;
+    let captured = events.lock();
+    assert_phase_b_two_gate_pass(&report, &captured);
+}
+
+#[tokio::test]
+async fn mock_drives_t01_via_strategy_json_sentinel_phase_b_two_gate() {
+    use atelier_core::protocol_strategy::{encode_json_sentinel, Strategy};
+    let envelope = envelope_done_claiming_edits(&["utils.py", "tests/test_utils.py"]);
+    // JsonSentinel: envelope rides in `assistant_text` between the
+    // sentinel tags; tool_calls carry only the real writes.
+    let sentinel_block = encode_json_sentinel(&envelope).expect("encode_json_sentinel");
+    let assistant_text =
+        format!("implementing divisible_by + tests (JsonSentinel carrier)\n\n{sentinel_block}",);
+    let response = MockResponse::new(assistant_text, t01_honest_writes());
+
+    let (report, events, _workspace) =
+        run_t01_with_strategy(Strategy::JsonSentinel, response).await;
+    let captured = events.lock();
+    assert_phase_b_two_gate_pass(&report, &captured);
+}
+
+#[tokio::test]
+async fn mock_drives_t01_via_strategy_regex_prose_phase_b_two_gate() {
+    use atelier_core::protocol_strategy::{encode_regex_prose, Strategy};
+    let envelope = envelope_done_claiming_edits(&["utils.py", "tests/test_utils.py"]);
+    // RegexProse: envelope rides in `assistant_text` as the tagged
+    // section list; tool_calls carry only the real writes. Lossy
+    // strategy — `plan_update` / `constraints_acknowledged` would be
+    // dropped, but the t01 envelope only carries
+    // `claimed_done` + `claimed_changes`, both representable.
+    let prose_block = encode_regex_prose(&envelope).expect("encode_regex_prose");
+    let assistant_text =
+        format!("implementing divisible_by + tests (RegexProse carrier)\n\n{prose_block}",);
+    let response = MockResponse::new(assistant_text, t01_honest_writes());
+
+    let (report, events, _workspace) = run_t01_with_strategy(Strategy::RegexProse, response).await;
+    let captured = events.lock();
+    assert_phase_b_two_gate_pass(&report, &captured);
+}
+
 #[test]
 fn canonical_loader_copies_fixture_to_isolated_tempdir() {
     let task = common::canonical::CanonicalTask::load("t01_add_pure_function").unwrap();
