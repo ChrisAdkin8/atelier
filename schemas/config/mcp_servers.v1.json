@@ -57,6 +57,11 @@
             "default": false,
             "description": "stdio transport only: if true, the subprocess sandbox permits outbound network. http/sse transports imply network; this flag is ignored."
           },
+          "allowed_hosts": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "http/sse transport only: hostnames the launcher is allowed to dispatch to on this server's behalf. Default when omitted = [host(url)]. Any `call_tool` whose effective URL host does not match is refused with `McpLaunchError::HostNotAllowed` and a `blocked` audit row."
+          },
           "enabled": {
             "type": "boolean",
             "default": true,

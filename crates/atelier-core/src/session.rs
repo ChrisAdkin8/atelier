@@ -460,6 +460,20 @@ pub enum Event {
         swapped_at: String,
     },
 
+    /// v60.28 H2 — the renderer asked to swap into a new adapter and we
+    /// want the user's explicit confirmation before tearing down the old
+    /// one. The webview renders a consent modal and replies with an
+    /// `AdapterSwapAccepted` / `AdapterSwapRejected` follow-up event.
+    AdapterSwapPending {
+        to_model_id: String,
+        base_url: String,
+    },
+
+    /// v60.28 H2 — the swap request was refused (either by the base_url
+    /// allowlist gate or by the user from the consent modal). Carries
+    /// the typed reason so the trust-budget UI can render a toast.
+    AdapterSwapRejected { to_model_id: String, reason: String },
+
     /// Phase B Track C1 — §7 verify Tier-1 LSP first-use install prompt.
     /// The runner observed an unverified language (today: TypeScript) and
     /// no cached `LspApprovals` entry exists; the UI presents a modal
@@ -524,6 +538,8 @@ impl Event {
             Self::ContextOverflowResolved { .. } => "ContextOverflowResolved",
             Self::AgentStalled { .. } => "AgentStalled",
             Self::AdapterSwapped { .. } => "AdapterSwapped",
+            Self::AdapterSwapPending { .. } => "AdapterSwapPending",
+            Self::AdapterSwapRejected { .. } => "AdapterSwapRejected",
             Self::RequestLspInstall { .. } => "RequestLspInstall",
             Self::LspInstallResolved { .. } => "LspInstallResolved",
             Self::Shutdown => "Shutdown",

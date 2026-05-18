@@ -5,6 +5,8 @@
 
 Change history in `../CHANGELOG.md`.
 
+**v60.28 (2026-05-18)** — Secrets & egress hardening bundle from `deep_code_scan_v60.27.md`. H2 swap_adapter base_url allowlist + `AdapterSwapPending`/`AdapterSwapRejected` consent flow; H3 `redact_response_body` wired into `AdapterError::{Auth,Provider}` construction sites; H4 disable reqwest auto-redirect on credential-bearing clients; H5 `allowed_hosts` field on MCP servers + `McpLaunchError::HostNotAllowed`; H6 per-`call_tool` `mcp-http-request` audit row; H7 32 MiB streamed body cap (`AdapterError::ResponseTooLarge`); H8 8 MiB per-event SSE accumulator cap (`AdapterError::SseEventTooLarge`); H16 `schemas/protocol/overhead.v1.json` `json_mode → json_sentinel` + schema-enum sweep test. H1 (rotate the leaked Anthropic key) remains an operator action.
+
 **Rig state (verified by `make check`):**
 - 21/21 schemas meta-validate
 - 52/52 artifacts validate against schemas

@@ -16,7 +16,7 @@
         "properties": {
           "provider": {"type": "string"},
           "model_id": {"type": "string"},
-          "strategy": {"enum": ["native_tool", "json_mode", "regex_prose"]},
+          "strategy": {"enum": ["native_tool", "json_sentinel", "regex_prose"]},
           "median_overhead_pct": {
             "type": "number",
             "description": "Median percentage token overhead vs. a no-protocol baseline turn on the same task"

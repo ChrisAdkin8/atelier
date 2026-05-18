@@ -48,8 +48,9 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::{
-    Adapter, AdapterError, Capabilities, CapabilityClaim, ChatResponse, ChunkSource, ChunkStream,
-    Message, Role, StopReason, StreamChunk, TokenCount, ToolCallRequest, ToolSpec, Usage,
+    redact_response_body, Adapter, AdapterError, Capabilities, CapabilityClaim, ChatResponse,
+    ChunkSource, ChunkStream, Message, Role, StopReason, StreamChunk, TokenCount, ToolCallRequest,
+    ToolSpec, Usage,
 };
 use crate::context::TokenSource;
 use crate::protocol_conformance::{ConformanceRingBuffer, ConformanceSnapshot};
@@ -60,6 +61,9 @@ const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
 const DEFAULT_MAX_TOKENS: u32 = 4096;
 const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 120;
+/// v60.28 H7 — hard cap on a single non-stream HTTP response body. A
+/// hostile or runaway upstream must not be allowed to push us into OOM.
+const MAX_RESPONSE_BODY_BYTES: usize = 32 << 20;
 
 /// Concrete BYOM adapter for Anthropic's Messages API.
 ///
@@ -98,6 +102,7 @@ impl AnthropicAdapter {
             },
             http: Client::builder()
                 .timeout(Duration::from_secs(DEFAULT_HTTP_TIMEOUT_SECS))
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .expect("reqwest::Client::builder default config is infallible"),
             ring: Arc::new(Mutex::new(ConformanceRingBuffer::new())),
@@ -232,10 +237,7 @@ impl Adapter for AnthropicAdapter {
         // Snapshot headers before bytes() consumes the response. Needed
         // for Retry-After on 429.
         let headers = resp.headers().clone();
-        let body_bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| AdapterError::Unreachable(e.to_string()))?;
+        let body_bytes = read_capped_body(resp).await?;
         if !status.is_success() {
             return Err(map_http_error(status, &headers, &body_bytes));
         }
@@ -300,10 +302,7 @@ impl Adapter for AnthropicAdapter {
         if !status.is_success() {
             // Snapshot headers before bytes() consumes the response.
             let headers = resp.headers().clone();
-            let body_bytes = resp
-                .bytes()
-                .await
-                .map_err(|e| AdapterError::Unreachable(e.to_string()))?;
+            let body_bytes = read_capped_body(resp).await?;
             return Err(map_http_error(status, &headers, &body_bytes));
         }
         let body_stream: BodyStream = Box::pin(resp.bytes_stream());
@@ -520,6 +519,28 @@ const DEFAULT_RATE_LIMIT_BACKOFF_MS: u64 = 1_000;
 /// the right value) must not let us hot-loop.
 const MIN_RATE_LIMIT_BACKOFF_MS: u64 = 100;
 
+/// v60.28 H7 — streamed accumulator with a `MAX_RESPONSE_BODY_BYTES`
+/// cap. Replaces `resp.bytes().await?` so a hostile or runaway upstream
+/// can't push the harness into OOM. Returns `AdapterError::Unreachable`
+/// on transport failure and `AdapterError::ResponseTooLarge` if the
+/// accumulated bytes would exceed the cap.
+async fn read_capped_body(mut resp: reqwest::Response) -> Result<Vec<u8>, AdapterError> {
+    let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| AdapterError::Unreachable(e.to_string()))?
+    {
+        if buf.len().saturating_add(chunk.len()) > MAX_RESPONSE_BODY_BYTES {
+            return Err(AdapterError::ResponseTooLarge {
+                limit: MAX_RESPONSE_BODY_BYTES,
+            });
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
 fn map_http_error(
     status: StatusCode,
     headers: &reqwest::header::HeaderMap,
@@ -536,13 +557,15 @@ fn map_http_error(
     let (overflow_needed, overflow_limit) = extract_overflow_numbers(&body_str);
 
     match status {
-        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => AdapterError::Auth(body_str),
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+            AdapterError::Auth(redact_response_body(&body_str))
+        }
         StatusCode::TOO_MANY_REQUESTS => AdapterError::RateLimited {
             retry_after_ms: parse_retry_after_ms(headers).unwrap_or(DEFAULT_RATE_LIMIT_BACKOFF_MS),
         },
         s if s.is_server_error() => AdapterError::Provider {
             status: status.as_u16(),
-            body: body_str,
+            body: redact_response_body(&body_str),
         },
         // 400 → ContextOverflow when the body identifies the request as
         // exceeding the context window. Anthropic uses three known markers:
@@ -564,7 +587,7 @@ fn map_http_error(
         }
         _ => AdapterError::Provider {
             status: status.as_u16(),
-            body: body_str,
+            body: redact_response_body(&body_str),
         },
     }
 }
@@ -670,6 +693,11 @@ struct AnthropicSseSource {
 /// 8 MiB ceiling catches a hostile or buggy server emitting an unbounded
 /// line without a terminator before it OOMs the parent.
 const MAX_SSE_BUFFER_BYTES: usize = 8 << 20;
+/// v60.28 H8 — per-event accumulator cap for the `current_event_data`
+/// buffer. Distinct from `MAX_SSE_BUFFER_BYTES` (which caps the raw
+/// incoming line buffer); this caps the assembled `data:` payload bytes
+/// for a single event before it's dispatched.
+const MAX_SSE_EVENT_BYTES: usize = 8 << 20;
 
 struct ToolBlockInProgress {
     id: String,
@@ -812,6 +840,21 @@ impl AnthropicSseSource {
                         None => continue,
                     };
                     if field == b"data" {
+                        let extra = if self.current_event_data.is_empty() {
+                            value.len()
+                        } else {
+                            value.len() + 1
+                        };
+                        if self.current_event_data.len().saturating_add(extra) > MAX_SSE_EVENT_BYTES
+                        {
+                            self.pending_chunks.push_back(StreamChunk::Error {
+                                error: AdapterError::SseEventTooLarge {
+                                    limit: MAX_SSE_EVENT_BYTES,
+                                },
+                            });
+                            self.finished = true;
+                            return;
+                        }
                         if !self.current_event_data.is_empty() {
                             self.current_event_data.push(b'\n');
                         }
@@ -999,7 +1042,7 @@ impl AnthropicSseSource {
                 self.pending_chunks.push_back(StreamChunk::Error {
                     error: AdapterError::Provider {
                         status: 0,
-                        body: msg,
+                        body: redact_response_body(&msg),
                     },
                 });
                 self.finished = true;
@@ -2263,6 +2306,102 @@ data: {"type":"message_stop"}
         assert!(
             a.few_shot_override(Strategy::RegexProse).is_none(),
             "RegexProse falls through to the shared baseline"
+        );
+    }
+
+    // ---------- v60.28 H4 — credential redirects are not followed ----------
+
+    #[tokio::test]
+    async fn chat_does_not_follow_302_redirect_with_credentials() {
+        // The cred-bearing client must refuse to auto-follow redirects so a
+        // hostile upstream can't peel `x-api-key` to a different host.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(302).insert_header("Location", "http://127.0.0.1:1/sink"),
+            )
+            .mount(&server)
+            .await;
+        let err = adapter_for(&server)
+            .chat(&[user("hi")], &[])
+            .await
+            .unwrap_err();
+        // 302 falls through to the catch-all in map_http_error → Provider{302}.
+        match err {
+            AdapterError::Provider { status, .. } => assert_eq!(status, 302),
+            other => panic!("expected Provider{{302}}, got {other:?}"),
+        }
+    }
+
+    // ---------- v60.28 H7 — non-stream body cap ----------
+
+    #[tokio::test]
+    async fn chat_response_body_above_cap_returns_response_too_large() {
+        let server = MockServer::start().await;
+        // 33 MiB body — over the 32 MiB cap.
+        let big = vec![b'x'; (MAX_RESPONSE_BODY_BYTES) + 1];
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(big))
+            .mount(&server)
+            .await;
+        let err = adapter_for(&server)
+            .chat(&[user("hi")], &[])
+            .await
+            .unwrap_err();
+        match err {
+            AdapterError::ResponseTooLarge { limit } => {
+                assert_eq!(limit, MAX_RESPONSE_BODY_BYTES);
+            }
+            other => panic!("expected ResponseTooLarge, got {other:?}"),
+        }
+    }
+
+    // ---------- v60.28 H8 — SSE per-event cap ----------
+
+    #[tokio::test]
+    async fn stream_sse_event_above_cap_emits_sse_event_too_large() {
+        // Build a single SSE event whose accumulated `data:` payload
+        // exceeds the cap.  We split it across ~1000 `data:` lines so
+        // the line splitter has to walk many appends before tripping
+        // the per-event cap (worst case for the accumulator).
+        let chunk = "x".repeat(16 * 1024);
+        let mut body = String::new();
+        for _ in 0..((MAX_SSE_EVENT_BYTES / chunk.len()) + 8) {
+            body.push_str("data: ");
+            body.push_str(&chunk);
+            body.push('\n');
+        }
+        body.push('\n');
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
+        let mut s = adapter_for(&server)
+            .stream(&[user("hi")], &[])
+            .await
+            .unwrap();
+        let mut got_too_large = false;
+        while let Some(c) = s.next().await {
+            if let StreamChunk::Error {
+                error: AdapterError::SseEventTooLarge { limit },
+            } = &c
+            {
+                assert_eq!(*limit, MAX_SSE_EVENT_BYTES);
+                got_too_large = true;
+                break;
+            }
+        }
+        assert!(
+            got_too_large,
+            "expected SseEventTooLarge from oversized event"
         );
     }
 }

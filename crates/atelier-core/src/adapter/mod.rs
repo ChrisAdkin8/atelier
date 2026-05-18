@@ -270,6 +270,56 @@ pub enum AdapterError {
     Provider { status: u16, body: String },
     #[error("adapter not configured: {0}")]
     NotConfigured(String),
+    /// v60.28 H7 — the non-stream HTTP response body grew past the hard
+    /// `limit` cap before reading completed. Caller treats this as a
+    /// transient `Unreachable`-class failure for budgeting; the §2.5
+    /// state machine maps onto `Retry`. Distinct from `Provider` so a
+    /// hostile / runaway response doesn't pollute the cost ledger with
+    /// a multi-megabyte error body.
+    #[error("response body exceeded {limit} bytes")]
+    ResponseTooLarge { limit: usize },
+    /// v60.28 H8 — one SSE event's accumulated `data:` payload grew past
+    /// the per-event `limit` cap before a terminator arrived. Same
+    /// recovery posture as `ResponseTooLarge`.
+    #[error("SSE event payload exceeded {limit} bytes")]
+    SseEventTooLarge { limit: usize },
+}
+
+impl AdapterError {
+    /// Stable wire label per **L-D-5** (`wire_label_*` agreement). Matches the
+    /// serde variant name (no `rename_all`), pinned by
+    /// `adapter_error_wire_labels_agree_with_serde` so a variant rename forces
+    /// the wire side to update in lockstep.
+    pub fn wire_label(&self) -> &'static str {
+        match self {
+            Self::ContextOverflow { .. } => "ContextOverflow",
+            Self::Auth(_) => "Auth",
+            Self::Unreachable(_) => "Unreachable",
+            Self::Malformed(_) => "Malformed",
+            Self::RateLimited { .. } => "RateLimited",
+            Self::Provider { .. } => "Provider",
+            Self::NotConfigured(_) => "NotConfigured",
+            Self::ResponseTooLarge { .. } => "ResponseTooLarge",
+            Self::SseEventTooLarge { .. } => "SseEventTooLarge",
+        }
+    }
+}
+
+/// v60.28 H3 — redact credentials and cap an external response body before
+/// it lands in `AdapterError::{Auth,Provider}`. Strips `sk-ant-*`, `sk-*`
+/// (20+ chars), `Bearer …`, and `"api_key": "…"` patterns, then truncates
+/// to 256 chars (UTF-8 safe via `chars().take`, not byte-slice).
+pub(crate) fn redact_response_body(body: &str) -> String {
+    use std::sync::OnceLock;
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(
+            r#"(?i)(sk-ant-[A-Za-z0-9_\-]+|sk-[A-Za-z0-9]{20,}|Bearer\s+[^\s"']+|"api_key"\s*:\s*"[^"]*")"#,
+        )
+        .expect("redact_response_body regex is statically valid")
+    });
+    let scrubbed = re.replace_all(body, "<redacted>");
+    scrubbed.chars().take(256).collect()
 }
 
 impl AdapterError {
@@ -838,6 +888,106 @@ mod tests {
             let json = serde_json::to_string(&chunk).unwrap();
             let back: StreamChunk = serde_json::from_str(&json).unwrap();
             assert_eq!(back, chunk);
+        }
+    }
+
+    // ---------- v60.28 H3 redaction + H7/H8 wire labels ----------
+
+    #[test]
+    fn redact_response_body_strips_anthropic_keys() {
+        let s = redact_response_body("oops sk-ant-abc123_DEF-456 leaked");
+        assert!(!s.contains("sk-ant-abc123"), "anthropic key survived: {s}");
+        assert!(s.contains("<redacted>"));
+    }
+
+    #[test]
+    fn redact_response_body_strips_generic_sk_keys() {
+        let s = redact_response_body("token sk-AAAAAAAAAAAAAAAAAAAAAA leaked");
+        assert!(
+            !s.contains("sk-AAAAAAAAAAAAAAAAAAAAAA"),
+            "generic key survived: {s}"
+        );
+    }
+
+    #[test]
+    fn redact_response_body_strips_bearer_tokens() {
+        let s = redact_response_body("Authorization: Bearer ey.abc.def trailing");
+        assert!(!s.contains("ey.abc.def"));
+    }
+
+    #[test]
+    fn redact_response_body_strips_api_key_json_field() {
+        let s = redact_response_body(r#"{"api_key": "totally-secret"}"#);
+        assert!(!s.contains("totally-secret"));
+    }
+
+    #[test]
+    fn redact_response_body_caps_to_256_chars_utf8_safe() {
+        let body: String = "é".repeat(400);
+        let s = redact_response_body(&body);
+        assert_eq!(s.chars().count(), 256);
+    }
+
+    #[test]
+    fn secrets_never_serialised_through_adapter_error() {
+        let err = AdapterError::Auth(redact_response_body(
+            "sk-ant-abc123_DEF-456 extra payload that should be capped",
+        ));
+        let json = serde_json::to_string(&err).unwrap();
+        assert!(
+            !json.contains("sk-ant-"),
+            "raw sk-ant token escaped: {json}"
+        );
+        assert!(
+            !json.contains("abc123_DEF-456"),
+            "raw token tail escaped: {json}"
+        );
+    }
+
+    #[test]
+    fn adapter_error_wire_labels_agree_with_serde() {
+        // L-D-5: serde variant name and `wire_label()` must match by
+        // construction so a future rename forces a deliberate edit on
+        // both sides.
+        let cases: Vec<(AdapterError, &str)> = vec![
+            (
+                AdapterError::ContextOverflow {
+                    needed_tokens: 1,
+                    limit_tokens: 1,
+                },
+                "ContextOverflow",
+            ),
+            (AdapterError::Auth("x".into()), "Auth"),
+            (AdapterError::Unreachable("x".into()), "Unreachable"),
+            (AdapterError::Malformed("x".into()), "Malformed"),
+            (
+                AdapterError::RateLimited { retry_after_ms: 1 },
+                "RateLimited",
+            ),
+            (
+                AdapterError::Provider {
+                    status: 500,
+                    body: "x".into(),
+                },
+                "Provider",
+            ),
+            (AdapterError::NotConfigured("x".into()), "NotConfigured"),
+            (
+                AdapterError::ResponseTooLarge { limit: 32 << 20 },
+                "ResponseTooLarge",
+            ),
+            (
+                AdapterError::SseEventTooLarge { limit: 8 << 20 },
+                "SseEventTooLarge",
+            ),
+        ];
+        for (err, label) in cases {
+            assert_eq!(err.wire_label(), label);
+            let json = serde_json::to_string(&err).unwrap();
+            assert!(
+                json.contains(label),
+                "serde shape for {err:?} missing wire label {label}: {json}"
+            );
         }
     }
 

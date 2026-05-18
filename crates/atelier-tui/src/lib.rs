@@ -750,6 +750,10 @@ impl AppState {
             // (per **L-D-2** the prep commit only pins the wire shape).
             | SessionEvent::RequestLspInstall { .. }
             | SessionEvent::LspInstallResolved { .. }
+            // v60.28 H2 — swap consent-modal events ride the bus as log
+            // lines; no AppState mutation here.
+            | SessionEvent::AdapterSwapPending { .. }
+            | SessionEvent::AdapterSwapRejected { .. }
             | SessionEvent::Shutdown => {}
         }
         self.events.push(line);
@@ -1052,6 +1056,16 @@ pub fn project_event(evt: &SessionEvent) -> EventLine {
             to_model_id,
             ..
         } => format!("{from_model_id} → {to_model_id}"),
+        // v60.28 H2 — swap consent-modal lifecycle. The TUI is not the
+        // consent surface (the GUI's the carrier), so just log the pair.
+        SessionEvent::AdapterSwapPending {
+            to_model_id,
+            base_url,
+        } => format!("pending → {to_model_id} ({base_url})"),
+        SessionEvent::AdapterSwapRejected {
+            to_model_id,
+            reason,
+        } => format!("rejected → {to_model_id}: {reason}"),
         // §2 — agent abandoned the turn-protocol contract (see
         // `Event::AgentStalled`). One-line summary in the event log;
         // the paired `Transitioned { Streaming → AwaitingUser }`

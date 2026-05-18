@@ -5,7 +5,7 @@
     {
       "provider": "mock",
       "model_id": "mock:protocol-overhead",
-      "strategy": "json_mode",
+      "strategy": "json_sentinel",
       "median_overhead_pct": 64.0,
       "conformance_rate": 1.0,
       "bytes_on_wire": 256,

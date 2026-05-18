@@ -154,6 +154,63 @@ def test_mcp_servers_bad_name_pattern_rejected():
         jsonschema.validate({"version": 1, "servers": [{"name": "FS-Caps", "transport": "stdio", "command": "x"}]}, schema)
 
 
+def test_mcp_servers_allowed_hosts_round_trips():
+    # v60.28 H5 — `allowed_hosts` is an optional `string[]`. Round-trips
+    # cleanly under the schema's `additionalProperties: false` posture.
+    schema = load("config/mcp_servers.v1.json")
+    jsonschema.validate({
+        "version": 1,
+        "servers": [{
+            "name": "ws", "transport": "http", "url": "https://x.example/mcp",
+            "allowed_hosts": ["x.example", "y.example"],
+        }],
+    }, schema)
+
+
+def test_mcp_servers_allowed_hosts_wrong_type_rejected():
+    schema = load("config/mcp_servers.v1.json")
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate({
+            "version": 1,
+            "servers": [{
+                "name": "ws", "transport": "http", "url": "https://x.example/mcp",
+                "allowed_hosts": "not-an-array",
+            }],
+        }, schema)
+
+
+# ---- schema enum sweep — every value reachable via Strategy::as_str() (H16) ----
+
+def test_schema_strategy_enums_align_with_strategy_as_str():
+    # v60.28 H16 — every `strategy` enum value across `schemas/` must be a
+    # member of the canonical strategy wire-label set (mirrored by
+    # `Strategy::as_str()` in `crates/atelier-core/src/protocol_strategy.rs`).
+    # Pre-v60.28 `overhead.v1.json` shipped a stale `json_mode` that
+    # `Strategy::as_str()` never emits. Sweep all schema files; flag any
+    # `strategy` enum whose values don't match.
+    allowed = {"native_tool", "json_sentinel", "regex_prose"}
+    for path in SCHEMAS.rglob("*.json"):
+        text = path.read_text()
+        if '"strategy"' not in text:
+            continue
+        schema = json.loads(text)
+        for enum_values in _strategy_enums(schema):
+            extras = set(enum_values) - allowed
+            assert not extras, f"{path} has stale strategy enum value(s) {extras}"
+
+
+def _strategy_enums(node):
+    """Yield every list of enum values for a property named `strategy`."""
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if k == "strategy" and isinstance(v, dict) and isinstance(v.get("enum"), list):
+                yield v["enum"]
+            yield from _strategy_enums(v)
+    elif isinstance(node, list):
+        for item in node:
+            yield from _strategy_enums(item)
+
+
 # ---- task_meta ----
 
 def test_task_meta_minimal_valid():

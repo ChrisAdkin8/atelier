@@ -198,6 +198,13 @@ pub struct McpServerManifest {
     #[serde(default)]
     pub allow_net: bool,
 
+    /// v60.28 H5 — http/sse transport: hostnames the launcher is
+    /// allowed to dispatch to on this server's behalf. `None` means
+    /// "default to [host(url)]" when first resolved. Reject any
+    /// per-call URL whose host doesn't match.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_hosts: Option<Vec<String>>,
+
     /// Set to `false` to keep the registration in the file but skip
     /// launching the server. The loader filters disabled entries out of
     /// the returned `Vec` so callers don't need to remember to gate on it.
@@ -839,6 +846,7 @@ mod tests {
                 headers: BTreeMap::new(),
                 side_effect_class: None,
                 allow_net: false,
+                allowed_hosts: None,
                 enabled: true,
             },
             McpServerManifest {
@@ -851,6 +859,7 @@ mod tests {
                 headers: BTreeMap::new(),
                 side_effect_class: None,
                 allow_net: false,
+                allowed_hosts: None,
                 enabled: true,
             },
         ];
@@ -876,6 +885,7 @@ mod tests {
             headers: BTreeMap::new(),
             side_effect_class: Some(SideEffectClass::LocalSafe),
             allow_net: true,
+            allowed_hosts: None,
             enabled: true,
         };
         let doc = McpServersDoc {

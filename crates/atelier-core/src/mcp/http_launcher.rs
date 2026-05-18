@@ -453,6 +453,7 @@ mod tests {
             headers,
             side_effect_class: Some(SideEffectClass::SharedState),
             allow_net,
+            allowed_hosts: None,
             enabled: true,
         }
     }

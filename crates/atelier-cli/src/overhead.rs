@@ -96,11 +96,8 @@ pub struct ProviderEntry {
     pub provider: String,
     pub model_id: String,
     /// Wire label for the strategy. Schema enum is
-    /// `["native_tool", "json_mode", "regex_prose"]`; the in-tree
-    /// strategy enum spells the sentinel one `json_sentinel`. The
-    /// schema's `json_mode` is the older spelling; we map
-    /// `Strategy::JsonSentinel` → `"json_mode"` so the schema stays
-    /// stable.
+    /// `["native_tool", "json_sentinel", "regex_prose"]`, matching the
+    /// in-tree `Strategy::as_str()` 1:1 since v60.28 H16.
     pub strategy: String,
     /// Median percent token overhead vs. a no-protocol baseline turn.
     pub median_overhead_pct: f64,
@@ -539,13 +536,9 @@ fn write_report(path: &Path, report: &OverheadReport) -> Result<(), OverheadErro
 }
 
 fn strategy_wire_label(s: Strategy) -> &'static str {
-    // Map in-tree `Strategy::JsonSentinel` to the schema's older
-    // `json_mode` spelling so the schema doesn't have to change.
-    match s {
-        Strategy::NativeTool => "native_tool",
-        Strategy::JsonSentinel => "json_mode",
-        Strategy::RegexProse => "regex_prose",
-    }
+    // v60.28 H16 — schema now agrees with `Strategy::as_str()`; no
+    // remapping needed.
+    s.as_str()
 }
 
 #[cfg(test)]
@@ -593,13 +586,13 @@ mod tests {
         let report = run(&config).expect("run should succeed");
         assert_eq!(report.version, 1);
         assert_eq!(report.providers.len(), 3);
-        // Sorted alphabetically by wire label: json_mode, native_tool, regex_prose.
+        // Sorted alphabetically by wire label: json_sentinel, native_tool, regex_prose.
         let labels: Vec<_> = report
             .providers
             .iter()
             .map(|p| p.strategy.as_str())
             .collect();
-        assert_eq!(labels, vec!["json_mode", "native_tool", "regex_prose"]);
+        assert_eq!(labels, vec!["json_sentinel", "native_tool", "regex_prose"]);
         assert!(out.exists(), "output file should have been written");
         for p in &report.providers {
             assert!(p.bytes_on_wire > 0);
@@ -715,9 +708,9 @@ mod tests {
     }
 
     #[test]
-    fn strategy_wire_label_maps_sentinel_to_schema_spelling() {
+    fn strategy_wire_label_agrees_with_strategy_as_str() {
         assert_eq!(strategy_wire_label(Strategy::NativeTool), "native_tool");
-        assert_eq!(strategy_wire_label(Strategy::JsonSentinel), "json_mode");
+        assert_eq!(strategy_wire_label(Strategy::JsonSentinel), "json_sentinel");
         assert_eq!(strategy_wire_label(Strategy::RegexProse), "regex_prose");
     }
 

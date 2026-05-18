@@ -625,6 +625,56 @@ pub struct SwapResult {
     pub swapped_at: String,
 }
 
+/// v60.28 H2 — built-in base_url allowlist for the `swap_adapter` Tauri
+/// command. A future revision will fold in user-configured entries from
+/// `providers.toml`; the wired-in set covers the two public providers
+/// the binary supports plus loopback.
+pub const SWAP_BASE_URL_ALLOWLIST: &[&str] = &[
+    "api.anthropic.com",
+    "api.openai.com",
+    "localhost",
+    "127.0.0.1",
+    "::1",
+];
+
+/// v60.28 H2 — predicate for whether a `swap_adapter` base_url is
+/// allowed. `None` base_url (e.g. anthropic uses no `base_url`) is
+/// allowed; only an explicit value off the allowlist is refused.
+pub fn is_base_url_allowed(base_url: Option<&str>) -> bool {
+    let Some(url) = base_url else {
+        return true;
+    };
+    let host = match host_of_url(url) {
+        Some(h) => h,
+        None => return false,
+    };
+    SWAP_BASE_URL_ALLOWLIST.iter().any(|h| *h == host)
+}
+
+/// Bare host extraction matching `atelier_core::mcp::mcp_tool::host_of_url`
+/// (kept local to avoid pulling in the mcp module for this single helper).
+fn host_of_url(url: &str) -> Option<String> {
+    let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let authority = authority
+        .rsplit_once('@')
+        .map(|(_, h)| h)
+        .unwrap_or(authority);
+    let host = if let Some(stripped) = authority.strip_prefix('[') {
+        stripped.split_once(']').map(|(h, _)| h).unwrap_or(stripped)
+    } else {
+        authority
+            .rsplit_once(':')
+            .map(|(h, _)| h)
+            .unwrap_or(authority)
+    };
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_ascii_lowercase())
+    }
+}
+
 /// v60.10 §1 BYOM — build a fresh `Arc<dyn Adapter>` from a
 /// `SwapProviderWire`. Mirrors the per-provider construction logic in
 /// `Runner::new`; lifted here so the swap-from-webview path doesn't
@@ -674,6 +724,43 @@ async fn swap_adapter(
     state: tauri::State<'_, SessionState>,
     provider: SwapProviderWire,
 ) -> Result<SwapResult, String> {
+    // v60.28 H2 — base_url allowlist gate. Refuses the swap before any
+    // credential build / event emission so a hostile webview message
+    // can't peel `OPENAI_API_KEY` to an arbitrary host.
+    let pending_base_url = match &provider {
+        SwapProviderWire::OpenAiCompat { base_url, .. } => base_url.clone(),
+        SwapProviderWire::Anthropic { .. } | SwapProviderWire::Mock { .. } => None,
+    };
+    let pending_to_id = match &provider {
+        SwapProviderWire::Mock { model_id }
+        | SwapProviderWire::Anthropic { model_id }
+        | SwapProviderWire::OpenAiCompat { model_id, .. } => model_id.clone(),
+    };
+    if !is_base_url_allowed(pending_base_url.as_deref()) {
+        let reason = format!(
+            "base_url {:?} not in swap_adapter allowlist",
+            pending_base_url.as_deref().unwrap_or("<none>")
+        );
+        emit_event(
+            &app,
+            &SessionEvent::AdapterSwapRejected {
+                to_model_id: pending_to_id,
+                reason: reason.clone(),
+            },
+        );
+        return Err(reason);
+    }
+    // Emit the consent-modal opener BEFORE the credential build so the
+    // webview sees a single ordered "pending → accepted/rejected" pair
+    // on the bus. The renderer's accept/reject reply lands via a
+    // follow-on Tauri command (deferred to the consent-UI bundle).
+    emit_event(
+        &app,
+        &SessionEvent::AdapterSwapPending {
+            to_model_id: pending_to_id.clone(),
+            base_url: pending_base_url.unwrap_or_default(),
+        },
+    );
     let new_adapter = build_swap_adapter(provider)?;
     let to_model_id = new_adapter.model_id().to_string();
     // Read the pre-swap model id off the live adapter slot. If
@@ -1229,6 +1316,24 @@ pub fn bridge_event(evt: &SessionEvent) -> BridgedEvent {
             "to_model_id": to_model_id,
             "swapped_at": swapped_at,
         }),
+        // v60.28 H2 — consent-modal lifecycle. `Pending` opens the modal
+        // in the webview; the renderer answers via the `accept_pending_swap`
+        // / `reject_pending_swap` Tauri commands which emit the
+        // `AdapterSwapped` / `AdapterSwapRejected` follow-ups.
+        SessionEvent::AdapterSwapPending {
+            to_model_id,
+            base_url,
+        } => json!({
+            "to_model_id": to_model_id,
+            "base_url": base_url,
+        }),
+        SessionEvent::AdapterSwapRejected {
+            to_model_id,
+            reason,
+        } => json!({
+            "to_model_id": to_model_id,
+            "reason": reason,
+        }),
         // §2 — agent abandoned the turn-protocol contract (no tool
         // calls and no claimed_done). Runner has already transitioned
         // Streaming → AwaitingUser; the toast surface in the Svelte
@@ -1711,5 +1816,46 @@ mod tests {
         assert_eq!(b.payload["from_model_id"], "anthropic:claude-opus-4-7");
         assert_eq!(b.payload["to_model_id"], "local:qwen2.5-coder:7b");
         assert_eq!(b.payload["swapped_at"], "2026-05-18T12:00:00Z");
+    }
+
+    // ---------- v60.28 H2 swap_adapter allowlist + consent ----------
+
+    #[test]
+    fn swap_allowlist_refuses_unknown_host() {
+        assert!(!is_base_url_allowed(Some("https://evil.example/v1")));
+        assert!(!is_base_url_allowed(Some("http://attacker.test/v1")));
+    }
+
+    #[test]
+    fn swap_allowlist_accepts_known_hosts_and_loopback() {
+        assert!(is_base_url_allowed(Some("https://api.anthropic.com/v1")));
+        assert!(is_base_url_allowed(Some("https://api.openai.com/v1")));
+        assert!(is_base_url_allowed(Some("http://localhost:11434/v1")));
+        assert!(is_base_url_allowed(Some("http://127.0.0.1:8080/v1")));
+        assert!(is_base_url_allowed(None));
+    }
+
+    #[test]
+    fn bridge_adapter_swap_pending_carries_to_id_and_base_url() {
+        let b = bridge_event(&SessionEvent::AdapterSwapPending {
+            to_model_id: "openai-compat:gpt-4o".into(),
+            base_url: "https://api.openai.com/v1".into(),
+        });
+        assert_eq!(b.kind, "AdapterSwapPending");
+        assert_eq!(b.payload["to_model_id"], "openai-compat:gpt-4o");
+        assert_eq!(b.payload["base_url"], "https://api.openai.com/v1");
+    }
+
+    #[test]
+    fn bridge_adapter_swap_rejected_carries_reason() {
+        let b = bridge_event(&SessionEvent::AdapterSwapRejected {
+            to_model_id: "openai-compat:gpt-4o".into(),
+            reason: "base_url \"https://evil.example/v1\" not in swap_adapter allowlist".into(),
+        });
+        assert_eq!(b.kind, "AdapterSwapRejected");
+        assert!(b.payload["reason"]
+            .as_str()
+            .unwrap()
+            .contains("evil.example"));
     }
 }

@@ -71,8 +71,9 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::{
-    Adapter, AdapterError, Capabilities, CapabilityClaim, ChatResponse, ChunkSource, ChunkStream,
-    Message, Role, StopReason, StreamChunk, TokenCount, ToolCallRequest, ToolSpec, Usage,
+    redact_response_body, Adapter, AdapterError, Capabilities, CapabilityClaim, ChatResponse,
+    ChunkSource, ChunkStream, Message, Role, StopReason, StreamChunk, TokenCount, ToolCallRequest,
+    ToolSpec, Usage,
 };
 use crate::context::TokenSource;
 use crate::protocol_conformance::{ConformanceRingBuffer, ConformanceSnapshot};
@@ -92,6 +93,11 @@ const DEFAULT_CONTEXT_WINDOW_TOKENS: u32 = 8_192;
 /// buggy server protection — see comment in anthropic.rs:
 /// `MAX_SSE_BUFFER_BYTES`.
 const MAX_SSE_BUFFER_BYTES: usize = 8 << 20;
+/// v60.28 H8 — per-event accumulator cap for the `current_event_data`
+/// buffer.
+const MAX_SSE_EVENT_BYTES: usize = 8 << 20;
+/// v60.28 H7 — hard cap on a single non-stream HTTP response body.
+const MAX_RESPONSE_BODY_BYTES: usize = 32 << 20;
 
 /// Floor on `Retry-After` so a server that emits `Retry-After: 0`
 /// can't push us into a hot-retry loop. Matches Anthropic adapter.
@@ -139,6 +145,7 @@ impl OpenAiCompatAdapter {
             },
             http: Client::builder()
                 .timeout(Duration::from_secs(DEFAULT_HTTP_TIMEOUT_SECS))
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .expect("reqwest::Client::builder default config is infallible"),
             ring: Arc::new(Mutex::new(ConformanceRingBuffer::new())),
@@ -284,10 +291,7 @@ impl Adapter for OpenAiCompatAdapter {
             .map_err(|e| AdapterError::Unreachable(e.to_string()))?;
         let status = resp.status();
         let headers = resp.headers().clone();
-        let body_bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| AdapterError::Unreachable(e.to_string()))?;
+        let body_bytes = read_capped_body(resp).await?;
         if !status.is_success() {
             return Err(map_http_error(status, &headers, &body_bytes));
         }
@@ -352,10 +356,7 @@ impl Adapter for OpenAiCompatAdapter {
         let status = resp.status();
         if !status.is_success() {
             let headers = resp.headers().clone();
-            let body_bytes = resp
-                .bytes()
-                .await
-                .map_err(|e| AdapterError::Unreachable(e.to_string()))?;
+            let body_bytes = read_capped_body(resp).await?;
             return Err(map_http_error(status, &headers, &body_bytes));
         }
         let body_stream: BodyStream = Box::pin(resp.bytes_stream());
@@ -606,6 +607,25 @@ fn parse_retry_after_ms(headers: &reqwest::header::HeaderMap) -> Option<u64> {
     Some(ms.max(MIN_RATE_LIMIT_BACKOFF_MS))
 }
 
+/// v60.28 H7 — streamed accumulator with a `MAX_RESPONSE_BODY_BYTES`
+/// cap (see anthropic.rs::read_capped_body for the rationale).
+async fn read_capped_body(mut resp: reqwest::Response) -> Result<Vec<u8>, AdapterError> {
+    let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| AdapterError::Unreachable(e.to_string()))?
+    {
+        if buf.len().saturating_add(chunk.len()) > MAX_RESPONSE_BODY_BYTES {
+            return Err(AdapterError::ResponseTooLarge {
+                limit: MAX_RESPONSE_BODY_BYTES,
+            });
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
 fn map_http_error(
     status: StatusCode,
     headers: &reqwest::header::HeaderMap,
@@ -613,13 +633,15 @@ fn map_http_error(
 ) -> AdapterError {
     let body_str = String::from_utf8_lossy(body).into_owned();
     match status {
-        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => AdapterError::Auth(body_str),
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+            AdapterError::Auth(redact_response_body(&body_str))
+        }
         StatusCode::TOO_MANY_REQUESTS => AdapterError::RateLimited {
             retry_after_ms: parse_retry_after_ms(headers).unwrap_or(DEFAULT_RATE_LIMIT_BACKOFF_MS),
         },
         s if s.is_server_error() => AdapterError::Provider {
             status: status.as_u16(),
-            body: body_str,
+            body: redact_response_body(&body_str),
         },
         // OpenAI's context-overflow error code is
         // `"code": "context_length_exceeded"`. Local servers vary;
@@ -637,7 +659,7 @@ fn map_http_error(
         }
         _ => AdapterError::Provider {
             status: status.as_u16(),
-            body: body_str,
+            body: redact_response_body(&body_str),
         },
     }
 }
@@ -787,6 +809,21 @@ impl OpenAiSseSource {
                         None => continue,
                     };
                     if field == b"data" {
+                        let extra = if self.current_event_data.is_empty() {
+                            value.len()
+                        } else {
+                            value.len() + 1
+                        };
+                        if self.current_event_data.len().saturating_add(extra) > MAX_SSE_EVENT_BYTES
+                        {
+                            self.pending_chunks.push_back(StreamChunk::Error {
+                                error: AdapterError::SseEventTooLarge {
+                                    limit: MAX_SSE_EVENT_BYTES,
+                                },
+                            });
+                            self.finished = true;
+                            return;
+                        }
                         if !self.current_event_data.is_empty() {
                             self.current_event_data.push(b'\n');
                         }

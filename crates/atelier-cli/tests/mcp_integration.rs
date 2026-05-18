@@ -65,6 +65,7 @@ fn filesystem_server_manifest(fixture: &Path) -> McpServerManifest {
         // We keep `allow_net: true` for that reason; subsequent runs hit the
         // cached package and don't need the net.
         allow_net: true,
+        allowed_hosts: None,
         enabled: true,
     }
 }
@@ -336,6 +337,7 @@ async fn egress_block_does_not_prevent_spawn() {
         headers: BTreeMap::new(),
         side_effect_class: Some(SideEffectClass::LocalSafe),
         allow_net: false,
+        allowed_hosts: None,
         enabled: true,
     };
 
@@ -379,6 +381,7 @@ fn http_manifest(
         headers,
         side_effect_class: Some(SideEffectClass::SharedState),
         allow_net,
+        allowed_hosts: None,
         enabled: true,
     }
 }

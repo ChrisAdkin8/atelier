@@ -1,5 +1,20 @@
 # Atelier Spec — Changelog
 
+## v60.28 — 2026-05-18 (Secrets & egress hardening; H2–H8 + H16 from `deep_code_scan_v60.27.md`)
+
+File-disjoint bundle of high-severity audit fixes scoped to BYOM adapters, the §15 MCP HTTP/SSE surface, the GUI's `swap_adapter` command, and one §2 schema typo. H1 (rotate the leaked `.envrc` Anthropic key) is an operator action tracked separately. Bundle gate: `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test --workspace`, `make check` — all green.
+
+- **H2** — `swap_adapter` Tauri command gates a base_url allowlist (`api.anthropic.com`, `api.openai.com`, `localhost`, `127.0.0.1`, `::1`) and emits an `AdapterSwapPending` → `AdapterSwapped | AdapterSwapRejected` consent flow on the event bus before tearing down the live adapter. New unit tests cover the allowlist (`evil.example` refused, loopback accepted) and the projection wire shape; the renderer-side accept/reject UI rides a follow-on bundle.
+- **H3** — `crates/atelier-core/src/adapter/mod.rs` now exposes a `redact_response_body` helper that strips `sk-ant-*`, `sk-*` (20+ chars), `Bearer …`, and `"api_key": "…"` substrings, then UTF-8-safely caps to 256 chars. Wired into every construction site of `AdapterError::{Auth, Provider}` in `anthropic.rs` + `openai_compat.rs` so serialised errors (RunReport JSONL, session.json, GUI/TUI projections) can't leak credentials.
+- **H4** — Credential-bearing reqwest clients in both adapters now build with `.redirect(reqwest::redirect::Policy::none())`. A new regression test stands up a wiremock returning 302 and asserts the adapter sees the status code rather than auto-following.
+- **H5** — `schemas/config/mcp_servers.v1.json` + `McpServerManifest` gain `allowed_hosts: Option<Vec<String>>` (default = `[host(url)]` when omitted). `McpToolWrapper` carries an opt-in `EgressContext`; every `call_tool` checks the URL host against the allowlist and on mismatch returns `McpLaunchError::HostNotAllowed` plus a `blocked` audit row. `host_of_url` (no `url` crate dep — manual parse handling scheme/userinfo/IPv6/port) is unit-tested.
+- **H6** — Per-`call_tool` egress emits an `mcp-http-request` row through the existing `append_mcp_egress` appender, populated with `provider`, `url`, `phase: "call-tool"`, `outcome`, optional `reason`, and `tool_name`. Schema unchanged; the launcher's handshake row and this row now share one NDJSON stream.
+- **H7** — `resp.bytes().await?` replaced in both adapters' non-stream chat paths with a streamed `chunk()` accumulator capped at 32 MiB. New `AdapterError::ResponseTooLarge { limit }` variant + wire-label entry. Verification test feeds 32 MiB + 1 bytes through wiremock and asserts the error fires before the body lands in memory.
+- **H8** — Per-event SSE accumulator (`current_event_data`) is capped at 8 MiB in both adapters. Overflow surfaces as `AdapterError::SseEventTooLarge { limit }` (also added to the L-D-5 wire-label/serde agreement test). Verification test feeds ~1000 `data:` lines totalling > 8 MiB and asserts the cap fires.
+- **H16** — `schemas/protocol/overhead.v1.json` strategy enum now reads `["native_tool", "json_sentinel", "regex_prose"]` (was `json_mode`); the CLI's `strategy_wire_label` now delegates to `Strategy::as_str()` so the rename can't drift again. New `tests/test_schemas.py` sweep asserts every `strategy` enum across `schemas/` is a member of the canonical set.
+
+Plus an `allowed_hosts` round-trip + wrong-type rejection test in `tests/test_schemas.py`, and the artifact in `tests/protocol/overhead.json` rewritten to the new spelling.
+
 ## v60.27 — 2026-05-18 (Phase B Track C3: hallucinating-agent fixture + §7 Tier-1 gate)
 
 Closes the final Phase B closeout track. The §7 hallucinated-symbol gate fires within one turn on the new canonical fixture; the lying-vs-hallucinating priority lattice from L-D-9 is pinned in code; the v60.12 lying-agent gate is non-regressing. Once `experiments/lsp_spike/` resolves GO and `async-lsp` lands, the runner produces Tier-1 diagnostics directly instead of through the test seam below.

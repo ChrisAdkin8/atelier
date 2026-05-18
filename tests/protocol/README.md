@@ -55,4 +55,4 @@ By default the harness reads `tests/protocol/fixtures/` and writes `tests/protoc
 
 ## Schema mapping note
 
-The strategy enum in `schemas/protocol/overhead.v1.json` is `["native_tool", "json_mode", "regex_prose"]`. The in-tree `Strategy` enum spells the sentinel strategy `JsonSentinel`. The harness maps `JsonSentinel` → `"json_mode"` on write so the schema stays stable; do not rename either side without renaming both.
+The strategy enum in `schemas/protocol/overhead.v1.json` is `["native_tool", "json_sentinel", "regex_prose"]` — matching `Strategy::as_str()` 1:1 since v60.28 H16 fixed the `json_mode` typo.

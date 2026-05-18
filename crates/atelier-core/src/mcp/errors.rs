@@ -112,6 +112,14 @@ pub enum McpLaunchError {
         header: String,
         reason: String,
     },
+
+    /// v60.28 H5 — a `call_tool` URL's host is not on the manifest's
+    /// `allowed_hosts` allowlist. Refuses the egress and (when audit
+    /// dir is wired) writes a `blocked` audit row. Distinct from
+    /// `Refused` so the trust-budget UI can prompt the user to update
+    /// `allowed_hosts` rather than retry.
+    #[error("MCP server {name:?} egress to host {host:?} not in allowed_hosts")]
+    HostNotAllowed { name: String, host: String },
 }
 
 impl McpLaunchError {
@@ -126,6 +134,7 @@ impl McpLaunchError {
                 | Self::Interpolation { .. }
                 | Self::ProtocolMismatch { .. }
                 | Self::InvalidHeader { .. }
+                | Self::HostNotAllowed { .. }
         )
     }
 }

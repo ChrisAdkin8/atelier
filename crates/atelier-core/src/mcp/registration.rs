@@ -475,6 +475,7 @@ mod tests {
             headers: BTreeMap::new(),
             side_effect_class: Some(ConfigSideEffectClass::LocalSafe),
             allow_net: false,
+            allowed_hosts: None,
             enabled,
         }
     }
@@ -570,6 +571,7 @@ mod tests {
             headers: BTreeMap::new(),
             side_effect_class: Some(ConfigSideEffectClass::LocalSafe),
             allow_net: false,
+            allowed_hosts: None,
             enabled: true,
         };
 

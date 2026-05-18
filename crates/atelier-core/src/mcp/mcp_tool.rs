@@ -27,16 +27,19 @@
 //! get the explicit JSONSchema route because their schemas are
 //! server-supplied and may express constraints serde can't.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use jsonschema::Validator;
 use serde_json::Value;
 
+use crate::audit::{append_mcp_egress, McpEgressEvent, McpEgressOutcome, McpEgressPhase};
 use crate::dispatcher::{SideEffectClass, Tool, ToolContext, ToolResult};
 use crate::error::ToolError;
 use crate::mcp::stdio_launcher::McpServerHandle;
 use crate::mcp::McpLaunchError;
+use crate::time::now_rfc3339;
 
 /// Tool impl that routes a single MCP-server-advertised tool through
 /// an [`McpServerHandle`]. Construct one per `(server, tool)` pair via
@@ -77,6 +80,18 @@ pub struct McpToolWrapper {
     /// manifest's per-server default (per-tool override is a tool-
     /// manifest concern and lands when we wire the manifest in).
     side_effect_class: SideEffectClass,
+    /// v60.28 H5 / H6 — egress config for http/sse servers. `None` for
+    /// stdio servers (no URL, no egress audit). When `Some`, every
+    /// `call_tool` checks the URL host against `allowed_hosts` and
+    /// appends an `McpEgressEvent` row to `<audit_dir>/audit.log`.
+    egress: Option<EgressContext>,
+}
+
+#[derive(Debug, Clone)]
+struct EgressContext {
+    url: String,
+    allowed_hosts: Vec<String>,
+    audit_dir: PathBuf,
 }
 
 impl McpToolWrapper {
@@ -100,7 +115,27 @@ impl McpToolWrapper {
             validator: Arc::new(validator),
             handle,
             side_effect_class,
+            egress: None,
         })
+    }
+
+    /// v60.28 H5 / H6 — opt into per-`call_tool` host allowlist enforcement
+    /// plus an `McpEgressEvent` row written through the existing audit
+    /// appender. Stdio servers should not call this; the launcher passes
+    /// the resolved URL, allowlist (defaulting to `[host(url)]`), and
+    /// audit dir for http/sse servers.
+    pub fn with_egress_audit(
+        mut self,
+        url: impl Into<String>,
+        allowed_hosts: Vec<String>,
+        audit_dir: PathBuf,
+    ) -> Self {
+        self.egress = Some(EgressContext {
+            url: url.into(),
+            allowed_hosts,
+            audit_dir,
+        });
+        self
     }
 
     pub fn server_name(&self) -> &str {
@@ -188,11 +223,58 @@ impl Tool for McpToolWrapper {
             }
         };
 
+        // v60.28 H5 — enforce the per-server allowed_hosts before egress.
+        if let Some(eg) = &self.egress {
+            if let Some(host) = host_of_url(&eg.url) {
+                if !eg.allowed_hosts.iter().any(|h| h == &host) {
+                    write_call_tool_audit(
+                        &eg.audit_dir,
+                        &self.server_name,
+                        &eg.url,
+                        &self.tool_name,
+                        McpEgressOutcome::Blocked,
+                        Some(format!("host {host:?} not in allowed_hosts")),
+                    );
+                    return Err(map_launch_error(
+                        &self.server_name,
+                        &self.tool_name,
+                        McpLaunchError::HostNotAllowed {
+                            name: self.server_name.clone(),
+                            host,
+                        },
+                    ));
+                }
+            }
+        }
+
         let result = self
             .handle
             .call_tool(self.tool_name.clone(), arguments)
             .await
-            .map_err(|e| map_launch_error(&self.server_name, &self.tool_name, e))?;
+            .map_err(|e| {
+                if let Some(eg) = &self.egress {
+                    write_call_tool_audit(
+                        &eg.audit_dir,
+                        &self.server_name,
+                        &eg.url,
+                        &self.tool_name,
+                        McpEgressOutcome::Failure,
+                        Some(format!("{e}")),
+                    );
+                }
+                map_launch_error(&self.server_name, &self.tool_name, e)
+            })?;
+
+        if let Some(eg) = &self.egress {
+            write_call_tool_audit(
+                &eg.audit_dir,
+                &self.server_name,
+                &eg.url,
+                &self.tool_name,
+                McpEgressOutcome::Success,
+                None,
+            );
+        }
 
         if result.is_error == Some(true) {
             // Server-side tool error.  Stringify the content blocks
@@ -223,6 +305,69 @@ impl Tool for McpToolWrapper {
             output,
             staged_writes: None,
         })
+    }
+}
+
+/// v60.28 H5 — parse the host portion of a URL string. Returns lowercase
+/// host without port. Tolerant of `scheme://host[:port]/path` shapes; no
+/// dependency on the `url` crate.
+pub(crate) fn host_of_url(url: &str) -> Option<String> {
+    let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .trim_end_matches('.');
+    // Strip optional `user@` prefix.
+    let authority = authority
+        .rsplit_once('@')
+        .map(|(_, h)| h)
+        .unwrap_or(authority);
+    // Strip `:port` suffix; defend against IPv6 brackets.
+    let host = if let Some(stripped) = authority.strip_prefix('[') {
+        // `[ipv6]:port` form — keep through the closing bracket.
+        stripped.split_once(']').map(|(h, _)| h).unwrap_or(stripped)
+    } else {
+        authority
+            .rsplit_once(':')
+            .map(|(h, _)| h)
+            .unwrap_or(authority)
+    };
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_ascii_lowercase())
+    }
+}
+
+/// v60.28 H6 — append one `call-tool` audit row through the existing
+/// `append_mcp_egress` appender. Logs (but does not propagate) I/O
+/// failures: an unwritable audit log must not silently block the call
+/// or break the dispatcher.
+fn write_call_tool_audit(
+    audit_dir: &std::path::Path,
+    server_name: &str,
+    url: &str,
+    tool_name: &str,
+    outcome: McpEgressOutcome,
+    reason: Option<String>,
+) {
+    let event = McpEgressEvent::new(
+        now_rfc3339(),
+        server_name,
+        url,
+        McpEgressPhase::CallTool,
+        outcome,
+        reason,
+        Some(tool_name.to_string()),
+    );
+    let path = audit_dir.join("audit.log");
+    if let Err(e) = append_mcp_egress(&path, &event) {
+        tracing::warn!(
+            target = "atelier::mcp::audit",
+            error = %e,
+            "append_mcp_egress call_tool row dropped for path={path:?}",
+        );
     }
 }
 
@@ -482,5 +627,73 @@ mod tests {
         let bad = json!({ "count": "five" });
         let err = validate_args_against(&v, &bad).expect_err("type mismatch must fail");
         assert!(!err.is_empty());
+    }
+
+    // ---------- v60.28 H5 host parsing ----------
+
+    #[test]
+    fn host_of_url_strips_scheme_port_path() {
+        assert_eq!(
+            host_of_url("https://search.example.com/mcp?x=1"),
+            Some("search.example.com".into())
+        );
+        assert_eq!(
+            host_of_url("http://127.0.0.1:8080/mcp"),
+            Some("127.0.0.1".into())
+        );
+        assert_eq!(
+            host_of_url("https://user:pass@host.example/"),
+            Some("host.example".into())
+        );
+        assert_eq!(host_of_url("https://[::1]:9000/mcp"), Some("::1".into()));
+    }
+
+    #[test]
+    fn host_of_url_lowercases() {
+        assert_eq!(
+            host_of_url("https://Search.Example.COM/mcp"),
+            Some("search.example.com".into())
+        );
+    }
+
+    // ---------- v60.28 H6 audit row shape ----------
+
+    #[test]
+    fn write_call_tool_audit_emits_one_ndjson_row() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let audit = dir.path();
+        write_call_tool_audit(
+            audit,
+            "search",
+            "https://search.example/mcp",
+            "list_index",
+            McpEgressOutcome::Success,
+            None,
+        );
+        let body = std::fs::read_to_string(audit.join("audit.log")).expect("audit row landed");
+        let row: McpEgressEvent = serde_json::from_str(body.lines().next().unwrap()).unwrap();
+        assert_eq!(row.kind, "mcp-http-request");
+        assert_eq!(row.provider, "search");
+        assert_eq!(row.phase, "call-tool");
+        assert_eq!(row.outcome, "success");
+        assert_eq!(row.tool_name.as_deref(), Some("list_index"));
+    }
+
+    #[test]
+    fn write_call_tool_audit_records_blocked_host() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let audit = dir.path();
+        write_call_tool_audit(
+            audit,
+            "search",
+            "https://evil.example/mcp",
+            "list_index",
+            McpEgressOutcome::Blocked,
+            Some("host \"evil.example\" not in allowed_hosts".into()),
+        );
+        let body = std::fs::read_to_string(audit.join("audit.log")).expect("audit row landed");
+        let row: McpEgressEvent = serde_json::from_str(body.lines().next().unwrap()).unwrap();
+        assert_eq!(row.outcome, "blocked");
+        assert!(row.reason.unwrap().contains("evil.example"));
     }
 }
