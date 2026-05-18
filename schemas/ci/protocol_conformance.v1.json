@@ -1,0 +1,103 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://atelier.example/schemas/ci/protocol_conformance.v1.json",
+  "title": "Phase B §2 real-model conformance nightly result",
+  "description": "One nightly run of the Phase B §2 conformance gate. Written by .github/workflows/nightly_phase_b_gate.yml to tests/phase_b_gate/last_run.json, validated by tests/validate_artifacts.py on every PR, and read by the `atelier-conformance-status` binary. Records per-strategy `ConformanceSummary` rows + the aggregate `ConformanceStatus` verdict (green/yellow/red) against the `PHASE_B_CONFORMANCE_FLOOR` (PROVISIONAL 0.95 per spec §2). The 7-night calibration window per `tasks/phase_b_closeout.md` decision row #3 records-only for the first week; once `calibration_phase` flips to `false`, the workflow asserts against `max(0.95, observed_p5)` from the rolling 7-day window.",
+  "type": "object",
+  "required": [
+    "version",
+    "run_id",
+    "git_sha",
+    "all_passed",
+    "status",
+    "calibration_phase",
+    "summaries"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "version": {"const": 1, "description": "Schema version."},
+    "run_id": {
+      "type": "string",
+      "format": "date-time",
+      "description": "RFC 3339 timestamp the run completed at. Acts as the natural key for run-to-run comparison + rolling-window p5 computation."
+    },
+    "git_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{7,40}$",
+      "description": "Commit the gate ran against. Short or full sha both accepted."
+    },
+    "workflow_run_url": {
+      "type": "string",
+      "format": "uri",
+      "description": "GitHub Actions run URL for debugging. Optional; missing for local runs."
+    },
+    "all_passed": {
+      "type": "boolean",
+      "description": "True iff the run's verdict is `green` OR `yellow` (the calibration phase keeps the nightly green even when below floor — see `calibration_phase`). `red` flips this to false."
+    },
+    "status": {
+      "$ref": "#/$defs/ConformanceStatus",
+      "description": "Aggregate verdict per the protocol_conformance::ConformanceStatus::for_run lattice."
+    },
+    "calibration_phase": {
+      "type": "boolean",
+      "description": "True during the first 7 nights of records-only operation. While true, the workflow does NOT assert against the floor — the artifact records the rate but `all_passed` only flips on red verdicts emanating from below-floor evidence (which the for_run lattice currently treats as Yellow during calibration). After 7 nights of green data, the maintainer flips this to false in the workflow + reruns; future evidence asserts at `max(0.95, observed_p5)`."
+    },
+    "floor": {
+      "type": "number",
+      "minimum": 0.0,
+      "maximum": 1.0,
+      "description": "Effective floor the run was compared against. Equal to PHASE_B_CONFORMANCE_FLOOR (0.95) during calibration; equal to max(0.95, observed_p5) once calibration completes. Optional — older artifacts may pre-date the field."
+    },
+    "summaries": {
+      "type": "array",
+      "minItems": 0,
+      "items": {"$ref": "#/$defs/ConformanceSummary"},
+      "description": "One row per emission strategy the model actually used. Order is the runner's emission order (NativeTool < JsonSentinel < RegexProse). An empty array is allowed in artifacts written when no conformance data was captured — the schema accepts it; the status binary surfaces it as `Yellow: no evidence`."
+    },
+    "providers_tested": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"type": "string"},
+      "description": "Provider strings (e.g. `anthropic:claude-haiku-4-5`, `openai-compat:gpt-4o-mini`) the run exercised. Optional in v1 so a pre-Track-B artifact (anthropic-only) is still valid."
+    }
+  },
+  "$defs": {
+    "ConformanceStatus": {
+      "enum": ["green", "yellow", "red"],
+      "description": "Stable wire labels from atelier_core::protocol_conformance::ConformanceStatus::wire_label(). Pinned by `conformance_status_wire_labels_are_stable`."
+    },
+    "Strategy": {
+      "enum": ["native_tool", "json_sentinel", "regex_prose"],
+      "description": "Stable wire labels from atelier_core::protocol_strategy::Strategy::as_str()."
+    },
+    "ConformanceSummary": {
+      "type": "object",
+      "required": ["strategy", "total_turns", "malformed_turns", "rate"],
+      "additionalProperties": false,
+      "properties": {
+        "strategy": {"$ref": "#/$defs/Strategy"},
+        "total_turns": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Total envelope-parse attempts observed for this strategy during the run."
+        },
+        "malformed_turns": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Subset of total_turns where the envelope failed to parse. The runner's degradation policy fires on the rolling-window failure ratio (see DEFAULT_DEGRADATION_WINDOW / DEFAULT_DEGRADATION_THRESHOLD); the nightly artifact reports the run-level number."
+        },
+        "rate": {
+          "type": "number",
+          "minimum": 0.0,
+          "maximum": 1.0,
+          "description": "Success rate: (total_turns - malformed_turns) / total_turns. 0.0 when total_turns == 0 (the summaries() projection suppresses rows in that case)."
+        },
+        "verdict": {
+          "$ref": "#/$defs/ConformanceStatus",
+          "description": "Per-strategy verdict from ConformanceStatus::for_summary against the effective floor + min_window. Optional — older artifacts may pre-date the field."
+        }
+      }
+    }
+  }
+}

@@ -50,6 +50,16 @@ pub const DEFAULT_DEGRADATION_WINDOW: usize = 20;
 /// downshift. See [`ConformanceRingBuffer::should_degrade`].
 pub const DEFAULT_DEGRADATION_THRESHOLD: u32 = 3;
 
+/// PROVISIONAL — spec §2 "≥95% real-model conformance" floor. Used by
+/// the Phase B nightly gate (`tests/phase_b_gate/last_run.json`) and
+/// the `atelier-conformance-status` reader binary. The Phase B closeout
+/// plan ratifies the calibration window: record-for-7-nights, then
+/// assert at `max(0.95, observed_p5)` — so this constant is the floor,
+/// not the only knob. Once the calibration window completes, the
+/// nightly workflow uses the rolling-7-day p5 if it exceeds 0.95.
+/// See `tasks/phase_b_closeout.md` decision row #3 and **L-D-6**.
+pub const PHASE_B_CONFORMANCE_FLOOR: f32 = 0.95;
+
 /// Per-turn tracker. One instance is created at the start of each turn and
 /// driven by the BYOM adapter's envelope-parse loop:
 ///
@@ -202,6 +212,122 @@ impl ConformanceSnapshot {
     /// for the common "skip the threshold check until we have data" pattern.
     pub fn has_evidence(&self) -> bool {
         self.total > 0
+    }
+
+    /// Phase B Track A — project the snapshot into one
+    /// [`ConformanceSummary`] row per observed strategy. The Phase B
+    /// nightly gate writes these rows to
+    /// `tests/phase_b_gate/last_run.json` per
+    /// `schemas/ci/protocol_conformance.v1.json` — one row per
+    /// strategy is more useful than the aggregate rate because the
+    /// runner's degradation policy is per-strategy.
+    pub fn summaries(&self) -> Vec<ConformanceSummary> {
+        self.by_strategy
+            .iter()
+            .map(|(strategy, total, successes)| {
+                let total_u = *total;
+                let malformed = total_u - *successes;
+                let rate = if total_u == 0 {
+                    0.0
+                } else {
+                    *successes as f32 / total_u as f32
+                };
+                ConformanceSummary {
+                    strategy: *strategy,
+                    total_turns: total_u as u32,
+                    malformed_turns: malformed as u32,
+                    rate,
+                }
+            })
+            .collect()
+    }
+}
+
+/// Phase B Track A — per-strategy projection of [`ConformanceSnapshot`].
+/// One row per emission strategy the model has actually used during the
+/// run, with the absolute counts and the success rate. Written to the
+/// nightly artifact at `tests/phase_b_gate/last_run.json` per
+/// `schemas/ci/protocol_conformance.v1.json` and read by the
+/// `atelier-conformance-status` binary.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ConformanceSummary {
+    pub strategy: Strategy,
+    pub total_turns: u32,
+    pub malformed_turns: u32,
+    /// Success rate as a fraction in `[0.0, 1.0]`. `0.0` when
+    /// `total_turns == 0` (the per-strategy row is suppressed in
+    /// `summaries()` in that case, so the floor only matters for
+    /// directly-constructed instances).
+    pub rate: f32,
+}
+
+/// Phase B Track A — verdict for one nightly run, against the
+/// PROVISIONAL §2 "≥95%" floor (see [`PHASE_B_CONFORMANCE_FLOOR`]) or a
+/// calibrated higher threshold from the rolling 7-day p5.
+///
+/// Modelled as a three-state lattice per **L-D-3** — same tier/fallback
+/// shape as `VerificationTier` and `LspInstallOutcome`. Stable wire
+/// labels (`green` / `yellow` / `red`) pinned by
+/// [`Self::wire_label`] + the agreement test below per **L-D-5**.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConformanceStatus {
+    /// All recorded strategies are at-or-above the threshold AND the
+    /// run has enough evidence (sample count ≥ window). The Phase B
+    /// nightly gate emits `Phase B §2: GREEN` in this state.
+    Green,
+    /// Below threshold OR insufficient evidence (still inside the
+    /// 7-night calibration window). Informational; does not flip the
+    /// nightly's `all_passed` to `false` so the calibration phase
+    /// doesn't pre-emptively go red.
+    Yellow,
+    /// At least one strategy is below the floor with enough evidence
+    /// to be confident. The Phase B nightly gate emits
+    /// `Phase B §2: RED` and flips `all_passed`.
+    Red,
+}
+
+impl ConformanceStatus {
+    /// Stable wire label used by the JSON artifact + the status binary.
+    /// Pinned by `conformance_status_wire_labels_are_stable` so a
+    /// variant rename forces a deliberate edit on the wire side.
+    pub fn wire_label(self) -> &'static str {
+        match self {
+            Self::Green => "green",
+            Self::Yellow => "yellow",
+            Self::Red => "red",
+        }
+    }
+
+    /// Verdict for a single per-strategy summary row against `floor`.
+    /// `min_window` is the evidence threshold below which we return
+    /// `Yellow` regardless of rate (the calibration window per **L-D-6**).
+    pub fn for_summary(summary: &ConformanceSummary, floor: f32, min_window: u32) -> Self {
+        if summary.total_turns < min_window {
+            return Self::Yellow;
+        }
+        if summary.rate >= floor {
+            Self::Green
+        } else {
+            Self::Red
+        }
+    }
+
+    /// Aggregate verdict over a slice of per-strategy rows. **Red** if
+    /// any row is `Red`; otherwise **Yellow** if any row is `Yellow`;
+    /// otherwise **Green**. Empty slice → **Yellow** (no evidence).
+    pub fn for_run(summaries: &[ConformanceSummary], floor: f32, min_window: u32) -> Self {
+        if summaries.is_empty() {
+            return Self::Yellow;
+        }
+        let mut acc = Self::Green;
+        for s in summaries {
+            match Self::for_summary(s, floor, min_window) {
+                Self::Red => return Self::Red,
+                Self::Yellow => acc = Self::Yellow,
+                Self::Green => {}
+            }
+        }
+        acc
     }
 }
 
@@ -587,5 +713,119 @@ mod tests {
         // forced to update this test.
         assert_eq!(DEFAULT_DEGRADATION_WINDOW, 20);
         assert_eq!(DEFAULT_DEGRADATION_THRESHOLD, 3);
+    }
+
+    // ---------- Phase B Track A — ConformanceSummary / Status ----------
+
+    #[test]
+    fn conformance_status_wire_labels_are_stable() {
+        // Pinned so a variant rename forces a deliberate change — the
+        // nightly artifact + the status binary consume these strings.
+        assert_eq!(ConformanceStatus::Green.wire_label(), "green");
+        assert_eq!(ConformanceStatus::Yellow.wire_label(), "yellow");
+        assert_eq!(ConformanceStatus::Red.wire_label(), "red");
+    }
+
+    #[test]
+    fn phase_b_conformance_floor_is_the_spec_provisional_value() {
+        // Pin the floor against the spec text — a calibration revision
+        // that nudges the floor must update this test.
+        assert!((PHASE_B_CONFORMANCE_FLOOR - 0.95).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn summaries_breaks_down_per_strategy_with_rate() {
+        let mut b = ConformanceRingBuffer::new();
+        // 8 native-tool, 7 successful → rate 0.875
+        for i in 0..8 {
+            if i < 7 {
+                b.record_success(Strategy::NativeTool);
+            } else {
+                b.record_failure(Strategy::NativeTool);
+            }
+        }
+        // 4 json-sentinel, 4 successful → rate 1.0
+        for _ in 0..4 {
+            b.record_success(Strategy::JsonSentinel);
+        }
+        let summaries = b.snapshot().summaries();
+        assert_eq!(
+            summaries.len(),
+            2,
+            "two strategies observed; got {summaries:?}"
+        );
+        let nt = summaries
+            .iter()
+            .find(|s| s.strategy == Strategy::NativeTool)
+            .unwrap();
+        assert_eq!(nt.total_turns, 8);
+        assert_eq!(nt.malformed_turns, 1);
+        assert!((nt.rate - 0.875).abs() < 1e-4);
+        let js = summaries
+            .iter()
+            .find(|s| s.strategy == Strategy::JsonSentinel)
+            .unwrap();
+        assert_eq!(js.total_turns, 4);
+        assert_eq!(js.malformed_turns, 0);
+        assert!((js.rate - 1.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn for_run_returns_yellow_below_min_window_regardless_of_rate() {
+        // 5 turns is below the typical 20-turn window — even at 100%
+        // success we don't have enough evidence to call it Green.
+        let summary = ConformanceSummary {
+            strategy: Strategy::NativeTool,
+            total_turns: 5,
+            malformed_turns: 0,
+            rate: 1.0,
+        };
+        assert_eq!(
+            ConformanceStatus::for_run(&[summary], PHASE_B_CONFORMANCE_FLOOR, 20),
+            ConformanceStatus::Yellow,
+        );
+    }
+
+    #[test]
+    fn for_run_returns_red_when_one_strategy_below_floor() {
+        let nt = ConformanceSummary {
+            strategy: Strategy::NativeTool,
+            total_turns: 30,
+            malformed_turns: 0,
+            rate: 1.0,
+        };
+        let js = ConformanceSummary {
+            strategy: Strategy::JsonSentinel,
+            total_turns: 30,
+            // 80% — well below the 95% floor.
+            malformed_turns: 6,
+            rate: 0.80,
+        };
+        assert_eq!(
+            ConformanceStatus::for_run(&[nt, js], PHASE_B_CONFORMANCE_FLOOR, 20),
+            ConformanceStatus::Red,
+        );
+    }
+
+    #[test]
+    fn for_run_returns_green_when_all_strategies_meet_floor_with_evidence() {
+        let nt = ConformanceSummary {
+            strategy: Strategy::NativeTool,
+            total_turns: 30,
+            malformed_turns: 1,
+            rate: 0.967,
+        };
+        assert_eq!(
+            ConformanceStatus::for_run(&[nt], PHASE_B_CONFORMANCE_FLOOR, 20),
+            ConformanceStatus::Green,
+        );
+    }
+
+    #[test]
+    fn for_run_returns_yellow_when_summaries_empty() {
+        assert_eq!(
+            ConformanceStatus::for_run(&[], PHASE_B_CONFORMANCE_FLOOR, 20),
+            ConformanceStatus::Yellow,
+        );
     }
 }

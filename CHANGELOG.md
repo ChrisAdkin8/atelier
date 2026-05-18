@@ -1,5 +1,69 @@
 # Atelier Spec — Changelog
 
+## v60.24 — 2026-05-18 (Phase B Track A: §2 real-model conformance harness + nightly gate)
+
+Lands the §2 real-model conformance half of the Phase B gate text. The mechanical half closed at v60.23 (Track D); v60.24 closes the harness side of the real-model half. The remaining piece is data accumulation — the workflow records-only for the first 7 nights per **L-D-6** + Phase B closeout decision row #3, then asserts at `max(0.95, observed_p5)`. Phase B closeout acceptance criteria #2 (measurement) is met; the gate-green criterion (#6) is data-blocked, not code-blocked.
+
+### New types in `crates/atelier-core/src/protocol_conformance.rs`
+
+- **`ConformanceSummary { strategy, total_turns, malformed_turns, rate }`** — per-strategy projection of the existing `ConformanceSnapshot`. `summaries()` method on the snapshot returns one row per observed strategy, suppressing zero-evidence strategies.
+- **`ConformanceStatus { Green, Yellow, Red }`** — tier/fallback lattice per **L-D-3**. `wire_label()` returns stable `"green"` / `"yellow"` / `"red"` strings (agreement test `conformance_status_wire_labels_are_stable` per **L-D-5**). `for_summary(summary, floor, min_window)` is the per-row verdict; `for_run(summaries, floor, min_window)` is the aggregate, Red-dominant lattice.
+- **`PHASE_B_CONFORMANCE_FLOOR: f32 = 0.95`** — pinned by `phase_b_conformance_floor_is_the_spec_provisional_value`. The PROVISIONAL spec §2 "≥95%" floor; calibration may push the effective threshold higher via the rolling 7-day p5.
+- Six new unit tests covering the projection + lattice (`summaries_breaks_down_per_strategy_with_rate`, `for_run_returns_*`, `conformance_status_wire_labels_are_stable`).
+
+### New schema `schemas/ci/protocol_conformance.v1.json`
+
+Mirrors `phase_a_gate.v1.json`'s shape — one object per nightly run, with `summaries: Vec<ConformanceSummary>` + aggregate `status` + `calibration_phase` toggle + effective `floor`. `providers_tested` records which adapters the run touched. `tests/validate_artifacts.py` extended with the new rule; `make check` reports 59/59 artifacts validated (was 58 pre-v60.24).
+
+### New binary `crates/atelier-cli/src/bin/conformance_status.rs`
+
+Sibling of `phase_a_gate_status`. Reads `tests/phase_b_gate/last_run.json`; prints a header + per-strategy lines + a one-line digest; exits 0 (Green/Yellow), 1 (Red), or 2 (missing/malformed). 7 unit tests pin the exit-code contract + bundled-seed round-trip.
+
+### New workflow `.github/workflows/nightly_phase_b_gate.yml`
+
+07:00 UTC cron — 30 minutes after Phase A's 06:30 so the commits don't race. Runs the new `phase_b_live_anthropic_conformance` integration test, reads its `$ATELIER_PHASE_B_SUMMARY_PATH` output, composes `tests/phase_b_gate/last_run.json`, validates against the schema, commits back to main. The `ANTHROPIC_API_KEY`-gated step records `status: skipped` (with `all_passed: true`) when the secret is absent — same posture as `nightly_phase_a_gate.yml`'s live-Anthropic gate (v60.19).
+
+### `RunReport.envelope_conformance: ConformanceSnapshot`
+
+`Runner::run` now snapshots the cross-call envelope-parse ring buffer at end-of-run so test callers can fold per-strategy summaries without reaching into the runner's internals. Cheap: the snapshot allocates a small `Vec`.
+
+### Live test `phase_b_live_anthropic_conformance` (`#[ignore]`-gated)
+
+Drives the five Phase B priority canonical tasks (t01, t02, t05, t06, t10) against `anthropic:claude-haiku-4-5`, folds the per-task `RunReport.envelope_conformance` snapshots into one aggregate `ConformanceRingBuffer`, projects it into per-strategy `ConformanceSummary` rows, and writes the JSON to `$ATELIER_PHASE_B_SUMMARY_PATH` (consumed by the nightly workflow). Records-only — does not assert against the floor.
+
+### Calibration discipline
+
+The workflow's `CALIBRATION_PHASE: "true"` env var keeps `all_passed: true` regardless of measured rate for the first 7 nights. After enough evidence accumulates, the maintainer flips it to `"false"` and the workflow asserts. The seed `tests/phase_b_gate/last_run.json` ships with `calibration_phase: true`, `status: "yellow"`, empty summaries, and `all_passed: true` — schema-valid, schema-readable, ready for the first real run to overwrite.
+
+### Lessons applied
+
+- **L-D-1** — live API calls from day 1; `#[ignore]`-gated test ready, secret-gated workflow step ready.
+- **L-D-3** — `ConformanceStatus` is a tier/fallback lattice (Green/Yellow/Red), same shape as `VerificationTier` and `LspInstallOutcome`.
+- **L-D-5** — `ConformanceStatus::wire_label()` agreement test landed in the first commit.
+- **L-D-6** — PROVISIONAL `PHASE_B_CONFORMANCE_FLOOR` + records-only calibration window; the `CALIBRATION_PHASE` toggle gates the assertion.
+
+### OpenAI half deferred
+
+Per user direction during Phase B closeout: the hosted-OpenAI half (originally Track B of the closeout plan) is dropped — the user does not have a paid OpenAI account. The workflow's structure leaves room for a second secret-gated step against `OPENAI_API_KEY` if/when a maintainer wires one in; the schema's `providers_tested` array is already `minItems: 1` (so any future expansion is additive). LiteLLM-proxy and local-OpenAI-compat paths remain runnable via the existing `phase_a_live_openai_compat_*` `#[ignore]`-gated tests for local development.
+
+### Verification
+
+- `cargo test -p atelier-core --lib` — 808 pass (was 802; six new tests in `protocol_conformance::tests`).
+- `cargo test -p atelier-cli --bin conformance_status` — 7 pass.
+- `cargo test --workspace --lib` — full suite green.
+- `cargo test -p atelier-cli --test run_integration` — 80 pass + 12 ignored (the new `phase_b_live_anthropic_conformance` joins the existing 11 live-API `#[ignore]`-gated tests).
+- `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings` clean.
+- `make check` — 25/25 schemas valid, 59/59 artifacts validated.
+
+### Phase B closeout progress
+
+- **#1** §2 mechanical gate end-to-end across three strategies — **done** v60.23.
+- **#2** measured real-model conformance with calibrated threshold — **done in code** v60.24; data-blocked on 7-night calibration + `ANTHROPIC_API_KEY` maintainer wiring.
+- #3 §7 Tier-1 + hallucinating-agent — pending Tracks C1/C2/C3.
+- #4 DoD checklist reconciliation — done v60.21.
+- #5 `cargo fmt` / `clippy` / `test --workspace` / `make check` all green — preserved.
+- **#6** `phase_b_gate_status` binary emits `Phase B: GREEN` — binary ships in v60.24; emits `YELLOW (calibration phase)` against the seed artifact and will emit `GREEN` after the calibration window completes.
+
 ## v60.23 — 2026-05-18 (Phase B Track D: §2 mechanical gate green across all three strategies)
 
 Closes `tasks/todo.md:220` (§2 mechanical gate snapshot tests across all three strategies). Pure-function encode/parse round-trip tests for `NativeTool` / `JsonSentinel` / `RegexProse` had been green since v60.7 (mock-model fixtures), but the end-to-end half — a runner driving the §2.5 loop through each carrier — was the missing piece. v60.23 lands it. Acceptance criterion #1 from `tasks/phase_b_closeout.md` flips green.

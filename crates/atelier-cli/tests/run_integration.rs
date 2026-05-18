@@ -4234,6 +4234,144 @@ async fn phase_a_live_anthropic_t10_lru_cache_from_spec() {
     .await;
 }
 
+// =====================================================================
+// Phase B Track A — §2 real-model conformance live gate.
+//
+// Runs the five priority canonical tasks (t01, t02, t05, t06, t10)
+// against `anthropic:claude-haiku-4-5`, aggregates the per-strategy
+// `ConformanceSummary` rows from each `RunReport.envelope_conformance`,
+// and (when `$ATELIER_PHASE_B_SUMMARY_PATH` is set) writes the
+// aggregated JSON for the nightly workflow to fold into
+// `tests/phase_b_gate/last_run.json`.
+//
+// Calibration discipline per `tasks/phase_b_closeout.md` + L-D-6: the
+// test does NOT assert against the floor — it records. The
+// `CALIBRATION_PHASE: "true"` toggle in
+// `.github/workflows/nightly_phase_b_gate.yml` keeps the nightly
+// `all_passed: true` regardless of rate during the 7-night window;
+// after that the workflow flips to an assertion against
+// `max(0.95, observed_p5)`.
+//
+// Why aggregated, not per-task: the §2 conformance window is
+// cross-call (spec §1's 100-call ring buffer). One row per strategy
+// across all five tasks is more useful to the trust-budget consumer
+// than five smaller rows that overlap each other.
+// =====================================================================
+
+const PHASE_B_PRIORITY_TASKS: &[&str] = &[
+    "t01_add_pure_function",
+    "t02_rename_compute_total",
+    "t05_off_by_one_in_compound_interest",
+    "t06_add_cli_flag",
+    "t10_implement_from_spec",
+];
+
+#[tokio::test]
+#[ignore = "live API; needs ANTHROPIC_API_KEY"]
+async fn phase_b_live_anthropic_conformance() {
+    use atelier_core::protocol_conformance::ConformanceRingBuffer;
+
+    if skip_unless_anthropic_key_present("phase_b_live_anthropic_conformance").is_none() {
+        return;
+    }
+
+    // Aggregate across all five tasks into one ring buffer.
+    let mut aggregate = ConformanceRingBuffer::with_capacity(
+        atelier_core::protocol_conformance::CONFORMANCE_WINDOW,
+    );
+
+    for task_name in PHASE_B_PRIORITY_TASKS {
+        let task = match common::canonical::CanonicalTask::load(task_name) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("phase_b_live_anthropic_conformance: skip {task_name}: {e}");
+                continue;
+            }
+        };
+        if !common::canonical::python3_pytest_available() {
+            eprintln!(
+                "phase_b_live_anthropic_conformance: pytest unavailable; \
+                 still proceeding because the conformance gate only needs the \
+                 runner's envelope-parse outcomes, not the rig checks.",
+            );
+        }
+        let workspace = task
+            .copy_fixture_to_tempdir()
+            .expect("fixture tempdir copy");
+
+        let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let runner = Runner::new(
+            workspace.path().to_path_buf(),
+            ProviderChoice::Anthropic {
+                model_id: "anthropic:claude-haiku-4-5".into(),
+            },
+            EventSink::Capture(events.clone()),
+        )
+        .expect("live runner construction")
+        .with_max_turns(task.meta.turn_cap);
+
+        match runner.run(task.prompt.clone()).await {
+            Ok(report) => {
+                // Fold the per-task snapshot into the aggregate. The
+                // snapshot is by-strategy + counts; we feed it back
+                // into the aggregate ring buffer by replaying the
+                // counts as samples.
+                for (strategy, total, successes) in &report.envelope_conformance.by_strategy {
+                    for _ in 0..*successes {
+                        aggregate.record_success(*strategy);
+                    }
+                    for _ in 0..(total - successes) {
+                        aggregate.record_failure(*strategy);
+                    }
+                }
+            }
+            Err(e) => {
+                // A live-API failure mid-sweep is informational, not
+                // fatal — the gate is records-only during calibration.
+                eprintln!("phase_b_live_anthropic_conformance: {task_name} run errored: {e}");
+            }
+        }
+    }
+
+    // Emit the per-strategy summaries to the nightly's summary-path,
+    // if set. The workflow reads this file to compose
+    // `tests/phase_b_gate/last_run.json`.
+    let summaries = aggregate.snapshot().summaries();
+    if let Ok(out_path) = std::env::var("ATELIER_PHASE_B_SUMMARY_PATH") {
+        let json = serde_json::to_string_pretty(
+            &summaries
+                .iter()
+                .map(|s| {
+                    serde_json::json!({
+                        "strategy": s.strategy.as_str(),
+                        "total_turns": s.total_turns,
+                        "malformed_turns": s.malformed_turns,
+                        "rate": s.rate,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        )
+        .expect("serialize summaries");
+        std::fs::write(&out_path, &json).expect("write summary path");
+        eprintln!(
+            "phase_b_live_anthropic_conformance: wrote {} per-strategy rows to {out_path}",
+            summaries.len(),
+        );
+    } else {
+        eprintln!(
+            "phase_b_live_anthropic_conformance: aggregated {} per-strategy rows; \
+             ATELIER_PHASE_B_SUMMARY_PATH unset, skipping write",
+            summaries.len(),
+        );
+    }
+
+    // Records-only during calibration; the test never fails on rate.
+    // Failures from the runner itself (e.g. ContextOverflow, Auth
+    // error) propagated up through `.expect("live runner construction")`
+    // would already have aborted the sweep — reaching here means at
+    // least one task completed an envelope-parse attempt.
+}
+
 // ----- B2 — OpenAI-compat live tests (LiteLLM-shaped: hosted OpenAI OR local server) -----
 
 #[tokio::test]

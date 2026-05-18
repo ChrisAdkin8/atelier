@@ -160,6 +160,14 @@ pub struct RunReport {
     /// `None` when no DoD config was found — the harness doesn't fail
     /// closed in that case; it's a soft "no DoD configured" state.
     pub dod_passed: Option<bool>,
+    /// Phase B Track A — final snapshot of the per-session envelope-parse
+    /// conformance ring buffer. Lets the Phase B nightly gate test
+    /// (`phase_b_live_anthropic_conformance`) aggregate per-strategy
+    /// success rates without re-driving the loop. Empty when the run
+    /// produced zero envelope-parse attempts (a degenerate failure mode;
+    /// the runner emits at least one attempt per turn under normal
+    /// operation).
+    pub envelope_conformance: atelier_core::protocol_conformance::ConformanceSnapshot,
 }
 
 /// Shared slot a caller registers via [`Runner::with_dispatcher_handle`]
@@ -1995,11 +2003,18 @@ impl Runner {
         // doesn't hang the test or CLI process.
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), sink_handle).await;
 
+        // Phase B Track A — snapshot the conformance ring buffer at
+        // end-of-run so test callers (and the nightly gate) can fold
+        // per-strategy summaries without reaching into the runner's
+        // internals. Cheap: the snapshot allocates a small Vec.
+        let envelope_conformance = envelope_conformance.snapshot();
+
         Ok(RunReport {
             session_id,
             turns,
             final_state,
             dod_passed,
+            envelope_conformance,
         })
     }
 }

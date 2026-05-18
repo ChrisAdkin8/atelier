@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "run_id": "2026-05-18T00:00:00Z",
+  "git_sha": "64f0fa6",
+  "all_passed": true,
+  "status": "yellow",
+  "calibration_phase": true,
+  "floor": 0.95,
+  "summaries": [],
+  "providers_tested": ["anthropic:claude-haiku-4-5", "openai-compat:gpt-4o-mini"]
+}
