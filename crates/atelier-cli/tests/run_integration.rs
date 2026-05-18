@@ -26,6 +26,14 @@ use atelier_core::State;
 // inside the included `runner` module.
 #[path = "../src/instrumentation.rs"]
 mod instrumentation;
+// §1 BYOM (v60.9) — runner.rs references `crate::compaction::compact`
+// for the context-overflow Compact arm. Mount `compaction` (and its
+// dependency `compaction_blob`) the same way `instrumentation` is
+// mounted so the path resolves inside the integration-test crate.
+#[path = "../src/compaction.rs"]
+mod compaction;
+#[path = "../src/compaction_blob.rs"]
+mod compaction_blob;
 #[path = "../src/runner.rs"]
 mod runner;
 use runner::{DispatcherHandle, EventSink, MockResponse, ProviderChoice, Runner};
@@ -69,6 +77,7 @@ async fn run_broadcasts_message_plan_ledger_and_context_events() {
     let responses = vec![MockResponse {
         assistant_text: "doing the write".into(),
         tool_calls: vec![write_call, mock_envelope_tool_call(&envelope_done())],
+        overflow: None,
     }];
 
     let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -132,6 +141,92 @@ async fn run_broadcasts_message_plan_ledger_and_context_events() {
     );
 }
 
+// §1 BYOM context-window asymmetry (v60.9).
+//
+// Turn 1: MockAdapter returns `AdapterError::ContextOverflow { needed: 50, limit: 100 }`.
+// The runner's Compact arm then issues a summary call (response #2 = the
+// summary text), publishes `Event::ContextOverflowResolved { resolution:
+// "compacted", … }`, and retries the turn — which pops response #3, a
+// normal envelope with `claimed_done`.  The session reaches `State::Done`.
+//
+// The runner inserts the initial user prompt as a context item before
+// turn 1 starts, so the auto-selector always has at least one
+// unpinned candidate to compact. We feed the model a moderately long
+// prompt so the freed token count is non-trivial.
+#[tokio::test]
+async fn run_recovers_from_context_overflow_via_compact_policy() {
+    let workspace = tempfile::TempDir::new().unwrap();
+
+    // Three queued responses (in order):
+    //   1. ContextOverflow — first chat call on turn 1.
+    //   2. Summary text — the compaction orchestrator's adapter call.
+    //   3. Happy envelope with claimed_done — the retry of turn 1.
+    let responses = vec![
+        MockResponse::context_overflow(50, 100),
+        MockResponse::new("Summary: covers prompt + seeded items.", vec![]),
+        MockResponse::new("ok, done", vec![mock_envelope_tool_call(&envelope_done())]),
+    ];
+
+    let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+
+    let runner = Runner::new(
+        workspace.path().to_path_buf(),
+        ProviderChoice::Mock { responses },
+        EventSink::Capture(events.clone()),
+    )
+    .expect("mock runner construction is infallible")
+    .with_max_turns(2);
+
+    // Long enough prompt that its char/4 approximation yields >0
+    // tokens so the auto-selector picks at least one item.
+    let prompt = "demonstrate the §1 context-overflow recovery path \
+                  with a deliberately long prompt that the auto-selector \
+                  can pick up and compact away on the first overflow."
+        .to_string();
+
+    let report = runner.run(prompt).await.expect("run must succeed");
+    assert_eq!(report.final_state, State::Done);
+
+    // Pin the contract: a ContextOverflowResolved { resolution:
+    // "compacted", … } landed on the bus before the run terminated.
+    let captured = events.lock();
+    let resolved = captured
+        .iter()
+        .find_map(|e| match e {
+            Event::ContextOverflowResolved {
+                resolution,
+                freed_tokens,
+                items_compacted,
+            } => Some((*resolution, *freed_tokens, *items_compacted)),
+            _ => None,
+        })
+        .expect("ContextOverflowResolved must be emitted");
+    assert_eq!(resolved.0, "compacted");
+    assert!(
+        resolved.1.is_some_and(|t| t > 0),
+        "freed_tokens must be populated and > 0; got {:?}",
+        resolved.1
+    );
+    assert!(
+        resolved.2.is_some_and(|n| n >= 1),
+        "items_compacted must be populated and >= 1; got {:?}",
+        resolved.2
+    );
+
+    // Also pin the side-effect: a CompactionExecuted event landed (the
+    // v60.5 terminal marker fires from the dispatcher, regardless of
+    // the overflow context — its presence proves the auto-compaction
+    // actually ran instead of being a no-op surface).
+    let compaction_count = captured
+        .iter()
+        .filter(|e| matches!(e, Event::CompactionExecuted { .. }))
+        .count();
+    assert_eq!(
+        compaction_count, 1,
+        "expected exactly one CompactionExecuted; got {compaction_count}"
+    );
+}
+
 #[tokio::test]
 async fn run_loops_until_claimed_done_and_reaches_terminal_state() {
     let workspace = tempfile::TempDir::new().unwrap();
@@ -139,6 +234,7 @@ async fn run_loops_until_claimed_done_and_reaches_terminal_state() {
     let responses = vec![MockResponse {
         assistant_text: "ack".into(),
         tool_calls: vec![mock_envelope_tool_call(&envelope_done())],
+        overflow: None,
     }];
 
     let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -177,10 +273,12 @@ async fn run_dispatches_real_tool_calls_and_loops() {
         MockResponse {
             assistant_text: "writing".into(),
             tool_calls: vec![write_call],
+            overflow: None,
         },
         MockResponse {
             assistant_text: "done".into(),
             tool_calls: vec![mock_envelope_tool_call(&envelope_done())],
+            overflow: None,
         },
     ];
 
@@ -212,10 +310,12 @@ async fn run_bails_after_max_turns_without_claimed_done() {
         MockResponse {
             assistant_text: "..".into(),
             tool_calls: vec![],
+            overflow: None,
         },
         MockResponse {
             assistant_text: "..".into(),
             tool_calls: vec![],
+            overflow: None,
         },
     ];
 
@@ -260,11 +360,13 @@ async fn run_scripted_multi_file_rename_drives_phase_c_mechanical_gate() {
                     "content": format!("new contents {n}"),
                 }),
             }],
+            overflow: None,
         });
     }
     responses.push(MockResponse {
         assistant_text: "all renamed".into(),
         tool_calls: vec![mock_envelope_tool_call(&envelope_done())],
+        overflow: None,
     });
 
     let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -301,6 +403,7 @@ async fn run_persists_session_to_disk_under_atelier_sessions() {
     let responses = vec![MockResponse {
         assistant_text: "done".into(),
         tool_calls: vec![mock_envelope_tool_call(&envelope_done())],
+        overflow: None,
     }];
     let runner = Runner::new(
         workspace.path().to_path_buf(),
@@ -432,10 +535,12 @@ async fn tool_error_with_quotes_produces_valid_json_tool_result() {
         MockResponse {
             assistant_text: "trying to escape".into(),
             tool_calls: vec![bad_write],
+            overflow: None,
         },
         MockResponse {
             assistant_text: "done".into(),
             tool_calls: vec![mock_envelope_tool_call(&envelope_done())],
+            overflow: None,
         },
     ];
 
@@ -477,6 +582,7 @@ async fn await_approval_via_runner_with_dispatcher_handle_round_trips() {
     let responses = vec![MockResponse {
         assistant_text: "demo write".into(),
         tool_calls: vec![write_call, mock_envelope_tool_call(&envelope_done())],
+        overflow: None,
     }];
 
     // Two sinks: Capture for event assertions, plus the DispatcherHandle
@@ -557,6 +663,7 @@ async fn await_approval_via_runner_with_full_reject_drops_the_write() {
     let responses = vec![MockResponse {
         assistant_text: "demo write".into(),
         tool_calls: vec![write_call, mock_envelope_tool_call(&envelope_done())],
+        overflow: None,
     }];
 
     let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -653,6 +760,7 @@ async fn v55_pin_context_item_round_trips_through_dispatcher() {
     let responses = vec![MockResponse {
         assistant_text: "ok".into(),
         tool_calls: vec![mock_envelope_tool_call(&envelope_done())],
+        overflow: None,
     }];
     let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let handle = DispatcherHandle::new();
@@ -722,6 +830,7 @@ async fn v55_add_memory_card_round_trips_through_dispatcher() {
     let responses = vec![MockResponse {
         assistant_text: "ok".into(),
         tool_calls: vec![mock_envelope_tool_call(&envelope_done())],
+        overflow: None,
     }];
     let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let handle = DispatcherHandle::new();
@@ -779,6 +888,7 @@ async fn v55_mark_plan_step_done_round_trips_through_dispatcher() {
     let responses = vec![MockResponse {
         assistant_text: "ok".into(),
         tool_calls: vec![mock_envelope_tool_call(&envelope_done())],
+        overflow: None,
     }];
     let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let handle = DispatcherHandle::new();
@@ -865,11 +975,13 @@ async fn v56_phase_c_mechanical_gate_at_ten_files_lines_up_live_diff_and_final_s
                     "content": format!("new contents {n}"),
                 }),
             }],
+            overflow: None,
         });
     }
     responses.push(MockResponse {
         assistant_text: "all ten renamed".into(),
         tool_calls: vec![mock_envelope_tool_call(&envelope_done())],
+        overflow: None,
     });
 
     let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -974,6 +1086,7 @@ async fn v56_envelope_claimed_changes_surfaces_as_bus_event() {
     let responses = vec![MockResponse {
         assistant_text: "explanation".into(),
         tool_calls: vec![mock_envelope_tool_call(&env)],
+        overflow: None,
     }];
     let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let runner = Runner::new(
@@ -1019,10 +1132,12 @@ async fn v60_5_compact_context_items_round_trips_through_dispatcher() {
         MockResponse {
             assistant_text: "ok".into(),
             tool_calls: vec![mock_envelope_tool_call(&envelope_done())],
+            overflow: None,
         },
         MockResponse {
             assistant_text: "Summary of items 1 and 2 (stubbed).".into(),
             tool_calls: vec![],
+            overflow: None,
         },
     ];
     let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -1184,10 +1299,12 @@ async fn v60_6_expand_memory_card_round_trips_through_dispatcher() {
         MockResponse {
             assistant_text: "ok".into(),
             tool_calls: vec![mock_envelope_tool_call(&envelope_done())],
+            overflow: None,
         },
         MockResponse {
             assistant_text: "Summary of items 1 and 2 (stubbed).".into(),
             tool_calls: vec![],
+            overflow: None,
         },
     ];
     let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -1359,6 +1476,7 @@ async fn run_writes_pane_visibility_when_driver_supplies_record() {
     let responses = vec![MockResponse {
         assistant_text: "ack".into(),
         tool_calls: vec![mock_envelope_tool_call(&envelope_done())],
+        overflow: None,
     }];
 
     let panes = PaneVisibility {
@@ -1402,6 +1520,7 @@ async fn run_skips_pane_visibility_when_driver_does_not_supply_record() {
     let responses = vec![MockResponse {
         assistant_text: "ack".into(),
         tool_calls: vec![mock_envelope_tool_call(&envelope_done())],
+        overflow: None,
     }];
 
     let runner = Runner::new(
@@ -1490,6 +1609,7 @@ async fn sigkill_then_resume_recovers_partial_state_and_advances_to_done() {
     let responses = vec![MockResponse {
         assistant_text: "resumed and done".into(),
         tool_calls: vec![mock_envelope_tool_call(&envelope_done())],
+        overflow: None,
     }];
     let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let runner = Runner::new(
@@ -1595,10 +1715,12 @@ async fn shell_curl_evil_example_is_blocked_and_audited() {
         MockResponse {
             assistant_text: "trying curl".into(),
             tool_calls: vec![curl_call],
+            overflow: None,
         },
         MockResponse {
             assistant_text: "blocked, calling it done".into(),
             tool_calls: vec![mock_envelope_tool_call(&envelope_done())],
+            overflow: None,
         },
     ];
 
@@ -1748,18 +1870,22 @@ async fn run_degrades_strategy_after_three_malformed_envelopes_in_window() {
         MockResponse {
             assistant_text: "no envelope here".into(),
             tool_calls: vec![],
+            overflow: None,
         },
         MockResponse {
             assistant_text: "still no envelope".into(),
             tool_calls: vec![],
+            overflow: None,
         },
         MockResponse {
             assistant_text: "one more bad turn".into(),
             tool_calls: vec![],
+            overflow: None,
         },
         MockResponse {
             assistant_text: format!("ok, here is the envelope\n\n{sentinel_payload}"),
             tool_calls: vec![],
+            overflow: None,
         },
     ];
 
@@ -1815,6 +1941,7 @@ async fn run_does_not_emit_strategy_degraded_when_envelopes_are_clean() {
     let responses = vec![MockResponse {
         assistant_text: "first turn, clean envelope".into(),
         tool_calls: vec![mock_envelope_tool_call(&envelope_done())],
+        overflow: None,
     }];
 
     let events = Arc::new(parking_lot::Mutex::new(Vec::new()));

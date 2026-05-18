@@ -383,6 +383,28 @@ pub enum Event {
         reason: String,
     },
 
+    /// §1 BYOM — context-window asymmetry resolution. Emitted by the
+    /// `Runner` after an `AdapterError::ContextOverflow` was handled
+    /// via the configured `ContextOverflowPolicy`. `resolution` is the
+    /// stable wire label of the policy arm that ran:
+    ///   * `"compacted"` — auto-compaction freed `freed_tokens` across
+    ///     `items_compacted` items, and the turn was retried.
+    ///   * `"rerouted"` — the routing-dispatcher arm picked an alternate
+    ///     adapter. v60.9 stub: this label is reserved; the policy
+    ///     currently surfaces a typed config error instead.
+    ///   * `"surfaced"` — the overflow was propagated to the caller as
+    ///     a typed `RunError`. `freed_tokens` / `items_compacted` are
+    ///     both `None`.
+    ///
+    /// UIs use this as the "we recovered from a context squeeze" toast
+    /// signal; the ledger trail is on `LedgerAppended` (Compaction) for
+    /// the auto-compaction arm.
+    ContextOverflowResolved {
+        resolution: &'static str,
+        freed_tokens: Option<u32>,
+        items_compacted: Option<usize>,
+    },
+
     /// The actor is shutting down. No further events will be emitted.
     Shutdown,
 }
@@ -419,6 +441,7 @@ impl Event {
             Self::FilesChangedAcknowledged { .. } => "FilesChangedAcknowledged",
             Self::VerificationPassed { .. } => "VerificationPassed",
             Self::StrategyDegraded { .. } => "StrategyDegraded",
+            Self::ContextOverflowResolved { .. } => "ContextOverflowResolved",
             Self::Shutdown => "Shutdown",
         }
     }
@@ -751,6 +774,41 @@ mod tests {
             reason: "3 malformed envelopes in last 20 calls".into(),
         };
         assert_eq!(ev.kind(), "StrategyDegraded");
+    }
+
+    #[test]
+    fn context_overflow_resolved_event_carries_expected_kind_and_wire_labels() {
+        // §1 BYOM — `ContextOverflowResolved.resolution` is a
+        // `&'static str`; the wire labels are the contract the GUI /
+        // TUI consume to render the "compact succeeded" / "rerouted"
+        // / "overflow surfaced" toasts. Pinning them here keeps a
+        // future variant rename from silently shipping a different
+        // string.
+        let compacted = Event::ContextOverflowResolved {
+            resolution: "compacted",
+            freed_tokens: Some(200),
+            items_compacted: Some(3),
+        };
+        assert_eq!(compacted.kind(), "ContextOverflowResolved");
+        if let Event::ContextOverflowResolved { resolution, .. } = compacted {
+            assert_eq!(resolution, "compacted");
+        }
+        let rerouted = Event::ContextOverflowResolved {
+            resolution: "rerouted",
+            freed_tokens: None,
+            items_compacted: None,
+        };
+        if let Event::ContextOverflowResolved { resolution, .. } = rerouted {
+            assert_eq!(resolution, "rerouted");
+        }
+        let surfaced = Event::ContextOverflowResolved {
+            resolution: "surfaced",
+            freed_tokens: None,
+            items_compacted: None,
+        };
+        if let Event::ContextOverflowResolved { resolution, .. } = surfaced {
+            assert_eq!(resolution, "surfaced");
+        }
     }
 
     #[test]

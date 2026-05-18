@@ -108,9 +108,49 @@ pub enum ProviderChoice {
 /// construct it with the `mock_envelope_tool_call` helper. The fields
 /// below are exactly what the mock returns over the wire; the runner's
 /// `extract_native_envelope` recovers the envelope from `tool_calls`.
+#[derive(Default)]
 pub struct MockResponse {
     pub assistant_text: String,
     pub tool_calls: Vec<ToolCallRequest>,
+    /// §1 BYOM context-overflow test seam. When `Some`, the mock
+    /// emits a `StreamChunk::Error { error: ContextOverflow { … } }`
+    /// instead of the usual `Complete` chunk — letting the
+    /// integration test drive the overflow recovery path through the
+    /// regular `ProviderChoice::Mock { responses }` channel. The
+    /// `assistant_text` / `tool_calls` fields are ignored when this
+    /// is set. Production callers always leave it `None`. Existing
+    /// callers that build the struct via the `MockResponse { … }`
+    /// literal can continue to do so by appending `..Default::default()`
+    /// — but every pre-existing site already populates the other
+    /// fields explicitly, so they only need to append `overflow: None`.
+    #[doc(hidden)]
+    pub overflow: Option<(u32, u32)>,
+}
+
+impl MockResponse {
+    /// Convenience constructor for the happy-path used by every
+    /// existing test. Keeps the call sites short and ensures
+    /// `overflow` stays `None` unless a test explicitly asks for it.
+    #[allow(dead_code)]
+    pub fn new(assistant_text: impl Into<String>, tool_calls: Vec<ToolCallRequest>) -> Self {
+        Self {
+            assistant_text: assistant_text.into(),
+            tool_calls,
+            overflow: None,
+        }
+    }
+
+    /// §1 BYOM test helper — drive the `ContextOverflow` arm.
+    /// `needed` / `limit` populate the `AdapterError::ContextOverflow`
+    /// fields the runner's auto-selector reads.
+    #[allow(dead_code)]
+    pub fn context_overflow(needed: u32, limit: u32) -> Self {
+        Self {
+            assistant_text: String::new(),
+            tool_calls: Vec::new(),
+            overflow: Some((needed, limit)),
+        }
+    }
 }
 
 /// What `Runner::run` returns. Caller (binary or test) decides whether a
@@ -325,7 +365,67 @@ pub struct Runner {
     /// (PROVISIONAL 3); tests dial it down via
     /// [`Self::with_degradation_threshold`].
     degradation_threshold: u32,
+    /// §1 BYOM — context-window asymmetry policy. Defaults to
+    /// [`ContextOverflowPolicy::Compact`]; the binary and the GUI/TUI
+    /// drivers will surface a flag/setting to flip it in a follow-on
+    /// bundle. See [`ContextOverflowPolicy`] for the three arms.
+    overflow_policy: ContextOverflowPolicy,
 }
+
+/// §1 BYOM — context-window asymmetry policy. Chosen at
+/// [`Runner::new`] time (default = [`Self::Compact`]) and consulted
+/// whenever `adapter.chat()` returns
+/// [`AdapterError::ContextOverflow`].
+///
+/// Three arms per spec §1 ("BYOM context-window asymmetry: Compact /
+/// Reroute / `ContextOverflowError`"):
+///
+///   * [`Self::Compact`] — auto-trigger a v60.5 non-destructive
+///     compaction on the largest unpinned context items, then retry
+///     the turn. Bounded by [`MAX_OVERFLOW_RETRIES`] consecutive
+///     attempts; after the cap is hit the runner falls back to the
+///     `Surface` behaviour so a wedged model can't drive a runaway
+///     compaction loop.
+///   * [`Self::Reroute`] — placeholder for the future
+///     routing-dispatcher work. v60.9 has no router yet, so this arm
+///     emits `RunError::Config("reroute not yet implemented")` and
+///     a `ContextOverflowResolved { resolution: "rerouted" }` event
+///     so subscribers can render "reroute requested but unconfigured"
+///     for the time being.
+///   * [`Self::Surface`] — propagate the overflow as a typed
+///     `RunError::ContextOverflow` so the caller (binary, GUI, TUI)
+///     decides what to do next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextOverflowPolicy {
+    /// Auto-compact the largest-token unpinned items then retry the
+    /// turn. Default.
+    Compact,
+    /// Future routing-dispatcher hook. Returns
+    /// `RunError::Config("reroute not yet implemented")` for now.
+    Reroute,
+    /// Propagate `AdapterError::ContextOverflow` as
+    /// [`RunError::ContextOverflow`] so the caller decides.
+    Surface,
+}
+
+/// Defence-in-depth cap on consecutive auto-compact retries within a
+/// single turn. If a second `adapter.chat()` after a successful
+/// compaction still overflows, the runner drops to
+/// [`ContextOverflowPolicy::Surface`] behaviour rather than spinning
+/// forever — a runaway compaction loop is worse than a clean error.
+///
+/// PROVISIONAL — `2` (one retry after the initial overflow) matches
+/// the spec §1 "single recovery attempt" intent; raise only after a
+/// calibration run shows real models routinely need more.
+pub const MAX_OVERFLOW_RETRIES: usize = 2;
+
+/// §1 BYOM — fraction of the freed-token target the auto-selector
+/// padds with so a near-miss heuristic doesn't immediately re-overflow
+/// after compaction. 25% over the strict `needed - (limit - current)`
+/// gap. PROVISIONAL — set by inspection of the v60.5 compaction
+/// summary-card token budget (≈120 words, ≈160 tokens worst case);
+/// a real calibration run pending Q1 will tune.
+const OVERFLOW_SAFETY_MARGIN_PCT: u32 = 25;
 
 /// v60.7 — §1 latency-weighted local-cost selector. Determined once
 /// at [`Runner::new`] time from the [`ProviderChoice`] + base URL;
@@ -448,6 +548,7 @@ impl Runner {
             degradation_window: atelier_core::protocol_conformance::DEFAULT_DEGRADATION_WINDOW,
             degradation_threshold:
                 atelier_core::protocol_conformance::DEFAULT_DEGRADATION_THRESHOLD,
+            overflow_policy: ContextOverflowPolicy::Compact,
         })
     }
 
@@ -555,6 +656,17 @@ impl Runner {
     #[allow(dead_code)]
     pub fn with_degradation_threshold(mut self, threshold: u32) -> Self {
         self.degradation_threshold = threshold;
+        self
+    }
+
+    /// §1 BYOM — install the context-window asymmetry policy. Defaults
+    /// to [`ContextOverflowPolicy::Compact`]; see the enum's docs for
+    /// the three arms. The binary's `--overflow-policy` flag and a
+    /// future GUI/TUI setting will flip this; today only the
+    /// integration tests reach this seam.
+    #[allow(dead_code)]
+    pub fn with_overflow_policy(mut self, policy: ContextOverflowPolicy) -> Self {
+        self.overflow_policy = policy;
         self
     }
 
@@ -900,11 +1012,146 @@ impl Runner {
             advance(&session_handle, State::Idle, State::Streaming).await?;
             final_state = State::Streaming;
 
-            let response = self
-                .adapter
-                .chat(&messages, &tools_spec)
-                .await
-                .map_err(|e| RunError::Adapter(format!("{e}")))?;
+            // §1 BYOM context-window asymmetry — wrap `adapter.chat()`
+            // in a small retry loop that consults
+            // [`ContextOverflowPolicy`] when the adapter raises
+            // `AdapterError::ContextOverflow`. Compact / Reroute /
+            // Surface arms each emit `ContextOverflowResolved` so the
+            // bus carries one terminal marker per overflow, regardless
+            // of which arm fired. The retry cap is
+            // [`MAX_OVERFLOW_RETRIES`] consecutive attempts; after that
+            // the runner drops to Surface behaviour rather than
+            // looping forever.
+            let response = {
+                let mut overflow_retries: usize = 0;
+                loop {
+                    match self.adapter.chat(&messages, &tools_spec).await {
+                        Ok(r) => break r,
+                        Err(AdapterError::ContextOverflow {
+                            needed_tokens,
+                            limit_tokens,
+                        }) => {
+                            // Choose the policy arm. After the retry
+                            // cap we always drop to Surface, even when
+                            // the policy is Compact, to defend against
+                            // a wedged model.
+                            let effective = if overflow_retries >= MAX_OVERFLOW_RETRIES {
+                                ContextOverflowPolicy::Surface
+                            } else {
+                                self.overflow_policy
+                            };
+                            match effective {
+                                ContextOverflowPolicy::Compact => {
+                                    // Snapshot the live context, pick
+                                    // items to free the gap (plus a
+                                    // small safety margin), and run
+                                    // the v60.5 compaction
+                                    // orchestrator. A successful
+                                    // compaction publishes the
+                                    // resolution event then retries
+                                    // the turn; a failure surfaces.
+                                    let current_total: u32 = context_manager
+                                        .lock()
+                                        .summarise()
+                                        .iter()
+                                        .map(|s| s.tokens)
+                                        .sum();
+                                    let summaries = context_manager.lock().summarise();
+                                    let picks = pick_overflow_compaction_targets(
+                                        &summaries,
+                                        needed_tokens,
+                                        limit_tokens,
+                                        current_total,
+                                    );
+                                    if picks.is_empty() {
+                                        // No unpinned items to free —
+                                        // there's nothing the
+                                        // compaction arm can do.
+                                        // Surface so the user can
+                                        // intervene (unpin, edit, etc).
+                                        let _ = bus.send(Event::ContextOverflowResolved {
+                                            resolution: "surfaced",
+                                            freed_tokens: None,
+                                            items_compacted: None,
+                                        });
+                                        return Err(RunError::ContextOverflow {
+                                            needed_tokens,
+                                            limit_tokens,
+                                        });
+                                    }
+                                    let now = now_rfc3339();
+                                    let sid_str = session_id.0.to_string();
+                                    match crate::compaction::compact(
+                                        self.adapter.as_ref(),
+                                        &session_dispatcher,
+                                        &workspace,
+                                        &sid_str,
+                                        picks.clone(),
+                                        &now,
+                                    )
+                                    .await
+                                    {
+                                        Ok(out) => {
+                                            let _ = bus.send(Event::ContextOverflowResolved {
+                                                resolution: "compacted",
+                                                freed_tokens: Some(out.freed_tokens),
+                                                items_compacted: Some(picks.len()),
+                                            });
+                                            overflow_retries += 1;
+                                            continue;
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                error = %e,
+                                                "context-overflow auto-compaction failed; surfacing the original overflow"
+                                            );
+                                            let _ = bus.send(Event::ContextOverflowResolved {
+                                                resolution: "surfaced",
+                                                freed_tokens: None,
+                                                items_compacted: None,
+                                            });
+                                            return Err(RunError::ContextOverflow {
+                                                needed_tokens,
+                                                limit_tokens,
+                                            });
+                                        }
+                                    }
+                                }
+                                ContextOverflowPolicy::Reroute => {
+                                    // v60.9 stub — the routing-dispatcher
+                                    // arm lands in a follow-on bundle.
+                                    // Emit the resolution event so a
+                                    // subscriber can render
+                                    // "reroute requested but unconfigured"
+                                    // and surface a typed config error
+                                    // so the caller knows the policy
+                                    // arm hasn't been wired yet.
+                                    let _ = bus.send(Event::ContextOverflowResolved {
+                                        resolution: "rerouted",
+                                        freed_tokens: None,
+                                        items_compacted: None,
+                                    });
+                                    return Err(RunError::Config(
+                                        "reroute not yet implemented".into(),
+                                    ));
+                                }
+                                ContextOverflowPolicy::Surface => {
+                                    let _ = bus.send(Event::ContextOverflowResolved {
+                                        resolution: "surfaced",
+                                        freed_tokens: None,
+                                        items_compacted: None,
+                                    });
+                                    return Err(RunError::ContextOverflow {
+                                        needed_tokens,
+                                        limit_tokens,
+                                    });
+                                }
+                            }
+                        }
+                        Err(e) => return Err(RunError::Adapter(format!("{e}"))),
+                    }
+                }
+            };
 
             // §1 BYOM (v60.7) — append one `ModelCall` ledger entry
             // per `adapter.chat()` call. `count_source` is the
@@ -1311,6 +1558,18 @@ pub enum RunError {
     Adapter(String),
     #[error("session command failed: {0}")]
     Session(String),
+    /// §1 BYOM — typed surface for the
+    /// [`ContextOverflowPolicy::Surface`] arm (and the
+    /// defence-in-depth Surface fallback after a Compact retry also
+    /// overflowed). Carries the same `needed` / `limit` token counts
+    /// the adapter extracted from the provider error body so the
+    /// caller can show an actionable message rather than "adapter:
+    /// context overflow: …".
+    #[error("context overflow: needed {needed_tokens} tokens, model accepts {limit_tokens}")]
+    ContextOverflow {
+        needed_tokens: u32,
+        limit_tokens: u32,
+    },
 }
 
 /// v60.7 §1 — does this OpenAI-compat base URL point at the hosted
@@ -1548,11 +1807,112 @@ fn context_item_for_tool_result(text: &str, tool_call_id: &str, now: &str) -> Co
 // Local re-export keeps the call sites in this module short.
 use atelier_core::time::now_rfc3339;
 
+/// §1 BYOM — auto-selector for [`ContextOverflowPolicy::Compact`].
+///
+/// Heuristic (deterministic, pure):
+///   1. Compute the target number of tokens to free, per the spec
+///      §1 sketch: `target = needed - (limit - current_total)`. With
+///      saturating arithmetic this is the gap by which the next call
+///      would overshoot the model's reported limit. A 0/negative gap
+///      doesn't mean "nothing to do" — the *adapter* already said
+///      we overflowed, so the harness must free *some* tokens
+///      regardless of the local estimate. We therefore floor the
+///      target at the smallest unpinned candidate's token count
+///      whenever the saturating delta lands at zero.
+///   2. Pad `target` by [`OVERFLOW_SAFETY_MARGIN_PCT`] so the
+///      freshly-pinned summary card (the v60.5 compaction always
+///      reads one back into the window) plus a small slop budget
+///      don't put us right back over the line on the retry.
+///   3. Filter the live `summarise()` projection to unpinned items
+///      only. Pinned items are user-asserted load-bearing — touching
+///      them silently would surprise the user. If everything is
+///      pinned the selector returns empty; the caller then surfaces
+///      the overflow.
+///   4. Sort the candidates by token count **descending**. Largest
+///      items free the most tokens per compaction blob entry — fewer
+///      items round-tripped through the summary call means cheaper
+///      recovery.
+///   5. Greedily accumulate until the running sum covers the padded
+///      target (or we run out of unpinned candidates).
+///   6. Return the chosen ids. Empty vec means "nothing to compact"
+///      (everything is pinned) and the caller surfaces the original
+///      overflow.
+///
+/// Pure function: takes the snapshot + the three counters and returns
+/// a `Vec<String>` of context-item ids. Unit-tested directly so the
+/// heuristic stays inspectable without a live `Runner`.
+fn pick_overflow_compaction_targets(
+    summaries: &[atelier_core::context::ContextItemSummary],
+    needed_tokens: u32,
+    limit_tokens: u32,
+    current_total: u32,
+) -> Vec<String> {
+    // Step 3 hoisted: unpinned candidates only. If none, the selector
+    // can't act.
+    let mut candidates: Vec<&atelier_core::context::ContextItemSummary> =
+        summaries.iter().filter(|s| !s.pinned).collect();
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    // Step 4: token-count-descending. Stable sort keeps insertion
+    // order as the tiebreaker so the test fixture stays predictable.
+    candidates.sort_by(|a, b| b.tokens.cmp(&a.tokens));
+
+    // Step 1: spec gap. Saturating arithmetic guards against an
+    // adapter that mis-reports `needed < limit + current_total`.
+    let headroom = limit_tokens.saturating_sub(current_total);
+    let raw_target = needed_tokens.saturating_sub(headroom);
+
+    // Floor: the adapter raised overflow, so we must free at least
+    // one item's worth of tokens even when the local estimate says
+    // we had headroom. Pick the smallest unpinned candidate's count
+    // as the floor so a tiny prompt doesn't force eviction of a
+    // multi-thousand-token item.
+    let min_unpinned = candidates
+        .iter()
+        .map(|c| c.tokens)
+        .min()
+        .unwrap_or(1)
+        .max(1);
+    let effective_target = raw_target.max(min_unpinned);
+
+    // Step 2: pad by the safety margin. `+25%` makes a near-miss
+    // unlikely to immediately re-overflow on the retry; saturating
+    // to u32::MAX is fine because the loop terminates on the
+    // candidates running out anyway.
+    let padded_target = effective_target
+        .saturating_add(effective_target.saturating_mul(OVERFLOW_SAFETY_MARGIN_PCT) / 100);
+
+    // Step 5: greedy accumulate.
+    let mut chosen = Vec::new();
+    let mut freed: u32 = 0;
+    for c in candidates {
+        if freed >= padded_target {
+            break;
+        }
+        chosen.push(c.id.clone());
+        freed = freed.saturating_add(c.tokens);
+    }
+    chosen
+}
+
 fn build_mock_adapter(responses: Vec<MockResponse>) -> MockAdapter {
     let m = MockAdapter::new("mock:run");
     for r in responses {
         use atelier_core::adapter::{ChatResponse, StreamChunk, Usage};
         use atelier_core::context::TokenSource;
+        if let Some((needed, limit)) = r.overflow {
+            // §1 BYOM — drive the ContextOverflow recovery path.
+            // A single Error chunk short-circuits the stream
+            // assembler in `Adapter::chat`'s default impl.
+            m.queue_stream(vec![StreamChunk::Error {
+                error: AdapterError::ContextOverflow {
+                    needed_tokens: needed,
+                    limit_tokens: limit,
+                },
+            }]);
+            continue;
+        }
         m.queue_stream(vec![
             StreamChunk::Text {
                 delta: r.assistant_text.clone(),
@@ -1728,5 +2088,130 @@ mod tests {
                 "{url} should be classified as local"
             );
         }
+    }
+
+    // ---- §1 BYOM: ContextOverflowPolicy + auto-selector heuristic ----
+
+    fn summary_fixture(
+        id: &str,
+        tokens: u32,
+        pinned: bool,
+    ) -> atelier_core::context::ContextItemSummary {
+        atelier_core::context::ContextItemSummary {
+            id: id.to_string(),
+            kind: "inline_text".into(),
+            label: format!("item-{id}"),
+            provenance: "user_attached".into(),
+            provenance_detail: None,
+            tokens,
+            token_source: "approx".into(),
+            pinned,
+        }
+    }
+
+    #[test]
+    fn overflow_policy_default_is_compact() {
+        // The default must stay `Compact` — that's the user-visible
+        // contract; flipping it would silently change recovery
+        // behaviour for every existing caller.
+        let workspace = std::path::PathBuf::from("/tmp");
+        let runner = Runner::new(
+            workspace,
+            ProviderChoice::Mock { responses: vec![] },
+            EventSink::Null,
+        )
+        .expect("mock runner construction is infallible");
+        assert_eq!(runner.overflow_policy, ContextOverflowPolicy::Compact);
+    }
+
+    #[test]
+    fn with_overflow_policy_overrides_default() {
+        // The builder method threads the policy through; the test
+        // pins the surface so a future refactor can't silently lose
+        // the override path. All three variants are covered.
+        let workspace = std::path::PathBuf::from("/tmp");
+        for policy in [
+            ContextOverflowPolicy::Compact,
+            ContextOverflowPolicy::Reroute,
+            ContextOverflowPolicy::Surface,
+        ] {
+            let runner = Runner::new(
+                workspace.clone(),
+                ProviderChoice::Mock { responses: vec![] },
+                EventSink::Null,
+            )
+            .expect("mock runner construction is infallible")
+            .with_overflow_policy(policy);
+            assert_eq!(runner.overflow_policy, policy);
+        }
+    }
+
+    #[test]
+    fn overflow_selector_picks_at_least_one_when_local_estimate_says_no_overshoot() {
+        // The adapter raised overflow, but the local token estimate
+        // says we had headroom. The selector must still pick at
+        // least one item (the smallest unpinned) — the adapter's
+        // claim wins over the local estimate; otherwise the runner
+        // would spin retrying the same overflowed call.
+        let summaries = vec![
+            summary_fixture("small", 50, false),
+            summary_fixture("medium", 100, false),
+            summary_fixture("large", 200, false),
+        ];
+        let picks = pick_overflow_compaction_targets(&summaries, 50, 1000, 100);
+        // Floor is min unpinned (50). After +25% the padded target
+        // is 62. The selector greedily takes the largest (200), which
+        // alone covers the padded floor, so picks = ["large"].
+        assert_eq!(
+            picks,
+            vec!["large".to_string()],
+            "expected exactly the largest item; got {picks:?}"
+        );
+    }
+
+    #[test]
+    fn overflow_selector_picks_largest_unpinned_first_with_margin() {
+        // limit=1000, current=900, needed=1050 ⇒ headroom = 100,
+        // raw_target = 1050 - 100 = 950. min_unpinned = 100 so the
+        // effective_target stays at 950. Padded by 25% = 1187.
+        // Unpinned items sorted desc: c(900), b(400), a(100). Greedy:
+        // pick c (900), still < 1187 → pick b (1300 ≥ 1187 → stop).
+        // Expected chosen list: ["c", "b"].
+        let summaries = vec![
+            summary_fixture("a", 100, false),
+            summary_fixture("b", 400, false),
+            summary_fixture("c", 900, false),
+        ];
+        let picks = pick_overflow_compaction_targets(&summaries, 1050, 1000, 900);
+        assert_eq!(picks, vec!["c".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn overflow_selector_skips_pinned_and_accumulates_when_needed() {
+        // limit=1000, current=950, needed=1300 ⇒ raw_target = 250,
+        // padded = 312. The largest item (c=400) is pinned, so the
+        // selector must skip it. b=200 doesn't cover alone; a=150
+        // accumulates to 350 ≥ 312. Order: largest unpinned first.
+        let summaries = vec![
+            summary_fixture("a", 150, false),
+            summary_fixture("b", 200, false),
+            summary_fixture("c", 400, true), // pinned ⇒ must skip
+        ];
+        let picks = pick_overflow_compaction_targets(&summaries, 1300, 1000, 950);
+        // b is larger than a so it ends up first; a is appended to
+        // make up the rest.
+        assert_eq!(picks, vec!["b".to_string(), "a".to_string()]);
+    }
+
+    #[test]
+    fn overflow_selector_returns_empty_when_all_pinned() {
+        // All candidates pinned ⇒ nothing the auto-selector can
+        // touch. The runner's Compact arm surfaces in this case.
+        let summaries = vec![
+            summary_fixture("a", 100, true),
+            summary_fixture("b", 200, true),
+        ];
+        let picks = pick_overflow_compaction_targets(&summaries, 5000, 1000, 0);
+        assert!(picks.is_empty(), "all-pinned ⇒ no picks; got {picks:?}");
     }
 }

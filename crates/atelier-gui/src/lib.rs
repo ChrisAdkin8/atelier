@@ -708,6 +708,7 @@ fn start_demo_run(
     let responses = vec![MockResponse {
         assistant_text: format!("Acknowledging: {prompt}"),
         tool_calls: vec![write_call, envelope_call],
+        overflow: None,
     }];
 
     // EventSink::Callback forwards every bus event to the webview as
@@ -990,6 +991,22 @@ pub fn bridge_event(evt: &SessionEvent) -> BridgedEvent {
             "from": from.as_str(),
             "to": to.as_str(),
             "reason": reason,
+        }),
+        // §1 BYOM (v60.9) — context-window asymmetry resolution. The
+        // `resolution` field is already a stable wire label
+        // (`"compacted"` / `"rerouted"` / `"surfaced"`). The toast
+        // surface in the Svelte reducer is a follow-on bundle; this
+        // arm just plumbs the payload through so the webview's event
+        // log shows the resolution alongside the existing
+        // `CompactionExecuted` / `LedgerAppended` rows.
+        SessionEvent::ContextOverflowResolved {
+            resolution,
+            freed_tokens,
+            items_compacted,
+        } => json!({
+            "resolution": resolution,
+            "freed_tokens": freed_tokens,
+            "items_compacted": items_compacted,
         }),
     };
     BridgedEvent { kind, payload }
