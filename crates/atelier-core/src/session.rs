@@ -361,6 +361,28 @@ pub enum Event {
         claim_count: usize,
     },
 
+    /// §1 BYOM — conformance-driven degradation fired. The runner's
+    /// rolling envelope-parse window crossed the §1/§2 threshold
+    /// (PROVISIONAL 3-of-20 default; see
+    /// [`crate::protocol_conformance::DEFAULT_DEGRADATION_WINDOW`] +
+    /// [`crate::protocol_conformance::DEFAULT_DEGRADATION_THRESHOLD`])
+    /// and the runner walked the active strategy one step toward the
+    /// more-tolerant end of the stack (NativeTool → JsonSentinel →
+    /// RegexProse). Degradation is one-way for the session — no
+    /// auto-promotion arm fires the reverse transition.
+    ///
+    /// UI consumers refresh the strategy badge in the footer (GUI's
+    /// `currentModel.strategy`, TUI's `CurrentModel.strategy`) so the
+    /// user sees the harness has lowered the bar on the active model.
+    /// `reason` is short, human-readable, and stable enough for a
+    /// regression test to assert on (e.g.
+    /// `"3 malformed envelopes in last 20 calls"`).
+    StrategyDegraded {
+        from: crate::protocol_strategy::Strategy,
+        to: crate::protocol_strategy::Strategy,
+        reason: String,
+    },
+
     /// The actor is shutting down. No further events will be emitted.
     Shutdown,
 }
@@ -396,6 +418,7 @@ impl Event {
             Self::FilesChanged { .. } => "FilesChanged",
             Self::FilesChangedAcknowledged { .. } => "FilesChangedAcknowledged",
             Self::VerificationPassed { .. } => "VerificationPassed",
+            Self::StrategyDegraded { .. } => "StrategyDegraded",
             Self::Shutdown => "Shutdown",
         }
     }
@@ -718,6 +741,16 @@ mod tests {
             claim_count: 2,
         };
         assert_eq!(ev.kind(), "VerificationPassed");
+    }
+
+    #[test]
+    fn strategy_degraded_event_carries_expected_kind() {
+        let ev = Event::StrategyDegraded {
+            from: crate::protocol_strategy::Strategy::NativeTool,
+            to: crate::protocol_strategy::Strategy::JsonSentinel,
+            reason: "3 malformed envelopes in last 20 calls".into(),
+        };
+        assert_eq!(ev.kind(), "StrategyDegraded");
     }
 
     #[test]

@@ -488,6 +488,22 @@ export function applyEvent(state: AppState, evt: BridgedEvent): AppState {
       }
       return { ...state, events, verificationStatus }
     }
+    case 'StrategyDegraded': {
+      // §1 BYOM — refresh the strategy badge on the model footer.
+      // `currentModel` is null until `ModelProfileLoaded` lands; the
+      // runner emits `ModelProfileLoaded` before the first turn, so by
+      // the time a degradation can fire `currentModel` is populated.
+      // Guard anyway so a misordered scenario doesn't crash the reducer.
+      const p = evt.payload as { from: string; to: string; reason: string }
+      if (!state.currentModel) {
+        return { ...state, events }
+      }
+      const currentModel: CurrentModel = {
+        ...state.currentModel,
+        strategy: p.to,
+      }
+      return { ...state, events, currentModel }
+    }
     // Variants we don't fold into pane state — just the event log.
     case 'IllegalTransitionAttempted':
     case 'Cancelled':
@@ -681,6 +697,13 @@ export function projectEvent(evt: BridgedEvent): EventLogEntry {
       return {
         kind,
         detail: `${verificationTierLabel(tier)} · ${files} files · ${claims} claims`,
+      }
+    }
+    case 'StrategyDegraded': {
+      const p = evt.payload as { from?: string; to?: string; reason?: string }
+      return {
+        kind,
+        detail: `${p.from ?? '?'} → ${p.to ?? '?'} (${p.reason ?? ''})`,
       }
     }
     default:

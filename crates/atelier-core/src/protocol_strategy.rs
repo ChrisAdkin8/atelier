@@ -69,6 +69,30 @@ impl Strategy {
             Self::RegexProse => "regex_prose",
         }
     }
+
+    /// Tolerance rank: bigger number = more tolerant of model misbehaviour.
+    /// `NativeTool` is the strictest carrier (the provider's typed
+    /// tool-call channel must be honoured); `RegexProse` is the most
+    /// forgiving (any tagged prose section that resembles the contract
+    /// counts). The `less_tolerant_than` helper degrades in this
+    /// direction.
+    pub fn tolerance_rank(self) -> u8 {
+        match self {
+            Self::NativeTool => 0,
+            Self::JsonSentinel => 1,
+            Self::RegexProse => 2,
+        }
+    }
+
+    /// `true` if `self` is strictly less tolerant than `other` — i.e.
+    /// `self` lives higher in the quality stack and should degrade
+    /// toward `other`. The degradation walk
+    /// `NativeTool → JsonSentinel → RegexProse` is encoded here so a
+    /// future quality-stack change is a single-table edit instead of
+    /// hunting down every `match` in the runner.
+    pub fn less_tolerant_than(self, other: Self) -> bool {
+        self.tolerance_rank() < other.tolerance_rank()
+    }
 }
 
 // ---------- native-tool ----------
@@ -636,6 +660,42 @@ mod tests {
         assert_eq!(Strategy::NativeTool.as_str(), "native_tool");
         assert_eq!(Strategy::JsonSentinel.as_str(), "json_sentinel");
         assert_eq!(Strategy::RegexProse.as_str(), "regex_prose");
+    }
+
+    #[test]
+    fn tolerance_rank_orders_native_below_sentinel_below_prose() {
+        // The degradation walk is encoded in this ordering. A bigger
+        // rank means "more tolerant of model misbehaviour" — the value
+        // the runner walks toward when it observes malformed envelopes.
+        assert!(
+            Strategy::NativeTool.tolerance_rank() < Strategy::JsonSentinel.tolerance_rank(),
+            "NativeTool should be strictly less tolerant than JsonSentinel"
+        );
+        assert!(
+            Strategy::JsonSentinel.tolerance_rank() < Strategy::RegexProse.tolerance_rank(),
+            "JsonSentinel should be strictly less tolerant than RegexProse"
+        );
+    }
+
+    #[test]
+    fn less_tolerant_than_walks_the_degradation_chain() {
+        // The full triangular check: every strategy is less tolerant
+        // than its `downshift` target and not less tolerant than itself.
+        assert!(Strategy::NativeTool.less_tolerant_than(Strategy::JsonSentinel));
+        assert!(Strategy::NativeTool.less_tolerant_than(Strategy::RegexProse));
+        assert!(Strategy::JsonSentinel.less_tolerant_than(Strategy::RegexProse));
+
+        assert!(!Strategy::JsonSentinel.less_tolerant_than(Strategy::NativeTool));
+        assert!(!Strategy::RegexProse.less_tolerant_than(Strategy::NativeTool));
+        assert!(!Strategy::RegexProse.less_tolerant_than(Strategy::JsonSentinel));
+
+        for s in [
+            Strategy::NativeTool,
+            Strategy::JsonSentinel,
+            Strategy::RegexProse,
+        ] {
+            assert!(!s.less_tolerant_than(s), "{s:?} less_tolerant_than itself");
+        }
     }
 
     // ---------- native-tool ----------

@@ -314,6 +314,17 @@ pub struct Runner {
     /// / `approval_policy` which `with_non_interactive` mutates).
     #[allow(dead_code)]
     non_interactive: bool,
+    /// §1 BYOM — rolling window size for conformance-driven strategy
+    /// degradation. Defaults to
+    /// [`atelier_core::protocol_conformance::DEFAULT_DEGRADATION_WINDOW`]
+    /// (PROVISIONAL 20); tests dial it down via
+    /// [`Self::with_degradation_window`].
+    degradation_window: usize,
+    /// §1 BYOM — failure threshold inside the rolling window. Defaults
+    /// to [`atelier_core::protocol_conformance::DEFAULT_DEGRADATION_THRESHOLD`]
+    /// (PROVISIONAL 3); tests dial it down via
+    /// [`Self::with_degradation_threshold`].
+    degradation_threshold: u32,
 }
 
 /// v60.7 — §1 latency-weighted local-cost selector. Determined once
@@ -434,6 +445,9 @@ impl Runner {
             concurrent_edit_policy: ConcurrentEditPolicy::Modal,
             resume_from: None,
             non_interactive: false,
+            degradation_window: atelier_core::protocol_conformance::DEFAULT_DEGRADATION_WINDOW,
+            degradation_threshold:
+                atelier_core::protocol_conformance::DEFAULT_DEGRADATION_THRESHOLD,
         })
     }
 
@@ -518,6 +532,29 @@ impl Runner {
             self.approval_policy = atelier_core::dispatcher::ApprovalPolicy::AutoApproveAll;
             self.concurrent_edit_policy = ConcurrentEditPolicy::AutoReload;
         }
+        self
+    }
+
+    /// §1 BYOM — override the conformance-driven degradation window
+    /// size. The default is
+    /// [`atelier_core::protocol_conformance::DEFAULT_DEGRADATION_WINDOW`]
+    /// (PROVISIONAL 20). Integration tests dial this down so a short
+    /// scripted sequence can exercise the degradation path without
+    /// queueing twenty mock responses.
+    #[allow(dead_code)]
+    pub fn with_degradation_window(mut self, window: usize) -> Self {
+        self.degradation_window = window;
+        self
+    }
+
+    /// §1 BYOM — override the conformance-driven degradation threshold
+    /// (failures-in-window count). The default is
+    /// [`atelier_core::protocol_conformance::DEFAULT_DEGRADATION_THRESHOLD`]
+    /// (PROVISIONAL 3). See [`Self::with_degradation_window`] for the
+    /// companion knob.
+    #[allow(dead_code)]
+    pub fn with_degradation_threshold(mut self, threshold: u32) -> Self {
+        self.degradation_threshold = threshold;
         self
     }
 
@@ -733,12 +770,17 @@ impl Runner {
             outcome,
             capability_row: Some(capability_row),
         });
-        // The profile itself is informational in v51 — the §1
-        // conformance tracker still drives runtime strategy
-        // selection at the adapter level. A v52 follow-on can
-        // thread `profile.strategy` into the adapter's initial
-        // strategy so the first turn skips the warm-up period.
-        let _initial_strategy_hint = profile.strategy;
+        // The profile recommends the starting §2 strategy; the
+        // runtime conformance tracker downshifts it (one-way) if the
+        // model emits malformed envelopes past the threshold. The
+        // active strategy lives in `active_strategy`; degrade events
+        // emit on every transition so UIs refresh the footer badge.
+        let mut active_strategy = profile.strategy;
+        // Rolling envelope-parse window. Successes / failures recorded
+        // by the parse arm of the turn loop drive
+        // `should_degrade` — see protocol_conformance::ConformanceRingBuffer.
+        let mut envelope_conformance =
+            atelier_core::protocol_conformance::ConformanceRingBuffer::new();
 
         // 5. Turn loop. v61 — when `resume_from` is set, replay the
         //    persisted conversation prefix first; the supplied prompt
@@ -898,24 +940,80 @@ impl Runner {
                 note: None,
             });
 
-            // 6. Parse envelope from response per the adapter's chosen
-            //    strategy. Native tool calls (if any) take precedence:
+            // 6. Parse envelope from response per the *active* strategy
+            //    (the §1/§2 conformance tracker may have already
+            //    downshifted from the adapter's reported one).
+            //
+            //    We track whether the parse cleanly produced an envelope
+            //    so the cross-call rolling window can drive the §1
+            //    degradation check. "Clean" means the strategy-specific
+            //    parser returned `Ok`. An empty `tool_calls` payload on
+            //    the native-tool path is treated as malformed for
+            //    conformance — the carrier did not actually carry an
+            //    envelope. Pre-degradation, the adapter's reported
+            //    strategy and the active one agree; once degraded, we
+            //    use the active value so the parse stays aligned with
+            //    the UI badge.
+            //
+            //    Native tool calls (if any) still take precedence:
             //    the dispatcher executes them and feeds results back as
             //    Role::Tool messages.
-            let envelope = match response.strategy {
-                Strategy::NativeTool => {
-                    // The envelope rides as a `harness_meta` tool call;
-                    // pull it out (if present) and dispatch the rest.
-                    extract_native_envelope(&response.tool_calls).unwrap_or_default()
-                }
-                Strategy::JsonSentinel => parse_json_sentinel(&response.text)
-                    .map(|parsed| parsed.envelope)
-                    .unwrap_or_default(),
+            let parse_strategy = active_strategy;
+            let (envelope, parse_ok) = match parse_strategy {
+                Strategy::NativeTool => match extract_native_envelope(&response.tool_calls) {
+                    Some(env) => (env, true),
+                    None => (Envelope::default(), false),
+                },
+                Strategy::JsonSentinel => match parse_json_sentinel(&response.text) {
+                    Ok(parsed) => (parsed.envelope, true),
+                    Err(_) => (Envelope::default(), false),
+                },
                 Strategy::RegexProse => {
-                    atelier_core::protocol_strategy::parse_regex_prose(&response.text)
-                        .unwrap_or_default()
+                    match atelier_core::protocol_strategy::parse_regex_prose(&response.text) {
+                        Ok(env) => (env, true),
+                        Err(_) => (Envelope::default(), false),
+                    }
                 }
             };
+            // Record the outcome against the *active* strategy so the
+            // per-strategy breakdown lines up with what the runner was
+            // actually trying to use.
+            if parse_ok {
+                envelope_conformance.record_success(parse_strategy);
+            } else {
+                envelope_conformance.record_failure(parse_strategy);
+            }
+            // §1/§2 conformance-driven degradation. One-way: NativeTool →
+            // JsonSentinel → RegexProse. When the rolling window crosses
+            // the threshold we walk one step toward the more-tolerant
+            // strategy and announce the transition on the bus so the
+            // UI badge can refresh. If we are already at the lowest
+            // strategy (`RegexProse`), `downshift()` returns `None` and
+            // the check no-ops — the §2 escalate-to-user path lives in
+            // `TurnConformance` and fires separately.
+            if envelope_conformance
+                .should_degrade_with(self.degradation_window, self.degradation_threshold)
+            {
+                if let Some(next) = active_strategy.downshift() {
+                    let previous = active_strategy;
+                    active_strategy = next;
+                    // Clear the window so a freshly-degraded strategy
+                    // gets its own evaluation window instead of carrying
+                    // the failures from the prior strategy into the new
+                    // one's accounting.
+                    envelope_conformance =
+                        atelier_core::protocol_conformance::ConformanceRingBuffer::new();
+                    let reason = format!(
+                        "{} of last {} envelope parses malformed",
+                        self.degradation_threshold, self.degradation_window,
+                    );
+                    let _ = bus.send(Event::StrategyDegraded {
+                        from: previous,
+                        to: next,
+                        reason,
+                    });
+                }
+            }
 
             // P5: re-send assistant turn with its tool_calls so multi-turn
             // tool flows round-trip the tool_use ids correctly. Pre-P5 we

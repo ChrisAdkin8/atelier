@@ -1714,3 +1714,132 @@ async fn shell_curl_evil_example_is_blocked_and_audited() {
         "tc-curl-evil should appear in the persisted conversation tool_calls"
     );
 }
+
+// ---------- §1 BYOM: conformance-driven strategy degradation ----------
+
+/// §1 BYOM — conformance-driven degradation. Three back-to-back
+/// malformed envelopes (no `harness_meta` tool call on the native-tool
+/// path) inside a 3-call window trip the rolling-window threshold;
+/// the runner walks NativeTool → JsonSentinel one-way and emits
+/// `Event::StrategyDegraded` on the bus. The fourth response carries
+/// a JSON-sentinel-encoded envelope (matching the *degraded* strategy)
+/// so the run terminates cleanly after the degradation has fired.
+///
+/// Window + threshold are dialled down to (3, 3) so a four-turn
+/// scripted run can exercise the path without queueing twenty mock
+/// responses. The default (3-of-20) is exercised separately by the
+/// `should_degrade*` unit tests in `protocol_conformance.rs`.
+#[tokio::test]
+async fn run_degrades_strategy_after_three_malformed_envelopes_in_window() {
+    use atelier_core::protocol_strategy::{encode_json_sentinel, Strategy};
+
+    let workspace = tempfile::TempDir::new().unwrap();
+
+    // 1..3: malformed — text-only response, no harness_meta tool call.
+    //       The runner parses on the active strategy (NativeTool, from
+    //       the Mock capability defaults), `extract_native_envelope`
+    //       returns `None`, the conformance buffer records a failure.
+    // 4   : sentinel-wrapped envelope with claimed_done = true. By
+    //       turn 4 the runner has already degraded to JsonSentinel,
+    //       so the parser walks `parse_json_sentinel` and recovers a
+    //       clean envelope. The loop sees `claimed_done` and exits.
+    let sentinel_payload = encode_json_sentinel(&envelope_done()).unwrap();
+    let responses = vec![
+        MockResponse {
+            assistant_text: "no envelope here".into(),
+            tool_calls: vec![],
+        },
+        MockResponse {
+            assistant_text: "still no envelope".into(),
+            tool_calls: vec![],
+        },
+        MockResponse {
+            assistant_text: "one more bad turn".into(),
+            tool_calls: vec![],
+        },
+        MockResponse {
+            assistant_text: format!("ok, here is the envelope\n\n{sentinel_payload}"),
+            tool_calls: vec![],
+        },
+    ];
+
+    let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let runner = Runner::new(
+        workspace.path().to_path_buf(),
+        ProviderChoice::Mock { responses },
+        EventSink::Capture(events.clone()),
+    )
+    .expect("mock runner construction is infallible")
+    .with_max_turns(8)
+    // Dial the rolling-window threshold down so a 4-turn fixture
+    // exercises the degradation path without queueing 20 responses.
+    // The default 3-of-20 is pinned by the `protocol_conformance`
+    // unit tests.
+    .with_degradation_window(3)
+    .with_degradation_threshold(3);
+
+    let report = runner.run("trigger degradation".into()).await.unwrap();
+    assert_eq!(report.final_state, State::Done);
+
+    let captured = events.lock();
+    let degraded: Vec<_> = captured
+        .iter()
+        .filter_map(|e| match e {
+            Event::StrategyDegraded { from, to, reason } => Some((*from, *to, reason.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        degraded.len(),
+        1,
+        "expected exactly one StrategyDegraded event, got: {degraded:?}"
+    );
+    let (from, to, reason) = &degraded[0];
+    assert_eq!(*from, Strategy::NativeTool, "should degrade off NativeTool");
+    assert_eq!(*to, Strategy::JsonSentinel, "should land on JsonSentinel");
+    assert!(
+        reason.contains("malformed"),
+        "reason should mention malformed envelopes, got: {reason}"
+    );
+}
+
+/// Companion to the above: when the parses are clean from the first
+/// turn, the runner does **not** emit `StrategyDegraded`. Pins the
+/// "no false positives" half of the contract — without this a future
+/// off-by-one in the parse-OK accounting would silently fire the
+/// degrade arm on every successful run.
+#[tokio::test]
+async fn run_does_not_emit_strategy_degraded_when_envelopes_are_clean() {
+    let workspace = tempfile::TempDir::new().unwrap();
+
+    let responses = vec![MockResponse {
+        assistant_text: "first turn, clean envelope".into(),
+        tool_calls: vec![mock_envelope_tool_call(&envelope_done())],
+    }];
+
+    let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let runner = Runner::new(
+        workspace.path().to_path_buf(),
+        ProviderChoice::Mock { responses },
+        EventSink::Capture(events.clone()),
+    )
+    .expect("mock runner construction is infallible")
+    .with_max_turns(4)
+    // Even with the threshold dialled to 1, a successful turn must
+    // not fire StrategyDegraded — success is recorded as
+    // `record_success`, not `record_failure`.
+    .with_degradation_window(1)
+    .with_degradation_threshold(1);
+
+    let report = runner.run("clean run".into()).await.unwrap();
+    assert_eq!(report.final_state, State::Done);
+
+    let any_degraded = events
+        .lock()
+        .iter()
+        .any(|e| matches!(e, Event::StrategyDegraded { .. }));
+    assert!(
+        !any_degraded,
+        "StrategyDegraded must not fire when envelopes parse cleanly"
+    );
+}

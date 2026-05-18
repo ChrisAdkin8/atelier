@@ -33,6 +33,23 @@ pub const TURN_FAILURE_BUDGET: usize = 3;
 /// PROVISIONAL — spec §1. Ring-buffer depth for `Adapter::conformance()`.
 pub const CONFORMANCE_WINDOW: usize = 100;
 
+/// PROVISIONAL — spec §1 / §2 cross-call degradation window. The runner
+/// degrades the active strategy when at least
+/// [`DEFAULT_DEGRADATION_THRESHOLD`] of the last
+/// [`DEFAULT_DEGRADATION_WINDOW`] envelope-parse outcomes were
+/// malformed. Tracked separately from the per-turn [`TURN_FAILURE_BUDGET`]
+/// (which fires after consecutive failures *within one turn*); this
+/// window covers the slower-burning case of a model that intermittently
+/// produces malformed envelopes across many turns. The 3-of-20 default
+/// is a placeholder pending the canonical-workload calibration row in
+/// `tasks/todo.md`.
+pub const DEFAULT_DEGRADATION_WINDOW: usize = 20;
+
+/// Companion to [`DEFAULT_DEGRADATION_WINDOW`]. Number of malformed
+/// envelope-parse outcomes in the window that triggers a one-way
+/// downshift. See [`ConformanceRingBuffer::should_degrade`].
+pub const DEFAULT_DEGRADATION_THRESHOLD: u32 = 3;
+
 /// Per-turn tracker. One instance is created at the start of each turn and
 /// driven by the BYOM adapter's envelope-parse loop:
 ///
@@ -232,6 +249,42 @@ impl ConformanceRingBuffer {
 
     pub fn is_empty(&self) -> bool {
         self.samples.is_empty()
+    }
+
+    /// Has the rolling window crossed the §1/§2 degradation threshold?
+    /// Returns `true` when the buffer holds **at least**
+    /// [`DEFAULT_DEGRADATION_WINDOW`] samples *and* **at least**
+    /// [`DEFAULT_DEGRADATION_THRESHOLD`] of them are failures. Empty or
+    /// not-yet-full buffers return `false` so the runner doesn't degrade
+    /// on a handful of early-session noise. Asymmetric on purpose: the
+    /// "lots of evidence, lots of failures" precondition is the v1
+    /// signal; calibration (`tasks/todo.md` PROVISIONAL row) can tune
+    /// both knobs together.
+    ///
+    /// One-way: the runner calls this each turn and acts on a positive
+    /// result by downshifting the active strategy. There is no
+    /// auto-promote helper here — promotion would require evidence
+    /// against the new strategy (which is what the buffer carries) but
+    /// the spec calls for the degradation to be sticky for the session.
+    pub fn should_degrade(&self) -> bool {
+        self.should_degrade_with(DEFAULT_DEGRADATION_WINDOW, DEFAULT_DEGRADATION_THRESHOLD)
+    }
+
+    /// Custom-threshold variant of [`Self::should_degrade`]. Exposed for
+    /// integration tests that want to dial the window down to a handful
+    /// of samples without monkeypatching the global constant.
+    pub fn should_degrade_with(&self, window: usize, threshold: u32) -> bool {
+        if self.samples.len() < window {
+            return false;
+        }
+        let recent = self
+            .samples
+            .iter()
+            .rev()
+            .take(window)
+            .filter(|s| !s.ok)
+            .count();
+        recent as u32 >= threshold
     }
 
     /// Build an immutable snapshot. Constructing the per-strategy breakdown
@@ -446,5 +499,93 @@ mod tests {
     fn buffer_default_capacity_is_the_spec_window_of_100() {
         let b = ConformanceRingBuffer::new();
         assert_eq!(b.capacity(), CONFORMANCE_WINDOW);
+    }
+
+    // ---------- should_degrade ----------
+
+    #[test]
+    fn should_degrade_returns_false_on_empty_buffer() {
+        let b = ConformanceRingBuffer::new();
+        assert!(!b.should_degrade());
+    }
+
+    #[test]
+    fn should_degrade_returns_false_when_window_not_yet_full() {
+        // 19 samples, all failures — still under the 20-sample window
+        // threshold, so the runner should NOT degrade on partial
+        // evidence.
+        let mut b = ConformanceRingBuffer::new();
+        for _ in 0..19 {
+            b.record_failure(Strategy::NativeTool);
+        }
+        assert!(!b.should_degrade());
+    }
+
+    #[test]
+    fn should_degrade_returns_true_at_three_failures_in_a_full_window() {
+        // 20 samples, exactly 3 failures (the threshold) — degrade.
+        let mut b = ConformanceRingBuffer::new();
+        for _ in 0..3 {
+            b.record_failure(Strategy::NativeTool);
+        }
+        for _ in 0..17 {
+            b.record_success(Strategy::NativeTool);
+        }
+        assert!(b.should_degrade());
+    }
+
+    #[test]
+    fn should_degrade_stays_false_with_two_failures_in_a_full_window() {
+        // 20 samples, only 2 failures — just under the 3-failure
+        // threshold, so no degradation.
+        let mut b = ConformanceRingBuffer::new();
+        for _ in 0..2 {
+            b.record_failure(Strategy::NativeTool);
+        }
+        for _ in 0..18 {
+            b.record_success(Strategy::NativeTool);
+        }
+        assert!(!b.should_degrade());
+    }
+
+    #[test]
+    fn should_degrade_considers_only_the_most_recent_window() {
+        // 30 samples: first 10 are failures, last 20 are successes.
+        // The rolling window only sees the recent 20 (all success), so
+        // `should_degrade` is false even though there were >3 failures
+        // earlier in the buffer.
+        let mut b = ConformanceRingBuffer::new();
+        for _ in 0..10 {
+            b.record_failure(Strategy::NativeTool);
+        }
+        for _ in 0..20 {
+            b.record_success(Strategy::NativeTool);
+        }
+        assert!(!b.should_degrade());
+    }
+
+    #[test]
+    fn should_degrade_custom_threshold_honours_arguments() {
+        // Dial the window to 5 and the threshold to 2 — useful for
+        // integration tests that script a short sequence.
+        let mut b = ConformanceRingBuffer::new();
+        for _ in 0..4 {
+            b.record_success(Strategy::NativeTool);
+        }
+        b.record_failure(Strategy::NativeTool);
+        // 5 samples, 1 failure → under threshold of 2.
+        assert!(!b.should_degrade_with(5, 2));
+        b.record_failure(Strategy::NativeTool);
+        // Now 6 samples; the recent 5 = 4 success + 2 failure → at
+        // threshold of 2 → degrade.
+        assert!(b.should_degrade_with(5, 2));
+    }
+
+    #[test]
+    fn should_degrade_threshold_default_is_the_spec_value() {
+        // Pin the constants so a calibration row touching them is
+        // forced to update this test.
+        assert_eq!(DEFAULT_DEGRADATION_WINDOW, 20);
+        assert_eq!(DEFAULT_DEGRADATION_THRESHOLD, 3);
     }
 }

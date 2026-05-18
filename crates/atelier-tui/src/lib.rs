@@ -657,6 +657,17 @@ impl AppState {
                     claim_count: u32::try_from(*claim_count).unwrap_or(u32::MAX),
                 };
             }
+            SessionEvent::StrategyDegraded { to, .. } => {
+                // §1 BYOM — refresh the strategy field on the active
+                // model badge so the footer shows the lowered tier.
+                // `current_model` is `Some` once `ModelProfileLoaded`
+                // has fired (which the runner emits before the first
+                // turn), but guard anyway: a misordered scenario
+                // shouldn't crash the apply loop.
+                if let Some(model) = self.current_model.as_mut() {
+                    model.strategy = to.as_str();
+                }
+            }
             SessionEvent::IllegalTransitionAttempted { .. }
             | SessionEvent::Cancelled
             | SessionEvent::Shutdown => {}
@@ -918,6 +929,9 @@ pub fn project_event(evt: &SessionEvent) -> EventLine {
             "{} · {file_count} files · {claim_count} claims",
             tier.wire_label()
         ),
+        SessionEvent::StrategyDegraded { from, to, reason } => {
+            format!("{} → {} ({reason})", from.as_str(), to.as_str())
+        }
         SessionEvent::Shutdown => String::new(),
     };
     EventLine { kind, detail }
@@ -3089,6 +3103,64 @@ mod tests {
         // Model badge must be hidden so the approval prompt is the
         // unambiguous focus.
         assert!(!rendered.contains("qwen2.5-coder"), "got:\n{rendered}");
+    }
+
+    // ---------- §1 BYOM: conformance-driven degradation ----------
+
+    #[test]
+    fn apply_strategy_degraded_refreshes_current_model_strategy() {
+        use atelier_core::protocol_strategy::Strategy;
+        let mut s = AppState::new();
+        s.current_model = Some(fixture_model());
+        // Sanity-check the starting strategy from the fixture.
+        assert_eq!(s.current_model.as_ref().unwrap().strategy, "json_sentinel");
+        s.apply(&SessionEvent::StrategyDegraded {
+            from: Strategy::JsonSentinel,
+            to: Strategy::RegexProse,
+            reason: "3 malformed envelopes in last 20 calls".into(),
+        });
+        // Footer badge should reflect the degraded tier.
+        assert_eq!(s.current_model.as_ref().unwrap().strategy, "regex_prose");
+    }
+
+    #[test]
+    fn apply_strategy_degraded_is_a_noop_when_no_model_loaded() {
+        // A misordered scenario (degrade fires before a profile has
+        // landed) must not crash the apply loop.
+        use atelier_core::protocol_strategy::Strategy;
+        let mut s = AppState::new();
+        s.apply(&SessionEvent::StrategyDegraded {
+            from: Strategy::NativeTool,
+            to: Strategy::JsonSentinel,
+            reason: "early".into(),
+        });
+        assert!(s.current_model.is_none());
+    }
+
+    #[test]
+    fn project_event_strategy_degraded_carries_transition_and_reason() {
+        use atelier_core::protocol_strategy::Strategy;
+        let line = project_event(&SessionEvent::StrategyDegraded {
+            from: Strategy::NativeTool,
+            to: Strategy::JsonSentinel,
+            reason: "3 malformed envelopes in last 20 calls".into(),
+        });
+        assert_eq!(line.kind, "StrategyDegraded");
+        assert!(
+            line.detail.contains("native_tool"),
+            "got detail: {}",
+            line.detail
+        );
+        assert!(
+            line.detail.contains("json_sentinel"),
+            "got detail: {}",
+            line.detail
+        );
+        assert!(
+            line.detail.contains("3 malformed envelopes"),
+            "got detail: {}",
+            line.detail
+        );
     }
 
     // ---------- v53: §5 Context pane ----------
