@@ -817,6 +817,7 @@ pub fn bridge_event(evt: &SessionEvent) -> BridgedEvent {
             base_url,
             strategy,
             outcome,
+            capability_row,
         } => json!({
             "model_id": model_id,
             "base_url": base_url,
@@ -826,6 +827,13 @@ pub fn bridge_event(evt: &SessionEvent) -> BridgedEvent {
             // `probed` / `reprobed` / `not_cached` land on the
             // wire as legible labels suitable for direct UI use.
             "outcome": serde_json::to_value(outcome).unwrap_or(Value::Null),
+            // v60.7 §1 BYOM — capability matrix row. The Svelte
+            // footer renders this as a tooltip on the model badge
+            // so the user can spot a `ClaimedButBroken` cell
+            // without opening a separate panel.
+            // `CapabilityMatrixRow` already derives Serialize with
+            // serde-rename-all=snake_case so pass through verbatim.
+            "capability_row": serde_json::to_value(capability_row).unwrap_or(Value::Null),
         }),
         SessionEvent::ContextItems { items } => json!({
             // `ContextItemSummary` already derives Serialize with
@@ -1152,6 +1160,7 @@ mod tests {
             base_url: "http://localhost:11434/v1".into(),
             strategy: Strategy::JsonSentinel,
             outcome: ProbeLoadOutcome::CacheHit,
+            capability_row: None,
         });
         assert_eq!(b.kind, "ModelProfileLoaded");
         assert_eq!(b.payload["model_id"], "local:qwen2.5-coder:7b");
@@ -1160,6 +1169,41 @@ mod tests {
         // Outcome is serialised through serde's snake_case rename,
         // which is what the footer renders directly.
         assert_eq!(b.payload["outcome"], "cache_hit");
+        // v60.7 — capability_row rides on the same bridge.
+        assert!(b.payload["capability_row"].is_null());
+    }
+
+    #[test]
+    fn bridge_model_profile_loaded_includes_capability_row_when_set() {
+        use atelier_core::adapter::capability_matrix;
+        use atelier_core::adapter::model_profile::ProbeLoadOutcome;
+        use atelier_core::adapter::Capabilities;
+        use atelier_core::adapter::CapabilityClaim;
+        use atelier_core::protocol_strategy::Strategy;
+
+        let caps = Capabilities {
+            native_tool_use: CapabilityClaim::Supported,
+            streaming: CapabilityClaim::Supported,
+            vision: CapabilityClaim::Supported,
+            prompt_cache: CapabilityClaim::Supported,
+            structured_output: CapabilityClaim::Supported,
+            long_context: CapabilityClaim::Supported,
+            context_window_tokens: 200_000,
+        };
+        let row = capability_matrix::matrix_row_for("anthropic:claude-opus-4-7", &caps);
+        let b = bridge_event(&SessionEvent::ModelProfileLoaded {
+            model_id: "anthropic:claude-opus-4-7".into(),
+            base_url: String::new(),
+            strategy: Strategy::NativeTool,
+            outcome: ProbeLoadOutcome::CacheHit,
+            capability_row: Some(row),
+        });
+        assert_eq!(
+            b.payload["capability_row"]["model_id"],
+            "anthropic:claude-opus-4-7"
+        );
+        assert_eq!(b.payload["capability_row"]["source"], "static");
+        assert_eq!(b.payload["capability_row"]["native_tool_use"], "supported");
     }
 
     // ---------- v60.5: compaction wiring ----------

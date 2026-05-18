@@ -237,6 +237,11 @@ pub struct CurrentModel {
     pub strategy: &'static str,
     /// `cache_hit` / `probed` / `reprobed` / `not_cached`.
     pub outcome: String,
+    /// v60.7 §1 BYOM — capability matrix row. Surfaced as an
+    /// auxiliary line in the footer (and a richer tooltip in the
+    /// GUI). `None` when the runner pre-dates the matrix wiring or
+    /// the event omits it.
+    pub capability_row: Option<atelier_core::adapter::capability_matrix::CapabilityMatrixRow>,
 }
 
 /// Currently-pending hunk approval, mirror of
@@ -449,6 +454,7 @@ impl AppState {
                 base_url,
                 strategy,
                 outcome,
+                capability_row,
             } => {
                 // v52 — record the active model so the footer can
                 // render it.
@@ -459,11 +465,20 @@ impl AppState {
                 // post-processed through `snake_case_debug`, which
                 // made Rust's Debug a wire format and would break
                 // silently on a variant rename.
+                //
+                // v60.7 — the capability_row rides alongside so the
+                // footer can render a "caps: native_tool=ok · …"
+                // sublabel under the model badge. Optional for
+                // backwards compatibility with any pre-v60.7 event
+                // producer (none on main today; the field is there
+                // so a downstream test fixture isn't forced through
+                // the matrix path).
                 self.current_model = Some(CurrentModel {
                     model_id: model_id.clone(),
                     base_url: base_url.clone(),
                     strategy: strategy.as_str(),
                     outcome: outcome.wire_label().to_string(),
+                    capability_row: capability_row.clone(),
                 });
             }
             SessionEvent::ContextItems { items } => {
@@ -1543,9 +1558,13 @@ fn render_help_left(state: &AppState) -> String {
 /// Mirrors the GUI's bottom-right model widget — same field order,
 /// same separator, same colour family (cyan id · green strategy ·
 /// dim outcome).
+///
+/// v60.7 — when the model carries a capability matrix row with at
+/// least one `ClaimedButBroken` cell, append a "[broken: <list>]"
+/// segment so the user can spot a degraded model at a glance
+/// without opening a tooltip.
 fn render_help_right_model(model: &CurrentModel) -> Paragraph<'static> {
-    // Trailing space so the badge doesn't hit the terminal edge.
-    let line = Line::from(vec![
+    let mut spans = vec![
         Span::styled(
             model.model_id.clone(),
             Style::default()
@@ -1559,9 +1578,55 @@ fn render_help_right_model(model: &CurrentModel) -> Paragraph<'static> {
         ),
         Span::styled(" · ", Style::default().fg(Color::DarkGray)),
         Span::styled(model.outcome.clone(), Style::default().fg(Color::DarkGray)),
-        Span::raw(" "),
-    ]);
-    Paragraph::new(line)
+    ];
+    if let Some(broken) = capability_broken_label(model.capability_row.as_ref()) {
+        spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled(
+            broken,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    // Trailing space so the badge doesn't hit the terminal edge.
+    spans.push(Span::raw(" "));
+    Paragraph::new(Line::from(spans))
+}
+
+/// If the row carries any `ClaimedButBroken` cells, return a short
+/// human-readable list (`"broken: native_tool, structured_output"`).
+/// Returns `None` for healthy rows so the footer doesn't gain a
+/// useless suffix on every well-behaved model. Used by both the
+/// width calculation and the renderer so the two stay in lock-step.
+fn capability_broken_label(
+    row: Option<&atelier_core::adapter::capability_matrix::CapabilityMatrixRow>,
+) -> Option<String> {
+    use atelier_core::adapter::CapabilityClaim;
+    let row = row?;
+    let mut broken: Vec<&'static str> = Vec::new();
+    if matches!(row.native_tool_use, CapabilityClaim::ClaimedButBroken) {
+        broken.push("native_tool");
+    }
+    if matches!(row.streaming, CapabilityClaim::ClaimedButBroken) {
+        broken.push("streaming");
+    }
+    if matches!(row.vision, CapabilityClaim::ClaimedButBroken) {
+        broken.push("vision");
+    }
+    if matches!(row.prompt_cache, CapabilityClaim::ClaimedButBroken) {
+        broken.push("prompt_cache");
+    }
+    if matches!(row.structured_output, CapabilityClaim::ClaimedButBroken) {
+        broken.push("structured_output");
+    }
+    if matches!(row.long_context, CapabilityClaim::ClaimedButBroken) {
+        broken.push("long_context");
+    }
+    if broken.is_empty() {
+        None
+    } else {
+        Some(format!("broken: {}", broken.join(", ")))
+    }
 }
 
 /// Visual column count of the model badge — the sum of each
@@ -1576,8 +1641,15 @@ fn model_badge_width(model: &CurrentModel) -> u16 {
     let id = model.model_id.chars().count();
     let strategy = model.strategy.chars().count();
     let outcome = model.outcome.chars().count();
-    // Three " · " separators (3 cols each) + leading 0 + trailing 1.
-    let total = id + strategy + outcome + (3 * 3) + 1;
+    let broken_extra = match capability_broken_label(model.capability_row.as_ref()) {
+        // The renderer prepends " · " (3 cols) before the broken
+        // label.
+        Some(label) => label.chars().count() + 3,
+        None => 0,
+    };
+    // Three " · " separators (3 cols each) + leading 0 + trailing 1
+    // + optional " · broken: …" suffix.
+    let total = id + strategy + outcome + (3 * 3) + 1 + broken_extra;
     total.try_into().unwrap_or(u16::MAX)
 }
 
@@ -2679,6 +2751,7 @@ mod tests {
             base_url: "http://localhost:11434/v1".into(),
             strategy: "json_sentinel",
             outcome: "cache_hit".into(),
+            capability_row: None,
         }
     }
 
@@ -2693,6 +2766,7 @@ mod tests {
             base_url: "http://localhost:11434/v1".into(),
             strategy: Strategy::JsonSentinel,
             outcome: ProbeLoadOutcome::CacheHit,
+            capability_row: None,
         });
         let m = s.current_model.expect("current_model populated");
         assert_eq!(m.model_id, "local:qwen2.5-coder:7b");

@@ -20,6 +20,7 @@
 //! tests off the network and lets us inject specific failure modes.
 
 pub mod anthropic;
+pub mod capability_matrix;
 pub mod model_profile;
 pub mod openai_compat;
 

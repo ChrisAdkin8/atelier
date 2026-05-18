@@ -431,16 +431,25 @@ impl AnthropicMessage {
         } else {
             Strategy::NativeTool
         };
-        let usage = self.usage.unwrap_or_default();
+        // §1 BYOM ledger discipline (v60.7) — `count_source` reports
+        // the *actual* origin of the numbers, not a blanket optimistic
+        // claim. Anthropic's Messages API always returns `usage`, but
+        // a malformed / truncated response can land here without one;
+        // in that case we surface `Unavailable` so the §1 cost ledger
+        // and the §3 cost meter can flag the row as imprecise.
+        let (usage_struct, count_source) = match self.usage {
+            Some(u) => (u, TokenSource::Exact),
+            None => (AnthropicUsage::default(), TokenSource::Unavailable),
+        };
         let stop_reason = map_stop_reason(self.stop_reason.as_deref());
         ChatResponse {
             text,
             tool_calls,
             usage: Usage {
-                prompt_tokens: usage.input_tokens,
-                completion_tokens: usage.output_tokens,
-                cached_tokens: usage.cache_read_input_tokens,
-                count_source: TokenSource::Exact,
+                prompt_tokens: usage_struct.input_tokens,
+                completion_tokens: usage_struct.output_tokens,
+                cached_tokens: usage_struct.cache_read_input_tokens,
+                count_source,
                 latency_ms: Some(latency_ms),
             },
             strategy,
@@ -610,6 +619,13 @@ struct AnthropicSseSource {
     /// dispatcher executes them in the order the model issued them).
     tool_order: Vec<u32>,
     usage: AnthropicUsage,
+    /// v60.7 §1 BYOM ledger discipline — `true` once any wire event
+    /// carried a `usage` block we successfully decoded. When the stream
+    /// terminates without `usage_observed = true`, the final
+    /// `ChatResponse` reports `TokenSource::Unavailable` so the §1 cost
+    /// ledger and §3 cost meter can distinguish "provider said zero"
+    /// from "provider said nothing."
+    usage_observed: bool,
     /// Most recent `stop_reason` carried by a `message_delta` event.
     /// Propagated to the final `ChatResponse` so the harness can tell
     /// `end_turn` from `max_tokens` / `refusal`.
@@ -651,6 +667,7 @@ impl AnthropicSseSource {
             tool_blocks: std::collections::HashMap::new(),
             tool_order: Vec::new(),
             usage: AnthropicUsage::default(),
+            usage_observed: false,
             stop_reason: None,
             pending_chunks: std::collections::VecDeque::new(),
             finished: false,
@@ -807,6 +824,9 @@ impl AnthropicSseSource {
                             if parsed.cache_read_input_tokens.is_some() {
                                 self.usage.cache_read_input_tokens = parsed.cache_read_input_tokens;
                             }
+                            // §1: usage was actually observed on the
+                            // wire — `count_source` will be `Exact`.
+                            self.usage_observed = true;
                         }
                     }
                 }
@@ -917,6 +937,8 @@ impl AnthropicSseSource {
                 if let Some(u) = v.get("usage") {
                     if let Some(out) = u.get("output_tokens").and_then(|n| n.as_u64()) {
                         self.usage.output_tokens = out as u32;
+                        // §1: usage was actually observed on the wire.
+                        self.usage_observed = true;
                     }
                 }
                 // stop_reason lives in `delta.stop_reason` for streaming
@@ -979,6 +1001,17 @@ impl AnthropicSseSource {
             Strategy::NativeTool
         };
         let latency_ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        // §1 BYOM ledger discipline (v60.7) — `Exact` iff the wire
+        // actually carried `usage`. A stream that completed without
+        // any usage event reports `Unavailable` so the §1 cost
+        // ledger downstream can flag the row honestly rather than
+        // rubber-stamping `prompt_tokens=0, completion_tokens=0`
+        // as ground truth.
+        let count_source = if self.usage_observed {
+            TokenSource::Exact
+        } else {
+            TokenSource::Unavailable
+        };
         ChatResponse {
             text: std::mem::take(&mut self.text_acc),
             tool_calls,
@@ -986,7 +1019,7 @@ impl AnthropicSseSource {
                 prompt_tokens: self.usage.input_tokens,
                 completion_tokens: self.usage.output_tokens,
                 cached_tokens: self.usage.cache_read_input_tokens,
-                count_source: TokenSource::Exact,
+                count_source,
                 latency_ms: Some(latency_ms),
             },
             strategy,

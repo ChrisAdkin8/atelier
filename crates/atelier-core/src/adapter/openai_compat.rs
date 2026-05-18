@@ -482,16 +482,24 @@ impl ChatCompletionResponse {
         } else {
             Strategy::NativeTool
         };
-        let usage = self.usage.unwrap_or_default();
+        // §1 BYOM ledger discipline (v60.7) — local OpenAI-compatible
+        // servers (Ollama, llama-server, vLLM) sometimes omit
+        // `usage` entirely. `Exact` iff the wire carried it;
+        // otherwise `Unavailable` so the §1 ledger can label the
+        // row "no provider count" instead of "exact zero."
+        let (usage_struct, count_source) = match self.usage {
+            Some(u) => (u, TokenSource::Exact),
+            None => (OpenAiUsage::default(), TokenSource::Unavailable),
+        };
         let stop_reason = map_finish_reason(finish_reason.as_deref());
         ChatResponse {
             text,
             tool_calls,
             usage: Usage {
-                prompt_tokens: usage.prompt_tokens,
-                completion_tokens: usage.completion_tokens,
+                prompt_tokens: usage_struct.prompt_tokens,
+                completion_tokens: usage_struct.completion_tokens,
                 cached_tokens: None,
-                count_source: TokenSource::Exact,
+                count_source,
                 latency_ms: Some(latency_ms),
             },
             strategy,
@@ -627,6 +635,12 @@ struct OpenAiSseSource {
     tool_blocks: std::collections::HashMap<u32, OpenAiToolBlockInProgress>,
     tool_order: Vec<u32>,
     usage: OpenAiUsage,
+    /// v60.7 §1 BYOM ledger discipline — set when any chunk carried a
+    /// `usage` block we successfully decoded. A stream that ends
+    /// without observing usage reports `TokenSource::Unavailable` in
+    /// the final response (common against local OpenAI-compat servers
+    /// that don't emit usage by default).
+    usage_observed: bool,
     stop_reason: Option<StopReason>,
     pending_chunks: std::collections::VecDeque<StreamChunk>,
     finished: bool,
@@ -663,6 +677,7 @@ impl OpenAiSseSource {
             tool_blocks: std::collections::HashMap::new(),
             tool_order: Vec::new(),
             usage: OpenAiUsage::default(),
+            usage_observed: false,
             stop_reason: None,
             pending_chunks: std::collections::VecDeque::new(),
             finished: false,
@@ -889,6 +904,8 @@ impl OpenAiSseSource {
             if let Ok(parsed) = serde_json::from_value::<OpenAiUsage>(u.clone()) {
                 if parsed.prompt_tokens > 0 || parsed.completion_tokens > 0 {
                     self.usage = parsed;
+                    // §1: usage was actually observed on the wire.
+                    self.usage_observed = true;
                 }
             }
         }
@@ -917,6 +934,17 @@ impl OpenAiSseSource {
             Strategy::NativeTool
         };
         let latency_ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        // §1 BYOM ledger discipline — same rationale as the
+        // non-streaming path. Local servers (Ollama default config,
+        // some llama.cpp builds) close the stream without ever
+        // emitting a `usage` block; those land here with
+        // `Unavailable` so the ledger doesn't pretend zero tokens
+        // crossed the wire.
+        let count_source = if self.usage_observed {
+            TokenSource::Exact
+        } else {
+            TokenSource::Unavailable
+        };
         ChatResponse {
             text: std::mem::take(&mut self.text_acc),
             tool_calls,
@@ -924,7 +952,7 @@ impl OpenAiSseSource {
                 prompt_tokens: self.usage.prompt_tokens,
                 completion_tokens: self.usage.completion_tokens,
                 cached_tokens: None,
-                count_source: TokenSource::Exact,
+                count_source,
                 latency_ms: Some(latency_ms),
             },
             strategy,
