@@ -1,5 +1,25 @@
 # Atelier Spec — Changelog
 
+## v60.32 — 2026-05-19 (Runner correctness + test-seam discipline — M01–M06)
+
+First medium-severity bundle from `tasks/plan_medium_severity_fixes.md`. Six file-disjoint fixes across `crates/atelier-cli/src/{main.rs,runner.rs,lib.rs}`, `crates/atelier-cli/src/bin/conformance_status.rs`, and `crates/atelier-cli/Cargo.toml`.
+
+- **M01 — `OPENAI_BASE_URL` precedence pinned + traced.** Extracted `resolve_openai_base_url(from_cli_or_profile, from_env)` so the documented `CLI > profile > env > default` order is a pure function and the live path emits a one-shot `tracing::info!` recording which layer won. Three new unit tests in `runner::tests::base_url_*` pin each layer.
+- **M02 — `AwaitingUser` final state exits 6.** New `atelier_cli::exit_code_for_final_state` helper maps `State::AwaitingUser` to 6 and every other terminal state to 0; the binary's `run_run` calls it. 130/143 stay reserved for the v60.29 signal handlers; adapter errors stay on 1. New integration test `crates/atelier-cli/tests/exit_codes.rs` drives a Mock that emits text without `claimed_done` and asserts the run lands in `AwaitingUser` + the helper maps it to 6.
+- **M03 — Compact-retry re-projects `messages_for_call` from post-mutation context.** The per-turn projection is now a closure (`project_messages_for_call`) called at the head of every overflow-retry iteration. On a successful compaction the runner snapshots the picked context items' text before the mutator runs, then trims the matching User/Assistant rows from `messages` so the retry payload is strictly smaller. New `compact_retry_rebuilds_messages_for_call_from_post_mutation_context` integration test asserts call 2's payload is smaller than call 1's and that the original prompt no longer appears in the retry.
+- **M04 — `Runner::swap_adapter` no longer sync-shaped behind `async`.** Removed the `async` annotation; the function holds only `parking_lot::Mutex` guards (no `.await`). Updated both test call sites to drop the `.await`. Lower future-deadlock risk for the next caller who adds an `.await` inside the body.
+- **M05 — `conformance-status` resolves its data file at run time.** `default_artifact_path` now reads `ATELIER_PROJECT_DIR` (when set) or the runtime CWD, falling back to `tests/phase_b_gate/last_run.json` relative to either. A new `--debug` flag preserves the build-time `CARGO_MANIFEST_DIR` path for the in-tree seed test. New `default_artifact_path_prefers_project_dir_env_then_cwd` test pins both layers.
+- **M06 — Test-seam discipline.** New `test-seams` Cargo feature on `atelier-cli` (default off). Gated `with_adapter_for_test`, `with_starting_strategy_override`, `with_tier1_diagnostics_for_test`, `with_degradation_window`, `with_degradation_threshold` under `#[cfg(any(test, feature = "test-seams"))]`; the integration-test crate enables the feature via a self-referential `dev-dependencies` entry. Production builds can no longer pin stale strategies through these seams. Fixed the pre-existing v60.29 `--all-targets` clippy warning on `Runner::with_external_cancel` with a targeted `#[allow(dead_code)]` (the binary uses it; the lib's test compilation doesn't); added module-level `#[allow(dead_code)]` to the `#[path]` includes in `tests/sigint_resume.rs` so partial surface coverage stops tripping clippy.
+
+### Verification
+
+- `cargo fmt --check` — clean.
+- `cargo clippy --workspace --all-targets -- -D warnings` — clean (M06 closes the pre-existing `with_external_cancel` warning).
+- `cargo test -p atelier-core` — 852 passed, no regressions.
+- `cargo test -p atelier-cli` — 233 passed across nine binaries / test crates including the three new tests (`base_url_*` ×3, `exit_codes::*` ×2, `compact_retry_*` ×1, `default_artifact_path_prefers_project_dir_env_then_cwd` ×1).
+- `cargo build --no-default-features -p atelier-cli` — succeeds (M06 feature is off by default).
+- `make check` — 115 rig tests + 14 workload dry-runs green.
+
 ## v60.30 — 2026-05-18 (TUI / frontend hygiene — H13–H15 + UI Mediums)
 
 Hardening pass on the TUI lifecycle, the TUI render path, and the GUI's inline-content renderers. Three high-severity bullets (H13–H15) plus five medium-severity UI items land together because they're file-disjoint with v60.28 / v60.29 but co-located in `crates/atelier-tui/` and `crates/atelier-gui/ui/`.

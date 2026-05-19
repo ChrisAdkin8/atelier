@@ -79,6 +79,17 @@ pub use runner::{
     RunError, RunReport, Runner,
 };
 
+/// v60.32 M02 — map a `RunReport.final_state` to the `atelier` binary's
+/// exit code so CI gates can distinguish "completed" (0) from
+/// "stalled, agent waiting for the user" (6). 130/143 stay reserved
+/// for the v60.29 signal handlers; non-zero adapter errors stay on 1.
+pub fn exit_code_for_final_state(state: atelier_core::State) -> u8 {
+    match state {
+        atelier_core::State::AwaitingUser => 6,
+        _ => 0,
+    }
+}
+
 // v50: re-export ApprovalPolicy from atelier-core so a downstream
 // driver (GUI / TUI) configuring a Runner doesn't have to depend on
 // atelier-core directly just to flip the policy. The blessed import

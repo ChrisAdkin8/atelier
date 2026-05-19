@@ -2928,7 +2928,6 @@ async fn swap_adapter_preserves_conversation_history_across_provider_boundary() 
             adapter_b.clone() as Arc<dyn atelier_core::adapter::Adapter>,
             "2026-05-18T12:00:00Z",
         )
-        .await
         .expect("swap_adapter must succeed");
 
     // Second run: with_resume reads the persisted session, replays
@@ -3030,7 +3029,6 @@ async fn swap_adapter_clears_few_shot_cache() {
             adapter_b as Arc<dyn atelier_core::adapter::Adapter>,
             "2026-05-18T12:34:56Z",
         )
-        .await
         .expect("swap must succeed");
 
     // Second fresh run (not resuming — the few-shot cache is the
@@ -4664,5 +4662,112 @@ async fn phase_a_live_anthropic_conformance_rate_priority_subset() {
          (samples: {} total, {} failed). See spec §2.",
         snap.total,
         snap.failures,
+    );
+}
+
+// v60.32 M03 — the compact-retry path must re-project
+// `messages_for_call` from the post-mutation `ContextManager`. Pre-fix
+// the retry re-sent the pre-compaction snapshot, so call 2's payload
+// was identical (in tokens) to call 1's. Verify by recording every
+// `adapter.chat(...)` payload and checking that the post-compaction
+// retry payload is strictly smaller than the pre-compaction payload.
+#[tokio::test]
+async fn compact_retry_rebuilds_messages_for_call_from_post_mutation_context() {
+    use atelier_core::adapter::{AdapterError, ChatResponse, StreamChunk, Usage};
+    use atelier_core::context::TokenSource;
+    use atelier_core::protocol_strategy::{Strategy, SENTINEL_CLOSE, SENTINEL_OPEN};
+
+    let workspace = tempfile::TempDir::new().unwrap();
+    let recording = Arc::new(RecordingMockAdapter::new("mock:compact-retry"));
+    // Queue 1: overflow on the first chat call.
+    recording.inner.queue_stream(vec![StreamChunk::Error {
+        error: AdapterError::ContextOverflow {
+            needed_tokens: 50,
+            limit_tokens: 100,
+        },
+    }]);
+    // Queue 2: compaction's summary call returns a short summary.
+    recording.inner.queue_stream(vec![StreamChunk::Complete {
+        response: ChatResponse {
+            text: "Summary: the compacted prompt.".to_string(),
+            tool_calls: vec![],
+            usage: Usage {
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                cached_tokens: None,
+                count_source: TokenSource::Approx,
+                latency_ms: Some(0),
+            },
+            strategy: Strategy::JsonSentinel,
+            stop_reason: Some(atelier_core::adapter::StopReason::EndTurn),
+        },
+    }]);
+    // Queue 3: retry of turn 1 — envelope-done so the run terminates.
+    let env_json = serde_json::to_string(&envelope_done()).unwrap();
+    let text = format!("ok, done\n{SENTINEL_OPEN}{env_json}{SENTINEL_CLOSE}");
+    recording.inner.queue_stream(vec![StreamChunk::Complete {
+        response: ChatResponse {
+            text,
+            tool_calls: vec![],
+            usage: Usage {
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                cached_tokens: None,
+                count_source: TokenSource::Approx,
+                latency_ms: Some(0),
+            },
+            strategy: Strategy::JsonSentinel,
+            stop_reason: Some(atelier_core::adapter::StopReason::EndTurn),
+        },
+    }]);
+
+    let received = recording.received.clone();
+    let runner = Runner::new(
+        workspace.path().to_path_buf(),
+        ProviderChoice::Mock { responses: vec![] },
+        EventSink::Null,
+    )
+    .expect("mock runner construction is infallible")
+    .with_adapter_for_test(recording as Arc<dyn atelier_core::adapter::Adapter>)
+    .with_max_turns(2);
+
+    // A long user prompt so the chars/4 approximation puts the picked
+    // context item over the floor and the compaction visibly trims it.
+    let prompt = "demonstrate the §1 context-overflow recovery path with a \
+                  deliberately long prompt that the auto-selector can pick \
+                  up and compact away on the first overflow."
+        .to_string();
+    let _ = runner.run(prompt.clone()).await.expect("run must succeed");
+
+    let calls = received.lock();
+    assert!(
+        calls.len() >= 3,
+        "expected ≥3 chat calls (overflow + summary + retry), got {}",
+        calls.len()
+    );
+    // Total content length is a deterministic proxy for "tokens on the
+    // wire" — call 0 (pre-overflow) carried the long prompt verbatim;
+    // call 2 (post-compaction retry) should not. The compaction
+    // mutator evicts the prompt's context item and the runner drops
+    // the matching User row from `messages` before issuing the retry.
+    let payload_len = |msgs: &Vec<atelier_core::adapter::Message>| -> usize {
+        msgs.iter().map(|m| m.content.len()).sum()
+    };
+    let pre = payload_len(&calls[0]);
+    let post = payload_len(&calls[2]);
+    assert!(
+        post < pre,
+        "post-compaction retry payload ({post} bytes) must be smaller \
+         than the pre-compaction payload ({pre} bytes); compaction was \
+         silently dropped",
+    );
+    // And specifically the user prompt body must not appear in the
+    // retry payload — that's the entry compaction removed.
+    let retry_contains_prompt = calls[2]
+        .iter()
+        .any(|m| m.content.contains("deliberately long prompt"));
+    assert!(
+        !retry_contains_prompt,
+        "post-compaction retry payload must not contain the original prompt"
     );
 }

@@ -583,10 +583,15 @@ impl Runner {
                 // OpenAI by accident with a `local:` model id would
                 // 404 in a confusing way.
                 let api_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
-                let base = base_url.unwrap_or_else(|| {
-                    std::env::var("OPENAI_BASE_URL")
-                        .unwrap_or_else(|_| "https://api.openai.com/v1".to_string())
-                });
+                // v60.32 M01 — only consult `OPENAI_BASE_URL` when no
+                // CLI flag and no profile entry set the base url.
+                // Documented precedence is `CLI > profile > env >
+                // default`; emit a one-shot `tracing::info!` recording
+                // which layer won so an operator can diagnose surprise
+                // origins.
+                let (base, source) =
+                    resolve_openai_base_url(base_url, std::env::var("OPENAI_BASE_URL").ok());
+                tracing::info!(layer = source, base_url = %base, "openai-compat base url resolved");
                 // §1 BYOM: "Mock + OpenAI-compat (local servers)"
                 // get the latency-weighted local rate.  Hosted
                 // OpenAI is the one openai-compat target that's a
@@ -646,6 +651,12 @@ impl Runner {
     /// `Runner::run` passes it through to `session::spawn_with_cancel_token`;
     /// the dispatcher's outer `tokio::select!` observes it via
     /// `ToolContext::cancel` and surfaces `ToolError::Cancelled` mid-tool.
+    ///
+    /// `#[allow(dead_code)]`: only the `atelier` binary and the
+    /// `sigint_resume` integration test reach this; the other integration
+    /// tests pull `runner.rs` in via `#[path]` (separate compilation
+    /// unit) and never call it, which the lint would otherwise flag.
+    #[allow(dead_code)]
     pub fn with_external_cancel(mut self, token: tokio_util::sync::CancellationToken) -> Self {
         self.external_cancel = Some(token);
         self
@@ -690,10 +701,12 @@ impl Runner {
     /// production binary never calls this; production paths construct
     /// the adapter via [`Self::new`].
     ///
-    /// `#[doc(hidden)]` so this doesn't appear in published docs. Marked
-    /// `pub` (not `pub(crate)`) because integration tests live in a
-    /// separate crate that pulls this module in via `#[path]`.
+    /// `#[doc(hidden)]` so this doesn't appear in published docs.
+    /// v60.32 M06 — gated under `#[cfg(any(test, feature =
+    /// "test-seams"))]` so production builds can't pin stale
+    /// strategies through this seam.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-seams"))]
     #[allow(dead_code)]
     pub fn with_adapter_for_test(mut self, adapter: Arc<dyn Adapter>) -> Self {
         self.adapter = adapter;
@@ -740,7 +753,7 @@ impl Runner {
     ///     a pre-built adapter (the caller decides policy).
     ///   * Pending approval — unchanged (lives on `SessionDispatcher`,
     ///     not on `Runner`; the user keeps accept/reject options).
-    pub async fn swap_adapter(
+    pub fn swap_adapter(
         &mut self,
         new_adapter: Arc<dyn Adapter>,
         now: &str,
@@ -839,7 +852,9 @@ impl Runner {
     /// [`atelier_core::protocol_conformance::DEFAULT_DEGRADATION_WINDOW`]
     /// (PROVISIONAL 20). Integration tests dial this down so a short
     /// scripted sequence can exercise the degradation path without
-    /// queueing twenty mock responses.
+    /// queueing twenty mock responses. v60.32 M06 — gated under
+    /// `test-seams`.
+    #[cfg(any(test, feature = "test-seams"))]
     #[allow(dead_code)]
     pub fn with_degradation_window(mut self, window: usize) -> Self {
         self.degradation_window = window;
@@ -850,7 +865,8 @@ impl Runner {
     /// (failures-in-window count). The default is
     /// [`atelier_core::protocol_conformance::DEFAULT_DEGRADATION_THRESHOLD`]
     /// (PROVISIONAL 3). See [`Self::with_degradation_window`] for the
-    /// companion knob.
+    /// companion knob. v60.32 M06 — gated under `test-seams`.
+    #[cfg(any(test, feature = "test-seams"))]
     #[allow(dead_code)]
     pub fn with_degradation_threshold(mut self, threshold: u32) -> Self {
         self.degradation_threshold = threshold;
@@ -904,7 +920,8 @@ impl Runner {
     /// against the `MockAdapter` (whose declared capabilities always
     /// resolve to `NativeTool`). Production callers should not set this —
     /// the probe-on-first-use + conformance tracker pair owns strategy
-    /// selection in real runs.
+    /// selection in real runs. v60.32 M06 — gated under `test-seams`.
+    #[cfg(any(test, feature = "test-seams"))]
     #[allow(dead_code)]
     pub fn with_starting_strategy_override(mut self, strategy: Strategy) -> Self {
         self.starting_strategy_override = Some(strategy);
@@ -916,7 +933,8 @@ impl Runner {
     /// callers leave the vec empty (the runner uses bare
     /// `verify_pass` in that case). Once `async-lsp` lands, the
     /// runner produces these from the LSP receiver and this builder
-    /// stays unused.
+    /// stays unused. v60.32 M06 — gated under `test-seams`.
+    #[cfg(any(test, feature = "test-seams"))]
     #[allow(dead_code)]
     pub fn with_tier1_diagnostics_for_test(
         mut self,
@@ -1420,12 +1438,21 @@ impl Runner {
             // conversation transcript stays free of the panel preamble
             // (which lives separately in `mental_model.json` and would
             // re-inject on resume anyway).
-            let mm_snapshot = session_dispatcher.snapshot_mental_model();
-            let messages_for_call: Vec<Message> =
+            // v60.32 M03 — `messages_for_call` is rebuilt at the head
+            // of every retry iteration so a compaction that runs in
+            // the `ContextOverflow → Compact` arm below feeds the
+            // post-mutation history into the next chat call. Pre-fix,
+            // the projection was captured once outside the loop and
+            // the retry re-sent the pre-compaction snapshot, defeating
+            // the compaction. The mental-model snapshot is also
+            // re-read each iteration so a concurrent
+            // `set_mental_model` mutation lands on the retry too.
+            let project_messages_for_call = |history: &[Message]| -> Vec<Message> {
+                let mm_snapshot = session_dispatcher.snapshot_mental_model();
                 if mm_snapshot.enabled && !mm_snapshot.text.trim().is_empty() {
-                    let mut v = Vec::with_capacity(messages.len() + 1);
+                    let mut v = Vec::with_capacity(history.len() + 1);
                     // Insert immediately after the atelier system prompt
-                    // (which is messages[0] on a fresh run) so both system
+                    // (which is history[0] on a fresh run) so both system
                     // messages land together at the head of the
                     // conversation; Anthropic concatenates multiple system
                     // entries cleanly, OpenAI-compat keeps them as separate
@@ -1433,12 +1460,12 @@ impl Runner {
                     // entry sits ahead of the rehydrated prefix — both
                     // shapes are acceptable wire-wise.
                     let insert_pos =
-                        if !messages.is_empty() && matches!(messages[0].role, Role::System) {
+                        if !history.is_empty() && matches!(history[0].role, Role::System) {
                             1
                         } else {
                             0
                         };
-                    v.extend(messages.iter().take(insert_pos).cloned());
+                    v.extend(history.iter().take(insert_pos).cloned());
                     v.push(Message::text(
                         Role::System,
                         format!(
@@ -1451,15 +1478,17 @@ impl Runner {
                             mm_snapshot.text.trim()
                         ),
                     ));
-                    v.extend(messages.iter().skip(insert_pos).cloned());
+                    v.extend(history.iter().skip(insert_pos).cloned());
                     v
                 } else {
-                    messages.clone()
-                };
+                    history.to_vec()
+                }
+            };
 
             let response = {
                 let mut overflow_retries: usize = 0;
                 loop {
+                    let messages_for_call = project_messages_for_call(&messages);
                     match self
                         .adapter
                         .chat(&messages_for_call, &turn_tools_spec)
@@ -1518,6 +1547,31 @@ impl Runner {
                                             limit_tokens,
                                         });
                                     }
+                                    // v60.32 M03 — snapshot the text
+                                    // of each picked context item
+                                    // before compaction so we can drop
+                                    // the matching conversation
+                                    // history entries after the
+                                    // mutator runs. Without this the
+                                    // retry chat call would re-send
+                                    // every original message verbatim,
+                                    // defeating the compaction.
+                                    let picked_texts: Vec<String> = {
+                                        let cm = context_manager.lock();
+                                        picks
+                                            .iter()
+                                            .filter_map(|id| {
+                                                cm.iter()
+                                                    .find(|it| it.id.to_string() == *id)
+                                                    .and_then(|it| match &it.payload {
+                                                        atelier_core::context::Payload::InlineText { text } => {
+                                                            Some(text.clone())
+                                                        }
+                                                        _ => None,
+                                                    })
+                                            })
+                                            .collect()
+                                    };
                                     let now = now_rfc3339();
                                     let sid_str = session_id.0.to_string();
                                     match crate::compaction::compact(
@@ -1536,6 +1590,36 @@ impl Runner {
                                                 freed_tokens: Some(out.freed_tokens),
                                                 items_compacted: Some(picks.len()),
                                             });
+                                            // v60.32 M03 — drop the
+                                            // history entries the
+                                            // compaction consumed so
+                                            // the next
+                                            // `project_messages_for_call`
+                                            // builds a smaller
+                                            // payload. We only trim
+                                            // User / Assistant rows
+                                            // (the rolling prose
+                                            // history); Tool rows
+                                            // stay so a pending
+                                            // tool_use → tool_result
+                                            // pair isn't orphaned.
+                                            // The atelier system
+                                            // prompt is never a
+                                            // compaction target — the
+                                            // picker filters pinned
+                                            // items and the system
+                                            // prompt isn't a context
+                                            // item to begin with.
+                                            if !picked_texts.is_empty() {
+                                                messages.retain(|m| {
+                                                    !(matches!(
+                                                        m.role,
+                                                        Role::User | Role::Assistant
+                                                    ) && picked_texts
+                                                        .iter()
+                                                        .any(|t| t == &m.content))
+                                                });
+                                            }
                                             overflow_retries += 1;
                                             continue;
                                         }
@@ -2492,6 +2576,26 @@ fn pick_overflow_compaction_targets(
     chosen
 }
 
+/// v60.32 M01 — pure resolution of the OpenAI-compat base url.
+///
+/// Documented precedence: CLI flag > profile entry > `OPENAI_BASE_URL`
+/// env > built-in default. The CLI and profile fold into the
+/// `from_cli_or_profile` argument upstream (`resolve_provider_choice`
+/// in `main.rs`). Returning the source label lets the caller log
+/// which layer won.
+fn resolve_openai_base_url(
+    from_cli_or_profile: Option<String>,
+    from_env: Option<String>,
+) -> (String, &'static str) {
+    if let Some(v) = from_cli_or_profile {
+        (v, "cli_or_profile")
+    } else if let Some(v) = from_env {
+        (v, "env")
+    } else {
+        ("https://api.openai.com/v1".to_string(), "default")
+    }
+}
+
 fn build_mock_adapter(responses: Vec<MockResponse>) -> MockAdapter {
     let m = MockAdapter::new("mock:run");
     for r in responses {
@@ -2609,6 +2713,34 @@ pub fn read_prompt(path: Option<&Path>) -> io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // v60.32 M01 — pin the documented `CLI > profile > env > default`
+    // precedence for the OpenAI-compat base url. The CLI and profile
+    // fold into the first argument upstream in `resolve_provider_choice`;
+    // the per-test scenarios below name the layer for clarity.
+    #[test]
+    fn base_url_cli_or_profile_wins_over_env_and_default() {
+        let (v, src) = resolve_openai_base_url(
+            Some("http://localhost:11434/v1".to_string()),
+            Some("http://env-override:9999/v1".to_string()),
+        );
+        assert_eq!(v, "http://localhost:11434/v1");
+        assert_eq!(src, "cli_or_profile");
+    }
+
+    #[test]
+    fn base_url_env_wins_over_default_when_cli_and_profile_absent() {
+        let (v, src) = resolve_openai_base_url(None, Some("http://env-host:8080/v1".to_string()));
+        assert_eq!(v, "http://env-host:8080/v1");
+        assert_eq!(src, "env");
+    }
+
+    #[test]
+    fn base_url_falls_back_to_default_when_all_layers_absent() {
+        let (v, src) = resolve_openai_base_url(None, None);
+        assert_eq!(v, "https://api.openai.com/v1");
+        assert_eq!(src, "default");
+    }
 
     #[test]
     fn user_prompt_item_uses_inline_text_and_user_attached_provenance() {

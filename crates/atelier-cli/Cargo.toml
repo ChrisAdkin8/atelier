@@ -6,6 +6,15 @@ rust-version.workspace = true
 license.workspace = true
 description = "Atelier command-line interface. Headless entry point — provides `atelier init` (spec §11) and will host `atelier login/logout/rotate/whoami` once §11 credentials land. No UI dependencies."
 
+[features]
+# v60.32 M06 — gate the test-only Runner builder seams
+# (`with_adapter_for_test`, `with_starting_strategy_override`,
+# `with_tier1_diagnostics_for_test`, `with_degradation_window`,
+# `with_degradation_threshold`) so production consumers can't pin
+# stale strategies through the public API. Off by default; tests
+# enable it via `dev-dependencies` on the same crate.
+test-seams = []
+
 [[bin]]
 name = "atelier"
 path = "src/main.rs"
@@ -54,3 +63,8 @@ parking_lot = { workspace = true }
 # adapter impl that records the message history it receives. Needs
 # `async-trait` to express the `async fn stream` method.
 async-trait = { workspace = true }
+# v60.32 M06 — enable the test-only Runner builder seams when the
+# integration-test crate compiles. Production consumers (the `atelier`
+# binary, GUI, TUI) build without this feature and therefore can't
+# pin stale strategies through the public API.
+atelier-cli = { path = ".", features = ["test-seams"] }

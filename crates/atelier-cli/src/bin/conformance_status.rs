@@ -40,7 +40,28 @@ use serde::Deserialize;
 
 /// In-tree default path. Override via positional arg for worktrees /
 /// CI matrices.
+///
+/// v60.32 M05 — resolve relative to runtime CWD (or
+/// `ATELIER_PROJECT_DIR` when set). A binary built in one workspace
+/// and run from another previously read the build-time manifest dir,
+/// surfacing stale data. The build-time manifest dir remains
+/// available as a last-resort fallback for `--debug` callers; without
+/// the flag we only consult runtime locations.
 fn default_artifact_path() -> PathBuf {
+    let rel = std::path::Path::new("tests/phase_b_gate/last_run.json");
+    if let Ok(project_dir) = std::env::var("ATELIER_PROJECT_DIR") {
+        return PathBuf::from(project_dir).join(rel);
+    }
+    match std::env::current_dir() {
+        Ok(cwd) => cwd.join(rel),
+        Err(_) => PathBuf::from(rel),
+    }
+}
+
+/// `--debug` fallback for test runs: the build-time manifest dir.
+/// Keeps `bundled_seed_artifact_parses` working without depending on
+/// the integration-test harness setting CWD.
+fn debug_artifact_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("tests/phase_b_gate/last_run.json")
@@ -74,10 +95,16 @@ struct Summary {
 }
 
 fn main() {
-    let path = std::env::args()
-        .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(default_artifact_path);
+    let mut args = std::env::args().skip(1);
+    let first = args.next();
+    let path = match first.as_deref() {
+        Some("--debug") => args
+            .next()
+            .map(PathBuf::from)
+            .unwrap_or_else(debug_artifact_path),
+        Some(p) => PathBuf::from(p),
+        None => default_artifact_path(),
+    };
     let exit_code = run(&path);
     std::process::exit(exit_code);
 }
@@ -273,12 +300,64 @@ mod tests {
     /// before it lands in CI.
     #[test]
     fn bundled_seed_artifact_parses() {
-        let path = default_artifact_path();
+        let path = debug_artifact_path();
         if !path.exists() {
             return;
         }
         let exit = run(&path);
         // The seed is calibration_phase=true → all_passed=true → exit 0.
         assert_eq!(exit, 0, "seed artifact at {} did not pass", path.display());
+    }
+
+    /// v60.32 M05 — `ATELIER_PROJECT_DIR` should win over CWD when set,
+    /// and CWD itself should drive the result when the env var is
+    /// absent. Build-time manifest dir is no longer the default.
+    #[test]
+    fn default_artifact_path_prefers_project_dir_env_then_cwd() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rel = std::path::Path::new("tests/phase_b_gate/last_run.json");
+
+        // SAFETY: tests in the same process can race on env vars and CWD;
+        // serialise via a process-wide mutex.
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
+        let prior_pd = std::env::var("ATELIER_PROJECT_DIR").ok();
+        let prior_cwd = std::env::current_dir().ok();
+
+        // ATELIER_PROJECT_DIR set → wins (no CWD canonicalisation needed
+        // because we pass the env path through unmodified).
+        unsafe {
+            std::env::set_var("ATELIER_PROJECT_DIR", tmp.path());
+        }
+        assert_eq!(default_artifact_path(), tmp.path().join(rel));
+
+        // No env var → CWD wins. We assert that the returned path is
+        // anchored at CWD, not the build-time manifest dir, by checking
+        // it does NOT start with `CARGO_MANIFEST_DIR` and DOES end with
+        // the relative artifact path.
+        unsafe {
+            std::env::remove_var("ATELIER_PROJECT_DIR");
+        }
+        std::env::set_current_dir(tmp.path()).unwrap();
+        let resolved = default_artifact_path();
+        assert!(
+            resolved.ends_with(rel),
+            "expected resolved path to end with {rel:?}, got {resolved:?}"
+        );
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        assert!(
+            !resolved.starts_with(manifest),
+            "default_artifact_path leaked the build-time manifest dir: {resolved:?}"
+        );
+
+        // Restore.
+        if let Some(prior) = prior_pd {
+            unsafe {
+                std::env::set_var("ATELIER_PROJECT_DIR", prior);
+            }
+        }
+        if let Some(prior) = prior_cwd {
+            let _ = std::env::set_current_dir(prior);
+        }
     }
 }

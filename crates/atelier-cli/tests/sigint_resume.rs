@@ -20,7 +20,6 @@
 //!    early-skip rather than failing).
 
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Duration;
 
 use atelier_core::adapter::ToolCallRequest;
@@ -32,13 +31,21 @@ use atelier_core::State;
 // crate; integration tests pull it in via the `#[path]` shim so the
 // `Runner` API is reachable. The shim is the same one
 // `run_integration.rs` uses (compaction + instrumentation + runner
-// modules in the right order so submodule paths resolve).
+// modules in the right order so submodule paths resolve). v60.32 M06
+// — `#[allow(dead_code)]` on the included modules because this test
+// crate only reaches a subset of the `Runner` builder surface;
+// clippy `--all-targets` would otherwise flag every unused public
+// item the lib exposes.
+#[allow(dead_code)]
 #[path = "../src/compaction.rs"]
 mod compaction;
+#[allow(dead_code)]
 #[path = "../src/compaction_blob.rs"]
 mod compaction_blob;
+#[allow(dead_code)]
 #[path = "../src/instrumentation.rs"]
 mod instrumentation;
+#[allow(dead_code)]
 #[path = "../src/runner.rs"]
 mod runner;
 

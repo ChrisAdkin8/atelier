@@ -495,7 +495,7 @@ fn run_run(args: impl Iterator<Item = String>) -> ExitCode {
                     None => "; DoD: not configured",
                 }
             );
-            ExitCode::SUCCESS
+            ExitCode::from(atelier_cli::exit_code_for_final_state(report.final_state))
         }
         SignalOutcome::Completed(Err(e)) => {
             eprintln!("atelier run: {e}");
