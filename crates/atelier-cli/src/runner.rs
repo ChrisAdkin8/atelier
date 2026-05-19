@@ -2261,7 +2261,9 @@ impl Runner {
         // Synchronous spawn() already awaits each child inline, so in practice
         // the map should be empty here. wait_all is a safety drain for the
         // rare cancel-race where a handle slipped past the normal await path.
-        spawner.wait_all(&atelier_core::subagents::SubagentId::new()).await;
+        spawner
+            .wait_all(&atelier_core::subagents::SubagentId::new())
+            .await;
 
         // 10. Done — transition to terminal and persist.
         if final_state == State::Verifying {
