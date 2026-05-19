@@ -37,8 +37,8 @@
             "command": {"type": "string"},
             "env": {
               "type": "object",
-              "additionalProperties": {"type": "string"},
-              "description": "Environment overrides. Values support ${env:NAME} / ${keychain:NAME} interpolation per §11 credential storage."
+              "additionalProperties": {"type": "string", "maxLength": 4096},
+              "description": "Environment overrides. Values support ${env:NAME} / ${keychain:NAME} interpolation per §11 credential storage. v60.37 SCH-M4 — values capped at 4 KiB."
             }
           }
         },

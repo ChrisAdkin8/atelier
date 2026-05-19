@@ -111,7 +111,7 @@
         "additionalProperties": false,
         "properties": {
           "tool_name": {"type": "string"},
-          "args": {},
+          "args": {"type": "object", "description": "v60.37 SCH-M1 — `args` must be a JSON object (matches the wire shape every adapter produces). Catches a misdispatched tool call that smuggled a string or list through earlier loose schema."},
           "result": {},
           "error": {
             "type": "object",
@@ -278,7 +278,7 @@
             "properties": {
               "tool_call_id": {"type": "string"},
               "tool_name": {"type": "string"},
-              "args": {},
+              "args": {"type": "object", "description": "v60.37 SCH-M1 — `args` must be a JSON object on the conversation turn too."},
               "fixture_ref": {"type": "string", "description": "Pointer into tool_fixtures by tool_call_id; replay reads results from here."}
             }
           }

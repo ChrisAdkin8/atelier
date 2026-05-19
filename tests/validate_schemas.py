@@ -23,7 +23,7 @@ SCHEMAS_DIR = Path(__file__).resolve().parent.parent / "schemas"
 
 def check_schema(path: Path) -> tuple[bool, str]:
     try:
-        schema = json.loads(path.read_text())
+        schema = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as e:
         return False, f"invalid JSON: {e}"
     if not isinstance(schema, dict):

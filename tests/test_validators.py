@@ -8,6 +8,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parent.parent
 SCHEMA_VALIDATOR = ROOT / "tests" / "validate_schemas.py"
 ARTIFACT_VALIDATOR = ROOT / "tests" / "validate_artifacts.py"
@@ -60,29 +62,49 @@ def test_validate_schemas_detects_invalid_json(tmp_path):
     assert "invalid JSON" in msg
 
 
-def test_validate_artifacts_fails_on_unmatched_path():
+@pytest.fixture
+def _m10_probe():
+    """v60.37 D2/RIG-M2 — fixture-managed scratch dir for the M10 probe.
+
+    pytest's fixture finalizer runs even when the test raises (Ctrl-C,
+    assertion failure, pytest -x), so the previous try/finally pattern's
+    orphan-dir hazard is eliminated. The probe still has to live inside
+    `tests/results/` because that's where the validator's ARTIFACT_ROOTS
+    looks; we just guarantee cleanup more robustly.
+    """
+    scratch_dir = ROOT / "tests" / "results" / "_m10_probe"
+    scratch_file = scratch_dir / "synthetic.json"
+    scratch_dir.mkdir(parents=True, exist_ok=True)
+    scratch_file.write_text("{}", encoding="utf-8")
+    yield scratch_dir
+    # pytest invokes this teardown even if the test errored / was
+    # interrupted via Ctrl-C (KeyboardInterrupt propagates through the
+    # yield-resume normally). SIGKILL of the entire pytest process is
+    # the only mode that can still leave the dir behind — that case
+    # already requires manual recovery anyway.
+    scratch_file.unlink(missing_ok=True)
+    try:
+        scratch_dir.rmdir()
+    except OSError:
+        # Someone else dropped a file in between; leave the dir alone.
+        pass
+
+
+def test_validate_artifacts_fails_on_unmatched_path(_m10_probe):
     """M10: an unrecognised JSON path inside an artifact root must exit non-zero.
 
     Drops a synthetic file two levels deep under `tests/results/` (the
     `tests/results/*.json` rule only matches depth 1). With no rule
     covering the path, the validator must fail loud.
     """
-    scratch_dir = ROOT / "tests" / "results" / "_m10_probe"
-    scratch_file = scratch_dir / "synthetic.json"
-    scratch_dir.mkdir(parents=True, exist_ok=True)
-    scratch_file.write_text("{}")
-    try:
-        r = run(ARTIFACT_VALIDATOR)
-        assert r.returncode != 0, (
-            f"expected non-zero exit on unmatched path; stdout: {r.stdout}"
-        )
-        assert "UNMATCHED" in (r.stdout + r.stderr), (
-            f"expected UNMATCHED diagnostic; stderr: {r.stderr}"
-        )
-        assert "_m10_probe/synthetic.json" in (r.stdout + r.stderr)
-    finally:
-        scratch_file.unlink(missing_ok=True)
-        scratch_dir.rmdir()
+    r = run(ARTIFACT_VALIDATOR)
+    assert r.returncode != 0, (
+        f"expected non-zero exit on unmatched path; stdout: {r.stdout}"
+    )
+    assert "UNMATCHED" in (r.stdout + r.stderr), (
+        f"expected UNMATCHED diagnostic; stderr: {r.stderr}"
+    )
+    assert "_m10_probe/synthetic.json" in (r.stdout + r.stderr)
 
 
 def test_validate_artifacts_honours_unvalidated_annotation():

@@ -35,18 +35,20 @@
           },
           "env": {
             "type": "object",
-            "additionalProperties": {"type": "string"},
-            "description": "Environment variables for the subprocess (stdio only). Values support interpolation tokens `${env:NAME}` and `${keychain:NAME}` per §11 credential storage. Subject to §12 redaction policy on values."
+            "additionalProperties": {"type": "string", "maxLength": 4096},
+            "description": "Environment variables for the subprocess (stdio only). Values support interpolation tokens `${env:NAME}` and `${keychain:NAME}` per §11 credential storage. Subject to §12 redaction policy on values. v60.37 SCH-M4 — values capped at 4 KiB to bound launcher memory + audit-log bloat."
           },
           "url": {
             "type": "string",
             "format": "uri",
-            "description": "Endpoint URL for http/sse transport."
+            "pattern": "^https?://",
+            "maxLength": 2048,
+            "description": "Endpoint URL for http/sse transport. v60.37 SCH-M6 — http(s) only + 2 KiB cap; a misconfigured registration (e.g. `file:///etc/passwd`) is rejected at schema time."
           },
           "headers": {
             "type": "object",
-            "additionalProperties": {"type": "string"},
-            "description": "HTTP headers for http/sse transport. Values support interpolation tokens `${env:NAME}` (read from environment) and `${keychain:NAME}` (read from OS keychain via §11 credential storage). Plaintext literals are accepted but discouraged for anything resembling a secret. `Authorization` headers are redacted in the §12 egress audit log; interpolation is resolved at request time and never persisted."
+            "additionalProperties": {"type": "string", "maxLength": 4096},
+            "description": "HTTP headers for http/sse transport. Values support interpolation tokens `${env:NAME}` (read from environment) and `${keychain:NAME}` (read from OS keychain via §11 credential storage). Plaintext literals are accepted but discouraged for anything resembling a secret. `Authorization` headers are redacted in the §12 egress audit log; interpolation is resolved at request time and never persisted. v60.37 SCH-M4 — values capped at 4 KiB."
           },
           "side_effect_class": {
             "enum": ["local-safe", "local-risky", "shared-state", "irreversible"],

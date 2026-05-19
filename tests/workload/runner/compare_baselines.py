@@ -24,7 +24,7 @@ DEFAULT_TARGET_RATIO = 0.30  # PROVISIONAL — see spec §8 calibration
 
 
 def load(p):
-    return json.loads(Path(p).read_text())
+    return json.loads(Path(p).read_text(encoding="utf-8"))
 
 
 def index_by_task(data):

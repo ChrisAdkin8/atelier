@@ -6,7 +6,7 @@
   "required": ["runner_version", "results"],
   "additionalProperties": false,
   "properties": {
-    "runner_version": {"type": "integer"},
+    "runner_version": {"const": 1, "description": "v60.37 SCH-M5 — pinned. A future runner emitting `runner_version: 2` is now rejected at v1 schema validation, surfacing the version mismatch up front."},
     "results": {
       "type": "array",
       "items": {
@@ -53,12 +53,12 @@
                 "description": "Per-mechanical-check outcomes from the task's checks.json. Empty if no checks.json present.",
                 "items": {
                   "type": "object",
-                  "required": ["name", "ok"],
+                  "required": ["name", "ok", "kind"],
                   "additionalProperties": false,
                   "properties": {
                     "name": {"type": "string"},
                     "ok": {"type": "boolean"},
-                    "kind": {"enum": ["command", "file_unchanged"]},
+                    "kind": {"enum": ["command", "file_unchanged"], "description": "v60.37 SCH-M5 — required so the schema contract matches `tests/test_runner.py::test_runner_harness_smoke_all_tasks_emit_checks`'s assertion (every check has a kind)."},
                     "exit_code": {"type": ["integer", "null"]},
                     "reason": {"type": ["string", "null"], "description": "Failure reason when ok=false."}
                   }

@@ -23,7 +23,7 @@ def build_schema_registry() -> Registry:
     """
     registry = Registry()
     for path in SCHEMAS_DIR.rglob("*.json"):
-        schema = json.loads(path.read_text())
+        schema = json.loads(path.read_text(encoding="utf-8"))
         sid = schema.get("$id")
         if sid:
             registry = registry.with_resource(uri=sid, resource=Resource.from_contents(schema))

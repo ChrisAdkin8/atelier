@@ -58,13 +58,13 @@ def load_task(task_id):
         raise SystemExit(f"fixture dir missing: {fixture}")
     if not meta_path.is_file():
         raise SystemExit(f"meta.json missing: {meta_path}")
-    meta = json.loads(meta_path.read_text())
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
     checks_path = task_dir / "checks.json"
-    checks = json.loads(checks_path.read_text())["checks"] if checks_path.is_file() else []
+    checks = json.loads(checks_path.read_text(encoding="utf-8"))["checks"] if checks_path.is_file() else []
     return {
         "task_id": task_dir.name,
         "dir": task_dir,
-        "prompt": (task_dir / "prompt.md").read_text(),
+        "prompt": (task_dir / "prompt.md").read_text(encoding="utf-8"),
         "fixture": fixture,
         "meta": meta,
         "checks": checks,
@@ -359,7 +359,20 @@ def main():
     payload = {"runner_version": 1, "results": results}
 
     if args.out:
-        Path(args.out).write_text(json.dumps(payload, indent=2))
+        # v60.37 D5/RIG-M5 — handle OSError on write so a full disk /
+        # permission failure surfaces explicitly instead of leaving the
+        # rig step green while the artifact never materialised. CI
+        # gates downstream of `--out` (the Phase A nightly's
+        # `tests/phase_a_gate/last_run.json` chain) would otherwise
+        # fail at a confusing step.
+        try:
+            Path(args.out).write_text(
+                json.dumps(payload, indent=2, allow_nan=False),
+                encoding="utf-8",
+            )
+        except OSError as e:
+            print(f"runner: failed to write --out path {args.out!r}: {e}", file=sys.stderr)
+            raise SystemExit(2) from e
     if args.summary or not args.out:
         if args.summary:
             for r in results:

@@ -78,11 +78,16 @@ def test_check_yml_top_level_permissions_is_read_only():
     )
 
 
-@pytest.mark.parametrize("name", [
-    "nightly_phase_a_gate.yml",
-    "nightly_phase_b_gate.yml",
-    "nightly_protocol_overhead.yml",
-])
+# v60.37 D6/RIG-M6 — discover nightly workflows dynamically. A future
+# `nightly_*.yml` (e.g. the Phase B Track B live-OpenAI gate) no longer
+# requires extending three hand-maintained literal lists — it picks up
+# the new workflow on first commit. Workflows that don't push to main
+# can opt out via `nightly_dummy_*.yml` (none today).
+def _nightly_workflows():
+    return [p.name for p in WORKFLOWS_DIR.glob("nightly_*.yml")]
+
+
+@pytest.mark.parametrize("name", _nightly_workflows())
 def test_nightly_workflows_have_concurrency_block(name):
     """M12: every nightly that commits to `main` must declare a `concurrency:`
     block grouping it with its siblings, so two nightlies can't race the same
@@ -99,11 +104,7 @@ def test_nightly_workflows_have_concurrency_block(name):
     )
 
 
-@pytest.mark.parametrize("name", [
-    "nightly_phase_a_gate.yml",
-    "nightly_phase_b_gate.yml",
-    "nightly_protocol_overhead.yml",
-])
+@pytest.mark.parametrize("name", _nightly_workflows())
 def test_nightly_workflows_rebase_before_push(name):
     """M12: the commit step in every nightly must `git pull --rebase origin main`
     before pushing, and on rebase failure must abort the workflow with `exit 1`.
@@ -147,11 +148,7 @@ _DEP_INSTALL_TOKENS = (
 )
 
 
-@pytest.mark.parametrize("name", [
-    "nightly_phase_a_gate.yml",
-    "nightly_phase_b_gate.yml",
-    "nightly_protocol_overhead.yml",
-])
+@pytest.mark.parametrize("name", _nightly_workflows())
 def test_nightly_workflows_default_to_read_only_permissions(name):
     """v60.36 H1: every nightly that commits to `main` must default the top-level
     `permissions:` to `contents: read`. Jobs that need write permission opt in
@@ -166,11 +163,7 @@ def test_nightly_workflows_default_to_read_only_permissions(name):
     )
 
 
-@pytest.mark.parametrize("name", [
-    "nightly_phase_a_gate.yml",
-    "nightly_phase_b_gate.yml",
-    "nightly_protocol_overhead.yml",
-])
+@pytest.mark.parametrize("name", _nightly_workflows())
 def test_nightly_write_jobs_do_not_install_deps(name):
     """v60.36 H1/H2: any job with `permissions: contents: write` must not run
     any dependency-installing step (pip install, cargo test/build, npm install,
@@ -235,11 +228,7 @@ def test_check_yml_declares_concurrency_group():
     )
 
 
-@pytest.mark.parametrize("name", [
-    "nightly_phase_a_gate.yml",
-    "nightly_phase_b_gate.yml",
-    "nightly_protocol_overhead.yml",
-])
+@pytest.mark.parametrize("name", _nightly_workflows())
 def test_nightly_has_separate_commit_job(name):
     """v60.36 H1: every nightly must have a dedicated commit job that holds
     `contents: write` — confirming the privilege split actually shipped, not

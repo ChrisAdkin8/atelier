@@ -95,12 +95,12 @@ FENCED_JSON_RE = re.compile(r"```json\s*\n(.*?)\n```", re.DOTALL)
 
 
 def load_schema(path):
-    return json.loads((ROOT / path).read_text())
+    return json.loads((ROOT / path).read_text(encoding="utf-8"))
 
 
 def validate_json_file(path, validator, desc):
     try:
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as e:
         return False, f"invalid JSON: {e}"
     errors = sorted(validator.iter_errors(data), key=lambda e: list(e.path))
@@ -110,7 +110,7 @@ def validate_json_file(path, validator, desc):
 
 
 def validate_envelopes_in_markdown(path, validator):
-    text = path.read_text()
+    text = path.read_text(encoding="utf-8")
     blocks = FENCED_JSON_RE.findall(text)
     if not blocks:
         return [(False, "no ```json blocks found")]

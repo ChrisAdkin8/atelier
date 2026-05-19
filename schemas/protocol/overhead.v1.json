@@ -21,7 +21,9 @@
           "strategy": {"enum": ["native_tool", "json_sentinel", "regex_prose"]},
           "median_overhead_pct": {
             "type": "number",
-            "description": "Median percentage token overhead vs. a no-protocol baseline turn on the same task"
+            "minimum": -1.0,
+            "maximum": 1000.0,
+            "description": "Median percentage token overhead vs. a no-protocol baseline turn on the same task. v60.37 SCH-M2 — bounded to [-1.0, 1000.0]; negative is legal when compaction produces less wire than baseline. Producers must write with `allow_nan=False` (Python's `json.dump`) so a NaN from a producer bug fails loudly at the write site rather than producing a JSON literal that crashes downstream `>10%` drift math."
           },
           "conformance_rate": {
             "type": "number",
