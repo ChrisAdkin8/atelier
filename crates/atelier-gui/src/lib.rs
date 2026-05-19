@@ -2096,7 +2096,7 @@ fn start_chat_run(
                 &app_clone,
                 &SessionEvent::MessageCommitted {
                     role: MessageRole::Assistant,
-                    text: resp.text,
+                    text: resp.text.clone(),
                 },
             );
             emit_event(
@@ -2121,6 +2121,71 @@ fn start_chat_run(
                     known_tokens: used,
                     unknown_tokens: 0,
                 },
+            );
+            // Emit synthetic ContextItems so the Context pane shows the
+            // conversation in chat mode (no ContextManager in this path).
+            let mut items: Vec<atelier_core::context::ContextItemSummary> =
+                Vec::with_capacity(messages.len() + 1);
+            for (idx, msg) in messages.iter().enumerate() {
+                let (provenance, token_source, tokens) = match msg.role {
+                    Role::System => ("initial", "approx", (msg.content.len() as u32 + 3) / 4),
+                    Role::User => (
+                        "user_attached",
+                        "approx",
+                        resp.usage.prompt_tokens.saturating_sub(
+                            (msg.content.len() as u32 + 3) / 4,
+                        ),
+                    ),
+                    _ => ("initial", "approx", (msg.content.len() as u32 + 3) / 4),
+                };
+                // For the user message use the full prompt_tokens count
+                // (it includes any prepended system context).
+                let tokens = if msg.role == Role::User {
+                    resp.usage.prompt_tokens
+                } else {
+                    tokens
+                };
+                let label: String = msg
+                    .content
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .take(60)
+                    .collect();
+                items.push(atelier_core::context::ContextItemSummary {
+                    id: format!("chat-{idx}"),
+                    kind: "inline_text".to_string(),
+                    label,
+                    provenance: provenance.to_string(),
+                    provenance_detail: None,
+                    tokens,
+                    token_source: token_source.to_string(),
+                    pinned: false,
+                });
+            }
+            // Assistant response as the final item.
+            let asst_label: String = resp
+                .text
+                .lines()
+                .next()
+                .unwrap_or("")
+                .chars()
+                .take(60)
+                .collect();
+            items.push(atelier_core::context::ContextItemSummary {
+                id: format!("chat-{}", messages.len()),
+                kind: "inline_text".to_string(),
+                label: asst_label,
+                provenance: "assistant_turn".to_string(),
+                provenance_detail: None,
+                tokens: resp.usage.completion_tokens,
+                token_source: "exact".to_string(),
+                pinned: false,
+            });
+            emit_event(
+                &app_clone,
+                &SessionEvent::ContextItems { items },
             );
         }
     });
