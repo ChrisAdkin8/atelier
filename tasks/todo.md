@@ -33,10 +33,14 @@ Change history in `../CHANGELOG.md`.
 
 **Phase A implementation order (per spec §"Phased build plan"):** §2.5 skeleton → §11 sandbox → §14 recovery scaffold → §15 MCP + built-in tools → §1 Anthropic adapter → §1 LiteLLM adapter → §15 hooks → §1 mechanical gate → §14 modal + §11 gate + crash test → Phase A gate.
 
-## v60.36+ deep scan (in progress, 2026-05-19)
-- Four parallel scan agents launched; three Rust scans (core/cli/gui+tui) stalled on the watchdog after producing partial output; CI/SH/UI scan completed; Python rig + schemas scan still running.
-- Recovering Rust findings via direct targeted greps + reads (this session). Synthesis → four bucketed plan files in `tasks/`: `plan_v60.36_critical.md` / `plan_v60.36_high.md` / `plan_v60.36_medium.md` / `plan_v60.36_low.md`.
-- Then implement in critical → high → medium → low order; finally update CHANGELOG.md, ATELIER.md, tasks/lessons.md.
+## v60.36+ deep scan (closed, 2026-05-19)
+Six scan agents (three Rust + two non-Rust, two stalled and reran), synthesised into four severity-bucketed plan files (`tasks/plan_v60.36_critical.md`, `_v60.36_high.md`, `_v60.37_medium.md`, `_v60.38_low.md`). All in-scope items landed across three release bundles:
+
+- **v60.36** (`caee6b2`) — Critical: 0/0 (none found). High: 7/7. CI privilege-split for the three nightlies + RIG-M-N robustness + audit/CI/envelope schema constraints.
+- **v60.37** (Bundle A `de26b90`, B `febaddf`, C `3019b6d`, D `33183e6`) — Medium: 30/31. B5 (hydrate swapOptions from `providers.toml`) deferred — needs a new Tauri command. Otherwise: atomic-write discipline + io_caps + compaction cost; GUI scheme validation + env-fallback gate + modal a11y; CI timeouts + concurrency + heredoc safety + cache + jq surfacing; rig UTF-8 + fixture-managed M10 + dynamic nightly discovery + schema field constraints.
+- **v60.38** (`c7f2e1c`) — Low: 8/10. L9 (mcp_catalog enum extension) deferred per plan. L10 (InlineRenderers `<script module>` migration) deferred — convention-only with one internal consumer.
+
+Outstanding: H1 (rotate the leaked Anthropic API key) is operator action, separate from this code series.
 
 ## Working notes
 - Schemas live under `../schemas/`. Spec references them by path.

@@ -1,5 +1,61 @@
 # Atelier Spec — Changelog
 
+## v60.38 — 2026-05-19 (Deep-scan low-severity hygiene sweep)
+
+Eighth and final commit in the 2026-05-19 deep-scan response. Closes 8 of 10 Low-severity findings; L9 (mcp_catalog `requires_secrets[*].where` enum extension) deferred to when the catalog grows beyond the bundled five; L10 (`InlineRenderers.svelte` `<script module>` migration) deferred — the existing `export function` on the instance script is functional and the rewrite cost exceeds the convention-only benefit while there's a single internal consumer.
+
+L1 was effectively closed by v60.37 C3's Python-heredoc migration in `nightly_phase_a_gate.yml`, so it's not re-listed here.
+
+L2 `.atelier/hooks/save-nudge.sh` bounds the user's prompt at 8 KiB before the case-pattern matcher. L3 captures + cancels every `setTimeout` toast-decay handle across `ContextPane.svelte`, `MemoryPane.svelte`, `MentalModelPane.svelte`, `PlanPane.svelte` in `onDestroy`. L4 switches `App.svelte::dropdownIndex` from `$derived` to `$state` so the user's swap-dropdown selection survives the swap-pending window. L5 inverts `test_no_claude_paths_in_tracked_source`'s suffix list from include to skip so new file types (`.svelte`, `.ts`, `.tsx`) are scanned by default. L6 renders `n/a` instead of `inf` in `compare_baselines.py` when the baseline is zero. L8 adds optional `row_version: {const: 1}` to `protocol/overhead.v1.json` per-row.
+
+## v60.37 — 2026-05-19 (Deep-scan medium-severity bundle, 4 sub-bundles)
+
+Lands tasks/plan_v60.37_medium.md — 22 of 23 items across four file-disjoint sub-bundles. B5 (hydrate swapOptions from providers.toml) deferred — requires a new Tauri command surface.
+
+### Bundle A — Rust core/cli correctness
+
+A1 promotes `persistence::fsync_dir` to `atelier_core::path_safety::fsync_dir` and applies the full atomic-write discipline (write → `sync_all` → `persist` → `fsync_dir`) to five remaining sites: `mcp_config.rs::save`, `memory_promote.rs`, `instrumentation.rs` × 2, `compaction_blob.rs`. A2 introduces `atelier_core::io_caps::{read_capped, read_capped_to_string}` with documented per-surface byte caps (hooks 1 MiB, providers 1 MiB, MCP configs 1 MiB, DoD 1 MiB, model profiles 1 MiB, session 16 MiB, recovery log 64 MiB) and wires it into every config loader (`config.rs`, `mcp_config.rs` ×2, `persistence.rs` ×2, `dod.rs`, `hooks.rs` ×2, `model_profile.rs`). A3 threads `ModelCostPolicy` through `compaction::compact` so the ledger ModelCall row for the summary call gets the same `LatencyWeighted` / `UnknownPending` attribution as the runner's main loop; the prior hardcoded `cost_usd: None` silently dropped local-provider cost. A4 rewrites `overhead.rs::write_report` to use the same atomic-write pattern so `tests/protocol/overhead.json` can't end up partial after a mid-write crash.
+
+### Bundle B — GUI Rust + Svelte hardening
+
+B1 makes `host_of_url` in `atelier-gui/src/lib.rs` require an explicit `http://` or `https://` prefix; scheme-less inputs (`localhost`) and non-http schemes (`gopher://`, `file://`, `ftp://`) are rejected. B2 resolves the effective base_url (wire value OR `OPENAI_BASE_URL` env) BEFORE the allowlist check so a polluted `.envrc` can't route an OpenAiCompat swap past the gate. B3 adds focus trap + Escape handler to both `SwapConsentModal` and `ConcurrentEditModal` (mount focuses first button, Tab cycles between buttons, Escape routes to the safer reject/pause arm); `App.svelte::onKeyDown` early-returns when ANY modal is open so the `[`/`]`/`g` scrub keys can't race the modal handler. B4 moves `MetersPane`'s 500ms ticker inside an `$effect` keyed on `lastOverflowResolution != null`; idle hours no longer rerender. B6 adds a `castPayload<T>(payload, required, kind)` DEV-mode shape guard to `state.ts` and applies it to the modal-trigger arms (`FilesChanged`, `AdapterSwapPending`).
+
+### Bundle C — CI / shell hygiene
+
+C1 adds `timeout-minutes` to every job in every workflow (check.yml: rig 20 / rust 30 / quality 15 / audit 15; nightlies: measure 30-45 / commit 10); new `test_every_job_declares_timeout_minutes` locks it in. C2 adds `concurrency: { group: check-…-${{ github.ref }}, cancel-in-progress: true }` to `check.yml` so two rapid pushes don't double-spend the matrix. C3 rewrites `nightly_phase_a_gate.yml`'s `Compose` step to build the JSON via Python with step outputs surfaced through env vars — replaces the shell heredoc that interpolated `${{ steps.X.outputs.Y }}` directly into a JSON literal. C4 validates `nightly_phase_b_gate.yml`'s `summary_path` as JSON before splicing into the artifact. C5 caches `cargo-audit + cargo-machete` in the `quality` job (matches the `audit` job's existing cache). C6 adds `trap … EXIT` to `assets/build-icon.sh` so the two mktemp dirs are cleaned even on `rsvg-convert` failure. C7 makes `.atelier/hooks/bounded-reads.sh` and `save-nudge.sh` log jq absence to stderr instead of silently exiting 0.
+
+### Bundle D — Rig + schemas hygiene
+
+D1 adds `encoding="utf-8"` to every production rig `read_text()` call (`_schema_helpers.py`, `validate_schemas.py`, `validate_artifacts.py`, `workload/runner/runner.py`, `workload/runner/compare_baselines.py`). D2 migrates `test_validate_artifacts_fails_on_unmatched_path` to a `@pytest.fixture`-managed scratch dir so the M10 probe cleans even on Ctrl-C / assertion failure. D5 catches `OSError` on the runner's `--out` write so a full disk fails loudly with exit 2. D6 makes `tests/test_ci.py` discover nightlies via `WORKFLOWS_DIR.glob("nightly_*.yml")` so a future nightly inherits every M12/H1/H2 lint on first commit. D7 tightens six schema fields: `session/v1.json` tool args are now `{"type": "object"}`; `protocol/overhead.v1.json::median_overhead_pct` is bounded to `[-1.0, 1000.0]`; `mcp_servers.v1.json` and `hook_manifest.v1.json` env/headers values cap at 4 KiB; `mcp_servers.v1.json::url` constrained to http(s) + 2 KiB; `runner_result.v1.json::runner_version` pinned to `const: 1` and checks-item `required` includes `kind`; `telemetry/payload.v1.json` token + cost fields gained `minimum: 0`.
+
+## v60.36 — 2026-05-19 (Deep-scan high-severity bundle)
+
+Closes 7 High-severity findings from the 2026-05-19 deep scan (see `tasks/plan_v60.36_high.md`). No Critical findings were identified; `tasks/plan_v60.36_critical.md` documents the empty bucket.
+
+### H1/H2 — CI privilege separation across the nightly commit boundary
+
+Every nightly that pushes to `main` (`nightly_phase_a_gate.yml`, `nightly_phase_b_gate.yml`, `nightly_protocol_overhead.yml`) is now split into a `measure` job (`permissions: contents: read`, no token, full dep install) and a `commit` job (`permissions: contents: write`, restricted to `actions/checkout` + `actions/download-artifact@v4.6.2/v4.3.0` + stock `git` — zero dependency-install steps). The artifact crosses the job boundary via `actions/upload-artifact`/`download-artifact`; `all_passed` crosses as a job output. Locked in by three new tests in `tests/test_ci.py`: `test_nightly_workflows_default_to_read_only_permissions`, `test_nightly_write_jobs_do_not_install_deps`, `test_nightly_has_separate_commit_job`. A compromised transitive PyPI / Cargo dep in the measure job no longer grants push access to a protected branch.
+
+### H3 — `extract_meta` robust to broken jsonschema import
+
+`tests/workload/runner/runner.py::extract_meta` previously had a single `try` block whose `except jsonschema.ValidationError` referenced the `jsonschema` module bound inside that same `try` — a partial import (e.g., editable install re-export glitch) would raise `NameError` in the except clause and crash the entire workload run. Split into two nested tries; the second catches both `ValidationError` and `SchemaError`. New `test_extract_meta_survives_partial_jsonschema_import` verifies both failure modes.
+
+### H4 — `harness_run` surfaces stderr on timeout
+
+`harness_run` now reads `e.output` and `e.stderr` off `TimeoutExpired` and propagates both as `stdout_tail` / `stderr_tail` in the result. Before this fix a timed-out workload artifact had no stderr signal whatsoever. New `test_harness_run_timeout_surfaces_stderr` runs a Python sleep that writes identifiable markers to both pipes before hanging; verifies both markers land in the result.
+
+### H5 — Audit-schema regex / free-form field caps
+
+Capped every free-form string field in `schemas/audit/*.v1.json`. `egress.v1.json::redactions_applied[].pattern` → `maxLength: 512`. `egress.v1.json::provider` gained `maxLength: 256` + `pattern: ^[a-z][a-z0-9_-]*$` (companion to L7). `mcp_egress.v1.json::url` → `maxLength: 2048 + pattern: ^https?://`; `reason` → `maxLength: 1024`. `subprocess_egress.v1.json::{tool_call_id, tool_name}` → 256; `destination` → 1024. `lsp_install.v1.json::language` → 64; `candidate_packages` items → 256, array capped at 16. Locked in by `test_audit_schemas_cap_free_form_strings`.
+
+### H6 — `git_sha` regex accepts mixed case
+
+`schemas/ci/{phase_a_gate, protocol_conformance}.v1.json::git_sha` pattern changed from `^[0-9a-f]{7,40}$` to `^[0-9a-fA-F]{7,40}$`. Locked in by `test_ci_git_sha_accepts_mixed_case`.
+
+### H7 — `model_protocol/envelope.v1.json` pinned with `version: {const: 1}`
+
+The envelope schema previously had no version discriminator; every other artifact pins `version` via `const: 1`. Added the pin as an optional property (not in `required`) so existing in-flight session.json files validate, while a future v2 envelope is structurally distinguishable. Locked in by `test_envelope_version_const_pinned`.
+
 ## v60.35 — 2026-05-19 (Supply-chain gates + broadcast-lag instrumentation, M27–M31)
 
 Lands the v60.35 bundle from `tasks/plan_medium_severity_fixes.md`. Five items, file-disjoint from the other v60.32–v60.34 bundles.

@@ -6,6 +6,28 @@ This file is volatile — entries are pruned when the underlying class of mistak
 
 ---
 
+## v60.36–v60.38 — Deep-scan response
+
+### Subagent stream-watchdog stalls on large-scope rust-reviewer tasks
+
+**Failure**: launched four parallel deep-scan agents (atelier-core, atelier-cli, atelier-gui+tui, non-Rust). Three of the rust-reviewer agents timed out on the 600s stream watchdog after producing meaningful partial output but before delivering a report. The non-Rust scan was too broad (rig + schemas + workflows + shell + frontend in one prompt) and also stalled.
+
+**Prevention**: when delegating a deep scan, keep per-agent scope under one crate-or-equivalent. If a single area (e.g., a 30k-LoC crate) is the target, split by module — give one agent `crates/atelier-core/src/{adapter,session,dispatcher}.rs` and another the rest. For multi-area scans, split by directory tree (rig in one agent, schemas in another) rather than bundling. Watch for the failure mode: snippets in `<result>` tags that look like the agent was about to produce findings — the work happened, the delivery failed.
+
+### Workflow privilege-split needs verified artifact-action SHAs
+
+**Failure**: refactoring three nightly workflows into measure+commit jobs needed `actions/upload-artifact` + `actions/download-artifact` SHAs. Without web access I'd have had to either guess (risky — wrong SHA breaks the nightly silently) or punt the fix.
+
+**Prevention**: when a deferred tool (here `WebFetch`) exists, load it via `ToolSearch` *before* spending tokens deliberating around the gap. For GitHub specifically, `gh api repos/<owner>/<repo>/git/refs/tags/<tag>` returns the commit SHA without needing WebFetch at all — faster path. The general lesson is "check the tool surface before declaring an action infeasible."
+
+### Heredoc-with-step-output interpolation is a foot-gun even with safe values
+
+**Failure**: `nightly_phase_a_gate.yml`'s `Compose` step interpolated `${{ steps.X.outputs.Y }}` directly into a JSON literal inside a heredoc. The values are integers today, but the pattern is a quiet hazard for any future step output that grows a quote, newline, or NaN.
+
+**Prevention**: build CI artifacts via Python (or `jq -n`) with structured field-by-field assignment, not via shell heredoc string concatenation. Step outputs flow through `env:` block + `os.environ.get(...)` so quoting is handled by the JSON encoder. The pattern also lets you use `allow_nan=False` to fail loudly on producer NaN.
+
+---
+
 ## v50 — OpenAI-compatible adapter
 
 ### Anthropic ≠ OpenAI for tool-call argument encoding
