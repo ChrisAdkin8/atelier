@@ -176,6 +176,8 @@ pub fn run() {
             start_demo_run,
             // v60.43 — pure chat path (no Runner, no tools, no §3 staging).
             start_chat_run,
+            // §10 — Runner-backed agent path (tools + sub-agents).
+            start_agent_run,
             // v55 §5 mutator commands.
             pin_context_item,
             unpin_context_item,
@@ -2006,30 +2008,11 @@ fn start_chat_run(
             messages.push(Message::text(Role::System, sys));
         }
         messages.push(Message::text(Role::User, prompt));
-        match adapter.chat(&messages, &[]).await {
-            Ok(resp) => {
-                let used = resp.usage.prompt_tokens + resp.usage.completion_tokens;
-                emit_event(
-                    &app_clone,
-                    &SessionEvent::MessageCommitted {
-                        role: MessageRole::Assistant,
-                        text: resp.text,
-                    },
-                );
-                // Emit the context-usage snapshot so the footer's meter
-                // reflects this turn's prompt + completion. `unknown` is 0
-                // because openai-compat returns exact counts via `usage`.
-                emit_event(
-                    &app_clone,
-                    &SessionEvent::ContextSnapshot {
-                        known_tokens: used,
-                        unknown_tokens: 0,
-                    },
-                );
-            }
+        // Stream the response so the conversation pane renders text
+        // word-by-word and the footer token meter updates continuously.
+        let mut stream = match adapter.stream(&messages, &[]).await {
+            Ok(s) => s,
             Err(e) => {
-                // Surface as a system message so the user sees what failed
-                // without us needing a brand-new event variant.
                 emit_event(
                     &app_clone,
                     &SessionEvent::MessageCommitted {
@@ -2037,11 +2020,7 @@ fn start_chat_run(
                         text: format!("[chat error] {e}"),
                     },
                 );
-                tracing::warn!(error = %e, "start_chat_run: adapter.chat failed");
-                // v60.47 — auto-draft a workspace-scope memory card if the
-                // error matches a known-fixable pattern. Skipped silently
-                // when no real workspace has been chosen (the tempdir
-                // case) or when the error doesn't map to a useful note.
+                tracing::warn!(error = %e, "start_chat_run: adapter.stream failed");
                 if let Some(card) = auto_card_for_error(&e) {
                     match write_workspace_auto_card(workspace_override.as_deref(), &card) {
                         Ok(Some(path)) => {
@@ -2074,7 +2053,176 @@ fn start_chat_run(
                         }
                     }
                 }
+                return;
             }
+        };
+        let mut final_resp: Option<atelier_core::adapter::ChatResponse> = None;
+        loop {
+            match stream.next().await {
+                Some(atelier_core::adapter::StreamChunk::Text { delta }) => {
+                    emit_event(
+                        &app_clone,
+                        &SessionEvent::AssistantTextDelta { delta },
+                    );
+                }
+                Some(atelier_core::adapter::StreamChunk::Complete { response }) => {
+                    final_resp = Some(response);
+                    break;
+                }
+                Some(atelier_core::adapter::StreamChunk::Error { error }) => {
+                    emit_event(
+                        &app_clone,
+                        &SessionEvent::MessageCommitted {
+                            role: MessageRole::System,
+                            text: format!("[chat error] {error}"),
+                        },
+                    );
+                    tracing::warn!(error = %error, "start_chat_run: mid-stream error");
+                    return;
+                }
+                Some(_) => {} // ToolCall variants — not used in zero-tool chat mode
+                None => break, // stream ended unexpectedly without Complete
+            }
+        }
+        if let Some(resp) = final_resp {
+            let used = resp.usage.prompt_tokens + resp.usage.completion_tokens;
+            // Commit the full assembled text to conversation history;
+            // the reducer clears streamingAssistant when this lands.
+            emit_event(
+                &app_clone,
+                &SessionEvent::MessageCommitted {
+                    role: MessageRole::Assistant,
+                    text: resp.text,
+                },
+            );
+            emit_event(
+                &app_clone,
+                &SessionEvent::LedgerAppended {
+                    entry: atelier_core::ledger::LedgerEntry::ModelCall {
+                        timestamp: atelier_core::time::now_rfc3339(),
+                        model_id: adapter.model_id().to_string(),
+                        prompt_tokens: resp.usage.prompt_tokens,
+                        completion_tokens: resp.usage.completion_tokens,
+                        cached_tokens: resp.usage.cached_tokens,
+                        count_source: atelier_core::context::TokenSource::Exact,
+                        latency_ms: None,
+                        cost_usd: None,
+                        note: None,
+                    },
+                },
+            );
+            emit_event(
+                &app_clone,
+                &SessionEvent::ContextSnapshot {
+                    known_tokens: used,
+                    unknown_tokens: 0,
+                },
+            );
+        }
+    });
+    Ok(())
+}
+
+/// Runner-backed agent path. Unlike `start_chat_run` (which calls
+/// `adapter.chat()` directly with no tools), this wires the prompt
+/// through the full Runner so sub-agent spawning, tool calls, §7
+/// verification, and all bus events propagate to the webview. Sub-agent
+/// events in particular feed the `SubagentPane` in the GUI.
+///
+/// Approval policy defaults to `AutoApproveAll` (the Runner default) so
+/// the run doesn't block awaiting a DiffPane that no longer exists in the
+/// chat-REPL GUI.
+#[tauri::command]
+fn start_agent_run(
+    app: AppHandle,
+    state: tauri::State<'_, SessionState>,
+    prompt: String,
+) -> Result<(), String> {
+    if prompt.len() > MAX_PROMPT_BYTES {
+        return Err(format!(
+            "prompt too long: {} bytes (max {} bytes)",
+            prompt.len(),
+            MAX_PROMPT_BYTES
+        ));
+    }
+    let (adapter, _) = match state.adapter_handle.get() {
+        Some(a) => (a, false),
+        None => match resolve_default_adapter(&state.workspace_root()) {
+            Ok(a) => {
+                state.adapter_handle.swap(a.clone());
+                (a, true)
+            }
+            Err(e) => return Err(e),
+        },
+    };
+    if state
+        .run_in_flight
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::Acquire,
+            std::sync::atomic::Ordering::Relaxed,
+        )
+        .is_err()
+    {
+        return Err("a run is already in progress — wait for it to finish".to_string());
+    }
+    // Use the user's chosen workspace if set; fall back to a per-run
+    // temp subdir so the Runner always has a writable directory for
+    // session.json.
+    let workspace_override = state.workspace_override.lock().ok().and_then(|g| g.clone());
+    let (workspace, cleanup_workspace) = if let Some(ref ws) = workspace_override {
+        (ws.clone(), None)
+    } else {
+        let run_id = uuid::Uuid::new_v4();
+        let ws = state.workspace_root().join(run_id.to_string());
+        if let Err(e) = std::fs::create_dir_all(&ws) {
+            state
+                .run_in_flight
+                .store(false, std::sync::atomic::Ordering::Release);
+            return Err(format!("workspace setup failed: {e}"));
+        }
+        let ws_clone = ws.clone();
+        (ws, Some(ws_clone))
+    };
+
+    let handle = state.dispatcher_handle.clone();
+    let adapter_handle = state.adapter_handle.clone();
+    let run_in_flight = state.run_in_flight.clone();
+
+    let app_clone = app.clone();
+    let cb = Arc::new(move |evt: &SessionEvent| {
+        emit_event(&app_clone, evt);
+    });
+
+    let runner = match Runner::new(
+        workspace,
+        ProviderChoice::Mock { responses: vec![] },
+        EventSink::Callback(cb),
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            run_in_flight.store(false, std::sync::atomic::Ordering::Release);
+            if let Some(ref ws) = cleanup_workspace {
+                let _ = std::fs::remove_dir_all(ws);
+            }
+            return Err(format!("Runner::new failed: {e}"));
+        }
+    };
+    // with_adapter replaces the Mock adapter with the real one;
+    // with_adapter_handle enables mid-session swaps via `swap_adapter`.
+    let runner = runner
+        .with_adapter(adapter)
+        .with_dispatcher_handle(handle)
+        .with_adapter_handle(adapter_handle);
+
+    tauri::async_runtime::spawn(async move {
+        let _cleanup = RunCleanup {
+            in_flight: run_in_flight,
+            workspace_to_remove: cleanup_workspace,
+        };
+        if let Err(e) = runner.run(prompt).await {
+            tracing::warn!(error = %e, "agent run failed");
         }
     });
     Ok(())
@@ -2189,6 +2337,9 @@ pub fn bridge_event(evt: &SessionEvent) -> BridgedEvent {
         SessionEvent::MessageCommitted { role, text } => json!({
             "role": role.wire_label(),
             "text": text,
+        }),
+        SessionEvent::AssistantTextDelta { delta } => json!({
+            "delta": delta,
         }),
         SessionEvent::PlanSnapshot { steps } => json!({
             "steps": serde_json::to_value(steps).unwrap_or(Value::Null),

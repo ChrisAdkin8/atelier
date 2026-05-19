@@ -41,8 +41,10 @@ pub const TOOL_PARALLELISM_CAP: usize = 4;
 
 /// Broadcast-channel buffer per session. Slow subscribers will get
 /// `RecvError::Lagged`; the on-disk session (§14) is authoritative for
-/// reconciliation after a UI falls behind.
-pub const EVENT_BUFFER: usize = 256;
+/// reconciliation after a UI falls behind. Scaled by
+/// [`crate::subagents::BUS_FANOUT_FACTOR`] (= 4) so a depth-3 spawn tree
+/// can burst events from all levels without overrunning the buffer.
+pub const EVENT_BUFFER: usize = 256 * crate::subagents::BUS_FANOUT_FACTOR;
 
 /// Default inbox depth. Producers `.await` when full — backpressure is
 /// intentional: a full inbox means the actor is wedged on a transition.
@@ -190,6 +192,13 @@ pub enum Event {
     /// the on-disk session. Spec §3 "conversation pane" + §5
     /// "non-destructive compaction" both rely on this stream.
     MessageCommitted { role: MessageRole, text: String },
+
+    /// Incremental text token from the active streaming turn. Emitted
+    /// by `start_chat_run` (GUI chat-REPL) for each `StreamChunk::Text`
+    /// so the conversation pane can render text word-by-word and the
+    /// footer token meter can show a running estimate. Followed by a
+    /// `MessageCommitted` with the full assembled text at end-of-turn.
+    AssistantTextDelta { delta: String },
 
     /// A plan snapshot — the canvas as it stands after the most recent
     /// `plan_update` was applied. Snapshots (not deltas) so a UI consumer
@@ -623,6 +632,7 @@ impl Event {
             Self::Cancelled => "Cancelled",
             Self::EditStaged { .. } => "EditStaged",
             Self::MessageCommitted { .. } => "MessageCommitted",
+            Self::AssistantTextDelta { .. } => "AssistantTextDelta",
             Self::PlanSnapshot { .. } => "PlanSnapshot",
             Self::LedgerAppended { .. } => "LedgerAppended",
             Self::ContextSnapshot { .. } => "ContextSnapshot",

@@ -182,6 +182,10 @@ pub struct AppState {
     /// decay window so a debug surface can still inspect the
     /// last resolution.
     pub last_overflow_resolution: Option<OverflowResolutionHint>,
+    /// §10 sub-agent delegation — active + completed sub-agents. Populated
+    /// by `SubagentSpawned`; updated by `SubagentTurnAdvanced`, `SubagentCompleted`,
+    /// and `SubagentCancelled`. Rendered by `render_subagents_pane`.
+    pub subagents: Vec<SubagentEntry>,
 }
 
 /// Phase C close — TUI's projection of
@@ -397,6 +401,20 @@ const MAX_DIFF_HISTORY: usize = 16;
 /// Sonnet/Opus 4.x today; overridden via `set_context_window` once the
 /// adapter publishes its capability set onto the bus.
 pub const DEFAULT_CONTEXT_WINDOW_TOKENS: u32 = 200_000;
+
+/// §10 — one row in the sub-agent list pane. Keyed by `id` (the sub-agent
+/// UUID string from `SubagentSpawned`). Status progresses from `"running"`
+/// through `"completed"` / `"failed"` / `"cancelled"`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubagentEntry {
+    pub id: String,
+    pub subagent_type: String,
+    pub description: String,
+    /// `"running"` / `"completed"` / `"failed"` / `"cancelled"`.
+    pub status: String,
+    pub turn: u32,
+    pub max_turns: u32,
+}
 
 /// One event-log line. Stored as already-projected strings so the render
 /// path is allocation-light per frame.
@@ -758,13 +776,49 @@ impl AppState {
             // lines; no AppState mutation here.
             | SessionEvent::AdapterSwapPending { .. }
             | SessionEvent::AdapterSwapRejected { .. }
-            | SessionEvent::Shutdown
-            // §10 sub-agent events — rendered as log lines; dedicated pane wired in WU-11
-            | SessionEvent::SubagentSpawned { .. }
-            | SessionEvent::SubagentTurnAdvanced { .. }
-            | SessionEvent::SubagentToolCall { .. }
-            | SessionEvent::SubagentCompleted { .. }
-            | SessionEvent::SubagentCancelled { .. } => {}
+            | SessionEvent::Shutdown => {}
+            // §10 sub-agent events — update the sub-agent list pane + log line.
+            SessionEvent::SubagentSpawned {
+                ref id,
+                ref subagent_type,
+                ref description,
+                max_turns,
+                ..
+            } => {
+                self.subagents.push(SubagentEntry {
+                    id: id.clone(),
+                    subagent_type: subagent_type.clone(),
+                    description: description.clone(),
+                    status: "running".to_string(),
+                    turn: 0,
+                    max_turns: *max_turns,
+                });
+            }
+            SessionEvent::SubagentTurnAdvanced {
+                ref id,
+                turn,
+                max_turns: _,
+            } => {
+                if let Some(e) = self.subagents.iter_mut().find(|e| e.id == *id) {
+                    e.turn = *turn;
+                }
+            }
+            SessionEvent::SubagentToolCall { .. } => {}
+            SessionEvent::SubagentCompleted {
+                ref id,
+                ref status,
+                turns_used,
+            } => {
+                if let Some(e) = self.subagents.iter_mut().find(|e| e.id == *id) {
+                    e.status = status.to_string();
+                    e.turn = *turns_used;
+                }
+            }
+            SessionEvent::SubagentCancelled { ref id, .. } => {
+                if let Some(e) = self.subagents.iter_mut().find(|e| e.id == *id) {
+                    e.status = "cancelled".to_string();
+                }
+            }
         }
         self.events.push(line);
         if self.events.len() > MAX_EVENT_LOG {
@@ -1165,10 +1219,15 @@ pub fn render(state: &AppState, area: Rect, buf: &mut Buffer) {
 
     let top_right = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .constraints([
+            Constraint::Percentage(50),
+            Constraint::Percentage(25),
+            Constraint::Percentage(25),
+        ])
         .split(top[1]);
     render_plan(state, top_right[0], buf);
     render_memory_pane(state, top_right[1], buf);
+    render_subagents_pane(state, top_right[2], buf);
 
     // Bottom row: diff | (meters + event log)
     let bottom = Layout::default()
@@ -1924,6 +1983,50 @@ fn short_timestamp(iso: &str) -> String {
     } else {
         iso.to_string()
     }
+}
+
+fn render_subagents_pane(state: &AppState, area: Rect, buf: &mut Buffer) {
+    let block = Block::bordered().title("Sub-agents");
+    let inner = block.inner(area);
+    Widget::render(block, area, buf);
+
+    if state.subagents.is_empty() {
+        Widget::render(
+            Paragraph::new("no sub-agents").style(Style::default().fg(Color::DarkGray)),
+            inner,
+            buf,
+        );
+        return;
+    }
+
+    let rows: Vec<ListItem> = state
+        .subagents
+        .iter()
+        .take(inner.height as usize)
+        .map(|e| {
+            let (badge, badge_style) = match e.status.as_str() {
+                "completed" => ("done", Style::default().fg(Color::Green)),
+                "failed" => ("fail", Style::default().fg(Color::Red)),
+                "cancelled" => ("canc", Style::default().fg(Color::Yellow)),
+                _ => ("run ", Style::default().fg(Color::Cyan)),
+            };
+            let turn_label = if e.max_turns > 0 {
+                format!("{}/{}", e.turn, e.max_turns)
+            } else {
+                e.turn.to_string()
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("[{badge}] "), badge_style),
+                Span::styled(
+                    format!("{:<18}", safe_span(&e.subagent_type)),
+                    Style::default().fg(Color::Magenta),
+                ),
+                Span::raw(format!("{:<7} ", turn_label)),
+                Span::raw(safe_span(&e.description)),
+            ]))
+        })
+        .collect();
+    Widget::render(List::new(rows), inner, buf);
 }
 
 fn render_event_log(state: &AppState, area: Rect, buf: &mut Buffer) {

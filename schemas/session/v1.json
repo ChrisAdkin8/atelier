@@ -227,11 +227,12 @@
       "description": "Sub-agents spawned during this session (§10 delegation mode). Each entry is an isolated §2.5 state-machine run; its conversation rolls up to the parent only via the `spawn_subagent` tool-call result. Keyed by `subagent_id` (matches the `spawn_subagent` tool's output).",
       "additionalProperties": {
         "type": "object",
-        "required": ["parent_turn_id", "started_at", "status"],
+        "required": ["status"],
         "additionalProperties": false,
         "properties": {
           "parent_turn_id": {"type": "string", "description": "Turn in the parent's `conversation` where `spawn_subagent` was invoked."},
           "subagent_type": {"type": "string", "description": "Name of the registered sub-agent type (matches a `schemas/config/subagent_type.v1.json` manifest)."},
+          "description": {"type": "string", "description": "Caller-supplied one-line description from the spawn_subagent call."},
           "started_at": {"type": "string", "format": "date-time"},
           "finished_at": {"type": "string", "format": "date-time"},
           "status": {"enum": ["running", "completed", "failed", "timed_out", "cancelled"]},

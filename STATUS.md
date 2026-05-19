@@ -2,7 +2,7 @@
 
 [← back to README](README.md)
 
-The harness is **end-to-end runnable** for the Phase A/B/C scope, against Mock, Anthropic, and any OpenAI-compatible server (LM Studio, llama-server, vLLM, sglang, Ollama, OpenAI itself). The Tauri GUI and `ratatui` TUI both run as driver-mode apps with hunk accept/reject. The spec, schemas, canonical workload, and self-testing rig are fully wired and verify the harness as it grows. This file tracks **what has landed**, **what is in flight**, and **what gates each phase**. Ordered build plan: [`tasks/todo.md`](tasks/todo.md); version-by-version trail: [`CHANGELOG.md`](CHANGELOG.md) (latest **v51**).
+The harness is **end-to-end runnable** for the Phase A/B/C scope, against Mock, Anthropic, and any OpenAI-compatible server (LM Studio, llama-server, vLLM, sglang, Ollama, OpenAI itself). The Tauri GUI and `ratatui` TUI both run as driver-mode apps with hunk accept/reject. The spec, schemas, canonical workload, and self-testing rig are fully wired and verify the harness as it grows. This file tracks **what has landed**, **what is in flight**, and **what gates each phase**. Ordered build plan: [`tasks/todo.md`](tasks/todo.md); version-by-version trail: [`CHANGELOG.md`](CHANGELOG.md) (latest **v60.58**).
 
 ---
 
@@ -18,7 +18,7 @@ The Phase A foundation, Phase B protocol/verification subset, and Phase C worksp
 - §11 sandbox profile generators — macOS `sandbox-exec` `.sb` + Linux `bwrap` argv; default-deny; `/etc` and `/usr/local` writes rejected at policy-build time.
 - §14 on-disk session + global registry + recovery-log scaffold; atomic save with `fsync_dir_best_effort`; 0700 session dirs on Unix.
 - §15 hook manifest loader + first-use approval; `ShellHookExecutor` runs hooks via `sandboxed_argv` + `subprocess::run`; `time_budget_ms` warns past but never blocks.
-- §15 dispatcher + `ToolRegistry` + seven built-in tools: `read_file`, `list_dir`, `grep`, `write_file`, `edit_file`, `ast_grep`, `shell` — all routed through the same dispatcher with hook + ledger + event-bus uniformity.
+- §15 dispatcher + `ToolRegistry` + eight built-in tools: `read_file`, `list_dir`, `grep`, `write_file`, `edit_file`, `ast_grep`, `shell`, `spawn_subagent` — all routed through the same dispatcher with hook + ledger + event-bus uniformity.
 - §2 typed envelope + three emission strategies (`native_tool` / `json_sentinel` / `regex_prose`) + downshifting conformance tracker (100-call ring buffer).
 - §7 did-it-do-what-it-said diff + per-repo DoD config loader.
 - §5 typed `ContextManager` + `MemoryStore` + `PlanCanvas`; `CacheBustEvent` bridges into the §1 ledger.

@@ -31,7 +31,7 @@ use atelier_core::{
     hooks::HookSet,
     ledger::Ledger,
     memory::MemoryStore,
-    persistence::{OnDiskSession, PersistedSubagent},
+    persistence::{OnDiskSession, PersistedSubagent, PersistedSubagentCost},
     plan::PlanCanvas,
     protocol::Envelope,
     protocol_strategy::{parse_json_sentinel, parse_native_tool, NativeToolCall, Strategy},
@@ -2366,20 +2366,57 @@ impl Runner {
                 SubagentStatus::TimedOut => "timed_out",
                 SubagentStatus::Cancelled => "cancelled",
             };
-            snapshot.subagents.insert(
-                rec.result.id.to_string(),
-                PersistedSubagent {
-                    subagent_type: rec.subagent_type_name,
-                    description: rec.description,
-                    status: status_str.to_string(),
-                    result: rec.result.result,
-                    turns_used: rec.result.turns_used,
+            let cost_summary = if rec.result.cost.prompt_tokens > 0
+                || rec.result.cost.completion_tokens > 0
+                || rec.result.cost.cost_usd.is_some()
+            {
+                Some(PersistedSubagentCost {
                     prompt_tokens: rec.result.cost.prompt_tokens,
                     completion_tokens: rec.result.cost.completion_tokens,
                     cached_tokens: rec.result.cost.cached_tokens,
                     cost_usd: rec.result.cost.cost_usd,
+                })
+            } else {
+                None
+            };
+            snapshot.subagents.insert(
+                rec.result.id.to_string(),
+                PersistedSubagent {
+                    subagent_type: Some(rec.subagent_type_name),
+                    description: Some(rec.description),
+                    started_at: Some(rec.started_at),
+                    finished_at: Some(rec.finished_at),
+                    status: status_str.to_string(),
+                    result: Some(rec.result.result),
+                    max_turns: Some(rec.max_turns),
+                    turns_used: Some(rec.result.turns_used),
+                    cost_summary,
                 },
             );
+        }
+        // R-1: carry forward completed sub-agents from the prior session so
+        // the subagents map is additive across resumes.
+        if let Some(resumed) = &resumed_session {
+            for (id, rec) in &resumed.subagents {
+                snapshot
+                    .subagents
+                    .entry(id.clone())
+                    .or_insert_with(|| rec.clone());
+            }
+            // Mark any sub-agent that was `running` in the prior session as
+            // cancelled — v1 does not resume in-flight sub-agent runs (§10).
+            for rec in snapshot.subagents.values_mut() {
+                if rec.status == "running" {
+                    rec.status = "cancelled".to_string();
+                    let _ = try_emit(
+                        &bus,
+                        Event::SubagentCancelled {
+                            id: rec.description.clone().unwrap_or_default(),
+                            reason: "resume_inflight".to_string(),
+                        },
+                    );
+                }
+            }
         }
 
         if let Err(e) = snapshot.save_to(&session_dir) {

@@ -1,5 +1,67 @@
 # Atelier Spec — Changelog
 
+## v60.60 — 2026-05-19 (§10 R-7 — GUI sub-agent pane)
+
+Unblocks R-7 from `tasks/plan_section10_subagents_remaining.md`. Adds a Runner-backed `start_agent_run` Tauri command and a `SubagentPane` component so sub-agent events surface in the GUI.
+
+### `crates/atelier-gui/src/lib.rs`
+- New `start_agent_run` Tauri command: wires the Composer prompt through `Runner::new` (Mock shell) + `.with_adapter(real_adapter)`, `EventSink::Callback`, and the existing dispatcher/adapter handles. Uses `AutoApproveAll` policy (the Runner default) so the run doesn't block waiting for a DiffPane that no longer exists in chat-REPL mode. Falls back to a per-run temp subdir when no `workspace_override` is set; uses `RunCleanup` to remove it only in that case.
+- Registered in the `generate_handler!` invoke list.
+
+### `crates/atelier-gui/ui/src/lib/state.ts`
+- New exported `SubagentEntry` type (mirrors TUI struct): `id`, `subagentType`, `description`, `status`, `turn`, `maxTurns`.
+- `subagents: SubagentEntry[]` added to `AppState`; initialized to `[]` in `initialState()`.
+- `applyEvent()`: new arms for `SubagentSpawned` (push), `SubagentTurnAdvanced` (map-update `turn`), `SubagentToolCall` (event-log only), `SubagentCompleted` (map-update `status` + `turn`), `SubagentCancelled` (map-update `status: "cancelled"`).
+- `projectEvent()`: new arms for all 5 variants with descriptive one-line strings.
+
+### `crates/atelier-gui/ui/src/lib/components/SubagentPane.svelte` (new)
+Ratatui-mirrored component: status badges `[run ]` / `[done]` / `[fail]` / `[canc]`, one row per entry with `type · "description" · turn N/M`. Empty-state message when no sub-agents have been spawned.
+
+### `crates/atelier-gui/ui/src/App.svelte`
+- Imports and mounts `SubagentPane` in the `plan-stack` div below `MemoryPane`.
+
+### `crates/atelier-gui/ui/src/lib/components/Composer.svelte`
+- Non-slash path now calls `start_agent_run` instead of `start_chat_run`.
+
+## v60.59+ — 2026-05-19 (§10 Sub-agent delegation — R-1 through R-6 remaining work)
+
+Closes all pending items from `tasks/plan_section10_subagents_remaining.md` (R-1 through R-6 and R-8 — R-7 GUI pane remains blocked on GUI gaining a Runner-backed agent mode).
+
+### Schema alignment
+- **`schemas/session/v1.json`**: `subagents.*` required array changed from `["parent_turn_id","started_at","status"]` to `["status"]`; added optional `description` property. Both `parent_turn_id` and `started_at` remain valid optional fields for rich fixtures.
+- **`tests/sessions/examples/with_subagent_description.json`** (new): exercises the new `description`-only shape (no `parent_turn_id`) + nested `cost_summary`.
+
+### Struct alignment (`persistence.rs`)
+- New `PersistedSubagentCost` struct — mirrors `cost_summary` schema shape (nested object).
+- `PersistedSubagent` rewritten to match schema exactly: `cost_summary: Option<PersistedSubagentCost>` replaces flat token fields; added `started_at`, `finished_at`, `max_turns` (all optional with `skip_serializing_if`); `description`, `subagent_type`, `result`, `turns_used` made optional to match `additionalProperties: false`.
+
+### R-1 — Resume safety (`runner.rs`)
+After the `drain_completed()` insert, two new blocks carry forward the prior session's state:
+1. `resumed.subagents.entry(id).or_insert_with(...)` — additive merge so completed sub-agents survive resume+re-save.
+2. Status `"running"` → `"cancelled"` sweep + `Event::SubagentCancelled { reason: "resume_inflight" }` for any in-flight entry from the prior session.
+
+### R-2 — Bus capacity (`session.rs`)
+`EVENT_BUFFER` changed from `256` to `256 * crate::subagents::BUS_FANOUT_FACTOR` (= 1024). The constant existed but was never applied.
+
+### R-3 — Cost-fields test (`run_integration.rs`)
+New `subagent_cost_fields_populated` — asserts `cost_summary.prompt_tokens > 0` in `session.json` after a mock sub-agent run.
+
+### R-4 — Schema round-trip rig tests (`test_schemas.py`)
+Five new tests: `test_subagent_field_validates`, `test_subagent_minimal_status_only_validates`, `test_subagent_description_without_parent_turn_id_validates`, `test_subagent_bad_status_rejected`, `test_subagent_extra_field_rejected`. Updated `test_session_subagent_missing_required_rejected` → `test_session_subagent_missing_status_rejected` (now tests the new single required field).
+
+### R-5 — Resume-cancel test (`run_integration.rs`)
+New `resume_marks_inflight_subagents_cancelled` — writes a session with a `status: "running"` sub-agent entry, resumes, asserts `SubagentCancelled` event emitted and entry updated to `"cancelled"`.
+
+### R-6 — TUI sub-agent list widget (`atelier-tui/src/lib.rs`)
+- New `SubagentEntry` struct with `id`, `subagent_type`, `description`, `status`, `turn`, `max_turns`.
+- `AppState.subagents: Vec<SubagentEntry>` field.
+- `apply()` arms for all five subagent events: `SubagentSpawned` pushes entry, `SubagentTurnAdvanced` updates turn counter, `SubagentCompleted`/`SubagentCancelled` update status.
+- `render_subagents_pane` — ratatui `Block` titled "Sub-agents" with a `List` widget; status badge (run/done/fail/canc) + turn counter + description per row.
+- Layout: top-right column split from 50/50 to 50/25/25 (plan / memory / sub-agents).
+
+### Verification
+`cargo test -p atelier-cli --test run_integration -- subagent resume` → 5 tests green. `cargo test -p atelier-tui --lib` → 111 tests green. `make check` → 81/81 artifacts, 168 rig tests, 14 workload dry-runs.
+
 ## v60.59 — 2026-05-19 (GUI dead-code sweep — remove orphaned DiffPane / submit_approval remnants)
 
 The v60.43 chat-REPL pivot removed the DiffPane component from App.svelte but left several artefacts in place. This version completes the cleanup.

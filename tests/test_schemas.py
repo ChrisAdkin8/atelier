@@ -222,6 +222,74 @@ def test_session_tool_fixture_bad_error_kind_rejected():
         }), schema)
 
 
+# ---- session: subagents map (§10 delegation) ----
+
+def _session_with_subagent(subagent_entries):
+    """Build a minimal session doc that has a populated subagents map."""
+    doc = _minimal_session({})
+    doc["subagents"] = subagent_entries
+    return doc
+
+
+def test_subagent_field_validates():
+    """Session JSON with populated subagents map validates against session/v1.json."""
+    schema = load("session/v1.json")
+    doc = _session_with_subagent({
+        "sa-abc": {
+            "subagent_type": "researcher",
+            "description": "research async Rust",
+            "started_at": "2026-05-19T10:00:00Z",
+            "finished_at": "2026-05-19T10:00:05Z",
+            "status": "completed",
+            "max_turns": 5,
+            "turns_used": 1,
+            "result": "Tokio uses a work-stealing scheduler.",
+            "cost_summary": {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "cached_tokens": 0,
+                "cost_usd": 0.001,
+            },
+        }
+    })
+    validate_with_registry(schema, doc)
+
+
+def test_subagent_minimal_status_only_validates():
+    """status alone satisfies the subagents entry required-fields contract."""
+    schema = load("session/v1.json")
+    doc = _session_with_subagent({"sa-1": {"status": "cancelled"}})
+    validate_with_registry(schema, doc)
+
+
+def test_subagent_description_without_parent_turn_id_validates():
+    """description present, parent_turn_id absent — must validate (both are optional)."""
+    schema = load("session/v1.json")
+    doc = _session_with_subagent({
+        "sa-2": {
+            "description": "in-flight task cancelled on resume",
+            "status": "cancelled",
+        }
+    })
+    validate_with_registry(schema, doc)
+
+
+def test_subagent_bad_status_rejected():
+    """Unrecognised status value must fail."""
+    schema = load("session/v1.json")
+    doc = _session_with_subagent({"sa-3": {"status": "UNKNOWN"}})
+    with pytest.raises(jsonschema.ValidationError):
+        validate_with_registry(schema, doc)
+
+
+def test_subagent_extra_field_rejected():
+    """additionalProperties: false — unknown field must fail."""
+    schema = load("session/v1.json")
+    doc = _session_with_subagent({"sa-4": {"status": "completed", "extra_field": "x"}})
+    with pytest.raises(jsonschema.ValidationError):
+        validate_with_registry(schema, doc)
+
+
 # ---- mcp_servers: transport-conditional required fields ----
 
 def test_mcp_servers_stdio_with_command_valid():
@@ -1184,14 +1252,14 @@ def test_session_with_subagents_valid():
     validate_with_registry(schema, doc)
 
 
-def test_session_subagent_missing_required_rejected():
+def test_session_subagent_missing_status_rejected():
+    """status is the only required field; omitting it must be rejected."""
     schema = load("session/v1.json")
     doc = _session_skeleton()
     doc["subagents"] = {
         "sa-1": {
             "subagent_type": "researcher",
             "started_at": "2026-05-16T00:00:00Z",
-            "status": "completed",
         }
     }
     with pytest.raises(jsonschema.ValidationError):

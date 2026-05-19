@@ -306,6 +306,9 @@ def test_no_claude_paths_in_tracked_source():
         # tree and need the same IoC battery. The string is descriptive,
         # not a code path the harness reads from.
         "tasks/shai_hulud_sweep_2026-05-19.md",
+        # References `.claude/commands/` for competitive-survey comparison only;
+        # not a code path the harness reads or writes.
+        "tasks/plan_skills_implementation.md",
     }
     offenders = []
     for path in ROOT.rglob("*"):

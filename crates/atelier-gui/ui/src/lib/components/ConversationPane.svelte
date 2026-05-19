@@ -12,16 +12,17 @@
 
   type Props = {
     conversation: ConversationLine[]
+    streamingAssistant?: string
   }
 
-  let { conversation }: Props = $props()
+  let { conversation, streamingAssistant = '' }: Props = $props()
 
   let scrollEl: HTMLDivElement | null = $state(null)
 
-  // Re-pin to the bottom whenever a new line arrives. `length` is the
-  // tracked reactive value; `$effect` re-runs whenever it changes.
+  // Re-pin to the bottom whenever a new line or streaming delta arrives.
   $effect(() => {
     const _len = conversation.length
+    const _stream = streamingAssistant
     queueMicrotask(() => {
       if (scrollEl) scrollEl.scrollTop = scrollEl.scrollHeight
     })
@@ -31,7 +32,7 @@
 <section class="pane">
   <header class="pane-title">Conversation</header>
   <div class="scroll" bind:this={scrollEl}>
-    {#if conversation.length === 0}
+    {#if conversation.length === 0 && streamingAssistant.length === 0}
       <p class="empty">no messages yet</p>
     {:else}
       <ol class="lines">
@@ -43,6 +44,12 @@
             <span class="text">{line.text}</span>
           </li>
         {/each}
+        {#if streamingAssistant.length > 0}
+          <li class="streaming">
+            <span class="role" style="color: {roleColour('assistant')}">assistant</span>
+            <span class="text streaming-text">{streamingAssistant}<span class="cursor">▍</span></span>
+          </li>
+        {/if}
       </ol>
     {/if}
   </div>
@@ -101,5 +108,14 @@
   .text {
     color: var(--fg-default);
     white-space: pre-wrap;
+  }
+  .cursor {
+    display: inline-block;
+    animation: blink 1s step-end infinite;
+    color: var(--fg-muted);
+  }
+  @keyframes blink {
+    0%, 100% { opacity: 1; }
+    50%       { opacity: 0; }
   }
 </style>

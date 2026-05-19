@@ -32,6 +32,7 @@ use atelier_core::subagents::{
     CancelError, SpawnError, SpawnRequest, SubagentCost, SubagentId, SubagentResult,
     SubagentSpawner, SubagentStatus, SubagentTypeRegistry,
 };
+use atelier_core::time::now_rfc3339;
 use atelier_core::Adapter;
 
 use crate::runner::{EventSink, ProviderChoice, RunReport, Runner};
@@ -50,6 +51,9 @@ struct InFlight {
 pub struct CompletedSubagentRecord {
     pub description: String,
     pub subagent_type_name: String,
+    pub started_at: String,
+    pub finished_at: String,
+    pub max_turns: u32,
     pub result: SubagentResult,
 }
 
@@ -101,6 +105,7 @@ impl SubagentSpawner for RunnerSpawner {
         // Capture metadata before req is partially moved.
         let description = req.description.clone();
         let type_name = req.subagent_type.name.clone();
+        let started_at = now_rfc3339();
 
         // Build the prompt injecting the system_prompt_addendum first.
         let addendum = req.subagent_type.system_prompt_addendum.clone();
@@ -181,10 +186,14 @@ impl SubagentSpawner for RunnerSpawner {
             }
         };
 
+        let finished_at = now_rfc3339();
         // Record for the parent runner to persist in session.json.
         self.completed.lock().push(CompletedSubagentRecord {
             description,
             subagent_type_name: type_name,
+            started_at,
+            finished_at,
+            max_turns: max_turns as u32,
             result: result.clone(),
         });
 

@@ -44,9 +44,11 @@ export type LedgerEntry =
       kind: 'model_call'
       timestamp: string
       model_id: string
+      prompt_tokens: number
+      completion_tokens: number
+      cached_tokens?: number | null
       cost_usd?: number | null
       tool_name?: string
-      // Other fields exist on the wire but we only need cost + a label.
     }
   | {
       kind: 'tool_call'
@@ -219,6 +221,17 @@ export type CurrentModel = {
   capabilityRow: CapabilityMatrixRow | null
 }
 
+/// §10 — one row in the sub-agent panel. Updated by the 5 SubagentXxx
+/// bus events. Mirrors `SubagentEntry` in `crates/atelier-tui/src/lib.rs`.
+export type SubagentEntry = {
+  id: string
+  subagentType: string
+  description: string
+  status: string // "running" | "completed" | "failed" | "cancelled"
+  turn: number
+  maxTurns: number
+}
+
 export type AppState = {
   events: EventLogEntry[]
   currentState: string
@@ -260,11 +273,15 @@ export type AppState = {
   /// `SwapConsentModal.svelte` when this is non-null; the modal calls
   /// the `respond_to_swap` Tauri command keyed by `swapId`.
   pendingSwap: { swapId: string; toModelId: string; baseUrl: string } | null
-  /// v62 — §7 verify-pass tier indicator. Populated by
-  /// `VerificationPassed` events from the dispatcher; the
-  /// `MetersPane` renders a small badge so the user can see which
-  /// tier (and therefore the hallucination coverage level) ran on
-  /// the last verify pass. Defaults to `not_run`.
+  /// Prompt/completion token counts for the most recent model call.
+  /// Updated by every `LedgerAppended` event whose entry is a
+  /// `model_call`; null until the first call lands.
+  lastTurnTokens: { prompt: number; completion: number; cached: number } | null
+  /// Streaming assistant text accumulator. Non-empty while a chat turn
+  /// is in flight (`AssistantTextDelta` events append here). Cleared to
+  /// '' when the turn's `MessageCommitted { role: assistant }` lands.
+  streamingAssistant: string
+  /// v62 — §7 verify-pass tier indicator. Defaults to `not_run`.
   verificationStatus: VerificationStatus
   /// v60.9 B1 follow-on — most recent §1 context-overflow resolution.
   /// Populated by `ContextOverflowResolved`; `null` before any
@@ -281,6 +298,9 @@ export type AppState = {
     items_compacted: number | null
     at: number
   } | null
+  /// §10 sub-agent panel rows. Populated by SubagentSpawned, updated by
+  /// SubagentTurnAdvanced / SubagentCompleted / SubagentCancelled events.
+  subagents: SubagentEntry[]
 }
 
 export function initialState(): AppState {
@@ -299,8 +319,11 @@ export function initialState(): AppState {
     mentalModel: initialMentalModel(),
     concurrentEditModal: null,
     pendingSwap: null,
+    lastTurnTokens: null,
+    streamingAssistant: '',
     verificationStatus: initialVerificationStatus(),
     lastOverflowResolution: null,
+    subagents: [],
   }
 }
 
@@ -357,7 +380,21 @@ export function applyEvent(state: AppState, evt: BridgedEvent): AppState {
       const role: ConversationRole = isConversationRole(p.role) ? p.role : 'system'
       const line: ConversationLine = { role, text: p.text }
       const conversation = pushBounded(state.conversation, line, MAX_CONVERSATION_LINES)
-      return { ...state, events, conversation }
+      // Clear the streaming buffer when the assistant turn finalises.
+      const streamingAssistant = role === 'assistant' ? '' : state.streamingAssistant
+      return { ...state, events, conversation, streamingAssistant }
+    }
+    case 'AssistantTextDelta': {
+      const p = evt.payload as { delta: string }
+      const streamingAssistant = state.streamingAssistant + (p.delta ?? '')
+      // Estimate completion tokens from streamed chars (≈4 chars/token).
+      const completionEst = Math.round(streamingAssistant.length / 4)
+      const lastTurnTokens = {
+        prompt: state.lastTurnTokens?.prompt ?? 0,
+        completion: completionEst,
+        cached: state.lastTurnTokens?.cached ?? 0,
+      }
+      return { ...state, events, streamingAssistant, lastTurnTokens }
     }
     case 'PlanSnapshot': {
       const p = evt.payload as { steps: PlanStep[] }
@@ -367,6 +404,14 @@ export function applyEvent(state: AppState, evt: BridgedEvent): AppState {
       const p = evt.payload as { entry: LedgerEntry }
       const c = ledgerEntryCost(p.entry)
       const totalCostUsd = c == null ? state.totalCostUsd : state.totalCostUsd + c
+      if (p.entry.kind === 'model_call') {
+        const lastTurnTokens = {
+          prompt: p.entry.prompt_tokens ?? 0,
+          completion: p.entry.completion_tokens ?? 0,
+          cached: p.entry.cached_tokens ?? 0,
+        }
+        return { ...state, events, totalCostUsd, lastTurnTokens }
+      }
       return { ...state, events, totalCostUsd }
     }
     case 'ContextSnapshot': {
@@ -567,6 +612,48 @@ export function applyEvent(state: AppState, evt: BridgedEvent): AppState {
     case 'RequestLspInstall':
     case 'LspInstallResolved':
       return { ...state, events }
+    // §10 sub-agent panel reducer arms.
+    case 'SubagentSpawned': {
+      const p = evt.payload as {
+        id: string
+        subagent_type: string
+        description: string
+        max_turns: number
+      }
+      const entry: SubagentEntry = {
+        id: p.id,
+        subagentType: p.subagent_type ?? '',
+        description: p.description ?? '',
+        status: 'running',
+        turn: 0,
+        maxTurns: p.max_turns ?? 0,
+      }
+      return { ...state, events, subagents: [...state.subagents, entry] }
+    }
+    case 'SubagentTurnAdvanced': {
+      const p = evt.payload as { id: string; turn: number }
+      const subagents = state.subagents.map((e) =>
+        e.id === p.id ? { ...e, turn: p.turn ?? e.turn } : e,
+      )
+      return { ...state, events, subagents }
+    }
+    case 'SubagentToolCall':
+      // No state change — event-log entry is sufficient.
+      return { ...state, events }
+    case 'SubagentCompleted': {
+      const p = evt.payload as { id: string; status: string; turns_used: number }
+      const subagents = state.subagents.map((e) =>
+        e.id === p.id ? { ...e, status: p.status ?? 'completed', turn: p.turns_used ?? e.turn } : e,
+      )
+      return { ...state, events, subagents }
+    }
+    case 'SubagentCancelled': {
+      const p = evt.payload as { id: string }
+      const subagents = state.subagents.map((e) =>
+        e.id === p.id ? { ...e, status: 'cancelled' } : e,
+      )
+      return { ...state, events, subagents }
+    }
     // Variants we don't fold into pane state — just the event log.
     case 'IllegalTransitionAttempted':
     case 'Cancelled':
@@ -681,6 +768,10 @@ export function projectEvent(evt: BridgedEvent): EventLogEntry {
       const p = evt.payload as { role: string; text: string }
       const firstLine = (p.text ?? '').split('\n')[0] ?? ''
       return { kind, detail: `${p.role}: ${firstLine.slice(0, 60)}` }
+    }
+    case 'AssistantTextDelta': {
+      const p = evt.payload as { delta: string }
+      return { kind, detail: `+${(p.delta ?? '').length}chars` }
     }
     case 'PlanSnapshot': {
       const p = evt.payload as { steps: PlanStep[] }
@@ -827,6 +918,40 @@ export function projectEvent(evt: BridgedEvent): EventLogEntry {
         kind,
         detail: `${p.language ?? '?'}: ${p.outcome ?? '?'}`,
       }
+    }
+    case 'SubagentSpawned': {
+      const p = evt.payload as {
+        id?: string
+        subagent_type?: string
+        description?: string
+        max_turns?: number
+      }
+      return {
+        kind,
+        detail: `[${p.id ?? '?'}] ${p.subagent_type ?? '?'}: "${p.description ?? ''}" (max ${p.max_turns ?? 0} turns)`,
+      }
+    }
+    case 'SubagentTurnAdvanced': {
+      const p = evt.payload as { id?: string; turn?: number; max_turns?: number }
+      return {
+        kind,
+        detail: `[${p.id ?? '?'}] turn ${p.turn ?? '?'}/${p.max_turns ?? '?'}`,
+      }
+    }
+    case 'SubagentToolCall': {
+      const p = evt.payload as { id?: string; tool?: string }
+      return { kind, detail: `[${p.id ?? '?'}] tool: ${p.tool ?? '?'}` }
+    }
+    case 'SubagentCompleted': {
+      const p = evt.payload as { id?: string; status?: string; turns_used?: number }
+      return {
+        kind,
+        detail: `[${p.id ?? '?'}] ${p.status ?? '?'} after ${p.turns_used ?? '?'} turns`,
+      }
+    }
+    case 'SubagentCancelled': {
+      const p = evt.payload as { id?: string; reason?: string }
+      return { kind, detail: `[${p.id ?? '?'}] cancelled: ${p.reason ?? '?'}` }
     }
     default:
       return { kind, detail: '' }

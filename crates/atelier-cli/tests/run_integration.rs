@@ -5098,3 +5098,161 @@ async fn subagent_depth_cap_surfaces_as_tool_error() {
 
     assert_eq!(report.final_state, atelier_core::State::Done);
 }
+
+/// R-3 — cost fields populated: after a sub-agent run the `cost_summary`
+/// in session.json must have non-zero `prompt_tokens` (spec §10.1 cost
+/// tracking contract).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn subagent_cost_fields_populated() {
+    let workspace = tempfile::TempDir::new().unwrap();
+
+    let spawn_call = atelier_core::adapter::ToolCallRequest {
+        id: "tc-cost-1".into(),
+        name: "spawn_subagent".into(),
+        arguments: serde_json::json!({
+            "description": "cost probe",
+            "prompt": "Summarise the cost of async Rust.",
+            "subagent_type": "researcher"
+        }),
+    };
+
+    let responses = vec![
+        MockResponse::new(
+            "Delegating to researcher.",
+            vec![spawn_call, mock_envelope_tool_call(&envelope_done())],
+        ),
+        // Sub-agent turn 1: claims done.
+        MockResponse::new(
+            "Async Rust is zero-cost.",
+            vec![mock_envelope_tool_call(&envelope_done())],
+        ),
+    ];
+
+    let runner = Runner::new(
+        workspace.path().to_path_buf(),
+        ProviderChoice::Mock { responses },
+        EventSink::Null,
+    )
+    .expect("runner must construct")
+    .with_max_turns(5);
+
+    let report = runner
+        .run("Cost probe.".into())
+        .await
+        .expect("run must succeed");
+
+    assert_eq!(report.final_state, atelier_core::State::Done);
+
+    let persist_uuid = report.session_id.0;
+    let session_path = workspace
+        .path()
+        .join(".atelier/sessions")
+        .join(persist_uuid.to_string())
+        .join("session.json");
+    let raw = std::fs::read_to_string(&session_path).expect("session.json must exist");
+    let session: serde_json::Value = serde_json::from_str(&raw).unwrap();
+
+    let subagents = session
+        .get("subagents")
+        .and_then(|v| v.as_object())
+        .expect("subagents map must be present");
+    assert!(!subagents.is_empty(), "subagents must be non-empty");
+
+    let entry = subagents.values().next().unwrap();
+    let cost_summary = entry
+        .get("cost_summary")
+        .expect("cost_summary must be present in sub-agent entry");
+    let prompt_tokens = cost_summary
+        .get("prompt_tokens")
+        .and_then(|v| v.as_u64())
+        .expect("cost_summary.prompt_tokens must be present");
+    assert!(
+        prompt_tokens > 0,
+        "cost_summary.prompt_tokens must be non-zero; entry={entry}"
+    );
+}
+
+/// R-5 — resume with in-flight sub-agent: resuming a session that has a
+/// `running` sub-agent entry must emit `SubagentCancelled` with
+/// `reason: "resume_inflight"` and write `status: "cancelled"` (§10 spec;
+/// v1 does not resume in-flight sub-agent runs).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_marks_inflight_subagents_cancelled() {
+    use atelier_core::persistence::{OnDiskSession, PersistedSubagent};
+    use atelier_core::session::Event;
+
+    let workspace = tempfile::TempDir::new().unwrap();
+
+    // Build a session.json with one sub-agent entry whose status is "running".
+    let stale_uuid = uuid::Uuid::new_v4();
+    let session_dir = workspace
+        .path()
+        .join(".atelier/sessions")
+        .join(stale_uuid.to_string());
+    std::fs::create_dir_all(&session_dir).unwrap();
+
+    let mut prior = OnDiskSession::fresh(
+        stale_uuid,
+        "test".to_string(),
+        "2026-01-01T00:00:00Z".to_string(),
+    );
+    prior.subagents.insert(
+        "sa-inflight-1".to_string(),
+        PersistedSubagent {
+            subagent_type: Some("researcher".to_string()),
+            description: Some("in-flight task".to_string()),
+            started_at: Some("2026-01-01T00:00:00Z".to_string()),
+            finished_at: None,
+            status: "running".to_string(),
+            result: None,
+            max_turns: Some(5),
+            turns_used: None,
+            cost_summary: None,
+        },
+    );
+    prior.save_to(&session_dir).unwrap();
+
+    // Resume this session with a fresh run that immediately claims done.
+    let responses = vec![MockResponse::new(
+        "Nothing more to do.",
+        vec![mock_envelope_tool_call(&envelope_done())],
+    )];
+
+    let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let runner = Runner::new(
+        workspace.path().to_path_buf(),
+        ProviderChoice::Mock { responses },
+        EventSink::Capture(events.clone()),
+    )
+    .expect("runner must construct")
+    .with_resume(stale_uuid)
+    .with_max_turns(3);
+
+    let report = runner
+        .run("Continue.".into())
+        .await
+        .expect("resumed run must succeed");
+
+    assert_eq!(report.final_state, atelier_core::State::Done);
+
+    // The SubagentCancelled event must have fired for the in-flight entry.
+    let captured = events.lock();
+    let cancelled_events: Vec<_> = captured
+        .iter()
+        .filter(|e| matches!(e, Event::SubagentCancelled { .. }))
+        .collect();
+    assert!(
+        !cancelled_events.is_empty(),
+        "SubagentCancelled must be emitted for in-flight sub-agent on resume; events={captured:?}"
+    );
+
+    // The session.json's subagents entry must be `"cancelled"` now.
+    let session_path = session_dir.join("session.json");
+    let raw = std::fs::read_to_string(&session_path).expect("session.json must exist");
+    let session: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    let entry = &session["subagents"]["sa-inflight-1"];
+    assert_eq!(
+        entry["status"], "cancelled",
+        "in-flight sub-agent must be marked cancelled after resume; entry={entry}"
+    );
+}

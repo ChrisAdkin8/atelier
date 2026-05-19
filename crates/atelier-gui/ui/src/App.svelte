@@ -31,10 +31,10 @@
   import Header from './lib/components/Header.svelte'
   import ConversationPane from './lib/components/ConversationPane.svelte'
   import PlanPane from './lib/components/PlanPane.svelte'
-  import MetersPane from './lib/components/MetersPane.svelte'
   import ContextPane from './lib/components/ContextPane.svelte'
   import MemoryPane from './lib/components/MemoryPane.svelte'
   import MentalModelPane from './lib/components/MentalModelPane.svelte'
+  import SubagentPane from './lib/components/SubagentPane.svelte'
   import Composer from './lib/components/Composer.svelte'
   import ConcurrentEditModal from './lib/components/ConcurrentEditModal.svelte'
   import SwapConsentModal from './lib/components/SwapConsentModal.svelte'
@@ -344,7 +344,7 @@
 
   <main class="grid" class:right-collapsed={rightPanelCollapsed}>
     <div class="pane-slot conversation-slot">
-      <ConversationPane conversation={app.conversation} />
+      <ConversationPane conversation={app.conversation} streamingAssistant={app.streamingAssistant} />
     </div>
     <div class="pane-slot plan-slot">
       <!-- v54: the top-right slot stacks the Plan canvas above
@@ -355,121 +355,90 @@
       <div class="plan-stack">
         <PlanPane planSteps={app.planSteps} />
         <MemoryPane cards={app.memoryCards} />
+        <SubagentPane subagents={app.subagents} />
       </div>
     </div>
-    <!-- v60.43 — DiffPane removed. The §3 staging surface is no
-         longer reachable from the GUI's chat-only Composer path;
-         Conversation now spans both rows of the left column so the
-         transcript gets the breathing room the diff used to occupy. -->
-    <div class="pane-slot meters-slot">
-      <!-- v53: the bottom-right slot stacks the aggregate Meters
-           (cost + context-window gauge) above the per-item Context
-           panel. The Meters pane stays fixed-height; the Context
-           pane fills the remaining vertical space because per-item
-           rows are what scales as the agent's context grows. -->
-      <div class="meters-stack">
-        <MetersPane
-          totalCostUsd={app.totalCostUsd}
-          knownTokens={app.contextTokens.known}
-          unknownTokens={app.contextTokens.unknown}
-          contextWindowTokens={app.contextWindowTokens}
-          verificationStatus={app.verificationStatus}
-          lastOverflowResolution={app.lastOverflowResolution}
-        />
-        <ContextPane items={app.contextItems} />
-      </div>
+    <div class="pane-slot context-slot">
+      <ContextPane items={app.contextItems} />
     </div>
   </main>
 
   <Composer busy={composerBusy} />
 
   <footer class="help">
-    <!-- Left side: scrub keys. -->
-    <span>[ prev</span>
-    <span>] next</span>
-    <span>g HEAD</span>
-    {#if app.scrubOffset != null}
-      <span class="hint">[pinned: g returns to HEAD]</span>
-    {/if}
-
-    <!-- v60.43 — context-window usage. Tokens-known divided by the
-         active model's `context_window_tokens`, rendered as both a
-         progress bar and a percent for at-a-glance status. Hidden
-         until at least one turn has landed (window denominator > 0). -->
-    {#if app.contextWindowTokens > 0}
-      {@const used = app.contextTokens.known}
-      {@const cap = app.contextWindowTokens}
-      {@const pct = Math.min(100, Math.round((used / cap) * 100))}
-      <span class="ctx-meter" title="context window usage">
-        <span class="ctx-label">ctx</span>
-        <span class="ctx-bar"
-          ><span class="ctx-fill" style="width: {pct}%"></span></span>
-        <span class="ctx-text">{used.toLocaleString()} / {cap.toLocaleString()} ({pct}%)</span>
+    <!-- Left column: context window usage + cost. -->
+    <span class="footer-left">
+      {#if app.contextWindowTokens > 0}
+        {@const used = app.contextTokens.known}
+        {@const cap = app.contextWindowTokens}
+        {@const pct = Math.min(100, Math.round((used / cap) * 100))}
+        <span class="ctx-meter" title="context window usage">
+          <span class="ctx-label">ctx</span>
+          <span class="ctx-bar"
+            ><span class="ctx-fill" style="width: {pct}%"></span></span>
+          <span class="ctx-text">{used.toLocaleString()} / {cap.toLocaleString()} ({pct}%)</span>
+        </span>
+      {/if}
+      <span class="cost-meter" title="session cost (USD)">
+        <span class="cost-label">cost</span>
+        <span class="cost-value">${app.totalCostUsd.toFixed(4)}</span>
       </span>
-    {/if}
-
-    <!-- v60.44 — cost meter moved out of the right-column MetersPane
-         and into the footer alongside the context-usage gauge. Always
-         rendered (even at $0.0000) so the user has a stable place to
-         look for cost; the value updates as LedgerAppended events
-         land (today only the Runner path emits those — chat mode
-         leaves it at $0 until cost wiring is added there too). -->
-    <span class="cost-meter" title="session cost (USD)">
-      <span class="cost-label">cost</span>
-      <span class="cost-value">${app.totalCostUsd.toFixed(4)}</span>
     </span>
 
-    <!-- v52 — active BYOM model on the right side. Empty until the
-         Runner emits its one-shot `ModelProfileLoaded` event at session
-         start; populated thereafter for the lifetime of the run.
-         v60.7 — when the model carries a §1 capability matrix row
-         (always set once the runner has wired the cross-walk), the
-         `title=` tooltip lists each capability + its claim so the user
-         can see at a glance which columns are broken.  Any
-         `ClaimedButBroken` cell is surfaced inline as a yellow
-         "broken: …" tag so a degraded model is unmissable. -->
-    <span class="model-badge" aria-label="active model">
-      {#if app.currentModel}
-        <span class="model-id" title={modelBadgeTooltip(app.currentModel)}>
-          {app.currentModel.modelId}
-        </span>
-        <span class="model-sep">·</span>
-        <span class="model-strategy" title="§2 emission strategy">
-          {app.currentModel.strategy}
-        </span>
-        <span class="model-sep">·</span>
-        <span class="model-outcome" title="probe outcome">
-          {app.currentModel.outcome}
-        </span>
-        {#if capabilityBrokenLabel(app.currentModel.capabilityRow)}
-          <span class="model-sep">·</span>
-          <span class="model-broken" title="§1 capability matrix · auto-degraded">
-            {capabilityBrokenLabel(app.currentModel.capabilityRow)}
-          </span>
+    <!-- Centre column: token meter. -->
+    <span class="footer-center">
+      <span class="tok-meter" title="last turn token counts (prompt / completion / cached)">
+        <span class="tok-label">↑</span><span class="tok-value">{(app.lastTurnTokens?.prompt ?? 0).toLocaleString()}</span>
+        <span class="tok-sep">·</span>
+        <span class="tok-label">↓</span><span class="tok-value">{(app.lastTurnTokens?.completion ?? 0).toLocaleString()}</span>
+        {#if (app.lastTurnTokens?.cached ?? 0) > 0}
+          <span class="tok-sep">·</span>
+          <span class="tok-label">cache</span><span class="tok-value cached">{(app.lastTurnTokens?.cached ?? 0).toLocaleString()}</span>
         {/if}
-      {:else}
-        <span class="model-pending">MODEL</span>
-      {/if}
-      <!-- v60.10 B2 follow-on — provider swap dropdown. Stub UI;
-           sends `{ kind, model_id }` to the `swap_adapter` Tauri
-           command. The full mid-run swap behaviour lands when the
-           v60.10 B2 bundle merges to main. -->
-      <select
-        class="swap-select"
-        value={String(dropdownIndex)}
-        onchange={onSwapChange}
-        disabled={app.pendingSwap != null}
-        title={app.pendingSwap != null
-          ? 'swap pending consent — respond to the modal first'
-          : 'swap adapter (§1 BYOM)'}
-        data-testid="swap-adapter-select"
-      >
-        {#each swapOptions as opt, i (opt.model_id)}
-          <option value={String(i)}>
-            {opt.is_default ? '★ ' : ''}{opt.label}
-          </option>
-        {/each}
-      </select>
+      </span>
+    </span>
+
+    <!-- Right column: model badge + swap dropdown. -->
+    <span class="footer-right">
+      <span class="model-badge" aria-label="active model">
+        {#if app.currentModel}
+          <span class="model-id" title={modelBadgeTooltip(app.currentModel)}>
+            {app.currentModel.modelId}
+          </span>
+          <span class="model-sep">·</span>
+          <span class="model-strategy" title="§2 emission strategy">
+            {app.currentModel.strategy}
+          </span>
+          <span class="model-sep">·</span>
+          <span class="model-outcome" title="probe outcome">
+            {app.currentModel.outcome}
+          </span>
+          {#if capabilityBrokenLabel(app.currentModel.capabilityRow)}
+            <span class="model-sep">·</span>
+            <span class="model-broken" title="§1 capability matrix · auto-degraded">
+              {capabilityBrokenLabel(app.currentModel.capabilityRow)}
+            </span>
+          {/if}
+        {:else}
+          <span class="model-pending">MODEL</span>
+        {/if}
+        <select
+          class="swap-select"
+          value={String(dropdownIndex)}
+          onchange={onSwapChange}
+          disabled={app.pendingSwap != null}
+          title={app.pendingSwap != null
+            ? 'swap pending consent — respond to the modal first'
+            : 'swap adapter (§1 BYOM)'}
+          data-testid="swap-adapter-select"
+        >
+          {#each swapOptions as opt, i (opt.model_id)}
+            <option value={String(i)}>
+              {opt.is_default ? '★ ' : ''}{opt.label}
+            </option>
+          {/each}
+        </select>
+      </span>
     </span>
   </footer>
 
@@ -559,7 +528,7 @@
     grid-template-columns: minmax(0, 1fr);
   }
   .grid.right-collapsed .plan-slot,
-  .grid.right-collapsed .meters-slot {
+  .grid.right-collapsed .context-slot {
     display: none;
   }
   .grid.right-collapsed .conversation-slot {
@@ -580,8 +549,6 @@
        fixed height clamp the flex child so the inner scroll engages. */
     min-height: 0;
   }
-  /* v60.43 — Conversation spans both rows of column 1 since
-     DiffPane was removed. Plan + Meters stay in column 2 as before. */
   .conversation-slot {
     grid-row: 1 / span 2;
     grid-column: 1;
@@ -590,22 +557,9 @@
     grid-row: 1;
     grid-column: 2;
   }
-  .meters-slot {
+  .context-slot {
     grid-row: 2;
     grid-column: 2;
-  }
-  /* v53 — Meters stays fixed-height (its content is two gauges);
-     Context takes the remaining vertical space because the row
-     count grows with the agent's working set. */
-  .meters-stack {
-    display: grid;
-    grid-template-rows: auto 1fr;
-    gap: var(--gap-pane, 0.5rem);
-    width: 100%;
-    min-height: 0;
-  }
-  .meters-stack > :global(:first-child) {
-    flex: none;
   }
   /* v54 — Plan stays at the top (typically 4-8 short rows, so a
      soft `auto` height suits it); Memory takes the remaining
@@ -625,7 +579,6 @@
      unified line-height fixes the v-align without per-element hacks. */
   .help {
     display: flex;
-    gap: 1rem;
     align-items: center;
     padding: 0.35rem 1rem;
     border-top: 1px solid var(--border-pane);
@@ -639,14 +592,10 @@
     font-size: inherit;
     line-height: inherit;
   }
-  .help .hint {
-    color: var(--accent-yellow);
-  }
   /* v60.43 — context-window usage meter. `margin-left: auto` pushes
      it to the right alongside the model badge so left-side scrub keys
      keep their stable position. */
   .help .ctx-meter {
-    margin-left: auto;
     display: inline-flex;
     align-items: center;
     gap: 0.4rem;
@@ -680,6 +629,43 @@
   /* v60.44 — cost meter, sibling of ctx-meter. No `margin-left:auto`
      here; the ctx-meter already claimed the auto-margin so cost sits
      immediately to its right via the parent flex `gap`. */
+  .help .footer-left {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+  }
+  .help .footer-center {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .help .footer-right {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+  }
+  .help .tok-meter {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    color: var(--fg-dim);
+  }
+  .help .tok-label {
+    opacity: 0.7;
+  }
+  .help .tok-value {
+    font-variant-numeric: tabular-nums;
+    color: var(--fg-default);
+  }
+  .help .tok-value.cached {
+    color: var(--accent-cyan);
+  }
+  .help .tok-sep {
+    opacity: 0.4;
+  }
   .help .cost-meter {
     display: inline-flex;
     align-items: center;
@@ -695,11 +681,7 @@
     font-variant-numeric: tabular-nums;
     color: var(--accent-green, #4ec9b0);
   }
-  /* v52 — push the model badge to the right edge of the footer.
-     `margin-left: auto` is the canonical flexbox idiom for "all
-     siblings hug the left; this one hugs the right." */
   .help .model-badge {
-    margin-left: auto;
     display: inline-flex;
     align-items: center;
     gap: 0.35rem;

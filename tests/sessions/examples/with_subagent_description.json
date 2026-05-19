@@ -1,0 +1,90 @@
+{
+  "session_uuid": "55555555-5555-4555-8555-555555555555",
+  "harness_session_version": 1,
+  "atelier_version": "0.0.0",
+  "created_at": "2026-05-19T10:00:00Z",
+  "conversation": [
+    {
+      "turn_id": "turn-1",
+      "role": "user",
+      "content": "Explain async Rust briefly."
+    },
+    {
+      "turn_id": "turn-2",
+      "role": "assistant",
+      "content": "Delegating to a researcher sub-agent.",
+      "tool_calls": [
+        {
+          "tool_call_id": "tc-1",
+          "tool_name": "spawn_subagent",
+          "args": {
+            "description": "research async Rust",
+            "prompt": "Explain the tokio executor model briefly.",
+            "subagent_type": "researcher"
+          },
+          "fixture_ref": "tc-1"
+        }
+      ]
+    }
+  ],
+  "cost_ledger": [
+    {
+      "timestamp": "2026-05-19T10:00:01Z",
+      "kind": "model_call",
+      "model_id": "mock",
+      "prompt_tokens": 10,
+      "completion_tokens": 5,
+      "count_source": "exact",
+      "latency_ms": 10
+    }
+  ],
+  "checkpoints": {
+    "root": "ck-0",
+    "nodes": {
+      "ck-0": {"parent": null, "diff_ref": "diff/00000000", "created_at": "2026-05-19T10:00:00Z"}
+    }
+  },
+  "tool_fixtures": {
+    "tc-1": {
+      "tool_name": "spawn_subagent",
+      "args": {
+        "description": "research async Rust",
+        "prompt": "Explain the tokio executor model briefly.",
+        "subagent_type": "researcher"
+      },
+      "result": {
+        "subagent_id": "sa-r3-1",
+        "result": "Tokio uses a work-stealing multi-thread scheduler.",
+        "status": "completed",
+        "turns_used": 1,
+        "cost": {"prompt_tokens": 10, "completion_tokens": 5}
+      },
+      "captured_at": "2026-05-19T10:00:05Z"
+    }
+  },
+  "memory": [],
+  "plan": {"steps": []},
+  "constraints": [],
+  "recovery_log": [],
+  "subagents": {
+    "sa-r3-1": {
+      "subagent_type": "researcher",
+      "description": "research async Rust",
+      "started_at": "2026-05-19T10:00:01Z",
+      "finished_at": "2026-05-19T10:00:05Z",
+      "status": "completed",
+      "max_turns": 5,
+      "turns_used": 1,
+      "result": "Tokio uses a work-stealing multi-thread scheduler.",
+      "cost_summary": {
+        "prompt_tokens": 10,
+        "completion_tokens": 5,
+        "cached_tokens": 0
+      }
+    },
+    "sa-r3-2": {
+      "status": "cancelled",
+      "description": "in-flight task from prior session"
+    }
+  }
+}

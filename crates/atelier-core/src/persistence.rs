@@ -95,6 +95,17 @@ pub struct OnDiskSession {
     pub subagents: BTreeMap<String, PersistedSubagent>,
 }
 
+/// Token + USD cost summary nested inside [`PersistedSubagent`].
+/// Mirrors `schemas/session/v1.json` → `subagents.*.cost_summary`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedSubagentCost {
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+    pub cached_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
+}
+
 /// Snapshot of a completed (or failed/cancelled) sub-agent invocation stored
 /// in `OnDiskSession::subagents`. Written once per §10.1 spawn-result; never
 /// mutated after the sub-agent finishes. Keyed by sub-agent UUID string in
@@ -102,20 +113,28 @@ pub struct OnDiskSession {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedSubagent {
     /// The `SubagentType::name` used (e.g. `"general-purpose"`).
-    pub subagent_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subagent_type: Option<String>,
     /// Caller-supplied one-line description from the `spawn_subagent` call.
-    pub description: String,
-    /// Terminal status: `"completed"`, `"failed"`, `"timed_out"`, or `"cancelled"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// RFC-3339 timestamp when the sub-agent was spawned.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    /// RFC-3339 timestamp when the sub-agent finished.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<String>,
+    /// Terminal status: `"completed"`, `"failed"`, `"timed_out"`, `"cancelled"`, or `"running"`.
     pub status: String,
     /// Final assistant text returned by the sub-agent (empty if failed/cancelled).
-    pub result: String,
-    pub turns_used: u32,
-    // Cost fields mirror SubagentCost for flat JSON storage.
-    pub prompt_tokens: u32,
-    pub completion_tokens: u32,
-    pub cached_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub cost_usd: Option<f64>,
+    pub result: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_turns: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turns_used: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_summary: Option<PersistedSubagentCost>,
 }
 
 /// Diff-based checkpoint tree (spec §4). Root id + map of nodes. Concrete

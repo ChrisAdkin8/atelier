@@ -2,7 +2,7 @@
 
 **Spec target:** `coding-harness-spec.md` §10.1 (delegation mode). §10.2 (comparison) and §10.3 (background critic) are Phase F and explicitly out of scope here.
 
-**Status going in:** contract-locked, runtime-deferred.
+**Status:** Core runtime code-complete as of v60.56–v60.58. Remaining: WU-6 (trust budget), WU-8 (bus events), WU-10/11/12 (UI), WU-13 partial (5/7 test scenarios), WU-14 (docs).
 - Tool manifest on disk: `crates/atelier-core/tools/spawn_subagent.v1.json`
 - Subagent-type schema: `schemas/config/subagent_type.v1.json`
 - 3 bundled subagent types on disk: `crates/atelier-core/subagents/{researcher,test-runner,general-purpose}.json`
@@ -18,13 +18,13 @@
 
 ## Success criteria (checkable)
 
-1. `cargo test -p atelier-core subagents::` green — registry loader, override resolution, recursion-cap.
-2. `cargo test -p atelier-cli subagent_run` green — end-to-end run against `MockAdapter`, parent sees one tool-result, sub-agent's intermediate turns absent from parent conversation.
-3. `make rig-tests` green — `tests/test_session.py::test_subagent_field_validates` passes against a real persisted session containing one completed sub-agent.
-4. Recursion depth 3 → 4 attempt returns `ToolError::SchemaViolation` (spec §10 line 556).
-5. Cancel cascade: cancelling depth-1 sub-agent terminates depth-2 grandchild within 5s.
-6. `cargo test -p atelier-core trust_budget_subagent` — unused budget returns to parent on completion (spec line 550).
-7. `cargo fmt --check && cargo clippy -- -D warnings && make check` all green.
+1. [x] `cargo test -p atelier-core subagents::` green — 7 passed (v60.56).
+2. [x] `cargo test -p atelier-cli --test run_integration -- subagent` green — 2 passed (`subagent_delegation_end_to_end`, `subagent_depth_cap_surfaces_as_tool_error`) (v60.58).
+3. [ ] `make rig-tests` green — `tests/test_session.py::test_subagent_field_validates` pending (rig test not yet written).
+4. [x] Recursion depth 4 attempt returns `ToolError::SchemaViolation` — `subagent_depth_cap_surfaces_as_tool_error` passes (v60.58).
+5. [ ] Cancel cascade: cancelling depth-1 sub-agent terminates depth-2 grandchild within 5s — pending (WU-13 scenario 4).
+6. [ ] `cargo test -p atelier-core trust_budget_subagent` — pending (WU-6).
+7. [x] `cargo fmt --check && cargo clippy --workspace -- -D warnings && make check` all green (v60.58).
 
 Verification report at the end lists the exact command + tail of output for each criterion above.
 
@@ -32,7 +32,7 @@ Verification report at the end lists the exact command + tail of output for each
 
 ## Work units (in execution order — each is a discrete checkpoint)
 
-### WU-1 · Sub-agent type registry  *(small, ~1 day, ~300 LOC)*
+### WU-1 · Sub-agent type registry  *(done — v60.56)*
 
 **New module:** `crates/atelier-core/src/subagents/mod.rs` (mirror `crate::skills`).
 
@@ -53,7 +53,11 @@ Verification report at the end lists the exact command + tail of output for each
 
 ---
 
-### WU-2 · `SessionCore` extraction  *(MEDIUM-LARGE, ~1 week, the keystone)*
+### WU-2 · `SessionCore` extraction  *(SKIPPED — replaced by IoC trait approach in v60.56)*
+
+Rather than a full `SessionCore` extraction, the implementation uses `SubagentSpawner` as a trait seam: `spawn_subagent` in `atelier-core` calls through the trait; `RunnerSpawner` in `atelier-cli` implements it by constructing a child `Runner` directly. This avoids the large refactor while satisfying the layering contract.
+
+### WU-2 (original) · `SessionCore` extraction  *(deferred to Phase F if ever needed)*
 
 **Why first?** Today `Runner` (`crates/atelier-cli/src/runner.rs`, 3,132 lines) owns its bus, ledger, dispatcher, conformance window, conversation, mental-model panel, and the §2.5 loop driver. A child sub-agent needs its own conversation/budget/turn-counter/cancel-token but must share the parent's dispatcher, sandbox profile, ledger, and bus subscription.
 
@@ -101,7 +105,7 @@ impl SessionCore {
 
 ---
 
-### WU-3 · `SubagentSpawner` trait + handle registry  *(small, ~half-day, ~150 LOC)*
+### WU-3 · `SubagentSpawner` trait + handle registry  *(done — v60.56)*
 
 **Why a trait?** The `spawn_subagent` Tool impl lives in `atelier-core`, but actually instantiating a child `SessionCore` requires the adapter, hook set, and sandbox-policy machinery that lives in `atelier-cli`. Inverting via a trait keeps the layering clean.
 
@@ -140,7 +144,7 @@ pub struct SpawnHandle {
 
 ---
 
-### WU-4 · `spawn_subagent` Tool impl  *(small, ~2 days, ~400 LOC)*
+### WU-4 · `spawn_subagent` Tool impl  *(done — v60.56)*
 
 **Resolves gotcha G6** (spawn vs cancel `oneOf`).
 
@@ -194,7 +198,11 @@ The dispatcher needs the spawner + type registry up front, so promote `register_
 
 ---
 
-### WU-5 · Session persistence round-trip  *(small, ~1 day, ~200 LOC)*
+### WU-5 · Session persistence round-trip  *(done — v60.56, partial)*
+
+Typed `BTreeMap<String, PersistedSubagent>` landed. The full WU-5 spec (resume marks in-flight as `Cancelled`, rig test) is still pending — see deferred items.
+
+### WU-5 (remaining deferred)
 
 **Resolves gotcha G1** (resume + in-flight subagents).
 
@@ -233,7 +241,7 @@ pub subagents: BTreeMap<SubagentId, PersistedSubagent>,
 
 ---
 
-### WU-6 · Cost ledger rollup + trust-budget inheritance  *(small, ~half-day, ~100 LOC)*
+### WU-6 · Cost ledger rollup + trust-budget inheritance  *(pending)*
 
 **Resolves gotcha G4** (outer `local-risky` / inner `irreversible`).
 
@@ -247,7 +255,7 @@ pub subagents: BTreeMap<SubagentId, PersistedSubagent>,
 
 ---
 
-### WU-7 · §7 verification-gate ordering  *(small, ~1 day, ~80 LOC)*
+### WU-7 · §7 verification-gate ordering  *(done — v60.57)*
 
 Spec line 548: "The parent's `claimed_done` gate runs only after all spawned sub-agents have terminated."
 
@@ -259,7 +267,7 @@ Spec line 548: "The parent's `claimed_done` gate runs only after all spawned sub
 
 ---
 
-### WU-8 · Bus events + capacity scaling  *(small, ~1 day, ~150 LOC)*
+### WU-8 · Bus events + capacity scaling  *(pending)*
 
 **Resolves gotcha G2** (bus capacity).
 
@@ -291,7 +299,7 @@ Out of scope — `spawn_subagent` is invoked by the model, not the user. Skills 
 
 ---
 
-### WU-10 · GUI sub-agent card + pane  *(medium, ~3 days, ~600 LOC)*
+### WU-10 · GUI sub-agent card + pane  *(pending)*
 
 - New Svelte component `crates/atelier-gui/src/lib/SubagentCard.svelte` — shown under the parent's conversation pane; status badge (`running`/`completed`/`failed`/`timed_out`/`cancelled`); click expands to a dedicated pane.
 - New `crates/atelier-gui/src/lib/SubagentPane.svelte` — mirrors `ConversationPane.svelte` against the sub-agent's conversation.
@@ -302,7 +310,7 @@ Out of scope — `spawn_subagent` is invoked by the model, not the user. Skills 
 
 ---
 
-### WU-11 · TUI sub-agent line  *(small, ~1 day, ~200 LOC)*
+### WU-11 · TUI sub-agent line  *(pending)*
 
 New ratatui block in the right column listing active sub-agents (one row per: `[sa-1] researcher ▶ "audit auth path" — turn 3/25`). `Tab` expands a selected sub-agent into a full conversation view (reuse the existing conversation widget against the sub-agent's conversation).
 
@@ -310,7 +318,7 @@ New ratatui block in the right column listing active sub-agents (one row per: `[
 
 ---
 
-### WU-12 · §4 time-travel interaction  *(medium, ~2 days, ~250 LOC)*
+### WU-12 · §4 time-travel interaction  *(pending)*
 
 (No floating gotchas here — fully self-contained.)
 
@@ -324,7 +332,11 @@ Spec line 547: "A sub-agent's checkpoints chain off the parent's at the spawn-po
 
 ---
 
-### WU-13 · Tests — end-to-end Mock-driven  *(small, ~3 days)*
+### WU-13 · Tests — end-to-end Mock-driven  *(done — v60.58, partial)*
+
+Two tests landed in `crates/atelier-cli/tests/run_integration.rs`: `subagent_delegation_end_to_end` (spec §10 line 568 acceptance gate) and `subagent_depth_cap_surfaces_as_tool_error`. Scenarios 1, 3, 5 from the original list are covered. Remaining scenarios (cancel cascade, trust-budget rollup, full session-schema round-trip, G5 allowlist vs MCP shadowing) are still pending.
+
+### WU-13 (remaining — pending)
 
 **Resolves gotcha G5** (allowlist vs MCP name collision).
 
@@ -344,7 +356,7 @@ Scenarios driven via `MockAdapter` scripted responses:
 
 ---
 
-### WU-14 · Cancel-race documentation  *(trivial, ~0.5 day)*
+### WU-14 · Cancel-race documentation  *(pending)*
 
 **Resolves gotcha G3** (cancel re-invocation race).
 
@@ -363,20 +375,19 @@ Deliverables:
 
 | Work unit | Effort |
 |---|---|
-| WU-1 registry | 1 day |
-| WU-2 SessionCore extract | **~1 week** (the keystone) |
-| WU-3 spawner trait | 0.5 day |
-| WU-4 Tool impl + register (incl. G6 oneOf coverage) | 2 days |
-| WU-5 persistence (incl. G1 resume cleanup) | 1.5 days |
-| WU-6 ledger + budget (incl. G4 inner-class test) | 1 day |
-| WU-7 §7 gate ordering | 1 day |
-| WU-8 bus events + capacity (incl. G2 fanout) | 1 day |
-| WU-10 GUI panes | 3 days |
-| WU-11 TUI line | 1 day |
-| WU-12 time-travel | 2 days |
-| WU-13 end-to-end tests (incl. G5 MCP shadowing) | 3 days |
-| WU-14 cancel-race documentation (G3) | 0.5 day |
-| **Total** | **~3.75 weeks single-engineer, ~2.25 weeks pair** |
+| WU-1 registry | **done v60.56** |
+| WU-2 SessionCore extract | **skipped** — IoC trait approach used instead |
+| WU-3 spawner trait | **done v60.56** |
+| WU-4 Tool impl + register (incl. G6 oneOf coverage) | **done v60.56** |
+| WU-5 persistence (incl. G1 resume cleanup) | **partial v60.56** — typed map done; resume cleanup pending |
+| WU-6 ledger + budget (incl. G4 inner-class test) | pending |
+| WU-7 §7 gate ordering | **done v60.57** |
+| WU-8 bus events + capacity (incl. G2 fanout) | pending |
+| WU-10 GUI panes | pending |
+| WU-11 TUI line | pending |
+| WU-12 time-travel | pending |
+| WU-13 end-to-end tests (incl. G5 MCP shadowing) | **partial v60.58** — 2/7 scenarios done |
+| WU-14 cancel-race documentation (G3) | pending |
 
 Roughly **1,500–2,500 LOC** across `atelier-core` + `atelier-cli` + `atelier-gui` + `atelier-tui` + tests.
 
@@ -411,12 +422,24 @@ Every gotcha is bound to a work unit and a verifiable test. None are left as "do
 
 ---
 
-## Verification report template
-
-End the implementation with one of these per success criterion:
+## Verification report (v60.56–v60.58)
 
 ```
-[✓] cargo test -p atelier-core subagents::          (12 tests, 0 failures)
+[✓] cargo test -p atelier-core -- subagents::         (7 tests, 0 failures)
+[✓] cargo test -p atelier-core -- spawn_subagent       (5 tests, 0 failures)
+[✓] cargo test -p atelier-cli --test run_integration -- subagent
+                                                       (2 tests, 0 failures)
+[✓] cargo fmt --check && cargo clippy --workspace -- -D warnings  (clean)
+[ ] make rig-tests (test_subagent_field_validates)     (not yet written)
+[ ] cargo test -p atelier-core trust_budget_subagent   (WU-6 pending)
+```
+
+## Verification report template (remaining WUs)
+
+End each remaining WU with a row in this table:
+
+```
+[✓] cargo test -p atelier-core subagents::          (N tests, 0 failures)
 [✓] cargo test -p atelier-cli subagent_e2e          (7 tests, 0 failures)
 [✓] make rig-tests                                    (rig: pass; test_subagent_field_validates: pass)
 [✓] cargo fmt --check && cargo clippy -- -D warnings  (clean)
