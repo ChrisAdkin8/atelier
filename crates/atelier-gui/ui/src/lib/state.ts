@@ -302,6 +302,13 @@ export type AppState = {
   /// `FilesChangedAcknowledged`. The webview renders
   /// `ConcurrentEditModal.svelte` when this is non-null.
   concurrentEditModal: { paths: string[]; observedAt: string } | null
+  /// v60.28 H2 follow-on — adapter-swap consent modal state. `null`
+  /// when no swap is pending the user's accept/reject; populated by
+  /// `AdapterSwapPending`, cleared by `AdapterSwapped` (accepted) or
+  /// `AdapterSwapRejected` (refused / timed out). The webview renders
+  /// `SwapConsentModal.svelte` when this is non-null; the modal calls
+  /// the `respond_to_swap` Tauri command keyed by `swapId`.
+  pendingSwap: { swapId: string; toModelId: string; baseUrl: string } | null
   /// v62 — §7 verify-pass tier indicator. Populated by
   /// `VerificationPassed` events from the dispatcher; the
   /// `MetersPane` renders a small badge so the user can see which
@@ -344,6 +351,7 @@ export function initialState(): AppState {
     claimedChanges: {},
     mentalModel: initialMentalModel(),
     concurrentEditModal: null,
+    pendingSwap: null,
     verificationStatus: initialVerificationStatus(),
     lastOverflowResolution: null,
   }
@@ -549,7 +557,34 @@ export function applyEvent(state: AppState, evt: BridgedEvent): AppState {
       // (which arrives next) carries the fresh model id + capability
       // row that the footer renders; this arm just refreshes the
       // event log so the user can see the transition in-stream.
-      return { ...state, events }
+      // v60.28 H2 follow-on — clear any open consent modal: an
+      // `AdapterSwapped` after an `AdapterSwapPending` means the
+      // renderer's reply was Accepted and the swap is now live.
+      return { ...state, events, pendingSwap: null }
+    }
+    case 'AdapterSwapPending': {
+      // v60.28 H2 follow-on — open the consent modal. `swap_adapter`
+      // is now awaiting `respond_to_swap` keyed by `swap_id`; the
+      // modal renders Accept / Reject buttons that invoke that
+      // command. Allowlist-refused swaps never emit `Pending` (they
+      // jump straight to `Rejected` with `swap_id: null`).
+      const p = evt.payload as { swap_id: string; to_model_id: string; base_url: string }
+      return {
+        ...state,
+        events,
+        pendingSwap: {
+          swapId: p.swap_id,
+          toModelId: p.to_model_id,
+          baseUrl: p.base_url,
+        },
+      }
+    }
+    case 'AdapterSwapRejected': {
+      // v60.28 H2 follow-on — close the consent modal (if open). A
+      // `swap_id: null` payload is an allowlist refusal that never
+      // opened a modal; we still treat it as "no pending swap" so
+      // any stale modal from a previous swap is cleared too.
+      return { ...state, events, pendingSwap: null }
     }
     // Phase B Track C1 prep — §7 Tier-1 LSP first-use install events.
     // Lands as event-log entries today; the approval modal surface in
@@ -796,6 +831,23 @@ export function projectEvent(evt: BridgedEvent): EventLogEntry {
       return {
         kind,
         detail: `${p.from_model_id ?? '?'} → ${p.to_model_id ?? '?'}`,
+      }
+    }
+    case 'AdapterSwapPending': {
+      // v60.28 H2 follow-on — one-line summary of the pending swap; the
+      // consent modal in App.svelte is the user-facing surface.
+      const p = evt.payload as { to_model_id?: string; base_url?: string }
+      const base = p.base_url ? ` (${p.base_url})` : ''
+      return { kind, detail: `pending → ${p.to_model_id ?? '?'}${base}` }
+    }
+    case 'AdapterSwapRejected': {
+      // v60.28 H2 follow-on — one-line summary of the rejection so the
+      // user can see the reason in the event log even after the modal
+      // closes.
+      const p = evt.payload as { to_model_id?: string; reason?: string }
+      return {
+        kind,
+        detail: `rejected → ${p.to_model_id ?? '?'}: ${p.reason ?? '?'}`,
       }
     }
     // Phase B Track C1 prep — §7 Tier-1 LSP first-use install events.

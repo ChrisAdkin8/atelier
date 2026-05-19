@@ -170,6 +170,7 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tempfile",
+ "tokio",
  "tracing",
  "tracing-subscriber",
  "uuid",

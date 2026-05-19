@@ -462,17 +462,30 @@ pub enum Event {
 
     /// v60.28 H2 — the renderer asked to swap into a new adapter and we
     /// want the user's explicit confirmation before tearing down the old
-    /// one. The webview renders a consent modal and replies with an
-    /// `AdapterSwapAccepted` / `AdapterSwapRejected` follow-up event.
+    /// one. The webview renders a consent modal and replies via the
+    /// `respond_to_swap` Tauri command, keyed by `swap_id`. Followed by
+    /// either an `AdapterSwapped` (accepted) or an `AdapterSwapRejected`
+    /// (refused / timed out) event carrying the same `swap_id`.
     AdapterSwapPending {
+        /// UUID v4 the producer mints per pending swap. The renderer
+        /// echoes it back via `respond_to_swap` so stale replies (after
+        /// a new swap started) are dropped.
+        swap_id: String,
         to_model_id: String,
         base_url: String,
     },
 
     /// v60.28 H2 — the swap request was refused (either by the base_url
-    /// allowlist gate or by the user from the consent modal). Carries
-    /// the typed reason so the trust-budget UI can render a toast.
-    AdapterSwapRejected { to_model_id: String, reason: String },
+    /// allowlist gate, by the user from the consent modal, or by a
+    /// consent-modal timeout). Carries the typed reason so the trust-
+    /// budget UI can render a toast. `swap_id` matches the originating
+    /// `AdapterSwapPending` when one was emitted; `None` for allowlist
+    /// rejections that refuse before opening the modal.
+    AdapterSwapRejected {
+        swap_id: Option<String>,
+        to_model_id: String,
+        reason: String,
+    },
 
     /// Phase B Track C1 — §7 verify Tier-1 LSP first-use install prompt.
     /// The runner observed an unverified language (today: TypeScript) and

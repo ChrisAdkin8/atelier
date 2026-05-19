@@ -73,7 +73,29 @@ pub struct SessionState {
     /// future edit that mutated one and not the other would
     /// silently desync. Callers read `workspace_root()` instead.
     pub workspace_tempdir: tempfile::TempDir,
+    /// v60.28 H2 follow-on — pending `swap_adapter` consent gates,
+    /// keyed by `swap_id` (UUID v4). The renderer's `respond_to_swap`
+    /// reply pops the sender and signals the decision; `swap_adapter`
+    /// awaits the receiver with a bounded timeout.
+    pub pending_swaps: tokio::sync::Mutex<
+        std::collections::HashMap<uuid::Uuid, tokio::sync::oneshot::Sender<SwapDecision>>,
+    >,
 }
+
+/// v60.28 H2 follow-on — wire-format decision the renderer's consent
+/// modal sends back through `respond_to_swap`.
+#[derive(serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SwapDecision {
+    Accepted,
+    Rejected,
+}
+
+/// v60.28 H2 follow-on — how long `swap_adapter` waits for the
+/// renderer's reply before treating the swap as rejected. 120s is
+/// generous enough for the user to read the modal and decide; a
+/// hung webview can't pin the credential-bearing path forever.
+const SWAP_CONSENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 impl SessionState {
     /// Per-process workspace root (the parent of every per-run UUID
@@ -115,6 +137,7 @@ pub fn run() {
                 adapter_handle: atelier_cli::AdapterHandle::new(),
                 run_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 workspace_tempdir,
+                pending_swaps: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             });
             Ok(())
         })
@@ -145,6 +168,8 @@ pub fn run() {
             resolve_concurrent_edit,
             // v60.10 §1 BYOM mid-session provider swap (B2 real impl + C3 dropdown UI).
             swap_adapter,
+            // v60.28 H2 follow-on — renderer reply for the consent modal.
+            respond_to_swap,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -744,23 +769,79 @@ async fn swap_adapter(
         emit_event(
             &app,
             &SessionEvent::AdapterSwapRejected {
+                swap_id: None,
                 to_model_id: pending_to_id,
                 reason: reason.clone(),
             },
         );
         return Err(reason);
     }
-    // Emit the consent-modal opener BEFORE the credential build so the
-    // webview sees a single ordered "pending → accepted/rejected" pair
-    // on the bus. The renderer's accept/reject reply lands via a
-    // follow-on Tauri command (deferred to the consent-UI bundle).
+    // Open the consent modal. Mint a per-swap UUID so the renderer's
+    // `respond_to_swap` reply can correlate (and a stale reply after a
+    // new swap has started is silently dropped). Register the oneshot
+    // sender BEFORE emitting `AdapterSwapPending` so a fast accept
+    // round-trip can't race the listener.
+    let swap_id = uuid::Uuid::new_v4();
+    let (decision_tx, decision_rx) = tokio::sync::oneshot::channel::<SwapDecision>();
+    state
+        .pending_swaps
+        .lock()
+        .await
+        .insert(swap_id, decision_tx);
     emit_event(
         &app,
         &SessionEvent::AdapterSwapPending {
+            swap_id: swap_id.to_string(),
             to_model_id: pending_to_id.clone(),
-            base_url: pending_base_url.unwrap_or_default(),
+            base_url: pending_base_url.clone().unwrap_or_default(),
         },
     );
+    let decision = match tokio::time::timeout(SWAP_CONSENT_TIMEOUT, decision_rx).await {
+        Ok(Ok(d)) => d,
+        Ok(Err(_recv_err)) => {
+            // Sender dropped without sending — treat as Rejected.
+            let reason = "consent channel closed without reply".to_string();
+            emit_event(
+                &app,
+                &SessionEvent::AdapterSwapRejected {
+                    swap_id: Some(swap_id.to_string()),
+                    to_model_id: pending_to_id.clone(),
+                    reason: reason.clone(),
+                },
+            );
+            return Err(reason);
+        }
+        Err(_elapsed) => {
+            // Timed out waiting for the user. Drop the registry slot so
+            // a late `respond_to_swap` is a no-op.
+            state.pending_swaps.lock().await.remove(&swap_id);
+            let reason = format!(
+                "consent timed out after {}s",
+                SWAP_CONSENT_TIMEOUT.as_secs()
+            );
+            emit_event(
+                &app,
+                &SessionEvent::AdapterSwapRejected {
+                    swap_id: Some(swap_id.to_string()),
+                    to_model_id: pending_to_id.clone(),
+                    reason: reason.clone(),
+                },
+            );
+            return Err(reason);
+        }
+    };
+    if matches!(decision, SwapDecision::Rejected) {
+        let reason = "user rejected the swap".to_string();
+        emit_event(
+            &app,
+            &SessionEvent::AdapterSwapRejected {
+                swap_id: Some(swap_id.to_string()),
+                to_model_id: pending_to_id.clone(),
+                reason: reason.clone(),
+            },
+        );
+        return Err(reason);
+    }
     let new_adapter = build_swap_adapter(provider)?;
     let to_model_id = new_adapter.model_id().to_string();
     // Read the pre-swap model id off the live adapter slot. If
@@ -828,6 +909,31 @@ async fn swap_adapter(
         to_model_id,
         swapped_at: now,
     })
+}
+
+/// v60.28 H2 follow-on — renderer-side accept/reject reply for the
+/// consent modal opened by `swap_adapter`. The renderer parses the
+/// `swap_id` off the matching `AdapterSwapPending` event and echoes it
+/// back here with its decision. A reply with a swap_id that isn't in
+/// the pending registry (stale: the originating swap already timed out
+/// or was answered) returns `Err` without touching adapter state.
+#[tauri::command]
+async fn respond_to_swap(
+    state: tauri::State<'_, SessionState>,
+    swap_id: String,
+    decision: SwapDecision,
+) -> Result<(), String> {
+    let parsed = uuid::Uuid::parse_str(&swap_id).map_err(|e| format!("invalid swap_id: {e}"))?;
+    let sender = {
+        let mut map = state.pending_swaps.lock().await;
+        map.remove(&parsed)
+    };
+    let Some(sender) = sender else {
+        return Err(format!("no pending swap with id {swap_id}"));
+    };
+    sender
+        .send(decision)
+        .map_err(|_| "swap_adapter no longer awaiting reply".to_string())
 }
 
 #[tauri::command]
@@ -1317,20 +1423,25 @@ pub fn bridge_event(evt: &SessionEvent) -> BridgedEvent {
             "swapped_at": swapped_at,
         }),
         // v60.28 H2 — consent-modal lifecycle. `Pending` opens the modal
-        // in the webview; the renderer answers via the `accept_pending_swap`
-        // / `reject_pending_swap` Tauri commands which emit the
-        // `AdapterSwapped` / `AdapterSwapRejected` follow-ups.
+        // in the webview; the renderer echoes `swap_id` back through the
+        // `respond_to_swap` Tauri command, which signals the swap_adapter
+        // future and emits `AdapterSwapped` (accepted) or
+        // `AdapterSwapRejected` (refused / timed out).
         SessionEvent::AdapterSwapPending {
+            swap_id,
             to_model_id,
             base_url,
         } => json!({
+            "swap_id": swap_id,
             "to_model_id": to_model_id,
             "base_url": base_url,
         }),
         SessionEvent::AdapterSwapRejected {
+            swap_id,
             to_model_id,
             reason,
         } => json!({
+            "swap_id": swap_id,
             "to_model_id": to_model_id,
             "reason": reason,
         }),
@@ -1836,26 +1947,147 @@ mod tests {
     }
 
     #[test]
-    fn bridge_adapter_swap_pending_carries_to_id_and_base_url() {
+    fn bridge_adapter_swap_pending_carries_swap_id_to_id_and_base_url() {
         let b = bridge_event(&SessionEvent::AdapterSwapPending {
+            swap_id: "9b3c8d52-8c9b-4e8e-a3b6-2c8e1c2a8f55".into(),
             to_model_id: "openai-compat:gpt-4o".into(),
             base_url: "https://api.openai.com/v1".into(),
         });
         assert_eq!(b.kind, "AdapterSwapPending");
+        assert_eq!(b.payload["swap_id"], "9b3c8d52-8c9b-4e8e-a3b6-2c8e1c2a8f55");
         assert_eq!(b.payload["to_model_id"], "openai-compat:gpt-4o");
         assert_eq!(b.payload["base_url"], "https://api.openai.com/v1");
     }
 
     #[test]
-    fn bridge_adapter_swap_rejected_carries_reason() {
+    fn bridge_adapter_swap_rejected_carries_reason_and_swap_id_when_known() {
         let b = bridge_event(&SessionEvent::AdapterSwapRejected {
+            swap_id: Some("9b3c8d52-8c9b-4e8e-a3b6-2c8e1c2a8f55".into()),
+            to_model_id: "openai-compat:gpt-4o".into(),
+            reason: "user rejected the swap".into(),
+        });
+        assert_eq!(b.kind, "AdapterSwapRejected");
+        assert_eq!(b.payload["swap_id"], "9b3c8d52-8c9b-4e8e-a3b6-2c8e1c2a8f55");
+        assert!(b.payload["reason"].as_str().unwrap().contains("rejected"));
+
+        // Allowlist refusal happens before the modal opens; swap_id is
+        // null on the wire in that case so the renderer can tell apart
+        // "modal refusal" from "we never opened a modal".
+        let b = bridge_event(&SessionEvent::AdapterSwapRejected {
+            swap_id: None,
             to_model_id: "openai-compat:gpt-4o".into(),
             reason: "base_url \"https://evil.example/v1\" not in swap_adapter allowlist".into(),
         });
-        assert_eq!(b.kind, "AdapterSwapRejected");
+        assert!(b.payload["swap_id"].is_null());
         assert!(b.payload["reason"]
             .as_str()
             .unwrap()
             .contains("evil.example"));
+    }
+
+    // ---------- v60.28 H2 follow-on: consent gate semantics ----------
+
+    #[test]
+    fn swap_decision_deserialises_from_lowercase_wire() {
+        // The Svelte modal calls `invoke('respond_to_swap', { swap_id,
+        // decision: 'accepted' | 'rejected' })`. Pin the wire labels so
+        // a future enum rename can't silently break the renderer reply.
+        let accepted: SwapDecision = serde_json::from_str("\"accepted\"").unwrap();
+        let rejected: SwapDecision = serde_json::from_str("\"rejected\"").unwrap();
+        assert_eq!(accepted, SwapDecision::Accepted);
+        assert_eq!(rejected, SwapDecision::Rejected);
+        // Anything else is a renderer bug; defensively reject it at the
+        // boundary so a typo doesn't get silently coerced.
+        assert!(serde_json::from_str::<SwapDecision>("\"yes\"").is_err());
+        assert!(serde_json::from_str::<SwapDecision>("\"ACCEPTED\"").is_err());
+    }
+
+    /// The pending-swaps registry the consent gate uses internally.
+    /// We exercise it through the same `tokio::sync::oneshot` shape
+    /// `swap_adapter` builds so the test asserts the actual signalling
+    /// path, not a stub.
+    fn empty_pending_swaps() -> tokio::sync::Mutex<
+        std::collections::HashMap<uuid::Uuid, tokio::sync::oneshot::Sender<SwapDecision>>,
+    > {
+        tokio::sync::Mutex::new(std::collections::HashMap::new())
+    }
+
+    #[tokio::test]
+    async fn consent_accepted_reply_signals_swap_adapter() {
+        // `swap_adapter` mints a swap_id, registers a oneshot sender,
+        // emits `AdapterSwapPending`, awaits the receiver. The renderer
+        // calls `respond_to_swap` which pops the sender and signals
+        // `Accepted`. Pin: the receiver sees the decision.
+        let registry = empty_pending_swaps();
+        let swap_id = uuid::Uuid::new_v4();
+        let (tx, rx) = tokio::sync::oneshot::channel::<SwapDecision>();
+        registry.lock().await.insert(swap_id, tx);
+
+        // `respond_to_swap`'s body, inline.
+        let sender = registry.lock().await.remove(&swap_id).unwrap();
+        sender.send(SwapDecision::Accepted).unwrap();
+
+        let decision = tokio::time::timeout(std::time::Duration::from_millis(50), rx)
+            .await
+            .expect("receiver should resolve within 50ms")
+            .expect("sender should not have been dropped");
+        assert_eq!(decision, SwapDecision::Accepted);
+    }
+
+    #[tokio::test]
+    async fn consent_rejected_reply_routes_through_oneshot() {
+        let registry = empty_pending_swaps();
+        let swap_id = uuid::Uuid::new_v4();
+        let (tx, rx) = tokio::sync::oneshot::channel::<SwapDecision>();
+        registry.lock().await.insert(swap_id, tx);
+
+        let sender = registry.lock().await.remove(&swap_id).unwrap();
+        sender.send(SwapDecision::Rejected).unwrap();
+
+        let decision = tokio::time::timeout(std::time::Duration::from_millis(50), rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(decision, SwapDecision::Rejected);
+    }
+
+    #[tokio::test]
+    async fn consent_unknown_swap_id_returns_none() {
+        // `respond_to_swap` with a stale or invented swap_id pops `None`
+        // from the registry and returns Err to the renderer. Pin: a
+        // stale reply doesn't accidentally signal some other in-flight
+        // swap.
+        let registry = empty_pending_swaps();
+        let real_id = uuid::Uuid::new_v4();
+        let bogus_id = uuid::Uuid::new_v4();
+        let (tx, _rx) = tokio::sync::oneshot::channel::<SwapDecision>();
+        registry.lock().await.insert(real_id, tx);
+
+        let bogus = registry.lock().await.remove(&bogus_id);
+        assert!(bogus.is_none(), "stale swap_id must not pop any sender");
+        // The real entry is still there waiting for a reply.
+        assert!(registry.lock().await.contains_key(&real_id));
+    }
+
+    #[tokio::test]
+    async fn consent_timeout_yields_rejected_via_dropped_sender() {
+        // If `swap_adapter`'s wait times out, the registry slot is
+        // removed so a late `respond_to_swap` is a no-op. The dropped
+        // sender on the still-living receiver path resolves to an
+        // `Err(RecvError)` which `swap_adapter` already treats as a
+        // refusal. Pin: dropping the sender wakes the receiver.
+        let registry = empty_pending_swaps();
+        let swap_id = uuid::Uuid::new_v4();
+        let (tx, rx) = tokio::sync::oneshot::channel::<SwapDecision>();
+        registry.lock().await.insert(swap_id, tx);
+
+        // Simulate `swap_adapter`'s timeout-path cleanup: pop and drop.
+        let sender = registry.lock().await.remove(&swap_id).unwrap();
+        drop(sender);
+
+        let recv = tokio::time::timeout(std::time::Duration::from_millis(50), rx)
+            .await
+            .expect("receiver should resolve within 50ms once sender is dropped");
+        assert!(recv.is_err(), "dropped sender must surface as RecvError");
     }
 }

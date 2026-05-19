@@ -1063,10 +1063,12 @@ pub fn project_event(evt: &SessionEvent) -> EventLine {
         SessionEvent::AdapterSwapPending {
             to_model_id,
             base_url,
+            ..
         } => format!("pending → {to_model_id} ({base_url})"),
         SessionEvent::AdapterSwapRejected {
             to_model_id,
             reason,
+            ..
         } => format!("rejected → {to_model_id}: {reason}"),
         // §2 — agent abandoned the turn-protocol contract (see
         // `Event::AgentStalled`). One-line summary in the event log;

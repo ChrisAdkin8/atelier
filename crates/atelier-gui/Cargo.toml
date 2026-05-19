@@ -23,6 +23,9 @@ atelier-core = { workspace = true }
 # Runner, ProviderChoice, MockResponse, EventSink, DispatcherHandle.
 atelier-cli = { workspace = true }
 tauri = { workspace = true }
+# v60.28 H2 follow-on — consent gate awaits the renderer's accept/reject
+# reply via `tokio::sync::oneshot`, bounded by `tokio::time::timeout`.
+tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 serde = { workspace = true }

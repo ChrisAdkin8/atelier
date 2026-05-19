@@ -38,6 +38,7 @@
   import MentalModelPane from './lib/components/MentalModelPane.svelte'
   import Composer from './lib/components/Composer.svelte'
   import ConcurrentEditModal from './lib/components/ConcurrentEditModal.svelte'
+  import SwapConsentModal from './lib/components/SwapConsentModal.svelte'
 
   // NOTE (v49): named `app` rather than `state` because svelte-check
   // 4.x's TS-mode treats `let state = $state(...)` as the Svelte-3-era
@@ -347,7 +348,10 @@
         class="swap-select"
         value={String(selectedSwapIndex)}
         onchange={onSwapChange}
-        title="swap adapter (§1 BYOM)"
+        disabled={app.pendingSwap != null}
+        title={app.pendingSwap != null
+          ? 'swap pending consent — respond to the modal first'
+          : 'swap adapter (§1 BYOM)'}
         data-testid="swap-adapter-select"
       >
         {#each swapOptions as opt, i (opt.model_id)}
@@ -361,6 +365,14 @@
     <ConcurrentEditModal
       paths={app.concurrentEditModal.paths}
       observedAt={app.concurrentEditModal.observedAt}
+    />
+  {/if}
+
+  {#if app.pendingSwap}
+    <SwapConsentModal
+      swapId={app.pendingSwap.swapId}
+      toModelId={app.pendingSwap.toModelId}
+      baseUrl={app.pendingSwap.baseUrl}
     />
   {/if}
 </div>
