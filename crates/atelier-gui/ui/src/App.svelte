@@ -199,11 +199,28 @@
   // Pick the dropdown's selected option from the current model id when
   // possible; otherwise fall back to the first entry so the `<select>`
   // never renders a blank state.
-  let selectedSwapIndex = $derived.by(() => {
+  //
+  // v60.38 L4/UI-7 — use a local `$state` for the dropdown index so the
+  // user's selection is sticky across the swap-pending window. Before
+  // this change, `selectedSwapIndex` was `$derived` from
+  // `currentModel.modelId`, which meant the dropdown could briefly
+  // snap back to the pre-swap value while the round-trip was in flight.
+  let dropdownIndex: number = $state(0)
+  // Keep the dropdown in sync with the model id on external updates
+  // (initial load, AdapterSwapped event from another driver). When the
+  // user picks an option, `onSwapChange` updates this state directly;
+  // the effect then re-runs only when `currentModel.modelId` actually
+  // changes, not on every render.
+  $effect(() => {
     const id = app.currentModel?.modelId
-    if (!id) return 0
+    if (!id) {
+      dropdownIndex = 0
+      return
+    }
     const idx = swapOptions.findIndex((o) => o.model_id === id)
-    return idx < 0 ? 0 : idx
+    if (idx >= 0 && idx !== dropdownIndex) {
+      dropdownIndex = idx
+    }
   })
 
   async function onSwapChange(e: Event) {
@@ -211,6 +228,11 @@
     const idx = Number(sel.value)
     const opt = swapOptions[idx]
     if (!opt) return
+    // v60.38 L4/UI-7 — pin the user's selection immediately. The
+    // effect tied to `currentModel.modelId` will reconcile if the swap
+    // succeeds; on rejection the AdapterSwapRejected event leaves
+    // `currentModel` unchanged and the effect snaps the dropdown back.
+    dropdownIndex = idx
     try {
       await invoke('swap_adapter', {
         provider: { kind: opt.kind, model_id: opt.model_id },
@@ -351,7 +373,7 @@
            v60.10 B2 bundle merges to main. -->
       <select
         class="swap-select"
-        value={String(selectedSwapIndex)}
+        value={String(dropdownIndex)}
         onchange={onSwapChange}
         disabled={app.pendingSwap != null}
         title={app.pendingSwap != null

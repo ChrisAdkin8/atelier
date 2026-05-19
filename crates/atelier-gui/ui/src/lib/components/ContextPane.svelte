@@ -21,6 +21,7 @@
 
   import type { ContextItemSummary } from '../state'
   import { invoke } from '@tauri-apps/api/core'
+  import { onDestroy } from 'svelte'
 
   interface Props {
     items: ContextItemSummary[]
@@ -145,13 +146,24 @@
     }
   }
 
+  // v60.38 L3/UI-6 — capture each toast's timer so we can cancel on
+  // unmount. Without this, a stale `toast = null` write can fire after
+  // the component is gone.
+  let toastTimer: ReturnType<typeof setTimeout> | null = null
+
   function showToast(msg: string, isError: boolean) {
     toast = msg
     toastError = isError
-    setTimeout(() => {
+    if (toastTimer != null) clearTimeout(toastTimer)
+    toastTimer = setTimeout(() => {
       if (toast === msg) toast = null
+      toastTimer = null
     }, 4000)
   }
+
+  onDestroy(() => {
+    if (toastTimer != null) clearTimeout(toastTimer)
+  })
 
   /// Map the snake_case provenance to a 4-char column-aligned label.
   /// Stable strings: the §5 mechanical gate asserts on them.

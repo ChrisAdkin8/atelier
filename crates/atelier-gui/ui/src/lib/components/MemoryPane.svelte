@@ -21,6 +21,7 @@
   import type { MemoryCardSummary } from '../state'
   import { invoke } from '@tauri-apps/api/core'
   import InlineRenderers from './InlineRenderers.svelte'
+  import { onDestroy } from 'svelte'
 
   // Phase C close — only attempt inline rendering when the preview
   // contains a fence or an image-shaped URL; otherwise we stay on
@@ -111,13 +112,24 @@
     }
   }
 
+  // v60.38 L3/UI-6 — capture each toast's timer so we can cancel on
+  // unmount. Without this, a stale `toast = null` write can fire after
+  // the component is gone.
+  let toastTimer: ReturnType<typeof setTimeout> | null = null
+
   function showToast(msg: string, isError: boolean) {
     toast = msg
     toastError = isError
-    setTimeout(() => {
+    if (toastTimer != null) clearTimeout(toastTimer)
+    toastTimer = setTimeout(() => {
       if (toast === msg) toast = null
+      toastTimer = null
     }, 4500)
   }
+
+  onDestroy(() => {
+    if (toastTimer != null) clearTimeout(toastTimer)
+  })
 
   /// "2026-05-17T12:34:56Z" → "2026-05-17 12:34". The full
   /// timestamp is kept in the `title` tooltip; the badge is the

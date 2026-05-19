@@ -36,6 +36,13 @@ except Exception:
 
 [[ -z "$prompt" ]] && exit 0
 
+# v60.38 L2/SH-3 — bound the prompt input before the pattern match. A
+# pathologically long prompt (a model dumping its full transcript into the
+# `prompt` field by accident) would otherwise sit in $prompt unbounded
+# and slow the case-match. 8 KiB is more than any legitimate prompt-as-
+# directive needs.
+prompt=${prompt:0:8192}
+
 # Case-insensitive pattern test. Each pattern is anchored to typical phrasing,
 # not bare keywords, to limit false positives.
 shopt -s nocasematch

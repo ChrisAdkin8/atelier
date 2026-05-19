@@ -16,6 +16,7 @@
         "required": ["provider", "model_id", "strategy", "median_overhead_pct", "conformance_rate"],
         "additionalProperties": false,
         "properties": {
+          "row_version": {"const": 1, "description": "v60.38 L8/SCH-L2 — per-row shape version. Optional (not in `required`) so existing artifacts still validate; locks the per-row contract independent of the top-level `version`."},
           "provider": {"type": "string"},
           "model_id": {"type": "string"},
           "strategy": {"enum": ["native_tool", "json_sentinel", "regex_prose"]},

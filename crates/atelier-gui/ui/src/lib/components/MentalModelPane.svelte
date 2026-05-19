@@ -16,6 +16,7 @@
 
   import type { MentalModel } from '../state'
   import { invoke } from '@tauri-apps/api/core'
+  import { onDestroy } from 'svelte'
 
   interface Props {
     mentalModel: MentalModel
@@ -98,13 +99,24 @@
     await save(mentalModel.enabled)
   }
 
+  // v60.38 L3/UI-6 — capture each toast's timer so we can cancel on
+  // unmount. Without this, a stale `toast = null` write can fire after
+  // the component is gone; Svelte 5 tolerates it but it's a leak surface.
+  let toastTimer: ReturnType<typeof setTimeout> | null = null
+
   function showToast(msg: string, isError: boolean) {
     toast = msg
     toastError = isError
-    setTimeout(() => {
+    if (toastTimer != null) clearTimeout(toastTimer)
+    toastTimer = setTimeout(() => {
       if (toast === msg) toast = null
+      toastTimer = null
     }, 3500)
   }
+
+  onDestroy(() => {
+    if (toastTimer != null) clearTimeout(toastTimer)
+  })
 </script>
 
 <section class="pane mental-model-pane">

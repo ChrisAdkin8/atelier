@@ -65,7 +65,14 @@ def main():
     print(f"{'task_id':40} {'baseline':>10} {'atelier':>10} {'ratio':>8}")
     print("-" * 72)
     for tid, b, a, r in rows:
-        print(f"{tid:40} {b:>10} {a:>10} {r:>8.2f}")
+        # v60.38 L6/RIG-L2 — render "n/a" instead of "inf" when the
+        # baseline is zero. The infinite ratio is meaningless as a
+        # value; "n/a" both reads correctly to humans and is greppable
+        # by downstream scripts looking for fail-rows.
+        if b == 0:
+            print(f"{tid:40} {b:>10} {a:>10} {'n/a':>8}")
+        else:
+            print(f"{tid:40} {b:>10} {a:>10} {r:>8.2f}")
     print("-" * 72)
     agg_ratio = (at_total / bl_total) if bl_total > 0 else float("inf")
     print(f"{'AGGREGATE':40} {bl_total:>10} {at_total:>10} {agg_ratio:>8.2f}")

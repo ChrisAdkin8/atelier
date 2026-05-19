@@ -319,12 +319,25 @@ def test_no_claude_paths_in_tracked_source():
             continue
         if rel in allowed:
             continue
-        # Only scan text-like extensions
-        if path.suffix not in {".md", ".json", ".py", ".rs", ".yml", ".yaml", ".toml", ".sh", ""}:
+        # v60.38 L5/RIG-L1 — inverted from include-list to skip-list.
+        # The previous "scan only these suffixes" approach silently
+        # skipped any new file type (e.g. .svelte, .ts, .tsx) — relevant
+        # because the GUI is Svelte + TypeScript. New file types are now
+        # scanned by default; opt out only for known-binary kinds.
+        if path.suffix.lower() in {
+            ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico",
+            ".woff", ".woff2", ".ttf", ".otf",
+            ".lock", ".pyc", ".so", ".dylib", ".dll", ".class",
+            ".zip", ".gz", ".bz2", ".xz", ".tar",
+            ".pdf", ".bin",
+        }:
             continue
         try:
-            text = path.read_text()
+            text = path.read_text(encoding="utf-8")
         except (UnicodeDecodeError, PermissionError):
+            # If the suffix wasn't on the binary skip-list but it's not
+            # decodable as UTF-8, treat it as opaque and move on. Catches
+            # the long tail of binary-ish files we didn't enumerate above.
             continue
         if ".claude" in text or "claudeignore" in text:
             offenders.append(rel)
