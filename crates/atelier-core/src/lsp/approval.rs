@@ -86,10 +86,20 @@ impl LspApprovals {
             path: tmp.path().to_path_buf(),
             source: e,
         })?;
+        // v60.34 (M15) — align with the v60.29 H11 staging pattern:
+        // sync the temp file's contents before persist, then fsync the
+        // parent dir entry. Without these, a power loss between write
+        // and the kernel's next natural flush can leave the approvals
+        // file zero-length or absent, silently re-prompting the user.
+        tmp.as_file().sync_all().map_err(|e| PersistenceError::Io {
+            path: tmp.path().to_path_buf(),
+            source: e,
+        })?;
         tmp.persist(path).map_err(|e| PersistenceError::Io {
             path: path.to_path_buf(),
             source: e.error,
         })?;
+        fsync_dir_best_effort(parent);
         Ok(())
     }
 
@@ -117,6 +127,16 @@ pub fn lsp_approvals_path(workspace_root: &Path) -> PathBuf {
         .join(LSP_APPROVALS_DIR)
         .join(LSP_APPROVALS_FILE)
 }
+
+#[cfg(unix)]
+fn fsync_dir_best_effort(dir: &Path) {
+    if let Ok(f) = std::fs::File::open(dir) {
+        let _ = f.sync_all();
+    }
+}
+
+#[cfg(not(unix))]
+fn fsync_dir_best_effort(_dir: &Path) {}
 
 #[cfg(test)]
 mod tests {
@@ -192,5 +212,62 @@ mod tests {
             ".atelier", LSP_APPROVALS_DIR, LSP_APPROVALS_FILE
         );
         assert!(p.ends_with(&suffix), "expected suffix {suffix:?} on {p:?}");
+    }
+}
+
+#[cfg(test)]
+mod durability_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    // v60.34 (M15) — `save` must either leave no file or a fully written
+    // one. The atomic-write pattern (write → sync_all → persist →
+    // fsync_dir) means after `save` returns, the on-disk bytes parse
+    // back to the same struct. There is no in-between "half-written"
+    // state that a subsequent `load` would observe.
+    #[test]
+    fn save_is_atomic_or_absent() {
+        let td = TempDir::new().unwrap();
+        let path = lsp_approvals_path(td.path());
+
+        // Pre-state: no file. `load` returns the empty default.
+        let pre = LspApprovals::load(&path).expect("missing file → empty");
+        assert!(pre.approved.is_empty());
+
+        let mut store = LspApprovals::default();
+        store.approve("typescript", "2026-05-19T10:00:00Z");
+        store.save(&path).expect("save");
+
+        // Post-state: file exists, parses, and round-trips. The fsync_dir
+        // call means after `save` returns, the directory entry update is
+        // durable; a power loss after this point cannot revert the file.
+        let metadata = std::fs::metadata(&path).expect("file present");
+        assert!(metadata.len() > 0, "approvals file is zero-length");
+        let back = LspApprovals::load(&path).expect("load");
+        assert_eq!(back, store);
+    }
+
+    #[test]
+    fn save_overwrite_is_atomic_or_absent() {
+        // A second save must replace the file atomically — the persist
+        // step rebinds the directory entry, never producing a partial
+        // file on the path.
+        let td = TempDir::new().unwrap();
+        let path = lsp_approvals_path(td.path());
+
+        let mut store = LspApprovals::default();
+        store.approve("typescript", "2026-05-19T10:00:00Z");
+        store.save(&path).expect("save 1");
+
+        let original_len = std::fs::metadata(&path).unwrap().len();
+        store.approve("python", "2026-05-19T11:00:00Z");
+        store.save(&path).expect("save 2");
+
+        let new_len = std::fs::metadata(&path).unwrap().len();
+        assert!(new_len > original_len, "file should have grown");
+        let back = LspApprovals::load(&path).expect("load");
+        assert_eq!(back, store);
+        assert!(back.is_approved("typescript"));
+        assert!(back.is_approved("python"));
     }
 }

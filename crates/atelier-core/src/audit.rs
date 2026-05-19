@@ -274,6 +274,16 @@ pub fn append_subprocess_egress(path: &Path, event: &EgressEvent) -> Result<(), 
         path: path.to_path_buf(),
         source: e,
     })?;
+    // v60.34 (M16) — durability for §11 sandbox-egress audit. A crash
+    // between flush and the kernel's next natural sync would lose rows
+    // exactly when the user-trust surface needs them. The fsync syscall
+    // costs ~1ms per row; the append cadence (one row per blocked
+    // egress) is rare enough that the cost is acceptable. Do not strip
+    // this for "performance" without first measuring the row rate.
+    f.sync_all().map_err(|e| AuditError::Io {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
     Ok(())
 }
 
@@ -314,6 +324,13 @@ pub fn append_mcp_egress(path: &Path, event: &McpEgressEvent) -> Result<(), Audi
         source: e,
     })?;
     f.flush().map_err(|e| AuditError::Io {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
+    // v60.34 (M16) — same durability rationale as
+    // `append_subprocess_egress`. §12 MCP-egress audit rows feed the
+    // trust-budget UI; losing them on crash defeats the point.
+    f.sync_all().map_err(|e| AuditError::Io {
         path: path.to_path_buf(),
         source: e,
     })?;
@@ -509,5 +526,64 @@ mod tests {
         let parsed2: McpEgressEvent = serde_json::from_str(lines[1]).unwrap();
         assert_eq!(parsed2.phase, "list-tools");
         assert_eq!(parsed2.outcome, "failure");
+    }
+}
+
+#[cfg(test)]
+mod durability_tests {
+    use super::*;
+
+    // v60.34 (M16) — after `append_subprocess_egress` returns, the row
+    // is durable on disk. The flush + sync_all sequence guarantees a
+    // crash (panic / SIGKILL / power loss) immediately after the call
+    // returns cannot lose the row. The test asserts the on-disk shape
+    // is parseable on a fresh handle that does NOT share any file
+    // descriptors with the writer — simulating the "next process start"
+    // read that the trust-budget UI performs.
+    #[test]
+    fn subprocess_egress_row_is_readable_after_append() {
+        let td = tempfile::TempDir::new().unwrap();
+        let path = td.path().join("audit").join("egress.ndjson");
+        let event = EgressEvent::blocked_subprocess_egress(
+            "2026-05-19T10:00:00Z",
+            "tc-1",
+            "shell",
+            "evil.example",
+        );
+        append_subprocess_egress(&path, &event).unwrap();
+
+        // Read through a fresh file handle (no shared state with the
+        // writer's handle, which has now been dropped). On a sync_all'd
+        // file this returns the full row even if the kernel's
+        // background flush hasn't run yet.
+        let body = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 1);
+        let parsed: EgressEvent = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(parsed.outcome, "blocked");
+        assert_eq!(parsed.destination, "evil.example");
+    }
+
+    #[test]
+    fn mcp_egress_row_is_readable_after_append() {
+        let td = tempfile::TempDir::new().unwrap();
+        let path = td.path().join("audit").join("mcp.ndjson");
+        let event = McpEgressEvent::new(
+            "2026-05-19T10:00:00Z",
+            "fs",
+            "https://example.org",
+            McpEgressPhase::Handshake,
+            McpEgressOutcome::Success,
+            None,
+            None,
+        );
+        append_mcp_egress(&path, &event).unwrap();
+
+        let body = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 1);
+        let parsed: McpEgressEvent = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(parsed.phase, "handshake");
+        assert_eq!(parsed.outcome, "success");
     }
 }

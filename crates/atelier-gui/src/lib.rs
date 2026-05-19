@@ -519,10 +519,25 @@ fn require_adapter(
         .ok_or_else(|| "no active adapter (start a run first)".to_string())
 }
 
+/// v60.34 (M25) — pure model-drift check. Used by
+/// `compact_context_items` to guard against the swap-adapter race:
+/// when `expected` is `Some`, reject the call if `live` doesn't match.
+fn check_model_drift(expected: Option<&str>, live: &str) -> Result<(), String> {
+    if let Some(expected) = expected {
+        if live != expected {
+            return Err(format!(
+                "ModelDrift: compaction expected model {expected:?} but live adapter is {live:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[tauri::command]
 async fn compact_context_items(
     state: tauri::State<'_, SessionState>,
     ids: Vec<String>,
+    expected_model_id: Option<String>,
 ) -> Result<CompactionResult, String> {
     if ids.len() > MAX_COMPACTION_IDS {
         return Err(format!(
@@ -532,6 +547,13 @@ async fn compact_context_items(
     }
     let sd = require_dispatcher(&state)?;
     let adapter = require_adapter(&state)?;
+    // v60.34 (M25) — guard the §5 compaction call against a stale
+    // adapter. The renderer is told the swap is live via
+    // `AdapterSwapped` before the Runner observes it; a compaction
+    // issued in that window would call the OLD adapter. The renderer
+    // stamps each compaction with the model id it expected; we reject
+    // with a typed ModelDrift signal if the live adapter has drifted.
+    check_model_drift(expected_model_id.as_deref(), adapter.model_id())?;
     let workspace = state.workspace_root().to_path_buf();
     // v49 per-run workspace lives under the per-process root; for v60.5
     // we use the process-wide root as the session id since the GUI
@@ -2089,5 +2111,38 @@ mod tests {
             .await
             .expect("receiver should resolve within 50ms once sender is dropped");
         assert!(recv.is_err(), "dropped sender must surface as RecvError");
+    }
+}
+
+#[cfg(test)]
+mod adapter_swap_tests {
+    use super::check_model_drift;
+
+    // v60.34 (M25) — when the renderer stamps the expected model id and
+    // it matches the live adapter, the compaction proceeds. When the
+    // live adapter has drifted (a swap raced ahead of the renderer),
+    // the call is rejected with a typed ModelDrift signal instead of
+    // silently invoking the wrong adapter.
+    #[test]
+    fn no_expected_id_is_always_ok() {
+        check_model_drift(None, "anthropic:claude-opus-4-7").expect("no expectation, no drift");
+    }
+
+    #[test]
+    fn matching_expected_id_is_ok() {
+        check_model_drift(
+            Some("anthropic:claude-opus-4-7"),
+            "anthropic:claude-opus-4-7",
+        )
+        .expect("match → ok");
+    }
+
+    #[test]
+    fn mismatched_expected_id_surfaces_model_drift_error() {
+        let err = check_model_drift(Some("anthropic:claude-opus-4-7"), "local:qwen2.5-coder:7b")
+            .expect_err("mismatch → ModelDrift");
+        assert!(err.starts_with("ModelDrift:"), "wrong error shape: {err}");
+        assert!(err.contains("anthropic:claude-opus-4-7"));
+        assert!(err.contains("local:qwen2.5-coder:7b"));
     }
 }

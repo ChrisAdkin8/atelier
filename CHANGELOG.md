@@ -1,5 +1,24 @@
 # Atelier Spec — Changelog
 
+## v60.34 — 2026-05-19 (Durability, audit polish, hardening — M15–M26)
+
+Bundle from `tasks/plan_medium_severity_fixes.md` v60.34. Twelve items, all `atelier-core` + one `atelier-gui`, with new tests per item and no schema bumps:
+
+- **M15** — `LspApprovals::save` now `sync_all`s the temp file and `fsync_dir_best_effort`s the parent, aligning with the v60.29 H11 staging pattern. New `lsp::approval::durability_tests`.
+- **M16** — `audit::append_subprocess_egress` + `append_mcp_egress` now `sync_all` after each row, so §11 + §12 audit rows are durable on crash. New `audit::durability_tests` with inline rationale against future "performance" reverts.
+- **M17** — `subprocess::run` replaces the `.expect("piped stdout was requested above")` panics with a typed `SubprocessError::PipePlumbingChanged { pipe }`, plumbed through a new `take_pipes()` helper. `wire_label()` agreement test added.
+- **M18** — `tools::read_file` now reports `byte_len = contents.len()` (what was actually returned) and adds a separate `total_byte_len: u64` for callers that need the on-disk size. New regression test for the 10 MiB / 4 KiB-cap case.
+- **M19** — `memory::sanitize_filename` now returns `Result<String, MemoryError::InvalidFilename { input }>` and rejects `""`, `"."`, `".."`, and any all-dots string. New `memory::sanitiser_tests`.
+- **M20** — `mcp::stdio_launcher` swaps the `format!("{:?}", ...).contains(...)` Debug-string match for a serde-driven extraction of `rmcp::model::ProtocolVersion`. New `McpLaunchError::UnsupportedProtocol { reported }` variant + `version_tests`.
+- **M21** — `lsp::typescript::truncate_to_bytes` truncates at `cap - '…'.len_utf8()`; output length is now always `≤ cap`. Existing test tightened; new `truncate_tests` module pins the contract across `cap = 0, 1, 2, 3, 4, …`.
+- **M22** — `dispatcher::extract_read_paths` skips the file-watcher read-set update when the grep tool's `path` arg is empty, `.`, or absent — the user didn't actually scope the read. New `extract_read_paths_for_grep_with_no_path_arg_is_empty` + the scoped-path positive test.
+- **M23** — New `lsp::install` submodule with `install_env_allowlist(bool)` building on `subprocess::ENV_PASSTHROUGH` plus an opt-in `LSP_INSTALL_ENV_EXTRAS` (`NPM_*` / `PIP_*` / `PYTHONPATH`). HTTP MCP launcher's `reqwest::Client::builder()` adds `.no_proxy()` so `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` from the parent env don't silently redirect MCP traffic past the §12 egress audit.
+- **M24** — Contract pin in `adapter::anthropic::retry_tests`: the adapter never internally retries on 429 or `ContextOverflow`, so the runner's compact-retry path can re-project messages cleanly. Pairs with v60.32 M03's runner-side re-projection.
+- **M25** — `compact_context_items` Tauri command grows an `expected_model_id: Option<String>` param; renderer stamps it from the model id it observed at `AdapterSwapped`, and the command returns a typed `ModelDrift` error if the live adapter has drifted between the renderer's swap notification and the dispatch. New `gui::adapter_swap_tests`.
+- **M26** — `SessionDispatcher::submit_approval` now delegates to a new `try_submit_approval` returning `Result<(), SubmitApprovalError>` with `NoPending` / `DispatcherGone` variants. The cancellation-race silent-loss case now emits `tracing::warn!` and surfaces a typed error so the renderer can toast. New `submit_approval_tests` module.
+
+Gates green: `cargo fmt --check`, `cargo clippy --workspace -- -D warnings`, `cargo test --workspace` (855 atelier-core + 32 atelier-gui), `make check` (26 schemas / 61 artifacts / 112 pytest / 14 workloads).
+
 ## v60.33 — 2026-05-19 (Schemas / rig / CI hygiene — M07–M14)
 
 Eight medium-severity hygiene items from `tasks/plan_medium_severity_fixes.md`. No Rust code touched; the diff lands in schemas, the rig, and `.github/workflows/`.

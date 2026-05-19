@@ -23,9 +23,11 @@
 //! variants from v60.22 (Day-0 prep).
 
 pub mod approval;
+pub mod install;
 pub mod typescript;
 
 pub use approval::{lsp_approvals_path, LspApprovals, LSP_APPROVALS_DIR, LSP_APPROVALS_FILE};
+pub use install::{install_env_allowlist, LSP_INSTALL_ENV_EXTRAS};
 pub use typescript::{map_diagnostic_to_discrepancy, DiagnosticInput, MAX_LSP_MESSAGE_BYTES};
 
 /// Outcome of an LSP install attempt — surfaced on the bus via

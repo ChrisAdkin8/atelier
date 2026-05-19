@@ -120,6 +120,12 @@ pub enum McpLaunchError {
     /// `allowed_hosts` rather than retry.
     #[error("MCP server {name:?} egress to host {host:?} not in allowed_hosts")]
     HostNotAllowed { name: String, host: String },
+
+    /// v60.34 (M20) — the rmcp handshake returned a protocol version
+    /// string that doesn't parse as one of the known
+    /// `rmcp::model::ProtocolVersion` constants we support.
+    #[error("MCP server reported unsupported protocol version {reported:?}")]
+    UnsupportedProtocol { reported: String },
 }
 
 impl McpLaunchError {
@@ -135,6 +141,7 @@ impl McpLaunchError {
                 | Self::ProtocolMismatch { .. }
                 | Self::InvalidHeader { .. }
                 | Self::HostNotAllowed { .. }
+                | Self::UnsupportedProtocol { .. }
         )
     }
 }

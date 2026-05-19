@@ -178,6 +178,22 @@ pub enum SubprocessError {
         "subprocess sandboxing is not supported on this platform; only macOS (sandbox-exec) and Linux (bwrap) are implemented"
     )]
     UnsupportedPlatform,
+
+    #[error("subprocess pipe plumbing changed: {pipe} pipe was not Stdio::piped()")]
+    PipePlumbingChanged { pipe: &'static str },
+}
+
+impl SubprocessError {
+    /// Stable wire label for cross-boundary serialisation. Matches the
+    /// `wire_label()` pattern used by `AdapterError` and `ToolError`.
+    pub fn wire_label(&self) -> &'static str {
+        match self {
+            Self::Spawn { .. } => "spawn",
+            Self::Io(_) => "io",
+            Self::UnsupportedPlatform => "unsupported_platform",
+            Self::PipePlumbingChanged { .. } => "pipe_plumbing_changed",
+        }
+    }
 }
 
 /// Spawn `(program, args)` under `spec`. Captures stdout / stderr in
@@ -234,14 +250,7 @@ pub async fn run(
     // Drain stdout/stderr concurrently with a per-pipe byte cap. Spawning
     // a reader for each side avoids the small-pipe-buffer deadlock; the
     // cap prevents a runaway `find /` from OOM'ing the parent.
-    let stdout_pipe = child
-        .stdout
-        .take()
-        .expect("piped stdout was requested above");
-    let stderr_pipe = child
-        .stderr
-        .take()
-        .expect("piped stderr was requested above");
+    let (stdout_pipe, stderr_pipe) = take_pipes(&mut child)?;
     let cap = spec.output_cap_bytes;
     let stdout_task = tokio::spawn(read_capped(stdout_pipe, cap));
     let stderr_task = tokio::spawn(read_capped(stderr_pipe, cap));
@@ -327,6 +336,25 @@ pub async fn run(
         duration_ms,
         timed_out,
     })
+}
+
+/// Take both pipes off the spawned child. Returns a typed error if either
+/// pipe was not configured with `Stdio::piped()` upstream — a future
+/// refactor that changes the `cmd.stdout(Stdio::piped())` calls won't
+/// crash production; the dispatcher already routes typed tool errors to
+/// the recovery surface.
+fn take_pipes(
+    child: &mut tokio::process::Child,
+) -> Result<(tokio::process::ChildStdout, tokio::process::ChildStderr), SubprocessError> {
+    let stdout_pipe = child
+        .stdout
+        .take()
+        .ok_or(SubprocessError::PipePlumbingChanged { pipe: "stdout" })?;
+    let stderr_pipe = child
+        .stderr
+        .take()
+        .ok_or(SubprocessError::PipePlumbingChanged { pipe: "stderr" })?;
+    Ok((stdout_pipe, stderr_pipe))
 }
 
 /// Read up to `cap` bytes into a buffer; if the child writes more, keep
@@ -747,5 +775,52 @@ mod tests {
         // additionally check `timed_out` if it wants the stricter
         // condition.
         assert!(out.is_success());
+    }
+}
+
+#[cfg(test)]
+mod pipe_handling_tests {
+    use super::*;
+    use tokio::process::Command as TokioCommand;
+
+    #[tokio::test]
+    async fn take_pipes_returns_typed_error_when_stdout_inherited() {
+        let mut cmd = TokioCommand::new("true");
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::piped());
+        let mut child = cmd.spawn().expect("spawn true");
+        let err = take_pipes(&mut child).expect_err("must fail with typed error");
+        match err {
+            SubprocessError::PipePlumbingChanged { pipe } => assert_eq!(pipe, "stdout"),
+            other => panic!("expected PipePlumbingChanged, got {other:?}"),
+        }
+        let _ = child.wait().await;
+    }
+
+    #[tokio::test]
+    async fn take_pipes_returns_typed_error_when_stderr_inherited() {
+        let mut cmd = TokioCommand::new("true");
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
+        let mut child = cmd.spawn().expect("spawn true");
+        let err = take_pipes(&mut child).expect_err("must fail with typed error");
+        match err {
+            SubprocessError::PipePlumbingChanged { pipe } => assert_eq!(pipe, "stderr"),
+            other => panic!("expected PipePlumbingChanged, got {other:?}"),
+        }
+        let _ = child.wait().await;
+    }
+
+    #[test]
+    fn pipe_plumbing_changed_wire_label_is_stable() {
+        let e = SubprocessError::PipePlumbingChanged { pipe: "stdout" };
+        assert_eq!(e.wire_label(), "pipe_plumbing_changed");
+        assert_eq!(
+            SubprocessError::UnsupportedPlatform.wire_label(),
+            "unsupported_platform"
+        );
+        assert_eq!(SubprocessError::Io("x".into()).wire_label(), "io");
     }
 }

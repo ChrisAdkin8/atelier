@@ -113,11 +113,19 @@ fn truncate_to_bytes(s: &str, max_bytes: usize) -> String {
     if s.len() <= max_bytes {
         return s.to_string();
     }
-    let mut cut = max_bytes;
+    const ELLIPSIS_LEN: usize = '…'.len_utf8();
+    if max_bytes < ELLIPSIS_LEN {
+        let mut cut = max_bytes;
+        while cut > 0 && !s.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        return s[..cut].to_string();
+    }
+    let mut cut = max_bytes - ELLIPSIS_LEN;
     while cut > 0 && !s.is_char_boundary(cut) {
         cut -= 1;
     }
-    let mut out = String::with_capacity(cut + 3);
+    let mut out = String::with_capacity(cut + ELLIPSIS_LEN);
     out.push_str(&s[..cut]);
     out.push('…');
     out
@@ -214,8 +222,7 @@ mod tests {
         };
         let r = map_diagnostic_to_discrepancy("a.ts", &d).unwrap();
         if let Discrepancy::HallucinatedSymbol { lsp_message, .. } = r {
-            // 1024 bytes + the 3-byte UTF-8 ellipsis.
-            assert!(lsp_message.len() <= MAX_LSP_MESSAGE_BYTES + 4);
+            assert!(lsp_message.len() <= MAX_LSP_MESSAGE_BYTES);
             assert!(lsp_message.ends_with('…'));
         }
     }
@@ -226,9 +233,54 @@ mod tests {
         // produce invalid UTF-8 — the helper walks back to the previous
         // boundary.
         let s = "🦀".repeat(100); // 400 bytes
-        let trimmed = truncate_to_bytes(&s, 6); // not a codepoint boundary
+        let trimmed = truncate_to_bytes(&s, 10);
         assert!(trimmed.ends_with('…'));
-        // 4 bytes (one 🦀) + the ellipsis.
-        assert_eq!(trimmed.chars().count(), 2);
+        assert!(trimmed.len() <= 10);
+    }
+}
+
+#[cfg(test)]
+mod truncate_tests {
+    use super::truncate_to_bytes;
+
+    #[test]
+    fn output_never_exceeds_cap() {
+        let s = "abcdefghijklmnopqrstuvwxyz0123456789".repeat(40); // ASCII, 1440 bytes
+        for cap in [0usize, 1, 2, 3, 4, 5, 10, 50, 1000, 1440, 2000] {
+            let out = truncate_to_bytes(&s, cap);
+            assert!(
+                out.len() <= cap || out.len() == s.len(),
+                "truncate_to_bytes overshot cap={cap}, got len={}",
+                out.len()
+            );
+        }
+    }
+
+    #[test]
+    fn small_caps_omit_ellipsis() {
+        let s = "abcdef".to_string();
+        for cap in 0..3usize {
+            let out = truncate_to_bytes(&s, cap);
+            assert!(out.len() <= cap, "cap={cap}, got len={}", out.len());
+            assert!(!out.contains('…'), "expected no ellipsis for cap={cap}");
+        }
+    }
+
+    #[test]
+    fn no_truncation_when_under_cap() {
+        let s = "short";
+        let out = truncate_to_bytes(s, 100);
+        assert_eq!(out, "short");
+    }
+
+    #[test]
+    fn utf8_boundary_respected_at_cap_minus_ellipsis() {
+        // 4-byte codepoints (🦀); ellipsis is 3 bytes; cap = 6 → cut = 3
+        // which isn't a boundary, so cut walks back to 0.
+        let s = "🦀🦀";
+        let out = truncate_to_bytes(s, 6);
+        assert!(out.len() <= 6);
+        // Output is just the ellipsis (cut walked back to 0).
+        assert_eq!(out, "…");
     }
 }

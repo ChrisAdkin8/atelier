@@ -408,17 +408,24 @@ pub async fn launch_stdio_server(
     // returns `&ServerInfo`; clone once at launch so later access is borrow-free.
     let server_info: rmcp::model::ServerInfo = handshake.peer().peer_info().clone();
 
-    // Protocol-version check. The version is a string like `"2024-11-05"`;
-    // rmcp 0.1.5 wraps it in a `ProtocolVersion(String)` newtype. Match on the
-    // string form so we don't bind to the specific newtype shape.
-    let version = format!("{:?}", server_info.protocol_version);
-    if !version.contains(SUPPORTED_PROTOCOL_VERSION) {
+    // v60.34 (M20) — typed protocol-version check. Round-trip the rmcp
+    // `ProtocolVersion` newtype through serde to extract the version
+    // string, then match against the supported constant directly. The
+    // pre-v60.34 path used `format!("{:?}", ...).contains(...)` which
+    // breaks if rmcp ever changes its Debug impl.
+    let reported = match serde_json::to_value(&server_info.protocol_version) {
+        Ok(serde_json::Value::String(s)) => s,
+        _ => {
+            let _ = handshake.cancel().await;
+            return Err(McpLaunchError::UnsupportedProtocol {
+                reported: format!("{:?}", server_info.protocol_version),
+            });
+        }
+    };
+    if reported != SUPPORTED_PROTOCOL_VERSION {
         // Best-effort cleanup; the spike confirmed `cancel()` is the safe path.
         let _ = handshake.cancel().await;
-        return Err(McpLaunchError::ProtocolMismatch {
-            name: manifest.name.clone(),
-            version,
-        });
+        return Err(McpLaunchError::UnsupportedProtocol { reported });
     }
 
     // ---------- first-use sanity probe ----------
@@ -767,6 +774,54 @@ mod tests {
         ];
         for (e, expected) in cases {
             assert_eq!(e.is_config_error(), expected, "wrong class for {e:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::SUPPORTED_PROTOCOL_VERSION;
+    use crate::mcp::errors::McpLaunchError;
+    use rmcp::model::ProtocolVersion;
+
+    // The launcher uses serde to extract the version string from the
+    // rmcp `ProtocolVersion` newtype. Replicate that contract here so a
+    // future rmcp release that changes the newtype shape trips this test
+    // before production.
+    fn parse_protocol_version(v: &ProtocolVersion) -> Result<String, McpLaunchError> {
+        match serde_json::to_value(v) {
+            Ok(serde_json::Value::String(s)) => Ok(s),
+            _ => Err(McpLaunchError::UnsupportedProtocol {
+                reported: format!("{v:?}"),
+            }),
+        }
+    }
+
+    #[test]
+    fn supported_version_round_trips() {
+        let v = ProtocolVersion::V_2024_11_05;
+        let s = parse_protocol_version(&v).expect("known version must parse");
+        assert_eq!(s, SUPPORTED_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn unsupported_version_yields_typed_error() {
+        // Deserialize an unknown version string through rmcp's Deserialize
+        // impl. rmcp accepts unknown versions by wrapping them in an
+        // owned Cow, so the parse step succeeds; the launcher's
+        // string-equality check then rejects.
+        let v: ProtocolVersion =
+            serde_json::from_value(serde_json::Value::String("9999-99-99".into()))
+                .expect("rmcp accepts unknown version strings");
+        let s = parse_protocol_version(&v).expect("string extraction always succeeds");
+        assert_ne!(s, SUPPORTED_PROTOCOL_VERSION);
+        // The launcher would convert this mismatch into the typed error.
+        let err = McpLaunchError::UnsupportedProtocol { reported: s };
+        match err {
+            McpLaunchError::UnsupportedProtocol { reported } => {
+                assert_eq!(reported, "9999-99-99");
+            }
+            other => panic!("expected UnsupportedProtocol, got {other:?}"),
         }
     }
 }

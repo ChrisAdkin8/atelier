@@ -2405,3 +2405,76 @@ data: {"type":"message_stop"}
         );
     }
 }
+
+#[cfg(test)]
+mod retry_tests {
+    //! v60.34 (M24) — contract pin: the adapter never internally retries.
+    //!
+    //! The runner's `ContextOverflow` compact-retry loop (see
+    //! `crates/atelier-cli/src/runner.rs`) owns retry policy. If the
+    //! adapter were to retry internally (e.g., to mask a transient 429
+    //! or a context-overflow), it would do so with a stale
+    //! `messages_for_call` snapshot — defeating compaction that ran in
+    //! the runner. This pin asserts each error class surfaces
+    //! immediately to the runner so the runner can choose to re-project
+    //! or bubble the error.
+    //!
+    //! Pairs with v60.32 M03's runner-side fix.
+    use super::*;
+    use crate::adapter::{Adapter, Message, Role};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn adapter_for(server: &MockServer) -> AnthropicAdapter {
+        AnthropicAdapter::new("test-key", "anthropic:claude-opus-4-7").with_base_url(server.uri())
+    }
+
+    fn user(text: &str) -> Message {
+        Message::text(Role::User, text)
+    }
+
+    #[tokio::test]
+    async fn chat_does_not_internally_retry_on_429() {
+        // If the adapter retried internally, this would either succeed
+        // (after some delay) or be a different error. The pin: 429
+        // surfaces RateLimited on the FIRST call, no retry, runner-owned.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "1"))
+            .expect(1) // exactly one request — no internal retry
+            .mount(&server)
+            .await;
+        let err = adapter_for(&server)
+            .chat(&[user("hi")], &[])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, AdapterError::RateLimited { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_does_not_internally_retry_on_context_overflow() {
+        // Context-overflow MUST bubble to the runner so the runner's
+        // compaction path can re-project messages_for_call. An internal
+        // retry would re-send the stale payload.
+        let server = MockServer::start().await;
+        let body = r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long"}}"#;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(body))
+            .expect(1) // exactly one request — overflow bubbles, no retry
+            .mount(&server)
+            .await;
+        let err = adapter_for(&server)
+            .chat(&[user("hi")], &[])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, AdapterError::ContextOverflow { .. }),
+            "got {err:?}"
+        );
+    }
+}

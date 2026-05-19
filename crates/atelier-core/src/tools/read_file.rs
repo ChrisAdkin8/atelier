@@ -3,7 +3,9 @@
 //!
 //! Args: `{ path: string, offset?: integer, length?: integer }`.
 //! Repo-relative path; optional byte range. Returns
-//! `{ contents: string, byte_len: integer, truncated: bool }`.
+//! `{ contents: string, byte_len: integer, total_byte_len: integer, truncated: bool }`.
+//! `byte_len` is the length of `contents`; `total_byte_len` is the on-disk
+//! file size pre-truncation.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -40,6 +42,7 @@ struct Args {
 struct Output {
     contents: String,
     byte_len: u64,
+    total_byte_len: u64,
     truncated: bool,
 }
 
@@ -134,8 +137,9 @@ impl Tool for ReadFile {
 
             Ok(ToolResult {
                 output: serde_json::to_value(Output {
+                    byte_len: contents.len() as u64,
+                    total_byte_len: total,
                     contents,
-                    byte_len: total,
                     truncated,
                 })
                 .expect("Output serialises"),
@@ -175,6 +179,7 @@ mod tests {
             .unwrap();
         assert_eq!(r.output["contents"], "hello");
         assert_eq!(r.output["byte_len"], 5);
+        assert_eq!(r.output["total_byte_len"], 5);
         assert_eq!(r.output["truncated"], false);
     }
 
@@ -191,7 +196,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.output["contents"], "cdef");
-        assert_eq!(r.output["byte_len"], 10);
+        assert_eq!(r.output["byte_len"], 4);
+        assert_eq!(r.output["total_byte_len"], 10);
         assert_eq!(r.output["truncated"], true);
     }
 
@@ -279,9 +285,28 @@ mod tests {
             "read must be capped at MAX_READ_BYTES"
         );
         assert_eq!(r.output["truncated"], true);
-        // byte_len still reports the full file size so the model
-        // knows there's more.
-        assert_eq!(r.output["byte_len"], big_size as u64);
+        assert_eq!(r.output["byte_len"], MAX_READ_BYTES);
+        assert_eq!(r.output["total_byte_len"], big_size as u64);
+    }
+
+    #[tokio::test]
+    async fn byte_len_reflects_truncated_contents_with_total_byte_len_separate() {
+        // Read a 10 MiB file with a 4 KiB cap; assert byte_len == 4096
+        // and total_byte_len == 10_485_760.
+        let dir = tempfile::TempDir::new().unwrap();
+        let total: u64 = 10 * 1024 * 1024;
+        std::fs::write(dir.path().join("big.txt"), vec![b'a'; total as usize]).unwrap();
+        let s = SandboxPolicy::restrictive(dir.path()).unwrap();
+        let r = ReadFile
+            .execute(
+                serde_json::json!({"path": "big.txt", "length": 4096}),
+                &ctx(dir.path(), &s),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.output["byte_len"], 4096u64);
+        assert_eq!(r.output["total_byte_len"], total);
+        assert_eq!(r.output["truncated"], true);
     }
 
     #[tokio::test]

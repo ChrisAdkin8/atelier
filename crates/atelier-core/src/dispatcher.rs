@@ -316,6 +316,33 @@ pub enum RegisterError {
     DuplicateName(String),
 }
 
+/// v60.34 (M26) — typed surface for `try_submit_approval`. The boolean
+/// `submit_approval` is preserved for existing callers; the renderer
+/// uses the typed variant so it can toast on "approval lost" (the
+/// dispatcher was dropped between submit and remove).
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum SubmitApprovalError {
+    /// No pending approval was registered for `commit_id`, or it had
+    /// already been resolved by a prior call.
+    #[error("no pending approval registered for commit_id {commit_id}")]
+    NoPending { commit_id: uuid::Uuid },
+
+    /// The dispatcher was dropped (cancellation, session shutdown)
+    /// between the renderer's submit and the dispatcher's remove. The
+    /// user's accept-set is discarded; the UI surfaces a toast.
+    #[error("dispatcher gone; accept-set for commit_id {commit_id} discarded")]
+    DispatcherGone { commit_id: uuid::Uuid },
+}
+
+impl SubmitApprovalError {
+    pub fn wire_label(&self) -> &'static str {
+        match self {
+            Self::NoPending { .. } => "no_pending",
+            Self::DispatcherGone { .. } => "dispatcher_gone",
+        }
+    }
+}
+
 /// v60.5 — error returned by `SessionDispatcher::compact_context_items`.
 ///
 /// Compaction crosses the §5 Context and Memory subsystems, so a single
@@ -1055,12 +1082,16 @@ fn extract_read_paths(
             // the read-set on a big repo. Spec §14 says the watcher
             // detects edits to files in the *read set*; for `grep`, the
             // read set is the directory the model targeted.
-            args.get("path")
-                .and_then(|v| v.as_str())
-                .and_then(resolve)
-                .or_else(|| Some(workspace_root.to_path_buf()))
-                .into_iter()
-                .collect()
+            //
+            // When the user didn't actually scope the grep (empty `path`,
+            // `.`, or absent), skip adding the workspace root — otherwise
+            // every save anywhere in the workspace fires FilesChanged.
+            let raw_path = args.get("path").and_then(|v| v.as_str());
+            let scoped = !matches!(raw_path, None | Some("") | Some("."));
+            if !scoped {
+                return Vec::new();
+            }
+            raw_path.and_then(resolve).into_iter().collect()
         }
         _ => Vec::new(),
     }
@@ -1214,10 +1245,32 @@ impl SessionDispatcher {
         commit_id: uuid::Uuid,
         selection: crate::staging::HunkSelection,
     ) -> bool {
+        self.try_submit_approval(commit_id, selection).is_ok()
+    }
+
+    /// v60.34 (M26) — typed variant of [`Self::submit_approval`]. Emits
+    /// `tracing::warn!` when the dispatcher dropped its receiver
+    /// between submit and remove (the silent-loss case the renderer
+    /// needs to toast on). `NoPending` is the routine "already
+    /// resolved" path and stays at debug level.
+    pub fn try_submit_approval(
+        &self,
+        commit_id: uuid::Uuid,
+        selection: crate::staging::HunkSelection,
+    ) -> Result<(), SubmitApprovalError> {
         let sender = self.pending.lock().remove(&commit_id);
         match sender {
-            Some(tx) => tx.send(selection).is_ok(),
-            None => false,
+            Some(tx) => match tx.send(selection) {
+                Ok(()) => Ok(()),
+                Err(_) => {
+                    tracing::warn!(
+                        commit_id = %commit_id,
+                        "submit_approval: dispatcher gone; accept-set discarded"
+                    );
+                    Err(SubmitApprovalError::DispatcherGone { commit_id })
+                }
+            },
+            None => Err(SubmitApprovalError::NoPending { commit_id }),
         }
     }
 
@@ -4227,14 +4280,34 @@ mod tests {
     }
 
     #[test]
-    fn extract_read_paths_for_grep_falls_back_to_workspace_root() {
+    fn extract_read_paths_for_grep_with_no_path_arg_is_empty() {
+        // v60.34 (M22): grep with no/empty/"." path arg means the user
+        // didn't actually scope the read. Tracking the workspace root
+        // would fire FilesChanged on every save anywhere in the repo.
+        let ws = std::path::Path::new("/tmp/repo");
+        for args in [
+            serde_json::json!({"pattern": "foo"}),
+            serde_json::json!({"pattern": "foo", "path": ""}),
+            serde_json::json!({"pattern": "foo", "path": "."}),
+        ] {
+            let paths = super::extract_read_paths("grep", &args, ws);
+            assert!(
+                paths.is_empty(),
+                "expected empty read-set for args={args}, got {paths:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_read_paths_for_grep_with_scoped_path_resolves() {
+        // When the user actually scoped the grep, track that directory.
         let ws = std::path::Path::new("/tmp/repo");
         let paths = super::extract_read_paths(
             "grep",
-            &serde_json::json!({"pattern": "foo"}), // no `path` key
+            &serde_json::json!({"pattern": "foo", "path": "src/"}),
             ws,
         );
-        assert_eq!(paths, vec![std::path::PathBuf::from("/tmp/repo")]);
+        assert_eq!(paths, vec![std::path::PathBuf::from("/tmp/repo/src/")]);
     }
 
     #[test]
@@ -4375,5 +4448,84 @@ mod tests {
             }
             other => panic!("expected VerificationPassed(NotRun), got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod submit_approval_tests {
+    use super::*;
+    use crate::ledger::Ledger;
+    use crate::staging::HunkSelection;
+    use tokio::sync::broadcast;
+
+    fn build_sd() -> SessionDispatcher {
+        let dispatcher = Dispatcher::new(ToolRegistry::new(), HookSet::empty());
+        let ledger = Arc::new(Ledger::new());
+        let (tx, _rx) = broadcast::channel::<crate::session::Event>(64);
+        SessionDispatcher::new(dispatcher, ledger, tx)
+    }
+
+    // v60.34 (M26) — when the dispatcher's oneshot receiver is dropped
+    // between submit and remove (cancellation, session shutdown), the
+    // typed surface returns `DispatcherGone` instead of silently
+    // returning `false`. The renderer toasts on the typed error.
+    #[tokio::test]
+    async fn try_submit_approval_returns_dispatcher_gone_when_receiver_dropped() {
+        let sd = build_sd();
+        let commit_id = uuid::Uuid::new_v4();
+
+        // Manually register a pending entry, then drop the receiver to
+        // simulate the dispatcher being torn down between the
+        // renderer's submit and the dispatcher's remove.
+        let (tx, rx) = tokio::sync::oneshot::channel::<HunkSelection>();
+        sd.pending.lock().insert(commit_id, tx);
+        drop(rx);
+
+        let selection: HunkSelection = HunkSelection::new();
+        let err = sd
+            .try_submit_approval(commit_id, selection)
+            .expect_err("must surface typed error");
+        match err {
+            SubmitApprovalError::DispatcherGone { commit_id: c } => assert_eq!(c, commit_id),
+            other => panic!("expected DispatcherGone, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn try_submit_approval_returns_no_pending_for_unknown_commit() {
+        let sd = build_sd();
+        let commit_id = uuid::Uuid::new_v4();
+        let err = sd
+            .try_submit_approval(commit_id, HunkSelection::new())
+            .expect_err("unknown commit_id");
+        match err {
+            SubmitApprovalError::NoPending { commit_id: c } => assert_eq!(c, commit_id),
+            other => panic!("expected NoPending, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn try_submit_approval_ok_when_receiver_alive() {
+        let sd = build_sd();
+        let commit_id = uuid::Uuid::new_v4();
+        let (tx, mut rx) = tokio::sync::oneshot::channel::<HunkSelection>();
+        sd.pending.lock().insert(commit_id, tx);
+
+        sd.try_submit_approval(commit_id, HunkSelection::new())
+            .expect("happy path");
+        let _selection = rx.try_recv().expect("oneshot fulfilled");
+    }
+
+    #[test]
+    fn submit_approval_error_wire_labels_are_stable() {
+        let id = uuid::Uuid::new_v4();
+        assert_eq!(
+            SubmitApprovalError::NoPending { commit_id: id }.wire_label(),
+            "no_pending"
+        );
+        assert_eq!(
+            SubmitApprovalError::DispatcherGone { commit_id: id }.wire_label(),
+            "dispatcher_gone"
+        );
     }
 }

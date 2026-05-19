@@ -119,6 +119,9 @@ pub enum MemoryError {
     /// in the promoted markdown file.
     #[error("memory card content is invalid: {0}")]
     InvalidContent(String),
+
+    #[error("memory card id {input:?} cannot be sanitised to a safe filename")]
+    InvalidFilename { input: String },
 }
 
 impl MemoryStore {
@@ -209,7 +212,7 @@ impl MemoryStore {
             content = card.content,
         );
         Ok(PromoteOutput {
-            relative_path: format!("{}.md", sanitize_filename(&card.id)),
+            relative_path: format!("{}.md", sanitize_filename(&card.id)?),
             bytes: body.into_bytes(),
         })
     }
@@ -367,8 +370,9 @@ fn split_title_and_preview(content: &str) -> (String, String) {
 /// replace anything else with `_`. Covers the common case where memory ids
 /// look like `mem-1` while still being defensive against ids that came from
 /// user input (e.g., card titles).
-fn sanitize_filename(id: &str) -> String {
-    id.chars()
+fn sanitize_filename(id: &str) -> Result<String, MemoryError> {
+    let cleaned: String = id
+        .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
                 c
@@ -376,7 +380,19 @@ fn sanitize_filename(id: &str) -> String {
                 '_'
             }
         })
-        .collect()
+        .collect();
+    // Reject empty, `.`, `..`, or any all-dots / underscore-only string that
+    // the filesystem would treat specially or that yields a hidden / unnamed
+    // file. After sanitisation, underscores have replaced everything that was
+    // a `.` in the input so we must check the *original* for the dot patterns
+    // too; we approximate by checking both forms.
+    let is_dot_only = !id.is_empty() && id.chars().all(|c| c == '.');
+    if cleaned.is_empty() || cleaned == "." || cleaned == ".." || is_dot_only {
+        return Err(MemoryError::InvalidFilename {
+            input: id.to_string(),
+        });
+    }
+    Ok(cleaned)
 }
 
 #[cfg(test)]
@@ -778,5 +794,45 @@ mod tests {
         assert!(plain_summary.cache_rewarm_tokens.is_none());
         let json = serde_json::to_value(&plain_summary).unwrap();
         assert!(json.get("cache_rewarm_tokens").is_none());
+    }
+}
+
+#[cfg(test)]
+mod sanitiser_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_empty_and_dot_inputs() {
+        for bad in ["", ".", "..", "...", "....", "....."] {
+            let r = sanitize_filename(bad);
+            assert!(
+                matches!(r, Err(MemoryError::InvalidFilename { ref input }) if input == bad),
+                "input {bad:?} should be rejected, got {r:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_safe_ids() {
+        for good in ["mem-1", "memCard_42", "abc", "0"] {
+            let r = sanitize_filename(good).expect("safe id should pass");
+            assert_eq!(r, good);
+        }
+    }
+
+    #[test]
+    fn output_never_matches_forbidden_strings() {
+        let inputs = [
+            "", ".", "..", "...", "....", ".....", "/.", "./", "/./", "..//", "...//",
+        ];
+        for bad in inputs {
+            if let Ok(out) = sanitize_filename(bad) {
+                assert!(out != "" && out != "." && out != "..");
+                assert!(
+                    !out.chars().all(|c| c == '.'),
+                    "sanitised output {out:?} is all dots for input {bad:?}"
+                );
+            }
+        }
     }
 }

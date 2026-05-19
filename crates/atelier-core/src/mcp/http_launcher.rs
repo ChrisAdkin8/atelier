@@ -190,9 +190,16 @@ pub async fn launch_http_server(
 
     // ---------- build reqwest client ----------
 
+    // v60.34 (M23) — disable reqwest's default proxy-from-env (HTTP_PROXY
+    // / HTTPS_PROXY / NO_PROXY). Those env vars are NOT on
+    // `subprocess::ENV_PASSTHROUGH`; allowing them to silently redirect
+    // MCP traffic through an attacker-controlled proxy would defeat the
+    // §12 egress audit trail. A future opt-in path can re-add proxy
+    // support via an explicit manifest field.
     let client = reqwest::Client::builder()
         .default_headers(header_map)
         .timeout(Duration::from_millis(HTTP_REQUEST_TIMEOUT_MS))
+        .no_proxy()
         .build()
         .map_err(|e| McpLaunchError::SseStream {
             name: manifest.name.clone(),
