@@ -548,6 +548,26 @@ export function applyEvent(state: AppState, evt: BridgedEvent): AppState {
       }
       return { ...state, events, verificationStatus }
     }
+    case 'VerificationFailed': {
+      // v60.41 — §7 verify-fail tier badge. The Rust side emits this
+      // when the did-it-do-what-it-said gate finds discrepancies
+      // between `claimed_changes` and the staged diff. Surfaces the
+      // tier on the meters badge; the discrepancies themselves are
+      // recorded in the event log via the standard `events` append
+      // above. (Pre-v60.41 this fell through to the default arm,
+      // which threw in DEV and crashed `applyEvent`.)
+      const p = evt.payload as {
+        tier: string
+        discrepancy_count?: number
+      }
+      const tier = isVerificationTier(p.tier) ? p.tier : 'not_run'
+      const verificationStatus: VerificationStatus = {
+        tier,
+        file_count: 0,
+        claim_count: p.discrepancy_count ?? 0,
+      }
+      return { ...state, events, verificationStatus }
+    }
     case 'ContextOverflowResolved': {
       // §1 BYOM (v60.9 B1 follow-on) — context-window asymmetry
       // resolution. Stash the most recent resolution so `MetersPane`
@@ -639,14 +659,18 @@ export function applyEvent(state: AppState, evt: BridgedEvent): AppState {
       return { ...state, events }
     default: {
       // v60.30 — surface unknown event variants instead of silently
-      // dropping them. In dev (Vite `import.meta.env.DEV` is `true`)
-      // this throws so CI / local smoke tests fail loud. In a
-      // production build we log and fall through to the event-log
-      // append so the user still sees something happened.
+      // dropping them.
+      //
+      // v60.41 — softened from `throw` in DEV to plain `console.error`.
+      // The throw fired the Rust side ever emitted a variant the
+      // reducer didn't yet have a case for (e.g. `VerificationFailed`),
+      // and that aborted the listener callback for that event. The
+      // shape-contract enforcement role moved to per-arm `castPayload`
+      // guards (v60.37 B6), which catch the failure mode the throw was
+      // protecting against — payload-field drift on KNOWN events. An
+      // unknown KIND is now a non-fatal "Rust grew an event the UI
+      // doesn't yet care about" signal.
       console.error('Unknown event variant', evt.kind, evt)
-      if (import.meta.env.DEV) {
-        throw new Error(`Unknown event variant: ${evt.kind}`)
-      }
       return { ...state, events }
     }
   }

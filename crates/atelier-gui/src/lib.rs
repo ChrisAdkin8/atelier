@@ -1014,7 +1014,30 @@ async fn swap_adapter(
         );
         return Err(reason);
     }
-    let new_adapter = build_swap_adapter(provider)?;
+    // v60.41 — emit `AdapterSwapRejected` on build failure so the
+    // consent modal closes when adapter construction fails (e.g.
+    // `AnthropicAdapter::from_env` returns `NotConfigured` because
+    // `ANTHROPIC_API_KEY` is unset). Before this fix, the user saw
+    // their first Accept click succeed (`respond_to_swap` returns Ok)
+    // then the modal sat orphaned because no terminal event ever
+    // arrived to clear `pendingSwap` in the reducer. A second click
+    // on Accept hit the now-empty registry and surfaced
+    // "no pending swap with id <uuid>" — a confusing downstream
+    // symptom of the missing rejection event.
+    let new_adapter = match build_swap_adapter(provider) {
+        Ok(a) => a,
+        Err(e) => {
+            emit_event(
+                &app,
+                &SessionEvent::AdapterSwapRejected {
+                    swap_id: Some(swap_id.to_string()),
+                    to_model_id: pending_to_id.clone(),
+                    reason: e.clone(),
+                },
+            );
+            return Err(e);
+        }
+    };
     let to_model_id = new_adapter.model_id().to_string();
     // Read the pre-swap model id off the live adapter slot. If
     // nothing is in flight (no active run), use "<none>" so the
