@@ -7,8 +7,14 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SVG="$ROOT/assets/icon.svg"
 ICONS="$ROOT/crates/atelier-gui/icons"
-ICONSET="$(mktemp -d)/atelier-icon.iconset"
+# v60.37 C6/SH-1 — capture the parent of the iconset and the second
+# tmpdir so a `trap … EXIT` can clean them up on success OR failure
+# (`set -euo pipefail` above means a single rsvg-convert miss would
+# otherwise leak both tmpdirs into `$TMPDIR`).
+ICONSET_ROOT="$(mktemp -d)"
+ICONSET="$ICONSET_ROOT/atelier-icon.iconset"
 ICO_TMP="$(mktemp -d)"
+trap 'rm -rf "$ICONSET_ROOT" "$ICO_TMP"' EXIT
 
 mkdir -p "$ICONSET" "$ICONS"
 

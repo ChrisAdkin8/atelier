@@ -199,6 +199,42 @@ def test_nightly_write_jobs_do_not_install_deps(name):
     )
 
 
+def test_every_job_declares_timeout_minutes():
+    """v60.37 C1/CI-3 — every job in every workflow must declare
+    `timeout-minutes:` so a hung step can't burn the GitHub-imposed 6-hour
+    default. Surfaces hangs as workflow failures within a bounded
+    interval instead of letting them sit silently.
+    """
+    offenders = []
+    for path in _workflow_files():
+        doc = _parse(path)
+        for job_name, job in (doc.get("jobs") or {}).items():
+            if "timeout-minutes" not in job:
+                offenders.append(f"{path.name}: job `{job_name}`")
+    assert not offenders, (
+        "workflow jobs missing `timeout-minutes:`; offenders: "
+        + "; ".join(offenders)
+    )
+
+
+def test_check_yml_declares_concurrency_group():
+    """v60.37 C2/CI-4 — `check.yml` must declare a workflow-level
+    `concurrency:` group with `cancel-in-progress: true` so two rapid
+    pushes to the same PR don't duplicate the matrix run.
+    """
+    doc = _parse(WORKFLOWS_DIR / "check.yml")
+    conc = doc.get("concurrency")
+    assert isinstance(conc, dict), "check.yml: missing `concurrency:` block"
+    assert conc.get("cancel-in-progress") is True, (
+        "check.yml: concurrency.cancel-in-progress must be true so stale runs are cancelled"
+    )
+    # Group must contain `github.ref` so distinct refs don't collide.
+    group = conc.get("group", "")
+    assert "github.ref" in group, (
+        f"check.yml: concurrency.group must include `github.ref`; got {group!r}"
+    )
+
+
 @pytest.mark.parametrize("name", [
     "nightly_phase_a_gate.yml",
     "nightly_phase_b_gate.yml",

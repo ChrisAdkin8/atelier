@@ -13,7 +13,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ATELIER_PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 export ATELIER_PROJECT_DIR
 
-command -v jq >/dev/null || exit 0  # quiet no-op when jq isn't installed
+if ! command -v jq >/dev/null; then
+  # v60.37 C7/SH-2 — surface jq absence on stderr exactly once so a host
+  # harness without jq isn't silently treated as "hook healthy". Still
+  # exit 0: hooks must remain non-blocking per spec §15.
+  echo "[atelier:bounded-reads] jq not on PATH — bounded-reads hook is inert" >&2
+  exit 0
+fi
 
 input=$(cat)
 # Silence jq's parse-error stderr on malformed payloads (N44): the hook is

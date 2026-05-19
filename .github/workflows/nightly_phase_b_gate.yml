@@ -58,6 +58,7 @@ jobs:
   measure:
     name: measure phase B §2 conformance
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     permissions:
       contents: read
     outputs:
@@ -152,74 +153,93 @@ jobs:
       # summary from the test above (when present) or an empty
       # `summaries: []` array (when skipped) so the schema's
       # `minItems: 0` is honoured.
+      #
+      # v60.37 C3 + C4/CI-5 + CI-6 — build the JSON via Python with
+      # `json.dump(allow_nan=False)` instead of shell heredoc + literal
+      # splicing. The previous shell heredoc spliced `$(cat
+      # "$summary_path")` into a JSON literal, which corrupts the
+      # outer JSON if `summary_path` ever contains anything that needs
+      # quoting (a newline, a stray comma at EOF, a NaN from a producer
+      # bug). The Python form validates the summary as JSON before use
+      # — a malformed file fails loudly here rather than producing an
+      # invalid artifact that downstream schema validation rejects in
+      # a confusing way.
       - name: Compose phase_b_gate/last_run.json
         id: compose
+        env:
+          PHASE_B_SKIPPED: ${{ steps.phase_b_anthropic.outputs.is_skipped }}
+          PHASE_B_SUMMARY_PATH: ${{ steps.phase_b_anthropic.outputs.summary_path }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -e
-          run_id=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-          git_sha=$(git rev-parse --short HEAD)
+          python3 - <<'PY'
+          import json, os, subprocess, sys
 
-          if [ "${{ steps.phase_b_anthropic.outputs.is_skipped }}" = "true" ]; then
-            # Skipped: empty summaries, status=yellow (no evidence),
-            # all_passed=true (the workflow stays green for forks /
-            # pre-maintainer-setup).
-            status="yellow"
-            calibration="${CALIBRATION_PHASE}"
-            all_passed="true"
-            summaries='[]'
-          else
-            # Read the per-strategy summary the test produced. If the
-            # test crashed before writing the file, treat that as a
-            # failure (status=red, all_passed=false).
-            if [ ! -f "${{ steps.phase_b_anthropic.outputs.summary_path }}" ]; then
-              status="red"
-              calibration="${CALIBRATION_PHASE}"
-              all_passed="false"
-              summaries='[]'
-            else
-              summaries=$(cat "${{ steps.phase_b_anthropic.outputs.summary_path }}")
+          skipped = os.environ.get("PHASE_B_SKIPPED") == "true"
+          summary_path = os.environ.get("PHASE_B_SUMMARY_PATH", "")
+          calibration_env = os.environ.get("CALIBRATION_PHASE", "true")
+          phase_b_floor = float(os.environ.get("PHASE_B_FLOOR", "0.95"))
+
+          if skipped:
+              # Skipped: empty summaries, status=yellow (no evidence),
+              # all_passed=true (the workflow stays green for forks /
+              # pre-maintainer-setup).
+              status = "yellow"
+              calibration = calibration_env == "true"
+              all_passed = True
+              summaries = []
+          elif not summary_path or not os.path.isfile(summary_path):
+              # Test crashed before writing the file — red.
+              status = "red"
+              calibration = calibration_env == "true"
+              all_passed = False
+              summaries = []
+          else:
+              # v60.37 C4/CI-6 — validate the summary as JSON before
+              # splicing it into our artifact. A malformed file fails
+              # loudly here rather than producing invalid JSON that
+              # downstream schema validation rejects in a confusing
+              # way.
+              try:
+                  with open(summary_path, encoding="utf-8") as f:
+                      summaries = json.load(f)
+              except json.JSONDecodeError as e:
+                  print(f"::error::summary at {summary_path} is malformed JSON: {e}", file=sys.stderr)
+                  sys.exit(1)
+              if not isinstance(summaries, list):
+                  print(f"::error::summary must be a JSON array; got {type(summaries).__name__}", file=sys.stderr)
+                  sys.exit(1)
               # During calibration, every run is yellow + all_passed=true.
               # Post-calibration the workflow computes status via the
               # Rust ConformanceStatus::for_run lattice (binary call
               # below) — for now we keep the records-only posture.
-              if [ "${CALIBRATION_PHASE}" = "true" ]; then
-                status="yellow"
-                all_passed="true"
-                calibration="true"
-              else
-                # Post-calibration: invoke the binary in --evaluate mode
-                # to compute the verdict. Placeholder for the v60.24+
-                # extension — for now the artifact records status=yellow
-                # so we don't pre-emptively flip red during calibration.
-                status="yellow"
-                all_passed="true"
-                calibration="false"
-              fi
-            fi
-          fi
+              status = "yellow"
+              all_passed = True
+              calibration = calibration_env == "true"
 
-          run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-
-          cat > tests/phase_b_gate/last_run.json <<EOF
-          {
-            "version": 1,
-            "run_id": "$run_id",
-            "git_sha": "$git_sha",
-            "workflow_run_url": "$run_url",
-            "all_passed": $all_passed,
-            "status": "$status",
-            "calibration_phase": $calibration,
-            "floor": ${PHASE_B_FLOOR},
-            "summaries": $summaries,
-            "providers_tested": ["anthropic:claude-haiku-4-5"]
+          payload = {
+              "version": 1,
+              "run_id": subprocess.check_output(["date", "-u", "+%Y-%m-%dT%H:%M:%SZ"], text=True).strip(),
+              "git_sha": subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], text=True).strip(),
+              "workflow_run_url": os.environ["RUN_URL"],
+              "all_passed": all_passed,
+              "status": status,
+              "calibration_phase": calibration,
+              "floor": phase_b_floor,
+              "summaries": summaries,
+              "providers_tested": ["anthropic:claude-haiku-4-5"],
           }
-          EOF
+          with open("tests/phase_b_gate/last_run.json", "w", encoding="utf-8") as f:
+              json.dump(payload, f, indent=2, allow_nan=False)
+              f.write("\n")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"all_passed={'true' if all_passed else 'false'}\n")
+          PY
 
           # Surface the binary's digest in the job summary.
           cargo build --release -p atelier-cli --bin conformance_status
           ./target/release/conformance_status >> "$GITHUB_STEP_SUMMARY" || true
-
-          echo "all_passed=$all_passed" >> "$GITHUB_OUTPUT"
 
       - name: Validate fresh artifact against schema
         run: python tests/validate_artifacts.py
@@ -236,6 +256,7 @@ jobs:
     name: commit refreshed last_run.json
     needs: measure
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: write
     steps:

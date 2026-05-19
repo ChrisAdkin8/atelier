@@ -55,6 +55,7 @@ jobs:
   measure:
     name: measure phase A gates
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     permissions:
       contents: read
     outputs:
@@ -222,74 +223,103 @@ jobs:
           exit $ec
 
       # Build the JSON artifact + commit + push.
+      #
+      # v60.37 C3/CI-5 — the heredoc below builds JSON via a Python
+      # one-liner instead of interpolating `${{ steps.X.outputs.Y }}`
+      # directly. Before this change, any step output that grew a
+      # quote, newline, or backslash (today they're all simple integers;
+      # tomorrow they might not be) would silently produce malformed
+      # JSON. The step-output values are surfaced to Python via
+      # environment variables so the `json.dumps` call handles quoting
+      # for us.
       - name: Compose phase_a_gate/last_run.json
         id: compose
+        env:
+          FMT_EXIT: ${{ steps.fmt.outputs.exit_code }}
+          FMT_DUR: ${{ steps.fmt.outputs.duration }}
+          CLIPPY_EXIT: ${{ steps.clippy.outputs.exit_code }}
+          CLIPPY_DUR: ${{ steps.clippy.outputs.duration }}
+          CARGO_EXIT: ${{ steps.cargo_test.outputs.exit_code }}
+          CARGO_DUR: ${{ steps.cargo_test.outputs.duration }}
+          RIG_EXIT: ${{ steps.rig.outputs.exit_code }}
+          RIG_DUR: ${{ steps.rig.outputs.duration }}
+          MCP_EXIT: ${{ steps.mcp.outputs.exit_code }}
+          MCP_DUR: ${{ steps.mcp.outputs.duration }}
+          PHASE_A_LIVE_EXIT: ${{ steps.phase_a_live.outputs.exit_code }}
+          PHASE_A_LIVE_DUR: ${{ steps.phase_a_live.outputs.duration }}
+          PHASE_A_LIVE_SKIPPED: ${{ steps.phase_a_live.outputs.is_skipped }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -e
-          run_id=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-          git_sha=$(git rev-parse --short HEAD)
-
           # Map step exit codes → status strings. 0 = passed, anything
           # else = failed. We don't emit `skipped` from the workflow
           # because every gate above actually runs; `skipped` is reserved
           # for prerequisite-missing situations (e.g. local runs without
           # a Python venv).
-          status_for() {
-            if [ "$1" = "0" ]; then echo "passed"; else echo "failed"; fi
+          python3 - <<'PY'
+          import json, os, subprocess
+
+          def status_for(env_name):
+              return "passed" if os.environ.get(env_name) == "0" else "failed"
+
+          fmt_status = status_for("FMT_EXIT")
+          clippy_status = status_for("CLIPPY_EXIT")
+          cargo_status = status_for("CARGO_EXIT")
+          rig_status = status_for("RIG_EXIT")
+          mcp_status = status_for("MCP_EXIT")
+          if os.environ.get("PHASE_A_LIVE_SKIPPED") == "true":
+              phase_a_live_status = "skipped"
+          else:
+              phase_a_live_status = status_for("PHASE_A_LIVE_EXIT")
+
+          # The MCP gate is non-fatal. The live-API gate is fatal when
+          # it runs (failed flips all_passed) but neutral when skipped.
+          all_passed = (
+              fmt_status == "passed"
+              and clippy_status == "passed"
+              and cargo_status == "passed"
+              and rig_status == "passed"
+              and phase_a_live_status != "failed"
+          )
+
+          def dur(name):
+              raw = os.environ.get(name, "0")
+              try:
+                  return int(raw)
+              except ValueError:
+                  return 0
+
+          payload = {
+              "version": 1,
+              "run_id": subprocess.check_output(
+                  ["date", "-u", "+%Y-%m-%dT%H:%M:%SZ"], text=True
+              ).strip(),
+              "git_sha": subprocess.check_output(
+                  ["git", "rev-parse", "--short", "HEAD"], text=True
+              ).strip(),
+              "workflow_run_url": os.environ["RUN_URL"],
+              "all_passed": all_passed,
+              "gates": [
+                  {"name": "fmt", "status": fmt_status, "duration_secs": dur("FMT_DUR")},
+                  {"name": "clippy", "status": clippy_status, "duration_secs": dur("CLIPPY_DUR")},
+                  {"name": "cargo_test_workspace", "status": cargo_status, "duration_secs": dur("CARGO_DUR")},
+                  {"name": "rig_check", "status": rig_status, "duration_secs": dur("RIG_DUR")},
+                  {"name": "mcp_integration_npx", "status": mcp_status, "duration_secs": dur("MCP_DUR")},
+                  {"name": "phase_a_live_anthropic", "status": phase_a_live_status, "duration_secs": dur("PHASE_A_LIVE_DUR")},
+              ],
           }
+          with open("tests/phase_a_gate/last_run.json", "w", encoding="utf-8") as f:
+              json.dump(payload, f, indent=2, allow_nan=False)
+              f.write("\n")
 
-          fmt_status=$(status_for "${{ steps.fmt.outputs.exit_code }}")
-          clippy_status=$(status_for "${{ steps.clippy.outputs.exit_code }}")
-          cargo_status=$(status_for "${{ steps.cargo_test.outputs.exit_code }}")
-          rig_status=$(status_for "${{ steps.rig.outputs.exit_code }}")
-          mcp_status=$(status_for "${{ steps.mcp.outputs.exit_code }}")
-          # Live-API gate: `skipped` when the secret isn't set, otherwise
-          # the normal pass/fail mapping. The is_skipped flag was emitted
-          # by the gate step above.
-          if [ "${{ steps.phase_a_live.outputs.is_skipped }}" = "true" ]; then
-            phase_a_live_status="skipped"
-          else
-            phase_a_live_status=$(status_for "${{ steps.phase_a_live.outputs.exit_code }}")
-          fi
-
-          # The MCP gate is non-fatal — see note above. The live-API gate
-          # is fatal when it runs (`failed` flips all_passed) but neutral
-          # when `skipped` (forks / pre-maintainer-setup).
-          if [ "$fmt_status" = "passed" ] && \
-             [ "$clippy_status" = "passed" ] && \
-             [ "$cargo_status" = "passed" ] && \
-             [ "$rig_status" = "passed" ] && \
-             [ "$phase_a_live_status" != "failed" ]; then
-            all_passed=true
-          else
-            all_passed=false
-          fi
-
-          run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-
-          cat > tests/phase_a_gate/last_run.json <<EOF
-          {
-            "version": 1,
-            "run_id": "$run_id",
-            "git_sha": "$git_sha",
-            "workflow_run_url": "$run_url",
-            "all_passed": $all_passed,
-            "gates": [
-              {"name": "fmt", "status": "$fmt_status", "duration_secs": ${{ steps.fmt.outputs.duration }}},
-              {"name": "clippy", "status": "$clippy_status", "duration_secs": ${{ steps.clippy.outputs.duration }}},
-              {"name": "cargo_test_workspace", "status": "$cargo_status", "duration_secs": ${{ steps.cargo_test.outputs.duration }}},
-              {"name": "rig_check", "status": "$rig_status", "duration_secs": ${{ steps.rig.outputs.duration }}},
-              {"name": "mcp_integration_npx", "status": "$mcp_status", "duration_secs": ${{ steps.mcp.outputs.duration }}},
-              {"name": "phase_a_live_anthropic", "status": "$phase_a_live_status", "duration_secs": ${{ steps.phase_a_live.outputs.duration }}}
-            ]
-          }
-          EOF
+          # Surface all_passed to subsequent steps.
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"all_passed={'true' if all_passed else 'false'}\n")
+          PY
 
           # Surface the binary's digest in the job summary.
           cargo build --release -p atelier-cli --bin phase_a_gate_status
           ./target/release/phase_a_gate_status >> "$GITHUB_STEP_SUMMARY" || true
-
-          echo "all_passed=$all_passed" >> "$GITHUB_OUTPUT"
 
       - name: Validate fresh artifact against schema
         run: python tests/validate_artifacts.py
@@ -306,6 +336,7 @@ jobs:
     name: commit refreshed last_run.json
     needs: measure
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: write
     steps:

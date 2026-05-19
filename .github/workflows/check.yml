@@ -8,10 +8,19 @@ on:
 permissions:
   contents: read
 
+# v60.37 C2/CI-4 — cancel earlier in-flight runs for the same ref so two
+# rapid pushes to the same PR don't multiply the matrix runner-minutes.
+# Distinct from `nightly-artifact-commits` (those serialise to protect
+# the push-to-main race; here we want the opposite: cancel the stale).
+concurrency:
+  group: check-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   rig:
     name: rig (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -49,6 +58,7 @@ jobs:
   rust:
     name: rust (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -118,6 +128,7 @@ jobs:
   quality:
     name: quality (cargo-audit + cargo-machete)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
@@ -126,11 +137,25 @@ jobs:
         with:
           toolchain: "1.85.0"
 
+      # v60.37 C5/CI-7 — cache the cargo-audit + cargo-machete binaries
+      # so per-PR runs skip the install. Mirrors the `audit` job's cache
+      # discipline (which already caches cargo-audit). cargo-machete is
+      # pinned to 0.7.0; the key encodes that so a bump invalidates.
+      - name: Cache cargo-tools binaries
+        id: cache-cargo-tools
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/bin/cargo-audit
+            ~/.cargo/bin/cargo-machete
+          key: ${{ runner.os }}-cargo-tools-audit-machete-0.7.0-v1
+
       # Pre-built binaries from GitHub releases — avoids compiling the
       # tools (and their transitive deps that need rustc > 1.85)
       # against our pinned toolchain. cargo-machete pinned to 0.7.0
       # for the same toolchain-compat reason captured in the Makefile.
       - name: Install cargo-audit + cargo-machete
+        if: steps.cache-cargo-tools.outputs.cache-hit != 'true'
         uses: taiki-e/install-action@b550161ef8a7bc4f2a671c0b03a18ac9ccedea1e # v2.79.1
         with:
           tool: cargo-audit,cargo-machete@0.7.0
@@ -147,6 +172,7 @@ jobs:
   audit:
     name: audit (cargo audit + npm audit)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
