@@ -233,10 +233,15 @@ impl HookSet {
             if !file_name.ends_with(".json") || file_name.starts_with('_') {
                 continue;
             }
-            let bytes = std::fs::read(&path).map_err(|e| HookError::Io {
-                path: path.clone(),
-                source: e,
-            })?;
+            // v60.37 A2 — cap at 1 MiB so a pathological hook manifest
+            // (runaway model, hostile commit) can't OOM the agent at
+            // startup. Hook configs are the highest-risk loader surface
+            // because they're user-writable under `.atelier/hooks/`.
+            let bytes = crate::io_caps::read_capped(&path, crate::io_caps::CAP_HOOK_CONFIG)
+                .map_err(|e| HookError::Io {
+                    path: path.clone(),
+                    source: e,
+                })?;
             let manifest = HookManifest::from_json(&bytes).map_err(|e| match e {
                 HookError::Parse(msg) => HookError::ParseAt {
                     path: path.clone(),
@@ -302,7 +307,8 @@ pub struct HookApprovals {
 
 impl HookApprovals {
     pub fn load(path: &Path) -> Result<Self, PersistenceError> {
-        match std::fs::read(path) {
+        // v60.37 A2 — cap at 1 MiB; the approvals file is a small index.
+        match crate::io_caps::read_capped(path, crate::io_caps::CAP_HOOK_CONFIG) {
             Ok(b) => serde_json::from_slice(&b).map_err(|e| PersistenceError::Deserialize {
                 path: path.to_path_buf(),
                 error: e.to_string(),

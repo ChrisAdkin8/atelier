@@ -827,7 +827,7 @@ mod sanitiser_tests {
         ];
         for bad in inputs {
             if let Ok(out) = sanitize_filename(bad) {
-                assert!(out != "" && out != "." && out != "..");
+                assert!(!out.is_empty() && out != "." && out != "..");
                 assert!(
                     !out.chars().all(|c| c == '.'),
                     "sanitised output {out:?} is all dots for input {bad:?}"

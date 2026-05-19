@@ -362,10 +362,15 @@ impl OnDiskSession {
     /// per spec §14 those need a one-way migration.
     pub fn load_from(dir: &Path) -> Result<Self, PersistenceError> {
         let path = dir.join(SESSION_FILE);
-        let bytes = std::fs::read(&path).map_err(|e| PersistenceError::Io {
-            path: path.clone(),
-            source: e,
-        })?;
+        // v60.37 A2 — cap at 16 MiB. Sessions accumulate conversation +
+        // tool fixtures, so the cap is higher than other configs.
+        let bytes =
+            crate::io_caps::read_capped(&path, crate::io_caps::CAP_SESSION).map_err(|e| {
+                PersistenceError::Io {
+                    path: path.clone(),
+                    source: e,
+                }
+            })?;
         let session: Self =
             serde_json::from_slice(&bytes).map_err(|e| PersistenceError::Deserialize {
                 path: path.clone(),
@@ -434,7 +439,8 @@ impl Registry {
     /// Load or return empty. Per spec §14: "Rebuilt opportunistically; safe
     /// to delete." A missing file is not an error.
     pub fn load(path: &Path) -> Result<Self, PersistenceError> {
-        match std::fs::read(path) {
+        // v60.37 A2 — cap at 1 MiB; the registry is a small index.
+        match crate::io_caps::read_capped(path, crate::io_caps::CAP_MCP_CONFIG) {
             Ok(bytes) => {
                 serde_json::from_slice(&bytes).map_err(|e| PersistenceError::Deserialize {
                     path: path.to_path_buf(),

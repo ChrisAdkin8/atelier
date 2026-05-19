@@ -19,6 +19,7 @@ pub mod error;
 pub mod file_watcher;
 pub mod hooks;
 pub mod init;
+pub mod io_caps;
 pub mod ledger;
 pub mod lsp;
 pub mod mcp;

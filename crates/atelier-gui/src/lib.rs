@@ -568,6 +568,12 @@ async fn compact_context_items(
         &session_id,
         ids,
         &now,
+        // v60.37 A3 — GUI demo path uses `LatencyWeighted` so Mock and
+        // local-OpenAI-compat compactions get their local-rate cost
+        // attribution. Cloud-provider compactions in the GUI are not
+        // the cost-accounting surface of record (the runner's main loop
+        // is); this is a best-effort default.
+        atelier_cli::runner::ModelCostPolicy::LatencyWeighted,
     )
     .await
     .map(|r| CompactionResult {

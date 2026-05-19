@@ -116,12 +116,21 @@ pub fn write_promoted_card(output: &PromoteOutput) -> Result<PromotedWrite, Stri
     }
 
     // ---- atomic write ----
+    // v60.37 A1 — full discipline: data + metadata fsync, then atomic
+    // rename, then parent-dir fsync. Earlier versions stopped at persist,
+    // leaving a window where a power loss between persist() and the next
+    // natural fs sync could leave the directory in its pre-rename state.
     let mut tmp = tempfile::NamedTempFile::new_in(&canonical_root)
         .map_err(|e| format!("create temp in {canonical_root:?}: {e}"))?;
     tmp.write_all(&output.bytes)
         .map_err(|e| format!("write temp: {e}"))?;
+    tmp.as_file()
+        .sync_all()
+        .map_err(|e| format!("sync_all temp: {e}"))?;
     tmp.persist(&target)
         .map_err(|e| format!("persist {target:?}: {e}"))?;
+    atelier_core::path_safety::fsync_dir(&canonical_root)
+        .map_err(|e| format!("fsync_dir {canonical_root:?}: {e}"))?;
     Ok(PromotedWrite {
         path: target,
         bytes: output.bytes.len(),

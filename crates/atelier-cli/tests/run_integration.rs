@@ -1536,6 +1536,7 @@ async fn v60_5_compact_context_items_round_trips_through_dispatcher() {
         &sid,
         target_ids.clone(),
         now,
+        atelier_cli::runner::ModelCostPolicy::LatencyWeighted,
     )
     .await
     .expect("orchestrator must succeed");
@@ -1702,6 +1703,7 @@ async fn v60_6_expand_memory_card_round_trips_through_dispatcher() {
         &sid,
         target_ids.clone(),
         "2026-05-17T11:00:00Z",
+        atelier_cli::runner::ModelCostPolicy::LatencyWeighted,
     )
     .await
     .expect("compaction must succeed");

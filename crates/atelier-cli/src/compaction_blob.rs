@@ -141,12 +141,21 @@ pub fn write(
     }
 
     // ---- atomic write ----
+    // v60.37 A1 — full discipline: data + metadata fsync, then atomic
+    // rename, then parent-dir fsync. Earlier versions stopped at persist,
+    // leaving a window where a power loss could leave the directory entry
+    // in its pre-rename state on stable storage.
     let mut tmp = tempfile::NamedTempFile::new_in(&canonical_dir)
         .map_err(|e| format!("compaction_blob::write: temp in {canonical_dir:?}: {e}"))?;
     tmp.write_all(&bytes)
         .map_err(|e| format!("compaction_blob::write: write temp: {e}"))?;
+    tmp.as_file()
+        .sync_all()
+        .map_err(|e| format!("compaction_blob::write: sync_all temp: {e}"))?;
     tmp.persist(&target)
         .map_err(|e| format!("compaction_blob::write: persist {target:?}: {e}"))?;
+    atelier_core::path_safety::fsync_dir(&canonical_dir)
+        .map_err(|e| format!("compaction_blob::write: fsync_dir {canonical_dir:?}: {e}"))?;
 
     Ok(WrittenBlob {
         blob_id,

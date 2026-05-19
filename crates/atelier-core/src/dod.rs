@@ -233,9 +233,13 @@ impl DodConfig {
 
     /// Load from an explicit path (testing, atypical layouts).
     pub fn load_from(path: &Path) -> Result<Self, DodError> {
-        let bytes = std::fs::read(path).map_err(|e| DodError::Io {
-            path: path.to_path_buf(),
-            source: e,
+        // v60.37 A2 — cap at 1 MiB so a pathological dod.v1.json
+        // can't OOM the agent at startup.
+        let bytes = crate::io_caps::read_capped(path, crate::io_caps::CAP_DOD).map_err(|e| {
+            DodError::Io {
+                path: path.to_path_buf(),
+                source: e,
+            }
         })?;
         Self::from_json(&bytes).map_err(|e| match e {
             DodError::Parse(message) => DodError::ParseAt {

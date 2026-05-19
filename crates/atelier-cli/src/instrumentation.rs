@@ -118,9 +118,16 @@ impl PaneVisibilityRecord {
         std::fs::create_dir_all(session_dir)?;
         let target = Self::path_for(session_dir);
         let json = serde_json::to_vec_pretty(self).map_err(std::io::Error::other)?;
+        // v60.37 A1 — full atomic-write discipline: data + metadata
+        // fsync, then atomic rename, then parent-dir fsync. Earlier
+        // versions stopped at persist, leaving a window where a power
+        // loss between persist() and the next natural fs sync could
+        // leave the directory in its pre-rename state on stable storage.
         let mut tmp = tempfile::NamedTempFile::new_in(session_dir)?;
         std::io::Write::write_all(&mut tmp, &json)?;
+        tmp.as_file().sync_all()?;
         tmp.persist(&target).map_err(|e| e.error)?;
+        atelier_core::path_safety::fsync_dir(session_dir)?;
         Ok(target)
     }
 
@@ -191,9 +198,12 @@ impl FindProbeLog {
         log.probes.push(probe);
         let target = Self::path_for(session_dir);
         let json = serde_json::to_vec_pretty(&log).map_err(std::io::Error::other)?;
+        // v60.37 A1 — full atomic-write discipline. See PaneVisibilityLog::save_to.
         let mut tmp = tempfile::NamedTempFile::new_in(session_dir)?;
         std::io::Write::write_all(&mut tmp, &json)?;
+        tmp.as_file().sync_all()?;
         tmp.persist(&target).map_err(|e| e.error)?;
+        atelier_core::path_safety::fsync_dir(session_dir)?;
         Ok(target)
     }
 }

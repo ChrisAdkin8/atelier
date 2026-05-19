@@ -518,18 +518,54 @@ fn check_regression(
 // ---------- output ----------
 
 fn write_report(path: &Path, report: &OverheadReport) -> Result<(), OverheadError> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| OverheadError::Io {
-            path: parent.to_path_buf(),
-            source: e,
-        })?;
-    }
+    let parent = match path.parent() {
+        Some(p) => {
+            fs::create_dir_all(p).map_err(|e| OverheadError::Io {
+                path: p.to_path_buf(),
+                source: e,
+            })?;
+            p
+        }
+        None => {
+            return Err(OverheadError::Io {
+                path: path.to_path_buf(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "overhead path has no parent directory",
+                ),
+            })
+        }
+    };
     // Pretty-print so the committed file is readable in code review and
     // diffs are line-by-line meaningful.
     let mut json = serde_json::to_string_pretty(report).map_err(OverheadError::Serialize)?;
     json.push('\n');
-    fs::write(path, json).map_err(|e| OverheadError::Io {
+    // v60.37 A4 — atomic write: tempfile in the same directory →
+    // write → sync_all → rename → fsync_dir. `fs::write` truncates
+    // the target then writes; a crash mid-write would leave a partial
+    // file in tracked source (`tests/protocol/overhead.json`). With
+    // the discipline below, the file on disk is always either the
+    // pre-write or post-write contents — never a partial.
+    let mut tmp = tempfile::NamedTempFile::new_in(parent).map_err(|e| OverheadError::Io {
+        path: parent.to_path_buf(),
+        source: e,
+    })?;
+    std::io::Write::write_all(tmp.as_file_mut(), json.as_bytes()).map_err(|e| {
+        OverheadError::Io {
+            path: tmp.path().to_path_buf(),
+            source: e,
+        }
+    })?;
+    tmp.as_file().sync_all().map_err(|e| OverheadError::Io {
+        path: tmp.path().to_path_buf(),
+        source: e,
+    })?;
+    tmp.persist(path).map_err(|e| OverheadError::Io {
         path: path.to_path_buf(),
+        source: e.error,
+    })?;
+    atelier_core::path_safety::fsync_dir(parent).map_err(|e| OverheadError::Io {
+        path: parent.to_path_buf(),
         source: e,
     })?;
     Ok(())

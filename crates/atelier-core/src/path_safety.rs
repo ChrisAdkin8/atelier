@@ -113,6 +113,29 @@ pub fn ensure_inside_workspace_creatable(
     Ok(canonical_parent.join(basename))
 }
 
+/// v60.37 A1 — promote the atomic-write helper to a shared location so
+/// every `NamedTempFile::persist` site can call it without re-implementing
+/// the cfg(unix)/cfg(windows) split. POSIX rename is atomic for content
+/// but the directory entry's update is buffered until the next natural
+/// fs sync — without this call, a crash between `tmp.persist()` and
+/// natural sync can leave the directory in its pre-rename state on stable
+/// storage.
+///
+/// Returns `std::io::Result<()>` so callers can map into their preferred
+/// error type. Windows + non-unix targets return Ok(()) — opening a
+/// directory as a file for fsync is not portable, and v1 doesn't target
+/// them per spec §11.
+#[cfg(unix)]
+pub fn fsync_dir(dir: &Path) -> std::io::Result<()> {
+    let f = std::fs::File::open(dir)?;
+    f.sync_all()
+}
+
+#[cfg(not(unix))]
+pub fn fsync_dir(_dir: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
 fn canonicalize_root(workspace_root: &Path, tool: &str) -> Result<PathBuf, ToolError> {
     std::fs::canonicalize(workspace_root).map_err(|e| ToolError::ExecutionFailed {
         tool: tool.to_string(),

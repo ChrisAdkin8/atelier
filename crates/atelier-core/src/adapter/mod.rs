@@ -517,6 +517,14 @@ impl MockAdapter {
     /// Convenience: queue a single-shot response that emits one text chunk +
     /// a final `Complete`. The most common test shape.
     pub fn queue_text_response(&self, text: impl Into<String>) {
+        self.queue_text_response_with_latency_ms(text, 0);
+    }
+
+    /// v60.37 A3 — same as `queue_text_response` but lets the caller pin
+    /// `usage.latency_ms`. Used by the compaction tests to verify that
+    /// `LatencyWeighted` cost attribution actually rounds-trips a non-zero
+    /// latency into a non-None `cost_usd`.
+    pub fn queue_text_response_with_latency_ms(&self, text: impl Into<String>, latency_ms: u64) {
         let text: String = text.into();
         self.queue_stream(vec![
             StreamChunk::Text {
@@ -531,7 +539,7 @@ impl MockAdapter {
                         completion_tokens: 1,
                         cached_tokens: None,
                         count_source: TokenSource::Approx,
-                        latency_ms: Some(0),
+                        latency_ms: Some(latency_ms),
                     },
                     strategy: Strategy::JsonSentinel,
                     stop_reason: Some(StopReason::EndTurn),

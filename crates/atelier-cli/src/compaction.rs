@@ -28,6 +28,7 @@ use atelier_core::dispatcher::{CompactionError, SessionDispatcher};
 use atelier_core::ledger::LedgerEntry;
 
 use crate::compaction_blob;
+use crate::runner::ModelCostPolicy;
 
 /// System prompt for the summary call. Fixed in v60.5; a future
 /// version may make it configurable per-project. Constrained to keep
@@ -112,6 +113,12 @@ pub async fn compact(
     session_id: &str,
     ids: Vec<String>,
     now: &str,
+    // v60.37 A3 — accept the runner's cost policy so the compaction
+    // ledger entry reflects the same `LatencyWeighted` / `UnknownPending`
+    // choice the main loop uses. Prior to v60.37 this was hardcoded to
+    // `None`, silently dropping local-provider cost attribution for
+    // every compaction model call.
+    cost_policy: ModelCostPolicy,
 ) -> Result<CompactionResult, CompactionRunError> {
     if ids.is_empty() {
         return Err(CompactionRunError::Empty);
@@ -140,6 +147,21 @@ pub async fn compact(
         .map_err(CompactionRunError::BlobWrite)?;
 
     // ---- Step 4: ledger the ModelCall for the summary. ----
+    // v60.37 A3 — compute cost_usd per the same `ModelCostPolicy` the
+    // runner's main loop applies (see `runner.rs::ModelCostPolicy`).
+    // Prior to v60.37 this was hardcoded to `None`, silently dropping
+    // the `LatencyWeighted` attribution for Mock and local OpenAI-compat
+    // compactions.
+    let latency_f64 = response.usage.latency_ms.map(|ms| ms as f64);
+    let cost_usd = match cost_policy {
+        ModelCostPolicy::LatencyWeighted => latency_f64.map(|ms| {
+            atelier_core::ledger::local_cost_usd(
+                ms,
+                atelier_core::ledger::DEFAULT_LOCAL_RATE_USD_PER_SEC,
+            )
+        }),
+        ModelCostPolicy::UnknownPending => None,
+    };
     dispatcher.append_ledger_entry(LedgerEntry::ModelCall {
         timestamp: now.to_string(),
         model_id: adapter.model_id().to_string(),
@@ -147,8 +169,8 @@ pub async fn compact(
         completion_tokens: response.usage.completion_tokens,
         cached_tokens: response.usage.cached_tokens,
         count_source: response.usage.count_source,
-        cost_usd: None,
-        latency_ms: response.usage.latency_ms.map(|ms| ms as f64),
+        cost_usd,
+        latency_ms: latency_f64,
         note: Some(format!(
             "compaction summary: {} items -> {} bytes",
             items.len(),
@@ -285,6 +307,7 @@ mod tests {
             &sid,
             ids.clone(),
             "2026-05-17T11:00:00Z",
+            ModelCostPolicy::LatencyWeighted,
         )
         .await
         .expect("compact must succeed");
@@ -311,15 +334,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compact_latency_weighted_attributes_cost() {
+        // v60.37 A3 — under `ModelCostPolicy::LatencyWeighted`, the
+        // compaction ModelCall ledger entry must carry a non-None
+        // `cost_usd` (the local rate × latency). Before v60.37 this
+        // was hardcoded to None.
+        let ws = TempDir::new().unwrap();
+        let sid = uuid::Uuid::new_v4().to_string();
+        let (adapter, sd, ledger, _cm, ids) = build_dispatcher_with_items(2);
+        adapter.queue_text_response_with_latency_ms("a summary", 250);
+
+        let _result = compact(
+            adapter.as_ref(),
+            &sd,
+            ws.path(),
+            &sid,
+            ids,
+            "2026-05-19T00:00:00Z",
+            ModelCostPolicy::LatencyWeighted,
+        )
+        .await
+        .expect("compact must succeed");
+        let entries = ledger.to_vec();
+        if let LedgerEntry::ModelCall { cost_usd, .. } = &entries[0] {
+            assert!(
+                cost_usd.is_some(),
+                "LatencyWeighted compaction must populate cost_usd"
+            );
+            assert!(cost_usd.unwrap() > 0.0);
+        } else {
+            panic!("expected first ledger entry to be ModelCall");
+        }
+    }
+
+    #[tokio::test]
+    async fn compact_unknown_pending_leaves_cost_none() {
+        // v60.37 A3 — under `ModelCostPolicy::UnknownPending` (cloud
+        // providers), the cost stays None until per-provider pricing
+        // ships. Matches the runner's main-loop behaviour for cloud.
+        let ws = TempDir::new().unwrap();
+        let sid = uuid::Uuid::new_v4().to_string();
+        let (adapter, sd, ledger, _cm, ids) = build_dispatcher_with_items(2);
+        adapter.queue_text_response_with_latency_ms("a summary", 250);
+
+        let _result = compact(
+            adapter.as_ref(),
+            &sd,
+            ws.path(),
+            &sid,
+            ids,
+            "2026-05-19T00:00:00Z",
+            ModelCostPolicy::UnknownPending,
+        )
+        .await
+        .expect("compact must succeed");
+        let entries = ledger.to_vec();
+        if let LedgerEntry::ModelCall { cost_usd, .. } = &entries[0] {
+            assert!(
+                cost_usd.is_none(),
+                "UnknownPending compaction must leave cost_usd = None"
+            );
+        } else {
+            panic!("expected first ledger entry to be ModelCall");
+        }
+    }
+
+    #[tokio::test]
     async fn compact_empty_ids_returns_empty_error_without_touching_adapter() {
         let ws = TempDir::new().unwrap();
         let sid = uuid::Uuid::new_v4().to_string();
         let (adapter, sd, ledger, cm, _) = build_dispatcher_with_items(2);
 
         // Adapter queue is empty — the call must NOT pop it.
-        let err = compact(adapter.as_ref(), &sd, ws.path(), &sid, vec![], "t")
-            .await
-            .unwrap_err();
+        let err = compact(
+            adapter.as_ref(),
+            &sd,
+            ws.path(),
+            &sid,
+            vec![],
+            "t",
+            ModelCostPolicy::LatencyWeighted,
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, CompactionRunError::Empty));
         assert_eq!(ledger.len(), 0);
         assert_eq!(cm.lock().len(), 2);
@@ -335,9 +432,17 @@ mod tests {
         let runaway: String = "x".repeat(20 * 1024);
         adapter.queue_text_response(runaway);
 
-        let err = compact(adapter.as_ref(), &sd, ws.path(), &sid, ids, "t")
-            .await
-            .unwrap_err();
+        let err = compact(
+            adapter.as_ref(),
+            &sd,
+            ws.path(),
+            &sid,
+            ids,
+            "t",
+            ModelCostPolicy::LatencyWeighted,
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, CompactionRunError::SummaryTooLarge(_)));
         // Nothing committed: ledger empty, items intact, no blob.
         assert_eq!(ledger.len(), 0);
@@ -359,9 +464,17 @@ mod tests {
 
         adapter.queue_text_response("summary OK");
 
-        let err = compact(adapter.as_ref(), &sd, ws.path(), &sid, ids, "t")
-            .await
-            .unwrap_err();
+        let err = compact(
+            adapter.as_ref(),
+            &sd,
+            ws.path(),
+            &sid,
+            ids,
+            "t",
+            ModelCostPolicy::LatencyWeighted,
+        )
+        .await
+        .unwrap_err();
         // The dispatcher path got far enough to reject — the ModelCall
         // ledger entry + blob have been written (intentional: the user
         // paid for the summary call), but the state mutation aborted.

@@ -288,7 +288,9 @@ fn resolve_token(token: &str) -> Result<String, McpConfigError> {
 ///     doesn't have to remember to gate every iteration on the flag).
 pub fn load_mcp_servers(workspace_root: &Path) -> Result<Vec<McpServerManifest>, McpConfigError> {
     let path = workspace_root.join(".atelier").join(MCP_SERVERS_FILE);
-    let bytes = match std::fs::read(&path) {
+    // v60.37 A2 — cap at 1 MiB so a pathological mcp_servers.json
+    // can't OOM the agent at startup.
+    let bytes = match crate::io_caps::read_capped(&path, crate::io_caps::CAP_MCP_CONFIG) {
         Ok(b) => b,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(McpConfigError::Io { path, source: e }),
@@ -378,7 +380,9 @@ impl McpApprovals {
     /// Load the approvals file. Missing file → empty store (the common
     /// case on first run); malformed file → typed error.
     pub fn load(path: &Path) -> Result<Self, PersistenceError> {
-        match std::fs::read(path) {
+        // v60.37 A2 — cap at 1 MiB so a pathological approvals file
+        // can't OOM the agent at startup.
+        match crate::io_caps::read_capped(path, crate::io_caps::CAP_MCP_CONFIG) {
             Ok(b) => serde_json::from_slice(&b).map_err(|e| PersistenceError::Deserialize {
                 path: path.to_path_buf(),
                 error: e.to_string(),
@@ -414,9 +418,22 @@ impl McpApprovals {
             path: tmp.path().to_path_buf(),
             source: e,
         })?;
+        // v60.37 A1 — full atomic-write discipline: data + metadata
+        // fsync, then atomic rename, then parent-dir fsync. Without
+        // sync_all + fsync_dir, a power loss between persist() and the
+        // next natural fs sync can leave the directory entry in its
+        // pre-rename state on stable storage.
+        tmp.as_file().sync_all().map_err(|e| PersistenceError::Io {
+            path: tmp.path().to_path_buf(),
+            source: e,
+        })?;
         tmp.persist(path).map_err(|e| PersistenceError::Io {
             path: path.to_path_buf(),
             source: e.error,
+        })?;
+        crate::path_safety::fsync_dir(parent).map_err(|e| PersistenceError::Io {
+            path: parent.to_path_buf(),
+            source: e,
         })?;
         Ok(())
     }

@@ -263,16 +263,19 @@ impl ProvidersConfig {
     /// exist; `Ok(Some)` means it parsed cleanly; `Err` means it
     /// exists but is malformed.
     fn try_load_one(path: &Path) -> Result<Option<Self>, ConfigError> {
-        let bytes = match std::fs::read_to_string(path) {
-            Ok(s) => s,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => {
-                return Err(ConfigError::Io {
-                    path: path.to_path_buf(),
-                    source: e,
-                });
-            }
-        };
+        // v60.37 A2 — cap at 1 MiB so a pathologically large providers.toml
+        // (runaway model, hostile commit) can't OOM the agent at startup.
+        let bytes =
+            match crate::io_caps::read_capped_to_string(path, crate::io_caps::CAP_PROVIDERS_TOML) {
+                Ok(s) => s,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => {
+                    return Err(ConfigError::Io {
+                        path: path.to_path_buf(),
+                        source: e,
+                    });
+                }
+            };
         let parsed: Self = toml::from_str(&bytes).map_err(|e| ConfigError::Parse {
             path: path.to_path_buf(),
             message: e.message().to_string(),

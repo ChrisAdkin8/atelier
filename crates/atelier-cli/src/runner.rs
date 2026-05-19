@@ -648,6 +648,21 @@ impl Runner {
         })
     }
 
+    /// v60.37 A3 — public accessor for the runner's [`ModelCostPolicy`]
+    /// so the GUI/TUI compaction commands can pass the same policy into
+    /// [`crate::compaction::compact`] that the runner's main loop uses.
+    /// Without this, off-main-loop compactions silently dropped the
+    /// `LatencyWeighted` attribution for local providers.
+    ///
+    /// `#[allow(dead_code)]`: today only the GUI/TUI driver paths would
+    /// call this through a `Runner` handle, and they go via the helper
+    /// at the call site rather than holding a Runner reference. The
+    /// accessor is exposed for future driver wiring.
+    #[allow(dead_code)]
+    pub fn cost_policy(&self) -> ModelCostPolicy {
+        self.cost_policy
+    }
+
     /// v60.29 H10 — wire a caller-supplied cancellation token so an
     /// external SIGINT/SIGTERM handler can unwind the in-flight run.
     /// `Runner::run` passes it through to `session::spawn_with_cancel_token`;
@@ -1607,6 +1622,10 @@ impl Runner {
                                         &sid_str,
                                         picks.clone(),
                                         &now,
+                                        // v60.37 A3 — propagate the same cost policy
+                                        // the main loop uses so the compaction ModelCall
+                                        // ledger entry is attributed correctly.
+                                        self.cost_policy,
                                     )
                                     .await
                                     {

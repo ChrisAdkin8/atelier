@@ -270,10 +270,15 @@ impl ModelProfile {
     /// [`ProfileError::IncompatibleVersion`] so callers re-probe
     /// rather than trust stale data.
     pub fn load_from(path: &Path) -> Result<Self, ProfileError> {
-        let bytes = std::fs::read(path).map_err(|e| ProfileError::Io {
-            path: path.to_path_buf(),
-            source: e,
-        })?;
+        // v60.37 A2 — cap at 1 MiB; a profile is a single capability
+        // matrix + probe outcome, well under this size legitimately.
+        let bytes =
+            crate::io_caps::read_capped(path, crate::io_caps::CAP_MODEL_PROFILE).map_err(|e| {
+                ProfileError::Io {
+                    path: path.to_path_buf(),
+                    source: e,
+                }
+            })?;
         let profile: Self =
             serde_json::from_slice(&bytes).map_err(|e| ProfileError::Deserialize {
                 path: path.to_path_buf(),

@@ -3081,6 +3081,12 @@ fn submit_compact(
             &session_id,
             ids,
             &now,
+            // v60.37 A3 — TUI demo path uses `LatencyWeighted` so Mock
+            // and local-OpenAI-compat compactions get their local-rate
+            // cost attribution. Cloud-provider compactions in the TUI
+            // are not the cost-accounting surface of record (the
+            // runner's main loop is); this is a best-effort default.
+            atelier_cli::runner::ModelCostPolicy::LatencyWeighted,
         )
         .await;
         if let Err(e) = result {
