@@ -4,6 +4,7 @@
   "title": "Model Protocol overhead measurements",
   "type": "object",
   "required": ["version", "measured_at", "providers"],
+  "additionalProperties": false,
   "properties": {
     "version": {"const": 1, "description": "Schema version."},
     "measured_at": {"type": "string", "format": "date-time"},
@@ -13,6 +14,7 @@
       "items": {
         "type": "object",
         "required": ["provider", "model_id", "strategy", "median_overhead_pct", "conformance_rate"],
+        "additionalProperties": false,
         "properties": {
           "provider": {"type": "string"},
           "model_id": {"type": "string"},
@@ -46,6 +48,7 @@
             "type": "object",
             "description": "Rolling 7-day median of median_overhead_pct, populated by the nightly job from the prior week's runs. Used by the regression check (>10% drift fails the job).",
             "required": ["window_days", "value"],
+            "additionalProperties": false,
             "properties": {
               "window_days": {"type": "integer", "minimum": 1, "description": "Number of days the median was computed over."},
               "value": {"type": "number", "description": "Median value of median_overhead_pct across the window."},

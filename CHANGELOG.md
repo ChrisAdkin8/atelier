@@ -1,5 +1,20 @@
 # Atelier Spec — Changelog
 
+## v60.33 — 2026-05-19 (Schemas / rig / CI hygiene — M07–M14)
+
+Eight medium-severity hygiene items from `tasks/plan_medium_severity_fixes.md`. No Rust code touched; the diff lands in schemas, the rig, and `.github/workflows/`.
+
+- **M07** — `.atelier/sessions/` is now gitignored. New `test_atelier_sessions_is_gitignored` in `tests/test_runner.py` probes via `git check-ignore`.
+- **M08** — `schemas/protocol/overhead.v1.json` carries `additionalProperties: false` everywhere; a new schema-wide sweep in `tests/test_schemas.py::test_every_object_subschema_declares_additional_properties` asserts every object sub-schema that enumerates `properties` declares its `additionalProperties` posture (with documented `if`/`then`/`else` exemptions). A typo'd-field fixture pins the rejection. Three nested cases swept clean: `runner_result.harness`, `mcp_catalog.command_template` (×2), `atelier_meta_sentinel.tokens`.
+- **M09** — `schemas/audit/egress.v1.json` now requires `kind: "model-call"`. The union with `mcp-http-request` + `subprocess-egress` siblings is now mutually exclusive at validation time. New `tests/audit/ambiguous_row.json` fixture pins the rejection across all three sibling schemas.
+- **M10** — `tests/validate_artifacts.py` exits non-zero on unmatched JSON paths inside known artifact roots. A new `# unvalidated:` annotation in the `JSON_RULES` table opts free-form fixtures out (audit rejection probe, canonical fixture inputs, protocol-overhead scenario fixtures).
+- **M11** — `tests/workload/runner/runner.py` switched to argv-list `shell=False` (with `shlex.split` for the string-shaped check commands), `start_new_session=True` for new children, and `os.killpg(..., SIGKILL)` on timeout — matching the v25 P1 discipline in `crates/atelier-core/src/subprocess.rs`. New `test_run_with_pg_timeout_kills_grandchildren` spawns a `sleep 120` grandchild and asserts its pid no longer exists after the parent's timeout.
+- **M12** — All three nightlies (`nightly_phase_a_gate.yml`, `nightly_phase_b_gate.yml`, `nightly_protocol_overhead.yml`) now `git pull --rebase origin main` before push and abort the workflow with `::error::` + `exit 1` on rebase conflict. Each declares `concurrency: { group: nightly-artifact-commits, cancel-in-progress: false }` so the three nightly commits serialise instead of racing the same git ref.
+- **M13** — Every `uses:` across `.github/workflows/*.yml` is SHA-pinned (22 entries, six unique actions). Tags retained in trailing `# vX.Y.Z` comments per the GitHub hardening guide. New `tests/test_ci.py::test_actions_are_sha_pinned` regex-locks the 40-char hex format.
+- **M14** — `.github/workflows/check.yml` declares `permissions: { contents: read }` at the top level. New `tests/test_ci.py::test_every_workflow_has_top_level_permissions` asserts every workflow declares the block explicitly.
+
+New rig dependency `PyYAML>=6.0` (for `tests/test_ci.py`). `tests/test_ci.py` is wired into `make rig-tests` and the per-PR `check.yml` job. Workspace rig totals: 130 rig self-tests (up from 112). Rust gates untouched.
+
 ## v60.32 — 2026-05-19 (Runner correctness + test-seam discipline — M01–M06)
 
 First medium-severity bundle from `tasks/plan_medium_severity_fixes.md`. Six file-disjoint fixes across `crates/atelier-cli/src/{main.rs,runner.rs,lib.rs}`, `crates/atelier-cli/src/bin/conformance_status.rs`, and `crates/atelier-cli/Cargo.toml`.

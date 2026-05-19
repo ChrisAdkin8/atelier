@@ -35,6 +35,10 @@ CLAUDE.md
 # in .atelier/settings.json which is tracked.
 .atelier/settings.local.json
 
+# On-disk session state from local runs (UUID-keyed dirs holding turn logs,
+# partial completions, compaction blobs). Per-user runtime data; never tracked.
+.atelier/sessions/
+
 # direnv per-project shell config. Holds developer-local secrets
 # (ANTHROPIC_API_KEY, OPENAI_API_KEY) that are loaded on `cd` into the
 # repo. NEVER commit — secrets-in-git is an irreversible leak that

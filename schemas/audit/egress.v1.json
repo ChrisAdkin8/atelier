@@ -2,12 +2,16 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://atelier.example/schemas/audit/egress.v1.json",
   "title": "Atelier egress audit log",
-  "description": "One record per remote-model call. Exportable for privacy review.",
+  "description": "One record per remote-model call. Exportable for privacy review. Shares the on-disk `audit.log` with subprocess-egress and MCP-egress rows; discriminated by `kind`.",
   "type": "object",
-  "required": ["version", "timestamp", "provider", "model_id", "content_hash", "redaction_policy_id", "tokens"],
+  "required": ["version", "kind", "timestamp", "provider", "model_id", "content_hash", "redaction_policy_id", "tokens"],
   "additionalProperties": false,
   "properties": {
     "version": {"const": 1, "description": "Schema version."},
+    "kind": {
+      "const": "model-call",
+      "description": "Discriminator. Distinct from `subprocess-egress` and `mcp-http-request` rows sharing the same `audit.log`."
+    },
     "timestamp": {"type": "string", "format": "date-time"},
     "provider": {"type": "string"},
     "model_id": {"type": "string"},

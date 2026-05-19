@@ -49,6 +49,7 @@
                     "type": "object",
                     "description": "Pre-fill for the user's mcp_servers.json entry. Variables like ${repo_root} are documented but not part of the schema.",
                     "required": ["command", "args"],
+                    "additionalProperties": false,
                     "properties": {
                       "command": {"type": "string"},
                       "args": {"type": "array", "items": {"type": "string"}}
@@ -67,6 +68,7 @@
                   "command_template": {
                     "type": "object",
                     "required": ["command"],
+                    "additionalProperties": false,
                     "properties": {
                       "command": {"type": "string"},
                       "args": {"type": "array", "items": {"type": "string"}}

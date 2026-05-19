@@ -37,6 +37,7 @@
               "harness": {
                 "type": "object",
                 "required": ["elapsed_s", "timed_out"],
+                "additionalProperties": false,
                 "properties": {
                   "returncode": {"type": ["integer", "null"]},
                   "elapsed_s": {"type": "number"},

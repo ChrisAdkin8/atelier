@@ -32,7 +32,7 @@ artifacts:
 	$(PY) tests/validate_artifacts.py
 
 rig-tests:
-	$(PY) -m pytest tests/test_schemas.py tests/test_validators.py tests/test_runner.py -q
+	$(PY) -m pytest tests/test_schemas.py tests/test_validators.py tests/test_runner.py tests/test_ci.py -q
 
 dry-run:
 	$(PY) tests/workload/runner/runner.py --task all --dry-run

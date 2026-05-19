@@ -354,3 +354,83 @@ def test_runner_harness_smoke_all_tasks_emit_checks():
             assert chk.get("kind") in ("command", "file_unchanged"), (
                 f"{res['task_id']}: check {chk.get('name')!r} missing kind"
             )
+
+
+def test_run_with_pg_timeout_kills_grandchildren():
+    """M11: a timeout must group-kill the whole subprocess tree, not just the
+    direct child. Parent spawns a long-lived `sleep` grandchild, then hangs; the
+    helper's timeout-path must reap both. We verify by checking the
+    grandchild's PID no longer exists after the helper returns.
+    """
+    import os
+    import platform
+    import time
+    import pytest
+
+    if platform.system() == "Windows":
+        pytest.skip("process-group kill is a Unix discipline")
+    rn = _import_runner()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        pidfile = Path(tmp) / "grandchild.pid"
+        # Parent: spawn long-lived `sleep`, write its pid, then hang.
+        parent = (
+            "import os, subprocess, sys, time, pathlib;\n"
+            f"pidpath = pathlib.Path({str(pidfile)!r});\n"
+            "p = subprocess.Popen(['sleep', '120']);\n"
+            "pidpath.write_text(str(p.pid));\n"
+            "time.sleep(120)\n"
+        )
+        try:
+            rn._run_with_pg_timeout(
+                [sys.executable, "-c", parent], cwd=tmp, timeout_s=1
+            )
+        except subprocess.TimeoutExpired:
+            pass
+        else:
+            raise AssertionError("expected TimeoutExpired")
+
+        deadline = time.monotonic() + 5
+        while not pidfile.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert pidfile.exists(), "grandchild never wrote its pidfile"
+        grandchild_pid = int(pidfile.read_text())
+
+        deadline = time.monotonic() + 5
+        alive = True
+        while time.monotonic() < deadline:
+            try:
+                os.kill(grandchild_pid, 0)
+            except ProcessLookupError:
+                alive = False
+                break
+            time.sleep(0.05)
+        assert not alive, (
+            f"grandchild pid={grandchild_pid} survived the parent's timeout — "
+            "process-group kill leaked"
+        )
+
+
+def test_atelier_sessions_is_gitignored():
+    """`.atelier/sessions/` holds per-user runtime data (UUID-keyed dirs);
+    one `git add .` after a local run must not stage it.
+
+    Probes via `git check-ignore` against a synthetic path inside the dir.
+    Skipped when not in a git work-tree.
+    """
+    in_git = subprocess.run(
+        ["git", "rev-parse", "--is-inside-work-tree"],
+        cwd=ROOT, capture_output=True, text=True,
+    )
+    if in_git.returncode != 0 or in_git.stdout.strip() != "true":
+        import pytest
+        pytest.skip("not inside a git work-tree")
+    probe = ".atelier/sessions/00000000-0000-0000-0000-000000000000/turn_log.jsonl"
+    r = subprocess.run(
+        ["git", "check-ignore", "--no-index", probe],
+        cwd=ROOT, capture_output=True, text=True,
+    )
+    assert r.returncode == 0, (
+        f"expected `.atelier/sessions/` to be gitignored; "
+        f"`git check-ignore {probe}` returned {r.returncode}, stdout={r.stdout!r}"
+    )

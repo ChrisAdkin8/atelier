@@ -58,3 +58,51 @@ def test_validate_schemas_detects_invalid_json(tmp_path):
     ok, msg = mod.check_schema(bad)
     assert not ok
     assert "invalid JSON" in msg
+
+
+def test_validate_artifacts_fails_on_unmatched_path():
+    """M10: an unrecognised JSON path inside an artifact root must exit non-zero.
+
+    Drops a synthetic file two levels deep under `tests/results/` (the
+    `tests/results/*.json` rule only matches depth 1). With no rule
+    covering the path, the validator must fail loud.
+    """
+    scratch_dir = ROOT / "tests" / "results" / "_m10_probe"
+    scratch_file = scratch_dir / "synthetic.json"
+    scratch_dir.mkdir(parents=True, exist_ok=True)
+    scratch_file.write_text("{}")
+    try:
+        r = run(ARTIFACT_VALIDATOR)
+        assert r.returncode != 0, (
+            f"expected non-zero exit on unmatched path; stdout: {r.stdout}"
+        )
+        assert "UNMATCHED" in (r.stdout + r.stderr), (
+            f"expected UNMATCHED diagnostic; stderr: {r.stderr}"
+        )
+        assert "_m10_probe/synthetic.json" in (r.stdout + r.stderr)
+    finally:
+        scratch_file.unlink(missing_ok=True)
+        scratch_dir.rmdir()
+
+
+def test_validate_artifacts_honours_unvalidated_annotation():
+    """M10: the `# unvalidated:` annotation in the rule table opts a glob out
+    of validation cleanly. The live `tests/audit/ambiguous_row.json` fixture is
+    intentionally invalid against every schema; the annotation keeps the
+    validator green and surfaces the file as SKIP, not OK or FAIL.
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("validate_artifacts", ARTIFACT_VALIDATOR)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    fixture_glob = "tests/audit/*.json"
+    rules = [g for g, _, _ in mod.JSON_RULES]
+    assert fixture_glob in rules, (
+        f"expected {fixture_glob} in JSON_RULES; got {rules}"
+    )
+    schema_field = next(s for g, s, _ in mod.JSON_RULES if g == fixture_glob)
+    assert schema_field == mod.UNVALIDATED
+    r = run(ARTIFACT_VALIDATOR)
+    assert r.returncode == 0, f"stderr: {r.stderr}\nstdout: {r.stdout}"
+    assert "SKIP tests/audit/ambiguous_row.json" in r.stdout

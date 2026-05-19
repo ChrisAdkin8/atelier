@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   rig:
     name: rig (${{ matrix.os }})
@@ -14,15 +17,15 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12"
 
       - name: Set up Node (for t11)
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "22"
 
@@ -38,7 +41,7 @@ jobs:
         run: python tests/validate_artifacts.py
 
       - name: Rig self-tests
-        run: pytest tests/test_schemas.py tests/test_validators.py tests/test_runner.py -q
+        run: pytest tests/test_schemas.py tests/test_validators.py tests/test_runner.py tests/test_ci.py -q
 
       - name: Workload dry-run (every task's starting state matches declared expected_starting_returncode)
         run: python tests/workload/runner/runner.py --task all --dry-run --summary
@@ -51,7 +54,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       # Explicitly install the toolchain pinned in rust-toolchain.toml so the
       # download happens once, before any cargo step, and the components
@@ -60,7 +63,7 @@ jobs:
       # major version tag) rather than @stable — `@stable` follows the action's
       # default branch and is a moving target; @v1 is the supported semver pin.
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@v1
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: "1.85.0"
           components: rustfmt, clippy
@@ -88,7 +91,7 @@ jobs:
       # Cache key includes rust-toolchain.toml so a channel bump invalidates the
       # cache. Without it, an old toolchain's target/ artefacts get reused.
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
@@ -116,10 +119,10 @@ jobs:
     name: quality (cargo-audit + cargo-machete)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@v1
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: "1.85.0"
 
@@ -128,7 +131,7 @@ jobs:
       # against our pinned toolchain. cargo-machete pinned to 0.7.0
       # for the same toolchain-compat reason captured in the Makefile.
       - name: Install cargo-audit + cargo-machete
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@b550161ef8a7bc4f2a671c0b03a18ac9ccedea1e # v2.79.1
         with:
           tool: cargo-audit,cargo-machete@0.7.0
 

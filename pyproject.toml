@@ -16,6 +16,7 @@ rig = [
   "jsonschema>=4.0",
   "referencing>=0.35",
   "pytest>=7.0",
+  "PyYAML>=6.0",
 ]
 
 [tool.setuptools]

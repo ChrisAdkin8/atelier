@@ -21,8 +21,11 @@ Exit code: zero iff every task passed.
 import argparse
 import hashlib
 import json
+import os
 import re
+import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -72,11 +75,59 @@ def copy_fixture(src, dst):
     shutil.copytree(src, dst, dirs_exist_ok=True)
 
 
+def _kill_process_group(proc):
+    """SIGKILL the process group on timeout so grandchildren don't leak.
+
+    Mirrors the v25 P1 discipline in `crates/atelier-core/src/subprocess.rs`.
+    `start_new_session=True` sets the child up as its own process-group leader;
+    `os.killpg(os.getpgid(pid), SIGKILL)` then reaps the whole tree. The
+    fallback `proc.kill()` covers Windows (where setsid doesn't apply) and the
+    race where the child has already exited.
+    """
+    if proc.poll() is not None:
+        return
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, OSError, AttributeError):
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
+def _run_with_pg_timeout(argv, *, cwd, timeout_s, stdin_text=None):
+    """`subprocess.run` equivalent that group-kills on timeout.
+
+    Returns either a `subprocess.CompletedProcess`-shaped namespace
+    (`returncode`, `stdout`, `stderr`) or raises `subprocess.TimeoutExpired`
+    after killing the whole process group.
+    """
+    proc = subprocess.Popen(
+        argv,
+        cwd=cwd,
+        stdin=subprocess.PIPE if stdin_text is not None else None,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = proc.communicate(input=stdin_text, timeout=timeout_s)
+        return subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)
+    except subprocess.TimeoutExpired:
+        _kill_process_group(proc)
+        try:
+            stdout, stderr = proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            stdout, stderr = "", ""
+        raise subprocess.TimeoutExpired(argv, timeout_s, output=stdout, stderr=stderr)
+
+
 def run_test_command(workdir, meta, timeout_s=DEFAULT_TEST_COMMAND_TIMEOUT_S):
     cmd = meta.get("test_command", DEFAULT_TEST_COMMAND)
     start = time.monotonic()
     try:
-        result = subprocess.run(cmd, cwd=workdir, capture_output=True, text=True, timeout=timeout_s)
+        result = _run_with_pg_timeout(cmd, cwd=workdir, timeout_s=timeout_s)
         return {
             "returncode": result.returncode,
             "elapsed_s": round(time.monotonic() - start, 3),
@@ -122,7 +173,17 @@ def run_check(check, workdir, fixture_src):
 
     cmd = check["command"]
     expect = check["expect"]
-    result = subprocess.run(cmd, cwd=workdir, capture_output=True, text=True, shell=True)
+    argv = shlex.split(cmd)
+    try:
+        result = _run_with_pg_timeout(argv, cwd=workdir, timeout_s=DEFAULT_TEST_COMMAND_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        return {
+            "name": name,
+            "ok": False,
+            "kind": "command",
+            "exit_code": None,
+            "reason": f"check command timed out after {DEFAULT_TEST_COMMAND_TIMEOUT_S}s",
+        }
     rc = result.returncode
     failures = []
     if "exit_code" in expect and rc != expect["exit_code"]:
@@ -188,11 +249,11 @@ def harness_run(task, harness_cmd, timeout_s):
     with tempfile.TemporaryDirectory(prefix=f"{task['task_id']}_") as tmp:
         copy_fixture(task["fixture"], tmp)
         cmd = harness_cmd.replace("{dir}", tmp)
+        argv = shlex.split(cmd)
         start = time.monotonic()
         try:
-            result = subprocess.run(
-                cmd, input=task["prompt"], shell=True,
-                capture_output=True, text=True, timeout=timeout_s,
+            result = _run_with_pg_timeout(
+                argv, cwd=None, timeout_s=timeout_s, stdin_text=task["prompt"]
             )
             elapsed = round(time.monotonic() - start, 3)
             timed_out = False

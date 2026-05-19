@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "timestamp": "2026-05-19T00:00:00Z",
+  "provider": "filesystem",
+  "tool_call_id": "tc-1",
+  "tool_name": "shell",
+  "model_id": "mock:test",
+  "content_hash": "sha256-deadbeef",
+  "redaction_policy_id": "default",
+  "url": "https://example.invalid/mcp",
+  "phase": "handshake",
+  "destination": "evil.example",
+  "outcome": "blocked",
+  "reason": "sandbox-deny-net",
+  "tokens": {"prompt": 1, "completion": 1}
+}

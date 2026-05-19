@@ -33,6 +33,10 @@ from _schema_helpers import build_schema_registry, validator_for  # noqa: E402
 ROOT = Path(__file__).resolve().parent.parent
 
 # (glob, schema rel-path, description)
+# Sentinel schema `# unvalidated:` opts a glob out of validation. Use only for
+# genuinely free-form artifacts (e.g., intentionally-invalid fixtures used by
+# the schema regression suite). Anything else lands as a non-zero exit per M10.
+UNVALIDATED = "# unvalidated:"
 JSON_RULES = [
     ("tests/workload/canonical/*/meta.json", "schemas/workload/task_meta.v1.json", "task meta"),
     ("tests/workload/canonical/*/checks.json", "schemas/workload/task_checks.v1.json", "task checks"),
@@ -53,6 +57,33 @@ JSON_RULES = [
     ("tests/results/*.json", "schemas/workload/runner_result.v1.json", "runner result"),
     ("tests/phase_a_gate/*.json", "schemas/ci/phase_a_gate.v1.json", "phase A gate result"),
     ("tests/phase_b_gate/*.json", "schemas/ci/protocol_conformance.v1.json", "phase B gate result"),
+    # Intentionally-invalid fixtures consumed by the schema regression suite.
+    ("tests/audit/*.json", UNVALIDATED, "audit fixture (rejection probe)"),
+    # Free-form fixtures: canonical-workload inputs (package.json,
+    # config.json, …) belong to the fixture's own toolchain, not the
+    # harness's schema set; protocol-overhead fixtures are labelled
+    # envelope scenarios consumed by the §2 harness directly.
+    ("tests/workload/canonical/*/fixture/**/*.json", UNVALIDATED, "canonical fixture input"),
+    ("tests/protocol/fixtures/*.json", UNVALIDATED, "protocol overhead fixture"),
+]
+
+# Roots scanned for JSON files that MUST be covered by JSON_RULES (or by the
+# `# unvalidated:` opt-out above). Anything inside these roots that doesn't
+# match any rule's glob is a M10 violation.
+ARTIFACT_ROOTS = [
+    "tests/workload/canonical",
+    "tests/sessions/examples",
+    "tests/baselines",
+    "tests/protocol",
+    "tests/results",
+    "tests/phase_a_gate",
+    "tests/phase_b_gate",
+    "tests/audit",
+    "examples",
+    "crates/atelier-core/tools",
+    "crates/atelier-core/skills",
+    "crates/atelier-core/subagents",
+    "crates/atelier-core/catalog",
 ]
 
 # Markdown files whose fenced ```json blocks should validate against an envelope schema.
@@ -104,6 +135,7 @@ def validate_envelopes_in_markdown(path, validator):
 def main():
     total = 0
     failures = []
+    matched_paths: set[Path] = set()
     registry = build_schema_registry()  # build once; reuse across rules
 
     for glob, schema_rel, desc in JSON_RULES:
@@ -111,9 +143,15 @@ def main():
         if not matches:
             print(f"--   no {desc} files matched {glob}")
             continue
+        if schema_rel == UNVALIDATED:
+            for artifact in matches:
+                matched_paths.add(artifact)
+                print(f"SKIP {artifact.relative_to(ROOT)} ({desc}: unvalidated)")
+            continue
         schema = load_schema(schema_rel)
         validator = validator_for(schema, registry=registry)
         for artifact in matches:
+            matched_paths.add(artifact)
             total += 1
             ok, msg = validate_json_file(artifact, validator, desc)
             rel = artifact.relative_to(ROOT)
@@ -122,6 +160,21 @@ def main():
             else:
                 print(f"FAIL {rel}: {msg}", file=sys.stderr)
                 failures.append((rel, msg))
+
+    # Unmatched-paths gate: every JSON file under ARTIFACT_ROOTS must be
+    # accounted for by JSON_RULES (either validated against a schema or
+    # explicitly tagged `# unvalidated:`). Silent skips were the M10 hazard.
+    unmatched = []
+    for root_rel in ARTIFACT_ROOTS:
+        root = ROOT / root_rel
+        if not root.is_dir():
+            continue
+        for path in sorted(root.rglob("*.json")):
+            if path not in matched_paths:
+                unmatched.append(path.relative_to(ROOT))
+    for rel in unmatched:
+        print(f"UNMATCHED {rel}: no rule in JSON_RULES covers this path", file=sys.stderr)
+        failures.append((rel, "no rule matches; add to JSON_RULES or tag `# unvalidated:`"))
 
     for glob, schema_rel, desc in ENVELOPE_RULES:
         # README files document the directory; they aren't example files.

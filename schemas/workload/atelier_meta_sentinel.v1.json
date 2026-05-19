@@ -11,6 +11,7 @@
     "permission_prompt_count": {"type": "integer", "minimum": 0},
     "tokens": {
       "type": "object",
+      "additionalProperties": false,
       "properties": {
         "prompt": {"type": "integer", "minimum": 0},
         "completion": {"type": "integer", "minimum": 0},

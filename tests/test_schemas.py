@@ -1119,3 +1119,108 @@ def test_session_subagents_field_is_optional():
     # Existing minimal-success-style session without `subagents` still validates.
     doc = _session_skeleton()
     validate_with_registry(schema, doc)
+
+
+# ---- additionalProperties: false sweep across every object sub-schema ----
+
+_CONDITIONAL_KEYS = {"if", "then", "else"}
+
+
+def _iter_object_subschemas(node, path="$", under_conditional=False):
+    """Yield (path, subschema) pairs for every dict that has a `properties` key.
+
+    `if`/`then`/`else` sub-schemas are skipped — they are partial-validation
+    discriminators inside `allOf` and must not set `additionalProperties: false`
+    (it would invalidate any document with more fields than the discriminator).
+    """
+    if isinstance(node, dict):
+        if not under_conditional and "properties" in node and isinstance(node["properties"], dict):
+            yield path, node
+        for key, val in node.items():
+            child_path = f"{path}.{key}"
+            child_under_conditional = under_conditional or key in _CONDITIONAL_KEYS
+            yield from _iter_object_subschemas(val, child_path, child_under_conditional)
+    elif isinstance(node, list):
+        for i, item in enumerate(node):
+            yield from _iter_object_subschemas(item, f"{path}[{i}]", under_conditional)
+
+
+def test_every_object_subschema_declares_additional_properties():
+    """Typos in artifact JSON should be caught by validation, not silently ignored.
+
+    Every object sub-schema that enumerates `properties` must declare its
+    `additionalProperties` posture — either `false` (the default expectation)
+    or an explicit schema/`true` for documented free-form payloads. A *missing*
+    key is the offense; the implicit JSON Schema default is `true`, which lets
+    typos through.
+
+    Discriminator-only sub-schemas (those at `if`/`then`/`else` positions inside
+    `allOf`) are intentionally exempted — adding `additionalProperties: false`
+    there would break the conditional.
+    """
+    offenders = []
+    for schema_path in sorted((ROOT / "schemas").rglob("*.json")):
+        schema = json.loads(schema_path.read_text())
+        for path, sub in _iter_object_subschemas(schema):
+            if "additionalProperties" not in sub:
+                offenders.append(f"{schema_path.relative_to(ROOT)} {path}")
+    assert not offenders, (
+        "object sub-schemas missing `additionalProperties` declaration: "
+        + "; ".join(offenders)
+    )
+
+
+def test_overhead_schema_rejects_typoed_field():
+    schema = load("protocol/overhead.v1.json")
+    bad = {
+        "version": 1,
+        "measured_at": "2026-05-19T00:00:00Z",
+        "providers": [{
+            "provider": "mock",
+            "model_id": "mock:test",
+            "strategy": "native_tool",
+            "median_overhead_pct": 1.0,
+            "conformance_rate": 1.0,
+            "median_overhead_pcnt": 2.0,
+        }],
+    }
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(bad, schema)
+
+
+# ---- audit egress: `kind` discriminator forces mutual-exclusion ----
+
+def test_ambiguous_audit_row_rejected_by_every_sibling():
+    """Fixture is shaped like a union of all three audit row variants.
+
+    Once `kind` is a required `const` on each sibling schema, the row must be
+    rejected by ALL THREE — its missing/wrong `kind` means it satisfies none.
+    Before M09, the row would silently validate against `egress.v1.json`
+    (no `kind` requirement there) even while looking like a subprocess egress.
+    """
+    row = json.loads((ROOT / "tests" / "audit" / "ambiguous_row.json").read_text())
+    for schema_rel in (
+        "audit/egress.v1.json",
+        "audit/subprocess_egress.v1.json",
+        "audit/mcp_egress.v1.json",
+    ):
+        schema = load(schema_rel)
+        with pytest.raises(jsonschema.ValidationError):
+            jsonschema.validate(row, schema)
+
+
+def test_model_call_egress_row_requires_kind():
+    schema = load("audit/egress.v1.json")
+    without_kind = {
+        "version": 1,
+        "timestamp": "2026-05-19T00:00:00Z",
+        "provider": "anthropic",
+        "model_id": "anthropic:claude-haiku-4-5",
+        "content_hash": "sha256-abc",
+        "redaction_policy_id": "default",
+        "tokens": {"prompt": 1, "completion": 1},
+    }
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(without_kind, schema)
+    with_kind = dict(without_kind, kind="model-call")
+    jsonschema.validate(with_kind, schema)
