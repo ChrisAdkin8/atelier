@@ -173,7 +173,6 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             ping,
-            submit_approval,
             start_demo_run,
             // v60.43 — pure chat path (no Runner, no tools, no §3 staging).
             start_chat_run,
@@ -221,88 +220,6 @@ pub fn run() {
 #[tauri::command]
 fn ping() -> &'static str {
     "pong"
-}
-
-/// v56 — wire-format file decision the webview sends on
-/// `submit_approval`. Mirrors `atelier_core::staging::FileApproval`.
-#[derive(serde::Deserialize, Debug)]
-#[serde(tag = "mode", rename_all = "lowercase")]
-pub enum FileApprovalWire {
-    /// Commit every staged byte for this file.
-    All,
-    /// Commit only the listed hunk indices. Empty list = drop.
-    Hunks { indices: Vec<u32> },
-}
-
-impl FileApprovalWire {
-    fn into_core(self) -> atelier_core::staging::FileApproval {
-        match self {
-            Self::All => atelier_core::staging::FileApproval::All,
-            Self::Hunks { indices } => atelier_core::staging::FileApproval::Hunks(
-                indices.into_iter().map(|i| i as usize).collect(),
-            ),
-        }
-    }
-}
-
-/// Spec §3 hunk accept/reject — frontend bridge. Routed to the
-/// live `SessionDispatcher` via the `DispatcherHandle` in
-/// `SessionState`. Returns `false` when there's no active run
-/// (`start_demo_run` hasn't been called) or when `commit_id` doesn't
-/// match an outstanding pending (already approved / dispatcher torn
-/// down).
-///
-/// v56: `selection` carries per-path decisions (and per-hunk indices
-/// for `Hunks::Lines` files); a path absent from the map is fully
-/// rejected.
-/// v57 (L cleanup) — defence-in-depth on the Tauri boundary. Pre-v57
-/// the path keys flowed straight to `PathBuf::from` and the staging
-/// layer rejected absolute / `..` paths later. Rejecting at the
-/// boundary makes the failure mode clearer in the IPC layer's logs.
-fn is_safe_repo_relative(p: &str) -> bool {
-    if p.is_empty() {
-        return false;
-    }
-    let path = std::path::Path::new(p);
-    if path.is_absolute() {
-        return false;
-    }
-    path.components()
-        .all(|c| !matches!(c, std::path::Component::ParentDir))
-}
-
-#[tauri::command]
-fn submit_approval(
-    state: tauri::State<'_, SessionState>,
-    commit_id: String,
-    selection: std::collections::HashMap<String, FileApprovalWire>,
-) -> bool {
-    let Ok(parsed_id) = uuid::Uuid::parse_str(&commit_id) else {
-        tracing::warn!(commit_id, "submit_approval: malformed commit_id");
-        return false;
-    };
-    // v57 (L cleanup) — reject absolute / `..`-containing path keys
-    // at the IPC boundary. The staging layer rejects them later
-    // anyway; doing it here means the log line names the actual
-    // problem and dispatch never sees a hostile selection map.
-    for k in selection.keys() {
-        if !is_safe_repo_relative(k) {
-            tracing::warn!(path = %k, "submit_approval: rejecting unsafe path key");
-            return false;
-        }
-    }
-    let Some(sd) = state.dispatcher_handle.get() else {
-        tracing::warn!(
-            commit_id,
-            "submit_approval: no active dispatcher (start_demo_run not running?)"
-        );
-        return false;
-    };
-    let core_selection: atelier_core::staging::HunkSelection = selection
-        .into_iter()
-        .map(|(p, fa)| (std::path::PathBuf::from(p), fa.into_core()))
-        .collect();
-    sd.submit_approval(parsed_id, core_selection)
 }
 
 /// v61 — §14 concurrent-edit modal resolver. Surfaced from the

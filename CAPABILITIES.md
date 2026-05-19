@@ -35,7 +35,7 @@ Atelier is one engine with three faces:
 
 - **`atelier` CLI** — `cargo run -p atelier-cli -- run "<prompt>"`. Headless, scriptable, great for one-shot prompts and CI workloads.
 - **TUI** — terminal app built on ratatui. Three panes (conversation, context/memory/plan, diff), scrubber-style history, full keyboard discipline. Good fit when you live in tmux.
-- **GUI** — Tauri 2 + Svelte 5 desktop app. Same three panes plus inline Mermaid / image rendering, drag-and-drop plan reorder, hunk-level diff acceptance with finger-paint precision.
+- **GUI** — Tauri 2 + Svelte 5 desktop app. Chat-REPL mode: Composer talks directly to the adapter, with the same three side-panels (Context, Memory, Plan), inline Mermaid / image rendering, and drag-and-drop plan reorder.
 
 The CLI, TUI, and GUI all consume the same `atelier-core` engine through a broadcast event channel. Whatever surface you prefer, the underlying behaviour is the same.
 
@@ -49,8 +49,8 @@ The CLI, TUI, and GUI all consume the same `atelier-core` engine through a broad
    - Call one or more built-in tools (`read_file`, `list_dir`, `grep`, `ast_grep`, `write_file`, `edit_file`, `shell`).
    - Call any MCP-registered external tool.
 3. **The dispatcher runs tool calls in a sandbox.** Filesystem reads are confined to the repo (symlink escapes are rejected); writes stage into a per-session staging area first. Network egress from the `shell` tool is denied by default; every blocked attempt is audited.
-4. **Edits land in the staging area.** Before anything hits your real working tree, you see the proposed change in the diff pane. The model's own rationale ("Why this change?") sits next to each diff — drawn from its `claimed_changes` envelope.
-5. **You accept or reject — per hunk in the GUI, per file in the TUI.** Accepted hunks atomically apply to disk; rejected hunks vanish. The accept path runs symlink-containment + per-file size checks again at commit time so a race between staging and apply can't escape the workspace.
+4. **Edits land in the staging area.** Before anything hits your real working tree, you see the proposed change in the diff pane (TUI). The model's own rationale ("Why this change?") is drawn from its `claimed_changes` envelope.
+5. **You accept or reject — per file in the TUI.** Accepted hunks atomically apply to disk; rejected hunks vanish. The accept path runs symlink-containment + per-file size checks again at commit time so a race between staging and apply can't escape the workspace.
 6. **Verification fires.** Atelier checks that the changes actually match what the model claimed (did-it-do-what-it-said). Mismatches surface as `VerificationFailed` events.
 7. **The turn ledger updates.** Token counts, latency, and (for local providers) latency-weighted cost land in the cost meter.
 
@@ -128,7 +128,7 @@ Each hook needs explicit first-use approval, persisted to `.atelier/hook_approva
 
 ## Skills (§15)
 
-Skills are named slash-invoked prompt expansions. The harness ships 14 bundled (`/review`, `/security-review`, `/test`, `/explain`, `/fix`, `/document`, `/refactor`, `/optimize`, `/commit`, `/changelog`, `/audit`, `/spec`, `/sweep`, `/scan`) and you can override or add new ones in `~/.atelier/skills/` (your scope) or `<workspace>/.atelier/skills/` (per-repo, checked into git).
+Skills are named slash-invoked prompt expansions. The harness ships 19 bundled (`/review`, `/security-review`, `/test`, `/explain`, `/fix`, `/document`, `/refactor`, `/optimize`, `/commit`, `/changelog`, `/audit`, `/spec`, `/sweep`, `/scan`, `/plan`, `/diagram`, `/triage`, `/release`, `/document-sweep`) and you can override or add new ones in `~/.atelier/skills/` (your scope) or `<workspace>/.atelier/skills/` (per-repo, checked into git).
 
 Typing `/review` in the GUI Composer (or `atelier run /review` on the CLI) expands the skill's `prompt_template` with `${arg}` substitution and routes the expanded text as the next user turn. The §2.5 agent loop runs unchanged — skills are a prompt-expansion layer, not a new transport. Cost-ledger discipline: every skill invocation is annotated as `note: "skill: <name>"` on the next `model_call` ledger entry.
 
@@ -145,9 +145,24 @@ The proactive-trigger surface (model self-suggests a skill via the §9 uncertain
 
 ---
 
-## Sub-agent delegation (contract only today)
+## Sub-agent delegation (§10.1)
 
-The §10.1 surface for spawning specialised sub-agents (researcher, test-runner, general-purpose, code-reviewer) is locked in via the bundled `spawn_subagent` tool. The schemas, manifests, and session-state slots all exist; the runtime that actually launches a sub-agent and gathers its findings lands in Phase D/E.
+The `spawn_subagent` built-in tool lets a parent agent delegate work to a specialised sub-agent. The harness materialises a fresh §2.5 state machine for the sub-agent, runs it to completion within its own turn budget, and returns the result as a single tool-result message back to the parent — so the parent's conversation stays clean.
+
+Three sub-agent types are bundled: `researcher`, `test-runner`, `general-purpose`. You can override or add new types in `~/.atelier/subagents/` or `<workspace>/.atelier/subagents/`.
+
+```
+# Prompt with spawn intent — the model issues spawn_subagent when it wants to delegate
+atelier run --provider anthropic --model anthropic:claude-opus-4-7 \
+    "research the async-trait crate and summarise its limitations"
+```
+
+Key constraints:
+- **Recursion depth cap = 3** (PROVISIONAL, spec §10 line 556). A depth-4 spawn is rejected with `ToolError::SchemaViolation`.
+- Sub-agent cost and turn count are recorded in `session.json` under the `subagents` map with typed fields (`status`, `result`, `turns_used`, `prompt_tokens`, `completion_tokens`, `cached_tokens`).
+- The parent's §7 verification gate runs only *after* all spawned sub-agents have terminated (spec line 548).
+
+Deferred: GUI sub-agent card, TUI sub-agent line, §4 time-travel checkpointing of sub-agent state, and the explicit trust-budget `reconcile_subagent` helper (spec line 550).
 
 ---
 

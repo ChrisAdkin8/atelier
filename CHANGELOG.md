@@ -1,5 +1,77 @@
 # Atelier Spec — Changelog
 
+## v60.59 — 2026-05-19 (GUI dead-code sweep — remove orphaned DiffPane / submit_approval remnants)
+
+The v60.43 chat-REPL pivot removed the DiffPane component from App.svelte but left several artefacts in place. This version completes the cleanup.
+
+### Removed
+
+- **`crates/atelier-gui/ui/src/lib/components/DiffPane.svelte`** (549 lines) — deleted. The component was never imported or mounted after the v60.43 pivot.
+- **`crates/atelier-gui/ui/src/lib/state.ts`**:
+  - Types `Hunks`, `Hunk`, `LineRange`, `StagedEdit`, `PendingApprovalFile`, `PendingApproval`.
+  - Constant `MAX_DIFF_HISTORY`.
+  - `AppState` fields `editStagedCount`, `recentEdits`, `pendingApproval`, `claimedChanges`.
+  - `applyEvent` cases `EditStaged`, `StagingPendingApproval`, `CommitDecision`, `ClaimedChanges`.
+  - `projectEvent` arms for the same four variants.
+  - Stale comments referencing `DiffPane.svelte`.
+- **`crates/atelier-gui/src/lib.rs`**:
+  - `submit_approval` Tauri command removed from the invoke handler and its implementation.
+  - `FileApprovalWire` enum and `into_core` impl.
+  - `is_safe_repo_relative` helper (was only called by `submit_approval`).
+
+### Verification
+
+`cargo build -p atelier-gui` — clean. `npm run check` in `crates/atelier-gui/ui` — 0 errors, 1 pre-existing a11y warning.
+
+## v60.56–v60.58 — 2026-05-19 (§10.1 Sub-agent delegation — full runtime implementation)
+
+Closes §10.1 "delegation mode": a parent agent can now invoke the built-in `spawn_subagent` tool and the harness materialises a fresh §2.5 state machine, runs it to completion, and returns the result as a single tool-result message back to the parent. The contract was locked since v60.13; this bundle delivers the executor.
+
+### `crates/atelier-core/src/subagents.rs` (new)
+
+- `SubagentTypeRegistry::load(repo_root, home_dir)` — three-layer walk: bundled JSON manifests (`include_str!`) → `~/.atelier/subagents/*.json` → `<repo>/.atelier/subagents/*.json`; later wins on name collision. Each manifest is schema-validated against `schemas/config/subagent_type.v1.json` before insertion.
+- `SubagentSpawner` async trait (`spawn`, `cancel`, `wait_all`) — the IoC seam that lets `atelier-core` declare the interface without depending on `atelier-cli`'s Runner.
+- Supporting types: `SubagentId`, `SpawnRequest`, `SpawnError`, `CancelError`, `SubagentResult`, `SubagentStatus`, `SubagentCost`.
+- Constants: `DEFAULT_MAX_TURNS = 25`, `RECURSION_DEPTH_CAP = 3` (spec §10 lines 521 + 556 PROVISIONAL).
+
+### `crates/atelier-core/src/tools/spawn_subagent.rs` (new — 8th built-in)
+
+- Implements the `spawn` and `cancel` `oneOf` shapes from `spawn_subagent.v1.json`.
+- `ToolContext::subagent_depth` check: `depth >= RECURSION_DEPTH_CAP` → `ToolError::SchemaViolation` before the spawner is even called.
+- `BuiltinDeps { spawner: Arc<dyn SubagentSpawner>, type_registry: Arc<SubagentTypeRegistry> }` — injected at `register_builtins` time; replaces the old `built_in_registry()` no-arg helper.
+- 5 unit tests: happy path, unknown subagent type, depth cap, cancel, oneOf invalid shape.
+
+### `crates/atelier-core/src/persistence.rs`
+
+- `subagents: Option<serde_json::Value>` placeholder replaced by `subagents: BTreeMap<String, PersistedSubagent>`.
+- New `PersistedSubagent` struct with typed fields: `subagent_type`, `description`, `status`, `result`, `turns_used`, `prompt_tokens`, `completion_tokens`, `cached_tokens`, `cost_usd`.
+
+### `crates/atelier-cli/src/subagent_spawner.rs` (new)
+
+- `RunnerSpawner` — production impl of `SubagentSpawner`. `spawn()` builds a child `Runner` via `ProviderChoice::Mock { responses: vec![] }` then `.with_adapter(parent_adapter.clone())` so parent and child share the same `Arc<dyn Adapter>` (responses consumed in FIFO order). Awaits the child inline (spec: tool call blocks until sub-agent finishes).
+- `CompletedSubagentRecord { description, subagent_type_name, result }` accumulated in a `Mutex<Vec<_>>` and drained by the parent runner after each `run()` for persistence into `session.json`.
+- `cancel()` trips the child `CancellationToken` and aborts the `JoinHandle`.
+- `wait_all()` drains the in-flight map and joins every handle.
+
+### `crates/atelier-cli/src/runner.rs`
+
+- `run()` constructs `SubagentTypeRegistry` + `RunnerSpawner` + `BuiltinDeps` and passes them to `register_builtins`.
+- After the §2.5 loop exits, drains `spawner.drain_completed()` and writes each record into `snapshot.subagents`.
+- WU-7 (v60.57): `spawner.wait_all()` called before the §7 verification gate, satisfying spec line 548.
+
+### `crates/atelier-cli/tests/run_integration.rs` (v60.58)
+
+- `subagent_delegation_end_to_end` — spec §10 line 568 acceptance gate. Scripts parent with a `spawn_subagent` tool call and a `harness_meta(claimed_done=true)` call; scripts child with one `harness_meta(claimed_done=true)` call. Asserts parent sees one tool-result message, session.json `subagents` map has one completed entry, sub-agent intermediate turns absent from parent conversation.
+- `subagent_depth_cap_surfaces_as_tool_error` — depth-4 attempt returns `ToolError::SchemaViolation` (spec §10 line 556).
+
+### Deferred
+
+- **WU-6** — cost ledger rollup + trust-budget `reconcile_subagent` helper. The sub-agent's cost is already recorded in `SubagentCost` and persisted; the explicit `TrustBudget::reconcile_subagent` semantics from spec line 550 are a focused follow-up.
+- **WU-10/11/12** — GUI sub-agent card, TUI sub-agent line, §4 time-travel checkpointing.
+- Rig test `test_subagent_field_validates` — Mock-driven end-to-end that asserts the session JSON validates against `schemas/session/v1.json` with the `subagents` map populated.
+
+---
+
 ## v60.50–v60.55 — 2026-05-19 (§15 Skills — bundled-manifest catalogue + slash interception across CLI / GUI / TUI, plus GUI polish)
 
 The §15 Skills surface lands end-to-end: an `atelier-core::skills` module that loads + override-resolves manifests, slash-command interception in the CLI runner + binary, a Tauri `list_skills`/`invoke_skill` pair + Composer autocomplete in the GUI, and a `skills_completion` state machine in the TUI. The bundled catalogue grows from 3 (`/review`, `/security-review`, `/test`) to 19, adding the cross-harness staples + atelier-specific shortcuts the changelog history begged for, plus a second wave of higher-leverage skills surfaced after the foundation landed.

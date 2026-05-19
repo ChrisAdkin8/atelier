@@ -29,28 +29,6 @@ export type ConversationLine = {
   text: string
 }
 
-// Mirror of `atelier_core::diff::Hunks`. Serde tag is `kind`.
-export type Hunks =
-  | { kind: 'same' }
-  | { kind: 'binary' }
-  | { kind: 'created'; new_byte_len: number; new_line_count: number }
-  | { kind: 'deleted'; old_byte_len: number; old_line_count: number }
-  | { kind: 'lines'; hunks: Hunk[] }
-
-export type Hunk = {
-  old_range: LineRange
-  new_range: LineRange
-  old_lines: string[]
-  new_lines: string[]
-}
-
-export type LineRange = { start: number; end: number }
-
-export type StagedEdit = {
-  path: string
-  hunks: Hunks
-}
-
 export type PlanStatus = 'pending' | 'in_progress' | 'done' | 'skipped'
 
 export type PlanStep = {
@@ -93,27 +71,12 @@ export const DEFAULT_CONTEXT_WINDOW_TOKENS = 200_000
 /// `MAX_CONVERSATION_LINES`.
 export const MAX_CONVERSATION_LINES = 1_000
 
-/// Cap on remembered staged-edit history. Matches `MAX_DIFF_HISTORY`.
-export const MAX_DIFF_HISTORY = 16
-
 /// Cap on the raw event log (newest-last). Matches `MAX_EVENT_LOG`.
 export const MAX_EVENT_LOG = 1_000
 
 export type EventLogEntry = {
   kind: string
   detail: string
-}
-
-/// One pending file in a `StagingPendingApproval` event.
-export type PendingApprovalFile = {
-  path: string
-  hunks: Hunks
-}
-
-/// Spec §3 pending hunk-approval state.
-export type PendingApproval = {
-  commitId: string
-  files: PendingApprovalFile[]
 }
 
 /// v53 — one row in the §5 Context panel. Mirror of
@@ -259,9 +222,7 @@ export type CurrentModel = {
 export type AppState = {
   events: EventLogEntry[]
   currentState: string
-  editStagedCount: number
   conversation: ConversationLine[]
-  recentEdits: StagedEdit[]
   planSteps: PlanStep[]
   totalCostUsd: number
   contextTokens: { known: number; unknown: number }
@@ -270,11 +231,6 @@ export type AppState = {
   // Phase D §4 owns the actual time-travel machinery; the GUI just
   // records intent the same way the TUI does.
   scrubOffset: number | null
-  /// Outstanding hunk approval. `null` when no commit is awaiting
-  /// user decision; populated by `StagingPendingApproval`, cleared by
-  /// `CommitDecision`. See `DiffPane.svelte` for the buttons that
-  /// invoke the `submit_approval` Tauri command.
-  pendingApproval: PendingApproval | null
   /// v52 — active BYOM model. See [`CurrentModel`].
   currentModel: CurrentModel | null
   /// v53 — §5 Context panel rows. Replaced wholesale on each
@@ -286,11 +242,6 @@ export type AppState = {
   /// `ContextItems`. Distinct from context items: cards are
   /// durable across sessions; context items are per-turn.
   memoryCards: MemoryCardSummary[]
-  /// v56 — per-file rationale from the envelope's `claimed_changes`,
-  /// keyed by repo-relative path. The DiffPane renders this next to
-  /// the file header so the user can see the agent's stated "why".
-  /// Wholesale-replaced on each `ClaimedChanges` event.
-  claimedChanges: Record<string, string>
   /// Phase C close — §5 mental-model panel state. Hydrated by an
   /// initial `snapshot_mental_model` Tauri call (App.svelte) and
   /// updated by `MentalModelSnapshot` events from the bus. Defaults
@@ -336,19 +287,15 @@ export function initialState(): AppState {
   return {
     events: [],
     currentState: '',
-    editStagedCount: 0,
     conversation: [],
-    recentEdits: [],
     planSteps: [],
     totalCostUsd: 0,
     contextTokens: { known: 0, unknown: 0 },
     contextWindowTokens: DEFAULT_CONTEXT_WINDOW_TOKENS,
     scrubOffset: null,
-    pendingApproval: null,
     currentModel: null,
     contextItems: [],
     memoryCards: [],
-    claimedChanges: {},
     mentalModel: initialMentalModel(),
     concurrentEditModal: null,
     pendingSwap: null,
@@ -396,12 +343,6 @@ export function applyEvent(state: AppState, evt: BridgedEvent): AppState {
   const events = pushBounded(state.events, logged, MAX_EVENT_LOG)
 
   switch (evt.kind) {
-    case 'EditStaged': {
-      const p = evt.payload as { path: string; hunks: Hunks }
-      const edit: StagedEdit = { path: p.path, hunks: p.hunks }
-      const recentEdits = [edit, ...state.recentEdits].slice(0, MAX_DIFF_HISTORY)
-      return { ...state, events, editStagedCount: state.editStagedCount + 1, recentEdits }
-    }
     case 'Transitioned': {
       const p = evt.payload as { from: string; to: string }
       return { ...state, events, currentState: p.to }
@@ -436,19 +377,6 @@ export function applyEvent(state: AppState, evt: BridgedEvent): AppState {
         contextTokens: { known: p.known_tokens, unknown: p.unknown_tokens },
       }
     }
-    case 'StagingPendingApproval': {
-      const p = evt.payload as { commit_id: string; files: { path: string; hunks: Hunks }[] }
-      const pending: PendingApproval = {
-        commitId: p.commit_id,
-        files: (p.files ?? []).map((f) => ({ path: f.path, hunks: f.hunks })),
-      }
-      return { ...state, events, pendingApproval: pending }
-    }
-    case 'CommitDecision': {
-      // The dispatcher resolved the pending — clear it. Per-file
-      // EditStaged events for the committed paths arrive separately.
-      return { ...state, events, pendingApproval: null }
-    }
     case 'ModelProfileLoaded': {
       const p = evt.payload as {
         model_id: string
@@ -477,19 +405,6 @@ export function applyEvent(state: AppState, evt: BridgedEvent): AppState {
       // v54 — same wholesale-replace policy as ContextItems.
       const p = evt.payload as { cards: MemoryCardSummary[] }
       return { ...state, events, memoryCards: p.cards ?? [] }
-    }
-    case 'ClaimedChanges': {
-      // v56 — wholesale-replace the path→rationale map. The DiffPane
-      // reads this to render the agent's "why this change?" summary
-      // next to the file header.
-      const p = evt.payload as {
-        changes: { path: string; kind: string; summary: string }[]
-      }
-      const map: Record<string, string> = Object.create(null)
-      for (const c of p.changes ?? []) {
-        map[c.path] = c.summary
-      }
-      return { ...state, events, claimedChanges: map }
     }
     case 'MentalModelSnapshot': {
       // Phase C close — refresh the enabled/text_tokens fields from
@@ -783,17 +698,6 @@ export function projectEvent(evt: BridgedEvent): EventLogEntry {
         detail: `known=${p.known_tokens} unknown=${p.unknown_tokens}`,
       }
     }
-    case 'StagingPendingApproval': {
-      const p = evt.payload as { files: unknown[] }
-      const n = Array.isArray(p.files) ? p.files.length : 0
-      return { kind, detail: `${n} files awaiting approval` }
-    }
-    case 'CommitDecision': {
-      const p = evt.payload as { committed: unknown[]; dropped: unknown[] }
-      const c = Array.isArray(p.committed) ? p.committed.length : 0
-      const d = Array.isArray(p.dropped) ? p.dropped.length : 0
-      return { kind, detail: `committed=${c} dropped=${d}` }
-    }
     case 'Transitioned': {
       const p = evt.payload as { from: string; to: string }
       return { kind, detail: `${p.from} → ${p.to}` }
@@ -801,10 +705,6 @@ export function projectEvent(evt: BridgedEvent): EventLogEntry {
     case 'IllegalTransitionAttempted': {
       const p = evt.payload as { from: string; to: string }
       return { kind, detail: `${p.from} ↛ ${p.to}` }
-    }
-    case 'EditStaged': {
-      const p = evt.payload as { path: string }
-      return { kind, detail: p.path }
     }
     case 'ModelProfileLoaded': {
       const p = evt.payload as { model_id: string; strategy: string; outcome: string }
@@ -822,11 +722,6 @@ export function projectEvent(evt: BridgedEvent): EventLogEntry {
       const p = evt.payload as { cards?: unknown[] }
       const n = Array.isArray(p.cards) ? p.cards.length : 0
       return { kind, detail: `${n} cards` }
-    }
-    case 'ClaimedChanges': {
-      const p = evt.payload as { changes?: unknown[] }
-      const n = Array.isArray(p.changes) ? p.changes.length : 0
-      return { kind, detail: `${n} file rationale(s)` }
     }
     case 'MentalModelSnapshot': {
       const p = evt.payload as { enabled?: boolean; text_tokens?: number }
