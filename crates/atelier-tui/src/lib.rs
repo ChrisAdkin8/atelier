@@ -758,7 +758,13 @@ impl AppState {
             // lines; no AppState mutation here.
             | SessionEvent::AdapterSwapPending { .. }
             | SessionEvent::AdapterSwapRejected { .. }
-            | SessionEvent::Shutdown => {}
+            | SessionEvent::Shutdown
+            // §10 sub-agent events — rendered as log lines; dedicated pane wired in WU-11
+            | SessionEvent::SubagentSpawned { .. }
+            | SessionEvent::SubagentTurnAdvanced { .. }
+            | SessionEvent::SubagentToolCall { .. }
+            | SessionEvent::SubagentCompleted { .. }
+            | SessionEvent::SubagentCancelled { .. } => {}
         }
         self.events.push(line);
         if self.events.len() > MAX_EVENT_LOG {
@@ -1092,6 +1098,21 @@ pub fn project_event(evt: &SessionEvent) -> EventLine {
             format!("{language}: {}", outcome.wire_label())
         }
         SessionEvent::Shutdown => String::new(),
+        SessionEvent::SubagentSpawned { id, subagent_type, description, .. } => {
+            format!("[subagent] spawned {id} ({subagent_type}): {description}")
+        }
+        SessionEvent::SubagentTurnAdvanced { id, turn, max_turns } => {
+            format!("[subagent] {id} turn {turn}/{max_turns}")
+        }
+        SessionEvent::SubagentToolCall { id, tool } => {
+            format!("[subagent] {id} → {tool}")
+        }
+        SessionEvent::SubagentCompleted { id, status, turns_used } => {
+            format!("[subagent] {id} {status} ({turns_used} turns)")
+        }
+        SessionEvent::SubagentCancelled { id, reason } => {
+            format!("[subagent] {id} cancelled: {reason}")
+        }
     };
     EventLine { kind, detail }
 }

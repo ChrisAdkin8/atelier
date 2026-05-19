@@ -27,6 +27,9 @@
 // migrating tests off the module path) is a one-line change.
 pub mod runner;
 
+/// §10 — [`SubagentSpawner`] implementation backed by `Runner`.
+pub mod subagent_spawner;
+
 /// v60 — shared "promote a memory card to disk" writer. Both
 /// drivers (GUI Tauri command + TUI mutation handler) route through
 /// here so the v58/v59 hardening (HOME validation, canonical-root

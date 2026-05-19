@@ -48,6 +48,9 @@ mod instrumentation;
 #[allow(dead_code)]
 #[path = "../src/runner.rs"]
 mod runner;
+#[allow(dead_code)]
+#[path = "../src/subagent_spawner.rs"]
+mod subagent_spawner;
 
 use runner::{EventSink, MockResponse, ProviderChoice, Runner};
 

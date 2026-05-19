@@ -68,6 +68,7 @@ pub mod grep;
 pub mod list_dir;
 pub mod read_file;
 pub mod shell;
+pub mod spawn_subagent;
 pub mod write_file;
 
 pub use builtin_wrapper::{BuiltInToolWrapper, BuiltInWrapError};
@@ -75,20 +76,22 @@ pub use builtin_wrapper::{BuiltInToolWrapper, BuiltInWrapError};
 use std::sync::Arc;
 
 use crate::dispatcher::{RegisterError, Tool, ToolRegistry};
+use crate::subagents::{SubagentSpawner, SubagentTypeRegistry};
 
-/// Bundled-manifest set for the seven built-in tools. Each `(name,
+/// Runtime dependencies required by tools that need late-bound state at
+/// registration time. Today only `spawn_subagent` uses this; the seven
+/// static built-ins construct their executors with `Arc::new(<Type>)`.
+pub struct BuiltinDeps {
+    pub spawner: Arc<dyn SubagentSpawner>,
+    pub type_registry: Arc<SubagentTypeRegistry>,
+}
+
+/// Bundled-manifest set for the seven static built-in tools. Each `(name,
 /// manifest_json, executor_ctor)` row lives in lockstep with
 /// `crates/atelier-core/tools/*.v1.json` and the corresponding module
 /// in this directory. A manifest/impl name drift is caught at startup
 /// by [`BuiltInToolWrapper::from_manifest_json`] (returns
 /// [`BuiltInWrapError::NameMismatch`]).
-///
-/// `spawn_subagent.v1.json` exists in the manifest set but its Rust
-/// `Tool` impl hasn't landed yet (§10 delegation work) — registering a
-/// wrapper without an executor would surface as `MethodNotFound` at
-/// dispatch time, so we leave it out of the table until the impl
-/// arrives. The manifest's existence on disk is a forward-looking
-/// surface contract for the §10 work, not a current registration.
 fn builtin_table() -> Vec<(&'static str, &'static str, Arc<dyn Tool>)> {
     vec![
         (
@@ -174,6 +177,7 @@ pub enum RegisterBuiltinsError {
 /// recorded as a `ServerFailure`).
 pub fn register_builtins(
     registry: &mut ToolRegistry,
+    deps: Option<BuiltinDeps>,
 ) -> Result<RegisterBuiltinsReport, RegisterBuiltinsError> {
     let mut report = RegisterBuiltinsReport::default();
     for (name, manifest_json, inner) in builtin_table() {
@@ -192,6 +196,33 @@ pub fn register_builtins(
             })?;
         report.tools_registered.push(name.to_string());
     }
+
+    // §10 spawn_subagent — registered only when runtime deps are supplied.
+    // Callers that haven't wired a SubagentSpawner (e.g. bare unit tests)
+    // pass `None` and get the original 7-tool set.
+    if let Some(d) = deps {
+        let name = "spawn_subagent";
+        let inner = Arc::new(spawn_subagent::SpawnSubagent::new(
+            d.spawner,
+            d.type_registry,
+        ));
+        let wrapper = BuiltInToolWrapper::from_manifest_json(
+            include_str!("../../tools/spawn_subagent.v1.json"),
+            inner,
+        )
+        .map_err(|source| RegisterBuiltinsError::Wrap {
+            name: name.to_string(),
+            source,
+        })?;
+        registry
+            .register(Arc::new(wrapper))
+            .map_err(|source| RegisterBuiltinsError::Register {
+                name: name.to_string(),
+                source,
+            })?;
+        report.tools_registered.push(name.to_string());
+    }
+
     Ok(report)
 }
 
@@ -206,7 +237,7 @@ mod register_tests {
     #[test]
     fn register_builtins_registers_all_seven_with_correct_metadata() {
         let mut registry = ToolRegistry::new();
-        let report = register_builtins(&mut registry).expect("register");
+        let report = register_builtins(&mut registry, None).expect("register");
         assert_eq!(
             report.tools_registered,
             vec![
@@ -239,8 +270,8 @@ mod register_tests {
     #[test]
     fn register_builtins_is_idempotent_only_once() {
         let mut registry = ToolRegistry::new();
-        register_builtins(&mut registry).unwrap();
-        let err = register_builtins(&mut registry).unwrap_err();
+        register_builtins(&mut registry, None).unwrap();
+        let err = register_builtins(&mut registry, None).unwrap_err();
         assert!(matches!(err, RegisterBuiltinsError::Register { .. }));
     }
 
@@ -250,7 +281,7 @@ mod register_tests {
     #[test]
     fn wrapper_rejects_unknown_field_via_manifest_schema() {
         let mut registry = ToolRegistry::new();
-        register_builtins(&mut registry).unwrap();
+        register_builtins(&mut registry, None).unwrap();
         let read_file = registry.get("read_file").unwrap();
         let err = read_file
             .validate_args(&serde_json::json!({"path": "a.txt", "bogus": 1}))

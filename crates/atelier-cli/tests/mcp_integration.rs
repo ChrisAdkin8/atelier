@@ -241,6 +241,7 @@ async fn register_and_dispatch_mcp_routed_call() {
         audit_log_path: None,
         cancel: tokio_util::sync::CancellationToken::new(),
         deadline: atelier_core::dispatcher::DEFAULT_TOOL_DEADLINE,
+        subagent_depth: 0,
     };
 
     let mut args = serde_json::Map::new();

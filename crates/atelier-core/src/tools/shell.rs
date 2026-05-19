@@ -478,6 +478,7 @@ mod tests {
             audit_log_path: None,
             cancel: tokio_util::sync::CancellationToken::new(),
             deadline: crate::dispatcher::DEFAULT_TOOL_DEADLINE,
+            subagent_depth: 0,
         }
     }
 
@@ -652,6 +653,7 @@ mod tests {
             audit_log_path: Some(audit_path.as_path()),
             cancel: tokio_util::sync::CancellationToken::new(),
             deadline: crate::dispatcher::DEFAULT_TOOL_DEADLINE,
+            subagent_depth: 0,
         };
 
         let err = Shell
@@ -709,6 +711,7 @@ mod tests {
             audit_log_path: Some(audit_path.as_path()),
             cancel: tokio_util::sync::CancellationToken::new(),
             deadline: crate::dispatcher::DEFAULT_TOOL_DEADLINE,
+            subagent_depth: 0,
         };
         // We don't care about the run outcome; we care that we did
         // NOT return early as SandboxViolation. Use `true` so the
@@ -748,6 +751,7 @@ mod tests {
             audit_log_path: Some(audit_path.as_path()),
             cancel: tokio_util::sync::CancellationToken::new(),
             deadline: crate::dispatcher::DEFAULT_TOOL_DEADLINE,
+            subagent_depth: 0,
         };
         let res = Shell
             .execute(

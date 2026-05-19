@@ -2542,6 +2542,46 @@ pub fn bridge_event(evt: &SessionEvent) -> BridgedEvent {
             "language": language,
             "outcome": outcome.wire_label(),
         }),
+        // §10 sub-agent events — GUI card pane wired in WU-10
+        SessionEvent::SubagentSpawned {
+            id,
+            parent_id,
+            subagent_type,
+            description,
+            max_turns,
+        } => json!({
+            "id": id,
+            "parent_id": parent_id,
+            "subagent_type": subagent_type,
+            "description": description,
+            "max_turns": max_turns,
+        }),
+        SessionEvent::SubagentTurnAdvanced {
+            id,
+            turn,
+            max_turns,
+        } => json!({
+            "id": id,
+            "turn": turn,
+            "max_turns": max_turns,
+        }),
+        SessionEvent::SubagentToolCall { id, tool } => json!({
+            "id": id,
+            "tool": tool,
+        }),
+        SessionEvent::SubagentCompleted {
+            id,
+            status,
+            turns_used,
+        } => json!({
+            "id": id,
+            "status": status.to_string(),
+            "turns_used": turns_used,
+        }),
+        SessionEvent::SubagentCancelled { id, reason } => json!({
+            "id": id,
+            "reason": reason,
+        }),
     };
     BridgedEvent { kind, payload }
 }

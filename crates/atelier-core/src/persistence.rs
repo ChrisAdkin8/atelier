@@ -89,8 +89,33 @@ pub struct OnDiskSession {
     pub constraints: Vec<serde_json::Value>,
     pub recovery_log: Vec<RecoveryEntry>,
 
+    /// §10.1 — sub-agent invocations recorded by the parent run. Keyed by
+    /// sub-agent UUID string. Omitted from JSON when empty.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
+    pub subagents: BTreeMap<String, PersistedSubagent>,
+}
+
+/// Snapshot of a completed (or failed/cancelled) sub-agent invocation stored
+/// in `OnDiskSession::subagents`. Written once per §10.1 spawn-result; never
+/// mutated after the sub-agent finishes. Keyed by sub-agent UUID string in
+/// the parent's `session.json`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedSubagent {
+    /// The `SubagentType::name` used (e.g. `"general-purpose"`).
+    pub subagent_type: String,
+    /// Caller-supplied one-line description from the `spawn_subagent` call.
+    pub description: String,
+    /// Terminal status: `"completed"`, `"failed"`, `"timed_out"`, or `"cancelled"`.
+    pub status: String,
+    /// Final assistant text returned by the sub-agent (empty if failed/cancelled).
+    pub result: String,
+    pub turns_used: u32,
+    // Cost fields mirror SubagentCost for flat JSON storage.
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+    pub cached_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub subagents: Option<serde_json::Value>,
+    pub cost_usd: Option<f64>,
 }
 
 /// Diff-based checkpoint tree (spec §4). Root id + map of nodes. Concrete
@@ -173,7 +198,7 @@ impl OnDiskSession {
             plan: Plan::default(),
             constraints: Vec::new(),
             recovery_log: Vec::new(),
-            subagents: None,
+            subagents: BTreeMap::new(),
         }
     }
 

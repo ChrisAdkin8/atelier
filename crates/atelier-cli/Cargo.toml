@@ -52,6 +52,8 @@ uuid = { workspace = true, features = ["v4"] }
 # v60.29 H9 / H10 — `Runner` threads a CancellationToken into ToolContext
 # and the CLI main races the run-future against ctrl_c + SIGTERM.
 tokio-util = { workspace = true }
+# §10 — `RunnerSpawner` implements `SubagentSpawner` (an async_trait).
+async-trait = { workspace = true }
 
 [dev-dependencies]
 assert_cmd = { workspace = true }

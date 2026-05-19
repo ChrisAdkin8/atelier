@@ -186,6 +186,7 @@ mod tests {
             audit_log_path: None,
             cancel: tokio_util::sync::CancellationToken::new(),
             deadline: crate::dispatcher::DEFAULT_TOOL_DEADLINE,
+            subagent_depth: 0,
         }
     }
 

@@ -169,6 +169,10 @@ pub struct ToolContext<'a> {
     /// Per-call wall-clock deadline. Enforced by the dispatcher's
     /// `tokio::select!` around `tool.execute(...)`.
     pub deadline: std::time::Duration,
+    /// Recursion depth: 0 for tools running in the root runner, +1 per
+    /// sub-agent level. Checked by `spawn_subagent` against
+    /// [`crate::subagents::RECURSION_DEPTH_CAP`] (spec §10 line 556).
+    pub subagent_depth: u8,
 }
 
 /// v60.29 H9 — default per-tool deadline when no `deadline_ms` is
@@ -657,6 +661,7 @@ impl Dispatcher {
             audit_log_path: ctx.audit_log_path,
             cancel: ctx.cancel.clone(),
             deadline: resolved_deadline,
+            subagent_depth: ctx.subagent_depth,
         };
         let raw_result = {
             let tool_fut = tool.execute(call.arguments.clone(), &per_call_ctx);
@@ -2139,6 +2144,7 @@ mod cancellation_tests {
             audit_log_path: None,
             cancel: CancellationToken::new(),
             deadline: Duration::from_millis(200),
+            subagent_depth: 0,
         };
         let d = build_dispatcher_with(Arc::new(MockSlowTool));
 
@@ -2186,6 +2192,7 @@ mod cancellation_tests {
             audit_log_path: None,
             cancel: cancel.clone(),
             deadline: Duration::from_secs(60),
+            subagent_depth: 0,
         };
         let d = build_dispatcher_with(Arc::new(MockSlowTool));
 
@@ -2220,6 +2227,7 @@ mod cancellation_tests {
             audit_log_path: None,
             cancel: cancel.clone(),
             deadline: Duration::from_secs(60),
+            subagent_depth: 0,
         };
         let d = build_dispatcher_with(Arc::new(MockSlowTool));
 
@@ -2278,6 +2286,7 @@ mod cancellation_tests {
             cancel: CancellationToken::new(),
             // Generous caller default; override should still win.
             deadline: Duration::from_secs(60),
+            subagent_depth: 0,
         };
         let d = build_dispatcher_with(Arc::new(TightSlow));
         let started = Instant::now();
@@ -2438,6 +2447,7 @@ mod tests {
             audit_log_path: None,
             cancel: tokio_util::sync::CancellationToken::new(),
             deadline: DEFAULT_TOOL_DEADLINE,
+            subagent_depth: 0,
         }
     }
 
@@ -2453,6 +2463,7 @@ mod tests {
             audit_log_path: None,
             cancel: tokio_util::sync::CancellationToken::new(),
             deadline: DEFAULT_TOOL_DEADLINE,
+            subagent_depth: 0,
         }
     }
 

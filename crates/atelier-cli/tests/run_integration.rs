@@ -36,6 +36,8 @@ mod compaction;
 mod compaction_blob;
 #[path = "../src/runner.rs"]
 mod runner;
+#[path = "../src/subagent_spawner.rs"]
+mod subagent_spawner;
 use runner::{DispatcherHandle, EventSink, MockResponse, ProviderChoice, Runner};
 
 // Phase A close — canonical-fixture loader for the §2.5 priority-subset

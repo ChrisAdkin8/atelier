@@ -571,6 +571,40 @@ pub enum Event {
 
     /// The actor is shutting down. No further events will be emitted.
     Shutdown,
+
+    // --- §10 Sub-agent delegation events ---
+    /// A sub-agent was spawned by the parent. Emitted on the shared bus
+    /// immediately after `spawn_subagent` validates the request and before
+    /// the child's first turn begins. The `description` field is the
+    /// one-liner passed by the model; UIs render it as the sub-agent card title.
+    SubagentSpawned {
+        id: String,
+        parent_id: String,
+        subagent_type: String,
+        description: String,
+        max_turns: u32,
+    },
+
+    /// A sub-agent advanced one turn. Used by the GUI sub-agent progress bar.
+    SubagentTurnAdvanced {
+        id: String,
+        turn: u32,
+        max_turns: u32,
+    },
+
+    /// A sub-agent dispatched a tool call.
+    SubagentToolCall { id: String, tool: String },
+
+    /// A sub-agent reached a terminal state.
+    SubagentCompleted {
+        id: String,
+        status: crate::subagents::SubagentStatus,
+        turns_used: u32,
+    },
+
+    /// A sub-agent was cancelled (via the cancel shape, parent cancel token, or
+    /// time-travel rewind). `reason` is a short free-text label for display.
+    SubagentCancelled { id: String, reason: String },
 }
 
 impl Event {
@@ -614,6 +648,11 @@ impl Event {
             Self::RequestLspInstall { .. } => "RequestLspInstall",
             Self::LspInstallResolved { .. } => "LspInstallResolved",
             Self::Shutdown => "Shutdown",
+            Self::SubagentSpawned { .. } => "SubagentSpawned",
+            Self::SubagentTurnAdvanced { .. } => "SubagentTurnAdvanced",
+            Self::SubagentToolCall { .. } => "SubagentToolCall",
+            Self::SubagentCompleted { .. } => "SubagentCompleted",
+            Self::SubagentCancelled { .. } => "SubagentCancelled",
         }
     }
 }

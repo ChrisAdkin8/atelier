@@ -31,7 +31,7 @@ use atelier_core::{
     hooks::HookSet,
     ledger::Ledger,
     memory::MemoryStore,
-    persistence::OnDiskSession,
+    persistence::{OnDiskSession, PersistedSubagent},
     plan::PlanCanvas,
     protocol::Envelope,
     protocol_strategy::{parse_json_sentinel, parse_native_tool, NativeToolCall, Strategy},
@@ -40,9 +40,13 @@ use atelier_core::{
         self, try_emit, Command as SessionCommand, ConcurrentEditOutcome, Event, MessageRole,
     },
     state::NoopHook,
-    tools::register_builtins,
+    subagents::SubagentStatus,
+    subagents::SubagentTypeRegistry,
+    tools::{register_builtins, BuiltinDeps},
     SessionHandle, SessionId, State, Transition,
 };
+
+use crate::subagent_spawner::RunnerSpawner;
 
 /// How `atelier run` reports events. The binary uses `Stdout` (one line per
 /// event); tests use `Capture` to assert on the recorded sequence without
@@ -170,6 +174,18 @@ pub struct RunReport {
     /// the runner emits at least one attempt per turn under normal
     /// operation).
     pub envelope_conformance: atelier_core::protocol_conformance::ConformanceSnapshot,
+    /// §10 — final assistant message text. `None` if the run produced no
+    /// assistant turns (degenerate; shouldn't happen under normal operation).
+    /// Used by sub-agent callers to extract the result to return to the
+    /// parent's tool-result slot.
+    pub final_assistant_text: Option<String>,
+    /// §10 — a copy of the ledger entries accumulated during this run.
+    /// Used by sub-agent callers to roll cost up into the parent's ledger.
+    /// Empty in the root-runner case where the caller doesn't need them.
+    pub ledger_entries: Vec<atelier_core::ledger::LedgerEntry>,
+    /// §10 — number of turns actually consumed (alias for `turns` for
+    /// clarity in sub-agent callers).
+    pub turns_used: usize,
 }
 
 /// Shared slot a caller registers via [`Runner::with_dispatcher_handle`]
@@ -448,6 +464,10 @@ pub struct Runner {
     /// repo with no `.atelier/skills/` directory still gets the
     /// bundled set.
     skill_registry: Option<Arc<atelier_core::skills::SkillRegistry>>,
+    /// §10 — recursion depth of this runner (0 = root; +1 per sub-agent
+    /// level). Threaded into `ToolContext::subagent_depth` so that
+    /// nested `spawn_subagent` calls can enforce the depth cap.
+    subagent_depth: u8,
 }
 
 /// v60.10 §1 BYOM — record of a pending mid-session adapter swap that
@@ -654,6 +674,7 @@ impl Runner {
             tier1_diagnostics_for_test: Vec::new(),
             external_cancel: None,
             skill_registry: None,
+            subagent_depth: 0,
         })
     }
 
@@ -752,6 +773,17 @@ impl Runner {
         // `few_shot_override`. Without this, a Runner re-used across
         // adapters would surface stale overrides — pathological in
         // production, plausible in tests.
+        *self.few_shot_cache.lock() = None;
+        self
+    }
+
+    /// §10 Sub-agent spawning — replace the adapter with a pre-built one.
+    /// Production callers (specifically `RunnerSpawner`) use this to give
+    /// a child runner the parent's adapter without going through credential
+    /// resolution again. Unlike `with_adapter_for_test` this is not gated
+    /// behind `test-seams` because sub-agent spawning is a production path.
+    pub fn with_adapter(mut self, adapter: Arc<dyn Adapter>) -> Self {
+        self.adapter = adapter;
         *self.few_shot_cache.lock() = None;
         self
     }
@@ -982,6 +1014,15 @@ impl Runner {
         self
     }
 
+    /// §10 — set the recursion depth for sub-agent runners. Called by
+    /// `RunnerSpawner` when constructing a child runner; root runners
+    /// stay at 0 (the default). The depth is threaded into every
+    /// `ToolContext` so nested `spawn_subagent` calls can enforce the cap.
+    pub fn with_subagent_depth(mut self, depth: u8) -> Self {
+        self.subagent_depth = depth;
+        self
+    }
+
     /// v60.51 §15 — pre-turn slash-command expansion.
     ///
     /// Returns `(expanded_prompt, pending_skill_note)`:
@@ -1071,7 +1112,24 @@ impl Runner {
         // 2. Sandbox + dispatcher + ledger.
         let sandbox = SandboxPolicy::restrictive(&workspace)
             .map_err(|e| RunError::Config(format!("sandbox: {e}")))?;
-        let registry = built_in_registry()?;
+
+        // §10 — wire spawn_subagent. Load the type registry (tolerates missing
+        // directory — falls back to bundled-only types). Build the spawner that
+        // shares the parent's adapter; register it as the 8th built-in.
+        let home_dir = std::env::var_os("HOME").map(PathBuf::from);
+        let type_registry = Arc::new(
+            SubagentTypeRegistry::load(&workspace, home_dir.as_deref())
+                .map_err(|e| RunError::Config(format!("subagent type registry: {e}")))?,
+        );
+        let spawner = Arc::new(RunnerSpawner::new(
+            self.adapter.clone(),
+            workspace.clone(),
+            type_registry.clone(),
+        ));
+        let registry = built_in_registry_with_deps(BuiltinDeps {
+            spawner: spawner.clone(),
+            type_registry,
+        })?;
         // Snapshot the §15 tool surface for the adapter's native tool-use
         // channel *before* moving the registry into the dispatcher.
         // Without this the model only sees an empty `tools` array on the
@@ -1514,6 +1572,8 @@ impl Runner {
         // which is what `emit_verify_not_run` makes explicit on the bus.
         let mut observed_changes: Vec<atelier_core::verify::ObservedChange> = Vec::new();
         let mut last_envelope: Envelope = Envelope::default();
+        // §10 — track the last assistant text for sub-agent result extraction.
+        let mut last_assistant_text: Option<String> = None;
 
         for turn in 0..self.max_turns {
             // v60.15 (M-bug-state-desync) — only fire the `Idle → Streaming`
@@ -1945,6 +2005,7 @@ impl Runner {
             // below into `real_tool_calls`), but the envelope tool_use
             // id must still appear in history because the next turn
             // (or a future audit) may reference it.
+            last_assistant_text = Some(response.text.clone());
             messages.push(Message {
                 role: Role::Assistant,
                 content: response.text.clone(),
@@ -2026,6 +2087,8 @@ impl Runner {
                     // `Tool::deadline_override` at dispatch time.
                     cancel: session_handle.cancel_token(),
                     deadline: atelier_core::dispatcher::DEFAULT_TOOL_DEADLINE,
+                    // §10 — depth from the runner; 0 for root, +1 per sub-agent level.
+                    subagent_depth: self.subagent_depth,
                 };
                 for call in real_tool_calls {
                     let outcome = session_dispatcher.dispatch(&call, &ctx, now_rfc3339).await;
@@ -2288,6 +2351,30 @@ impl Runner {
                 tool_calls_json,
             );
         }
+        // §10 — persist completed sub-agent records into session.json.
+        for rec in spawner.drain_completed() {
+            let status_str = match rec.result.status {
+                SubagentStatus::Completed => "completed",
+                SubagentStatus::Failed => "failed",
+                SubagentStatus::TimedOut => "timed_out",
+                SubagentStatus::Cancelled => "cancelled",
+            };
+            snapshot.subagents.insert(
+                rec.result.id.to_string(),
+                PersistedSubagent {
+                    subagent_type: rec.subagent_type_name,
+                    description: rec.description,
+                    status: status_str.to_string(),
+                    result: rec.result.result,
+                    turns_used: rec.result.turns_used,
+                    prompt_tokens: rec.result.cost.prompt_tokens,
+                    completion_tokens: rec.result.cost.completion_tokens,
+                    cached_tokens: rec.result.cost.cached_tokens,
+                    cost_usd: rec.result.cost.cost_usd,
+                },
+            );
+        }
+
         if let Err(e) = snapshot.save_to(&session_dir) {
             tracing::warn!(error = %e, "atelier run: session snapshot save failed");
         }
@@ -2337,12 +2424,16 @@ impl Runner {
         // internals. Cheap: the snapshot allocates a small Vec.
         let envelope_conformance = envelope_conformance.snapshot();
 
+        let ledger_snapshot = ledger.to_vec();
         Ok(RunReport {
             session_id,
             turns,
+            turns_used: turns,
             final_state,
             dod_passed,
             envelope_conformance,
+            final_assistant_text: last_assistant_text,
+            ledger_entries: ledger_snapshot,
         })
     }
 }
@@ -2478,9 +2569,21 @@ fn adapter_to_run_error(e: AdapterError) -> RunError {
     }
 }
 
+#[allow(dead_code)]
 fn built_in_registry() -> Result<ToolRegistry, RunError> {
     let mut r = ToolRegistry::new();
-    register_builtins(&mut r).map_err(|e| RunError::Config(format!("tool registry: {e}")))?;
+    // deps=None: spawn_subagent is wired separately when a RunnerSpawner is
+    // available; the root runner supplies deps through built_in_registry_with_deps().
+    register_builtins(&mut r, None).map_err(|e| RunError::Config(format!("tool registry: {e}")))?;
+    Ok(r)
+}
+
+pub(crate) fn built_in_registry_with_deps(
+    deps: atelier_core::tools::BuiltinDeps,
+) -> Result<ToolRegistry, RunError> {
+    let mut r = ToolRegistry::new();
+    register_builtins(&mut r, Some(deps))
+        .map_err(|e| RunError::Config(format!("tool registry: {e}")))?;
     Ok(r)
 }
 
