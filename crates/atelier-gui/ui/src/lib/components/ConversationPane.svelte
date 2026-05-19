@@ -29,7 +29,7 @@
 </script>
 
 <section class="pane">
-  <header class="pane-title">conversation</header>
+  <header class="pane-title">Conversation</header>
   <div class="scroll" bind:this={scrollEl}>
     {#if conversation.length === 0}
       <p class="empty">no messages yet</p>

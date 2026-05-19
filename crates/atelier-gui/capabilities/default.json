@@ -1,10 +1,11 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capability set for the Atelier shell. Deliberately narrow: the webview only needs the `event` API (so the frontend can subscribe to `atelier://event`) and the `core:default` permissions (window-close, drag, etc.). Everything else — fs, shell, http — stays denied so the webview can't bypass the §15 dispatcher's sandbox.",
+  "description": "Capability set for the Atelier shell. Deliberately narrow: the webview only needs the `event` API (so the frontend can subscribe to `atelier://event`), the `core:default` permissions (window-close, drag, etc.), and the `dialog:allow-open` permission (native folder picker for the v60.46 workspace selector). Everything else — fs, shell, http — stays denied so the webview can't bypass the §15 dispatcher's sandbox.",
   "windows": ["main"],
   "permissions": [
     "core:default",
-    "core:event:default"
+    "core:event:default",
+    "dialog:allow-open"
   ]
 }

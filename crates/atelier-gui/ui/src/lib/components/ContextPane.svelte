@@ -197,7 +197,7 @@
 
 <section class="pane context-pane">
   <header class="pane-title">
-    <span>§5 Context</span>
+    <span>Context</span>
     {#if selectedIds.size >= 2}
       <button
         class="compact-action"

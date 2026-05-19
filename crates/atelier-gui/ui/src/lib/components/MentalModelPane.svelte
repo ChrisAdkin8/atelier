@@ -121,7 +121,7 @@
 
 <section class="pane mental-model-pane">
   <header class="pane-title">
-    <span>§5 Mental Model</span>
+    <span>Mental Model</span>
     <span class="pane-actions">
       <span class="cost-badge" title={costBadgeTitle}>
         {perTurnCost}

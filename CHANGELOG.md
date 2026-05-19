@@ -1,5 +1,60 @@
 # Atelier Spec — Changelog
 
+## v60.43–v60.49 — 2026-05-19 (GUI chat-mode pivot — Composer talks to a real adapter, no Runner / DiffPane / scripted Mock)
+
+Bundle of GUI-side changes that turn the panel into a working chat REPL backed by the user's BYOM adapter. Originally the GUI's `start_demo_run` hard-coded a `ProviderChoice::Mock` with a scripted `write_file` + `harness_meta` envelope to exercise the §3 staging + AwaitApproval flow against the DiffPane; that demo path was the *only* way prompts reached an adapter. This bundle replaces it with a `start_chat_run` direct-to-adapter path and reshapes the GUI around the new flow.
+
+### `crates/atelier-core/src/adapter/openai_compat.rs`
+
+- **HTTP timeout bumped 120s → 600s** (`DEFAULT_HTTP_TIMEOUT_SECS`). The 120s cap was severing slow local-model streams mid-generation on Apple Silicon (Qwen3 4B-30B class), leaving the GUI with a phantom in-flight request and no surfaced error. 600s is a generous bound; the streaming path is still the right answer long-term, but the non-stream `chat()` call is what chat mode uses today.
+
+### `crates/atelier-gui/src/lib.rs` — new commands & state
+
+- **`start_chat_run(prompt)`** — direct path to the live adapter. Reads `adapter_handle.get()` (or lazy-builds the default profile from `providers.toml` via `resolve_default_adapter` when nothing's in the slot); calls `adapter.chat(messages, &[])` with **zero tools advertised** (no tool catalog → no tool-call chatter → small prompt → fast response); emits `MessageCommitted { role: Assistant, .. }` for the reply, `ContextSnapshot { known_tokens, .. }` for the footer's context meter, and `ModelProfileLoaded` on first-time default-build so the model badge populates. Errors surface as a `[chat error]` system message in the Conversation pane plus `tracing::warn!` so verbose log captures them.
+- **`get_workspace` / `set_workspace`** — runtime-swappable workspace path. `SessionState` grows a `workspace_override: Mutex<Option<PathBuf>>` field; `workspace_root()` returns that path when set, falls back to the ephemeral tempdir otherwise. `set_workspace` validates (path exists, is a directory), expands a leading `~`, canonicalises, persists to `~/.atelier/gui.toml` via a minimal hand-rolled TOML reader/writer. Startup re-reads `gui.toml` and silently falls back to the tempdir if the path no longer exists.
+- **`load_promoted_memory(workspace_root)`** — chat-mode recall. Reads every `*.md` file in `~/.atelier/memory/` *and* `<workspace>/.atelier/memory/` (skipping `MEMORY.md` and `README.md` index files), strips Jekyll-style frontmatter, concatenates under per-file `## <slug>` headers, caps at 16 KiB total. Prepended as a `Role::System` message to every chat round. Workspace-scope cards from `<workspace>/.atelier/memory/` are read alongside the global ones so project-specific notes land in the prompt for that project only.
+- **Auto memory-card drafting** — when `adapter.chat()` fails with a known-shape error, `auto_card_for_error(err)` pattern-matches against the AdapterError variants and drafts a workspace-scope card at `<workspace>/.atelier/memory/auto_<slug>.md`. Coverage: `Auth` → `auth_failure`, `NotConfigured` → `adapter_not_configured`, `Unreachable` → `provider_unreachable`, `ContextOverflow` → `context_overflow`, `RateLimited` → `rate_limited`, `ResponseTooLarge` → `response_too_large`, `SseEventTooLarge` → `sse_event_too_large`, `Provider 5xx` → `provider_5xx`. Slug is deterministic per variant — repeat occurrences overwrite. Skipped silently when the workspace is still the ephemeral tempdir (no real project picked). Each card carries frontmatter `metadata: { type: feedback, auto: true, created_at: <rfc3339> }`. The drafted path is announced as a follow-up `[auto-memory]` system message.
+
+### `crates/atelier-gui/Cargo.toml`
+
+- **`tauri = { features = ["custom-protocol", "devtools"] }`** — already in v60.42; this bundle keeps it.
+- **`tauri-plugin-dialog = "2"`** added for the native folder picker.
+
+### `crates/atelier-gui/capabilities/default.json`
+
+- Grants `dialog:allow-open` so the webview can open the native folder picker.
+
+### `crates/atelier-gui/ui/`
+
+- **`package.json`** — `@tauri-apps/plugin-dialog ^2.0.0`.
+- **`Composer.svelte`** — `invoke('start_chat_run', ...)` instead of `start_demo_run`; placeholder copy updated; hint line below the textarea now reads "pure chat · uses the swap-adapter dropdown's active model" instead of "scripted mock adapter · AwaitApproval policy".
+- **`App.svelte`** —
+  - `DiffPane` import + slot removed (chat path doesn't stage edits). `.conversation-slot` spans both rows of column 1 (`grid-row: 1 / span 2`).
+  - **Outer layout switched from grid → flex column** (the `auto auto auto 1fr auto auto` grid template was misplacing the Composer into the `1fr` track when the mental-model row was absent, causing the textarea to balloon on full-screen). Composer now always sits where it's written in the JSX.
+  - `.pane-slot > *` gets `min-height: 0` so vertical scroll propagates into ConversationPane.
+  - New **context-usage meter in the footer** (`CTX [▓▓▓░░░░] 1,247 / 8,192 (15%)`), drawn from `app.contextTokens.known / app.contextWindowTokens`.
+  - **Cost meter moved** from MetersPane into the footer alongside the ctx meter (green tabular-nums, accent colour).
+  - **Right-column collapse toggle** (`→` / `←` arrow button at far right of header). State persists to localStorage `atelier:right-collapsed`. Collapsed state hides `.plan-slot` + `.meters-slot` and switches `.grid` to a single column so Conversation gets the full width.
+- **`Header.svelte`** —
+  - Workspace selector (current path, text-edit, `Browse…` button that opens the native OS folder picker via `@tauri-apps/plugin-dialog::open({ directory: true })`).
+  - Dead meta items removed: `state` label, `EditStaged` count, `scrub HEAD`. None of them populate in chat mode and the scrub controls had no backend in any mode (no consumer reads `scrubOffset`).
+  - `.meta` block pinned to the far right via `margin-left: auto`.
+  - Wordmark restyled to match `assets/banner.svg`: `'Iowan Old Style', Georgia, serif`, weight 400, cream `#f0ead6`, slight negative tracking.
+- **Panel header title-case sweep**: `§5 Context` → `Context`, `§5 Memory` → `Memory`, `§5 Mental Model` → `Mental Model` (and toggle button), `meters` → `Meters`, `plan` → `Plan`, `conversation` → `Conversation`.
+- **`MetersPane.svelte`** — cost row removed (the meter is now in the footer); `verify` badge stays for when Runner-driven mode comes back.
+- **`MODEL` footer placeholder** (was `<no model>` in italics) when no model has been swapped in yet.
+
+### What's deliberately *not* in this bundle
+
+- **Write-back memory** in the agent's voice — chat mode has no tool surface, so the model can't author its own memory cards; auto-drafting on errors is the closest analogue and rides on heuristic pattern-matching, not model declaration.
+- **Adapter dropdown live-rehydration** after `set_workspace` — the dropdown still only fetches on App mount, so a workspace change today requires a relaunch for the dropdown to re-read the new project's `providers.toml`. Cheap to fix later (emit an event + re-`invoke('list_provider_profiles')`); not blocking.
+
+### Verification
+
+- `cargo build --release -p atelier-gui` clean; binary ~14.5 MB.
+- Manual smoke against `mlx-community/Qwen3-4B-4bit-DWQ` via `mlx_lm.server` on port 8080: prompt round-trips in ~2-3s for short replies; ContextPane footer meter updates with the per-turn usage; recall pulls in `feedback_worktree_isolation_drift.md` as a system prompt prefix.
+- Manual smoke against an unreachable port: chat error surfaces; an `auto_provider_unreachable.md` card is written to `<workspace>/.atelier/memory/` and announced via `[auto-memory]` follow-up message.
+
 ## v60.42 — 2026-05-19 (atelier-gui: `custom-protocol` feature so `cargo build --release` produces a working binary)
 
 Plain `cargo build [--release] -p atelier-gui` was producing a binary that opened a blank window because the `tauri` dependency was declared with `features = []`. Without the `custom-protocol` feature, the binary dials `devUrl` (Vite at `localhost:1420`) on startup instead of serving the embedded `frontendDist` — and with no Vite dev server running, the webview's resource fetch fails (`Failed to load resource: Could not connect to the server`) and renders nothing.

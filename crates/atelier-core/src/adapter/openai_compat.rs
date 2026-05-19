@@ -83,7 +83,12 @@ const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 const API_KEY_ENV: &str = "OPENAI_API_KEY";
 const BASE_URL_ENV: &str = "OPENAI_BASE_URL";
 const DEFAULT_MAX_TOKENS: u32 = 4096;
-const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 120;
+// Bumped from 120s to 600s. The original cap assumed a remote OpenAI-class
+// model that streams every few hundred ms. Local mlx-lm / llama.cpp servers
+// on Apple Silicon can take 5+ minutes to generate a long completion off a
+// large prompt — the 120s cap was severing the connection mid-generation,
+// leaving the GUI with a phantom in-flight run and no surfaced error.
+const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 600;
 /// Default context window when the caller doesn't override. 8192 is a
 /// typical local-model floor (llama 2 / mistral 7b shipped with 4096
 /// or 8192; modern local models go higher but we don't autodetect).

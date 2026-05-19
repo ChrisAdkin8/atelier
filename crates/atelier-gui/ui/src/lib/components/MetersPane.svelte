@@ -122,14 +122,12 @@
 </script>
 
 <section class="pane">
-  <header class="pane-title">meters</header>
+  <header class="pane-title">Meters</header>
   <div class="body">
-    <div class="meter cost">
-      <div class="meter-row">
-        <span class="meter-label">cost</span>
-        <span class="meter-value cost">{costLabel}</span>
-      </div>
-    </div>
+    <!-- v60.44 — cost meter moved to the App footer alongside the
+         context-usage gauge. `totalCostUsd` is still received as a
+         prop so the type interface stays stable; if cost is needed
+         here again later, restore the `.meter.cost` row. -->
 
     <div class="meter context">
       <div class="meter-row">

@@ -1,9 +1,8 @@
 <script lang="ts">
-  // Prompt composer. v47: kicks off a demo-scripted run via the
-  // `start_demo_run` Tauri command. The run drives the dispatcher
-  // through the AwaitApproval gate; the user sees the staging
-  // banner in DiffPane, accepts or rejects, and watches the
-  // resulting commit land.
+  // Prompt composer. v60.43: pure chat REPL. Routes the prompt
+  // through `start_chat_run` — a direct adapter.chat() call with no
+  // tools and no §3 staging plumbing. The model's reply lands in
+  // ConversationPane as a MessageCommitted event.
   //
   // Cmd+Enter / Ctrl+Enter submits without taking the mouse off
   // the keyboard.
@@ -26,7 +25,7 @@
     starting = true
     error = null
     try {
-      await invoke('start_demo_run', { prompt: trimmed })
+      await invoke('start_chat_run', { prompt: trimmed })
       prompt = ''
     } catch (e) {
       error = String(e)
@@ -50,8 +49,8 @@
 <section class="composer">
   <textarea
     placeholder={busy
-      ? 'a run is in progress — wait for it to finish or scrub back'
-      : 'type a prompt and hit Cmd+Enter (or click Send) to start a demo run'}
+      ? 'a turn is in progress — wait for it to finish'
+      : 'type a prompt and hit Cmd+Enter (or click Send) to chat with the active model'}
     bind:value={prompt}
     onkeydown={onKey}
     disabled={busy || starting}
@@ -59,7 +58,7 @@
   ></textarea>
   <div class="composer-actions">
     <span class="hint">
-      Cmd+Enter to send · scripted mock adapter · AwaitApproval policy
+      Cmd+Enter to send · pure chat · uses the swap-adapter dropdown's active model
     </span>
     <button
       class="send"

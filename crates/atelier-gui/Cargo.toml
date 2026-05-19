@@ -33,6 +33,9 @@ atelier-cli = { workspace = true }
 # available while we still need to diagnose. Cheap to leave on; consider
 # gating behind a feature flag once the GUI is stable.
 tauri = { workspace = true, features = ["custom-protocol", "devtools"] }
+# v60.46 — native OS folder picker for the workspace selector.
+# Frontend pairs with `@tauri-apps/plugin-dialog`.
+tauri-plugin-dialog = "2"
 # v60.28 H2 follow-on — consent gate awaits the renderer's accept/reject
 # reply via `tokio::sync::oneshot`, bounded by `tokio::time::timeout`.
 tokio = { workspace = true }

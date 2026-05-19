@@ -151,7 +151,7 @@
 </script>
 
 <section class="pane memory-pane">
-  <header class="pane-title">§5 Memory</header>
+  <header class="pane-title">Memory</header>
 
   <form class="composer" onsubmit={(e) => { e.preventDefault(); void add() }}>
     <textarea

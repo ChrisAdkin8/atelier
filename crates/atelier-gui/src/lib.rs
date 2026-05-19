@@ -22,11 +22,11 @@
 use std::sync::Arc;
 
 use atelier_cli::runner::{DispatcherHandle, EventSink, MockResponse, ProviderChoice, Runner};
-use atelier_core::adapter::ToolCallRequest;
+use atelier_core::adapter::{Message, Role, ToolCallRequest};
 use atelier_core::dispatcher::ApprovalPolicy;
 use atelier_core::protocol::Envelope;
 use atelier_core::protocol_strategy::HARNESS_META_NAME;
-use atelier_core::session::Event as SessionEvent;
+use atelier_core::session::{Event as SessionEvent, MessageRole};
 use serde::Serialize;
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager};
@@ -73,6 +73,13 @@ pub struct SessionState {
     /// future edit that mutated one and not the other would
     /// silently desync. Callers read `workspace_root()` instead.
     pub workspace_tempdir: tempfile::TempDir,
+    /// v60.45 — user-selectable workspace override. When `Some`,
+    /// `workspace_root()` returns this path instead of the ephemeral
+    /// tempdir; persisted across launches via `~/.atelier/gui.toml`.
+    /// `std::sync::Mutex` (not `parking_lot`) because the lock is
+    /// only taken on `get_workspace` / `set_workspace` / startup —
+    /// contention is functionally zero.
+    pub workspace_override: std::sync::Mutex<Option<std::path::PathBuf>>,
     /// v60.28 H2 follow-on — pending `swap_adapter` consent gates,
     /// keyed by `swap_id` (UUID v4). The renderer's `respond_to_swap`
     /// reply pops the sender and signals the decision; `swap_adapter`
@@ -98,12 +105,17 @@ pub enum SwapDecision {
 const SWAP_CONSENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 impl SessionState {
-    /// Per-process workspace root (the parent of every per-run UUID
-    /// subdir created by `start_demo_run`). Always points inside the
-    /// owned `workspace_tempdir` so RAII cleanup covers any descendant
-    /// left behind by `RunCleanup`.
-    pub fn workspace_root(&self) -> &std::path::Path {
-        self.workspace_tempdir.path()
+    /// Per-process workspace root. v60.45 — if `workspace_override`
+    /// is `Some`, returns that path (user picked a real repo via
+    /// `set_workspace`); otherwise returns the ephemeral tempdir.
+    /// Returns `PathBuf` (owned) because the override is behind a
+    /// mutex — there's no way to hand out a `&Path` reference that
+    /// outlives the lock guard safely.
+    pub fn workspace_root(&self) -> std::path::PathBuf {
+        match self.workspace_override.lock().ok().and_then(|g| g.clone()) {
+            Some(p) => p,
+            None => self.workspace_tempdir.path().to_path_buf(),
+        }
     }
 }
 
@@ -113,6 +125,8 @@ pub fn run() {
     tracing_subscriber::fmt::try_init().ok();
 
     tauri::Builder::default()
+        // v60.46 — native folder picker for the workspace selector.
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             // v47: ephemeral workspace per process. Real "open project"
             // selection lands when the GUI grows a file-tree pane.
@@ -132,11 +146,27 @@ pub fn run() {
                 .tempdir()
                 .map_err(|e| std::io::Error::other(format!("workspace tempdir: {e}")))?;
 
+            // v60.45 — restore the user's last-chosen workspace (if any).
+            // A missing / unreadable / non-existent path is logged + falls
+            // back to the tempdir, so a stale gui.toml never blocks startup.
+            let workspace_override = std::sync::Mutex::new(
+                load_persisted_workspace().filter(|p| {
+                    let ok = p.is_dir();
+                    if !ok {
+                        tracing::warn!(
+                            path = %p.display(),
+                            "persisted workspace no longer exists or isn't a directory; falling back to tempdir"
+                        );
+                    }
+                    ok
+                }),
+            );
             app.manage(SessionState {
                 dispatcher_handle: DispatcherHandle::new(),
                 adapter_handle: atelier_cli::AdapterHandle::new(),
                 run_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 workspace_tempdir,
+                workspace_override,
                 pending_swaps: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             });
             Ok(())
@@ -145,6 +175,8 @@ pub fn run() {
             ping,
             submit_approval,
             start_demo_run,
+            // v60.43 — pure chat path (no Runner, no tools, no §3 staging).
+            start_chat_run,
             // v55 §5 mutator commands.
             pin_context_item,
             unpin_context_item,
@@ -172,6 +204,9 @@ pub fn run() {
             respond_to_swap,
             // v60.37 B5 — hydrate the dropdown from .atelier/providers.toml.
             list_provider_profiles,
+            // v60.45 — workspace selector (set + read live workspace path).
+            get_workspace,
+            set_workspace,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -787,7 +822,7 @@ pub struct SwapOptionWire {
 /// "polish + convenience" — failing it shouldn't disable the GUI.
 #[tauri::command]
 fn list_provider_profiles(state: tauri::State<'_, SessionState>) -> Vec<SwapOptionWire> {
-    list_provider_profiles_in(state.workspace_root())
+    list_provider_profiles_in(&state.workspace_root())
 }
 
 /// Test-visible inner helper for [`list_provider_profiles`]. Splitting
@@ -1296,6 +1331,721 @@ fn start_demo_run(
         }
     });
     Ok(())
+}
+
+// ────────────────────────────────────────────────────────────────────
+// v60.47 — auto memory-card drafting on known-fixable adapter errors
+// ────────────────────────────────────────────────────────────────────
+//
+// When `start_chat_run`'s `adapter.chat()` fails with a known-shape
+// error, we draft a workspace-scope memory card describing the failure
+// + a likely fix. The card lands at
+// `<workspace>/.atelier/memory/auto_<slug>.md`. Slug is deterministic
+// per error variant so repeat occurrences overwrite rather than
+// accumulate.
+//
+// Cards are workspace-scope so they only fire when the user has
+// pointed the GUI at a real repo via the workspace selector. If the
+// active workspace is still the ephemeral tempdir, we skip — there's
+// no point writing a card to a directory that'll be deleted on
+// shutdown.
+
+use atelier_core::adapter::AdapterError;
+
+/// One auto-card draft: a slug (filename stem) and the markdown body
+/// (including frontmatter) to write at
+/// `<workspace>/.atelier/memory/auto_<slug>.md`.
+struct AutoCard {
+    slug: &'static str,
+    body: String,
+}
+
+/// Pattern-match a chat error against the set of known-fixable
+/// variants. Returns `None` for errors that don't map to a useful
+/// note — we'd rather skip auto-drafting than fill the workspace
+/// memory with vague placeholders.
+fn auto_card_for_error(err: &AdapterError) -> Option<AutoCard> {
+    let now = atelier_core::time::now_rfc3339();
+    let (slug, description, body_md) = match err {
+        AdapterError::Auth(msg) => (
+            "auth_failure",
+            "Adapter auth failed — credentials missing or expired.",
+            format!(
+                "The adapter rejected the request with an authentication error:\n\n\
+                 ```\n{msg}\n```\n\n\
+                 **Likely fix:**\n\
+                 - For Anthropic: export `ANTHROPIC_API_KEY` (in `~/.envrc` for direnv users, or your shell rc).\n\
+                 - For OpenAI / openai-compat against OpenAI itself: export `OPENAI_API_KEY`.\n\
+                 - For a local server (mlx_lm.server, Ollama, vLLM): the server usually doesn't need a key; if it returned 401, check the server config rather than the env var.\n\n\
+                 **How to verify:** rerun any prompt — a successful round-trip clears the issue.\n"
+            ),
+        ),
+        AdapterError::NotConfigured(msg) => (
+            "adapter_not_configured",
+            "Adapter dependency missing — env var or config file not found.",
+            format!(
+                "The adapter refused to construct itself:\n\n\
+                 ```\n{msg}\n```\n\n\
+                 **Likely fix:** the named env var (e.g. `ANTHROPIC_API_KEY`) isn't set. Set it before relaunching the GUI; the adapter is built once at swap-time and won't re-read the environment until the next adapter swap.\n"
+            ),
+        ),
+        AdapterError::Unreachable(msg) => (
+            "provider_unreachable",
+            "Provider's HTTP endpoint did not respond.",
+            format!(
+                "The adapter could not reach the configured `base_url`:\n\n\
+                 ```\n{msg}\n```\n\n\
+                 **Likely fix:**\n\
+                 - For a local server: confirm it's running. On macOS, `lsof -i :8080 -sTCP:LISTEN` (or whatever port your `providers.toml` uses) should show a Python / llama-server process.\n\
+                 - For mlx-lm specifically: `mlx_lm.server --model <id> --host 127.0.0.1 --port 8080 --chat-template-args '{{\"enable_thinking\": false}}'`.\n\
+                 - For a cloud provider: check network / VPN / corporate proxy.\n"
+            ),
+        ),
+        AdapterError::ContextOverflow {
+            needed_tokens,
+            limit_tokens,
+        } => (
+            "context_overflow",
+            "Prompt exceeded the model's context window.",
+            format!(
+                "The conversation needed **{needed_tokens}** tokens but the active model only accepts **{limit_tokens}**.\n\n\
+                 **Likely fix:**\n\
+                 - Switch to a larger-context profile in `providers.toml` (Qwen3 8B = 32k, Qwen3-Coder-30B = 256k, Anthropic Claude = 200k).\n\
+                 - Or use the Context panel's compact action to summarise old items into a memory card.\n\
+                 - Or just start a fresh chat — recall picks up your promoted memory automatically.\n"
+            ),
+        ),
+        AdapterError::RateLimited { retry_after_ms } => (
+            "rate_limited",
+            "Provider returned a rate-limit response.",
+            format!(
+                "The provider asked us to back off for **{retry_after_ms} ms**.\n\n\
+                 **Likely fix:** wait the named window before retrying. If this repeats, check the provider's quota dashboard — you may need a higher tier or to throttle local request rate.\n"
+            ),
+        ),
+        AdapterError::ResponseTooLarge { limit } => (
+            "response_too_large",
+            "Adapter response body exceeded its per-call cap.",
+            format!(
+                "The non-streaming HTTP response grew past **{limit} bytes** before reading completed.\n\n\
+                 **Likely fix:** reduce `max_tokens` in `providers.toml`, or move to a streaming code path (the openai-compat adapter has `stream()`; chat mode uses `chat()` non-streaming today).\n"
+            ),
+        ),
+        AdapterError::SseEventTooLarge { limit } => (
+            "sse_event_too_large",
+            "Streaming SSE event payload exceeded its per-event cap.",
+            format!(
+                "One SSE event's accumulated `data:` body grew past **{limit} bytes**.\n\n\
+                 **Likely fix:** the provider is misbehaving (sending a single mega-event instead of per-token chunks). Switch providers or temporarily route to the non-streaming `chat()` path.\n"
+            ),
+        ),
+        AdapterError::Provider { status, body: _ }
+            if *status >= 500 =>
+        {
+            (
+                "provider_5xx",
+                "Provider returned a 5xx server error.",
+                format!(
+                    "The provider responded with status **{status}**. This is typically transient; retrying after a brief pause usually resolves it. If it persists for one provider but not another, check that provider's status page.\n"
+                ),
+            )
+        }
+        // Provider 4xx and Malformed are usually request-shape bugs in
+        // the harness, not actionable user fixes — skip those.
+        _ => return None,
+    };
+    let body = format!(
+        "---\nname: auto-{slug}\ndescription: {description}\nmetadata:\n  type: feedback\n  auto: true\n  created_at: \"{now}\"\n---\n\n{body_md}"
+    );
+    Some(AutoCard { slug, body })
+}
+
+/// Write an auto-card to `<workspace>/.atelier/memory/auto_<slug>.md`.
+/// Skips silently when the workspace is still the ephemeral tempdir
+/// (no real project picked yet, indicated by `real_workspace == None`)
+/// so we don't litter `/var/folders/`. Returns the resolved path on
+/// success so the caller can surface it to the user.
+///
+/// Takes the workspace path by owned value rather than via
+/// `&SessionState` so the spawned async task in `start_chat_run` can
+/// call this without holding a state reference across `.await`.
+fn write_workspace_auto_card(
+    real_workspace: Option<&std::path::Path>,
+    card: &AutoCard,
+) -> std::io::Result<Option<std::path::PathBuf>> {
+    let Some(workspace) = real_workspace else {
+        // No real workspace picked yet; auto-cards would be lost.
+        return Ok(None);
+    };
+    let dir = workspace.join(".atelier/memory");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("auto_{}.md", card.slug));
+    // Atomic write via tempfile + persist; mirror the discipline used
+    // by `atelier-core::memory::promote`.
+    let mut tmp = tempfile::NamedTempFile::new_in(&dir)?;
+    use std::io::Write;
+    tmp.write_all(card.body.as_bytes())?;
+    tmp.flush()?;
+    tmp.persist(&path).map_err(|e| e.error)?;
+    Ok(Some(path))
+}
+
+// ────────────────────────────────────────────────────────────────────
+// v60.45 — workspace selector
+// ────────────────────────────────────────────────────────────────────
+//
+// The GUI launches with an ephemeral tempdir as its workspace root.
+// `set_workspace` lets the user point it at any directory (typically
+// the repo they're driving from a coding session); the choice is
+// persisted to `~/.atelier/gui.toml` so it survives relaunches.
+//
+// Validation is intentionally light: the path must exist and be a
+// directory. We do NOT require it to be a git repo — atelier doesn't
+// hard-depend on git, and many useful workspaces (a docs tree, a
+// scratch dir) aren't repos.
+
+/// Maximum length of a workspace path. 4 KiB is far above any sane
+/// real path on every supported platform; the cap exists so a hostile
+/// webview message can't ask us to canonicalise a 1 GB string.
+const MAX_WORKSPACE_PATH_BYTES: usize = 4096;
+
+#[tauri::command]
+fn get_workspace(state: tauri::State<'_, SessionState>) -> String {
+    state.workspace_root().to_string_lossy().into_owned()
+}
+
+/// Set the active workspace root. Validates that the path exists and
+/// is a directory; canonicalises (resolves symlinks + relative
+/// segments) so downstream consumers always see an absolute path;
+/// persists the result so the next launch picks it up automatically.
+///
+/// Returns the canonicalised path on success so the frontend can
+/// display the resolved form (e.g. `~` expanded, `..` collapsed).
+#[tauri::command]
+fn set_workspace(
+    state: tauri::State<'_, SessionState>,
+    path: String,
+) -> Result<String, String> {
+    if path.is_empty() {
+        return Err("workspace path is empty".to_string());
+    }
+    if path.len() > MAX_WORKSPACE_PATH_BYTES {
+        return Err(format!(
+            "workspace path is {} bytes (max {} bytes)",
+            path.len(),
+            MAX_WORKSPACE_PATH_BYTES
+        ));
+    }
+    // Expand a leading `~` to the user's home so the natural shell
+    // shorthand works. We don't expand `$VAR`-style env refs — keep
+    // the surface area narrow.
+    let expanded = if let Some(rest) = path.strip_prefix("~") {
+        let home = std::env::var_os("HOME").ok_or_else(|| "HOME not set".to_string())?;
+        let mut p = std::path::PathBuf::from(home);
+        // strip a leading '/' on `rest` so PathBuf::push doesn't reset.
+        let rest = rest.trim_start_matches('/');
+        if !rest.is_empty() {
+            p.push(rest);
+        }
+        p
+    } else {
+        std::path::PathBuf::from(&path)
+    };
+    let canonical = std::fs::canonicalize(&expanded).map_err(|e| {
+        format!(
+            "could not resolve {:?}: {e} (does it exist?)",
+            expanded.display()
+        )
+    })?;
+    if !canonical.is_dir() {
+        return Err(format!("{:?} is not a directory", canonical.display()));
+    }
+    // Swap under the mutex, then persist outside the lock so a slow
+    // disk doesn't pin the read path.
+    {
+        let mut guard = state
+            .workspace_override
+            .lock()
+            .map_err(|e| format!("workspace_override mutex poisoned: {e}"))?;
+        *guard = Some(canonical.clone());
+    }
+    if let Err(e) = persist_workspace(&canonical) {
+        // Persistence failure is non-fatal — the swap is already in
+        // effect; just warn so the user sees it via tracing.
+        tracing::warn!(error = %e, "failed to persist workspace selection to ~/.atelier/gui.toml");
+    }
+    Ok(canonical.to_string_lossy().into_owned())
+}
+
+/// `~/.atelier/gui.toml` schema:
+///
+/// ```toml
+/// [workspace]
+/// path = "/absolute/path/the/user/picked"
+/// ```
+fn gui_settings_path() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(std::path::PathBuf::from(home).join(".atelier/gui.toml"))
+}
+
+fn load_persisted_workspace() -> Option<std::path::PathBuf> {
+    let path = gui_settings_path()?;
+    let body = std::fs::read_to_string(&path).ok()?;
+    // Minimal hand-roll instead of pulling in serde_toml derive plumbing
+    // for a 2-field file — find `[workspace]` then `path = "..."`.
+    let mut in_workspace = false;
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if trimmed.starts_with('[') {
+            in_workspace = trimmed == "[workspace]";
+            continue;
+        }
+        if in_workspace {
+            if let Some(rest) = trimmed.strip_prefix("path") {
+                let rest = rest.trim().strip_prefix('=')?.trim();
+                let unquoted = rest.trim_matches('"');
+                if !unquoted.is_empty() {
+                    return Some(std::path::PathBuf::from(unquoted));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn persist_workspace(path: &std::path::Path) -> std::io::Result<()> {
+    let settings = gui_settings_path().ok_or_else(|| {
+        std::io::Error::other("HOME not set; cannot resolve ~/.atelier/gui.toml")
+    })?;
+    if let Some(parent) = settings.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let body = format!(
+        "# atelier-gui settings — managed by the workspace selector.\n\
+         # Edit by hand only if the GUI is closed; otherwise use the\n\
+         # in-app picker so changes round-trip cleanly.\n\
+         [workspace]\n\
+         path = \"{}\"\n",
+        path.to_string_lossy()
+    );
+    std::fs::write(&settings, body)
+}
+
+/// v60.44 — memory recall for chat mode. Reads every promoted card
+/// from `~/.atelier/memory/*.md` (skipping the `MEMORY.md` index file)
+/// and concatenates them into a single system-prompt string the chat
+/// path prepends to the user's first message.
+///
+/// Files use a Jekyll-style frontmatter:
+///
+/// ```text
+/// ---
+/// name: <slug>
+/// description: <one-liner>
+/// metadata:
+///   type: feedback
+/// ---
+///
+/// <body>
+/// ```
+///
+/// We strip the frontmatter (so the model sees only the rendered
+/// content) but keep the `description:` line as a brief lead-in
+/// because it's the part the user wrote as a TL;DR. Total recalled
+/// memory is capped at `MEMORY_RECALL_BYTE_CAP` (16 KiB) — over the
+/// cap, later files are dropped with a `tracing::warn`.
+///
+/// Returns `None` when there's nothing to recall (directory missing
+/// or empty after exclusions) so the caller can skip the system
+/// message entirely instead of sending an empty preamble.
+const MEMORY_RECALL_BYTE_CAP: usize = 16 * 1024;
+
+fn load_promoted_memory(workspace_root: Option<&std::path::Path>) -> Option<String> {
+    // v60.47 — workspace-scope cards (auto-drafts from chat errors,
+    // user-added notes scoped to a single repo) are read alongside
+    // the global ones from `~/.atelier/memory/`. Workspace cards
+    // sort after global so a project-specific note overrides a
+    // global one when they describe the same topic (the chat is
+    // free to read both — the order is just deterministic).
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(home) = std::env::var_os("HOME") {
+        dirs.push(std::path::PathBuf::from(home).join(".atelier/memory"));
+    }
+    if let Some(ws) = workspace_root {
+        dirs.push(ws.join(".atelier/memory"));
+    }
+    let mut entries: Vec<std::path::PathBuf> = Vec::new();
+    for dir in &dirs {
+        let Ok(read) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in read.flatten() {
+            let p = entry.path();
+            let keep = p.extension().map(|x| x == "md").unwrap_or(false)
+                && p.file_name()
+                    .and_then(|f| f.to_str())
+                    .map(|n| n != "MEMORY.md" && n != "README.md")
+                    .unwrap_or(false);
+            if keep {
+                entries.push(p);
+            }
+        }
+    }
+    if entries.is_empty() {
+        return None;
+    }
+    // Stable order so the prompt is deterministic across launches.
+    entries.sort();
+    let mut out = String::from(
+        "The following durable notes were promoted by the user across previous sessions. \
+         Treat them as ground truth about the user's preferences and project context.\n\n",
+    );
+    let mut included = 0usize;
+    for path in entries {
+        let body = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let rendered = strip_frontmatter(&body);
+        let chunk = format!(
+            "## {}\n\n{}\n\n",
+            path.file_stem().and_then(|s| s.to_str()).unwrap_or("memory"),
+            rendered.trim()
+        );
+        if out.len() + chunk.len() > MEMORY_RECALL_BYTE_CAP {
+            tracing::warn!(
+                cap = MEMORY_RECALL_BYTE_CAP,
+                "load_promoted_memory: byte cap reached; dropping {} and later",
+                path.display()
+            );
+            break;
+        }
+        out.push_str(&chunk);
+        included += 1;
+    }
+    if included == 0 {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// Strip a `---\n...\n---\n` frontmatter block from the head of `s`.
+/// Returns `s` unchanged if the frontmatter delimiters aren't present.
+fn strip_frontmatter(s: &str) -> &str {
+    let trimmed = s.trim_start();
+    if !trimmed.starts_with("---") {
+        return s;
+    }
+    // Skip the opening `---` line.
+    let after_open = match trimmed.find('\n') {
+        Some(i) => &trimmed[i + 1..],
+        None => return s,
+    };
+    // Find the closing `---` on its own line.
+    let mut search = after_open;
+    let mut offset_from_start = trimmed.len() - after_open.len();
+    while let Some(idx) = search.find("\n---") {
+        offset_from_start += idx + 4;
+        let after_close = &search[idx + 4..];
+        // The closing fence should be followed by a newline (or EOF) to
+        // qualify — otherwise it's just text that happens to contain `---`.
+        if after_close.starts_with('\n') || after_close.is_empty() {
+            let abs = (s.len() - trimmed.len()) + offset_from_start;
+            return s[abs..].trim_start_matches('\n');
+        }
+        // Not a closing fence; continue searching past this position.
+        search = &search[idx + 4..];
+    }
+    s
+}
+
+/// v60.43 — load the default profile from providers.toml and build
+/// its adapter. Used by `start_chat_run` when the `adapter_handle`
+/// slot is empty (no explicit dropdown swap has happened yet).
+///
+/// Why not require the user to click the dropdown? The dropdown
+/// shows the providers.toml default as pre-selected on mount, but a
+/// `<select>` doesn't fire `onchange` for the default-selected value
+/// — only when the user actively picks a different option. So a
+/// fresh-launch user who types a prompt against the visibly-selected
+/// model would otherwise get "no adapter selected" with no way out
+/// short of toggling the dropdown twice. This helper closes that
+/// gap by activating the default exactly as the CLI does.
+fn resolve_default_adapter(
+    repo_root: &std::path::Path,
+) -> Result<std::sync::Arc<dyn atelier_core::adapter::Adapter>, String> {
+    use atelier_core::config::{ProviderKind, ProvidersConfig};
+    let loaded = ProvidersConfig::load(repo_root)
+        .map_err(|e| format!("providers.toml load failed: {e}"))?
+        .ok_or_else(|| {
+            "no providers.toml found at <workspace>/.atelier/ or ~/.atelier/ — \
+             create one or pick a profile from the dropdown"
+                .to_string()
+        })?;
+    let cfg = &loaded.config;
+    // Pick the named default; if no `default = ...` is set, take the
+    // first profile in iteration order (HashMap iteration is unstable
+    // but the singleton case is what matters here).
+    let (name, prof) = match cfg.default.as_deref() {
+        Some(name) => cfg.providers.get(name).map(|p| (name.to_string(), p)).ok_or_else(|| {
+            format!("providers.toml `default = {name:?}` but no `[providers.{name}]` table defined")
+        })?,
+        None => cfg
+            .providers
+            .iter()
+            .next()
+            .map(|(k, v)| (k.clone(), v))
+            .ok_or_else(|| "providers.toml has no profiles defined".to_string())?,
+    };
+    let kind = prof
+        .provider
+        .ok_or_else(|| format!("profile {name:?} is missing `provider = ...`"))?;
+    let model = prof
+        .model
+        .clone()
+        .ok_or_else(|| format!("profile {name:?} is missing `model = ...`"))?;
+    let wire = match kind {
+        ProviderKind::Mock => SwapProviderWire::Mock { model_id: model },
+        ProviderKind::Anthropic => SwapProviderWire::Anthropic { model_id: model },
+        ProviderKind::OpenaiCompat => SwapProviderWire::OpenAiCompat {
+            model_id: model,
+            base_url: prof.base_url.clone(),
+        },
+    };
+    build_swap_adapter(wire)
+}
+
+/// v60.43 — pure chat path. Bypasses the Runner / Mock / §3 staging
+/// pipeline entirely. Takes the prompt, asks the live adapter for a
+/// completion with NO tools advertised, emits the assistant reply
+/// straight onto the bus. Use this when the user wants a chat REPL
+/// rather than a scripted demo.
+///
+/// Why not just reuse `start_demo_run`?
+///
+/// `start_demo_run` wraps a Mock adapter with a scripted
+/// `write_file` + `harness_meta` tool-call sequence designed to
+/// exercise the §3 atomic-staging + AwaitApproval flow. Even when the
+/// `adapter_handle` carries a live OpenaiCompat adapter (post-swap),
+/// the Runner builds with `ProviderChoice::Mock` and registers the
+/// full built-in tool surface — so a real adapter would receive a
+/// ~2.5k-token prompt full of tool definitions and try to tool-call
+/// its way through. On a 4B-class local model that costs minutes,
+/// blows the HTTP timeout, and surfaces nothing.
+///
+/// `start_chat_run` is the inverse: zero tools, single round-trip,
+/// the reply lands as `MessageCommitted { role: Assistant, .. }`.
+/// Concurrent-run guard reuses `run_in_flight` so the Composer
+/// disables correctly while a turn is in flight.
+#[tauri::command]
+fn start_chat_run(
+    app: AppHandle,
+    state: tauri::State<'_, SessionState>,
+    prompt: String,
+) -> Result<(), String> {
+    if prompt.len() > MAX_PROMPT_BYTES {
+        return Err(format!(
+            "prompt too long: {} bytes (max {} bytes)",
+            prompt.len(),
+            MAX_PROMPT_BYTES
+        ));
+    }
+    // Prefer whatever's in the handle (a prior explicit swap wins). Fall
+    // back to lazily building the default profile from providers.toml so a
+    // user who just opened the app and typed a prompt — without picking
+    // anything in the dropdown — still gets a working adapter. The
+    // dropdown's default-selected option visually matches providers.toml's
+    // `default = ...`, so this matches user expectation.
+    // Note `default_was_built` so we can emit a one-shot
+    // `ModelProfileLoaded` after the adapter is in the slot — that gives
+    // the footer's context-usage meter a `context_window_tokens` value
+    // to divide against. Without it the meter renders as `N / 0` until
+    // an explicit dropdown swap.
+    let (adapter, default_was_built) = match state.adapter_handle.get() {
+        Some(a) => (a, false),
+        None => match resolve_default_adapter(&state.workspace_root()) {
+            Ok(a) => {
+                state.adapter_handle.swap(a.clone());
+                (a, true)
+            }
+            Err(e) => return Err(e),
+        },
+    };
+    if state
+        .run_in_flight
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::Acquire,
+            std::sync::atomic::Ordering::Relaxed,
+        )
+        .is_err()
+    {
+        return Err("a run is already in progress — wait for it to finish".to_string());
+    }
+    // v60.47 — capture the real workspace path (the override, if set)
+    // before spawning so the async task can write workspace-scope
+    // auto-cards without re-locking `state.workspace_override`.
+    let workspace_override = state
+        .workspace_override
+        .lock()
+        .ok()
+        .and_then(|g| g.clone());
+    let app_clone = app.clone();
+    let run_in_flight = state.run_in_flight.clone();
+    tauri::async_runtime::spawn(async move {
+        let _cleanup = ChatRunCleanup {
+            in_flight: run_in_flight,
+        };
+        // First chat through the default-built adapter: synthesise a
+        // `ModelProfileLoaded` so the footer's context-usage meter has a
+        // window-size denominator. (The swap_adapter path emits this
+        // already; the lazy-default path didn't until now.)
+        if default_was_built {
+            let caps = adapter.capabilities();
+            let strategy = if caps.native_tool_use.is_usable() {
+                atelier_core::protocol_strategy::Strategy::NativeTool
+            } else {
+                atelier_core::protocol_strategy::Strategy::JsonSentinel
+            };
+            let now = now_rfc3339();
+            let profile = atelier_core::adapter::model_profile::ModelProfile::skipped_for_well_known(
+                adapter.model_id(),
+                strategy,
+                caps.context_window_tokens,
+                atelier_core::adapter::model_profile::DEFAULT_PROFILE_MAX_TOKENS,
+                now.clone(),
+            );
+            let capability_row = {
+                let base = atelier_core::adapter::capability_matrix::matrix_row_for(
+                    adapter.model_id(),
+                    &caps,
+                );
+                atelier_core::adapter::capability_matrix::crosswalk_with_profile(base, &profile)
+            };
+            emit_event(
+                &app_clone,
+                &SessionEvent::ModelProfileLoaded {
+                    model_id: profile.model_id.clone(),
+                    base_url: profile.base_url.clone(),
+                    strategy: profile.strategy,
+                    outcome:
+                        atelier_core::adapter::model_profile::ProbeLoadOutcome::CacheHit,
+                    capability_row: Some(capability_row),
+                },
+            );
+        }
+        // Echo the user message onto the bus first so the ConversationPane
+        // renders it immediately, then the model reply lands as a second
+        // MessageCommitted once the adapter returns.
+        emit_event(
+            &app_clone,
+            &SessionEvent::MessageCommitted {
+                role: MessageRole::User,
+                text: prompt.clone(),
+            },
+        );
+        // v60.44 — memory recall. Prepend a system message built from
+        // every promoted card in `~/.atelier/memory/` so the model
+        // starts every chat with the user's durable cross-session
+        // context. No write-back: chat mode doesn't have a tool surface
+        // for the model to create cards. Cards still get added/promoted
+        // via the MemoryPane.
+        let mut messages = Vec::with_capacity(2);
+        if let Some(sys) = load_promoted_memory(workspace_override.as_deref()) {
+            messages.push(Message::text(Role::System, sys));
+        }
+        messages.push(Message::text(Role::User, prompt));
+        match adapter.chat(&messages, &[]).await {
+            Ok(resp) => {
+                let used = resp.usage.prompt_tokens + resp.usage.completion_tokens;
+                emit_event(
+                    &app_clone,
+                    &SessionEvent::MessageCommitted {
+                        role: MessageRole::Assistant,
+                        text: resp.text,
+                    },
+                );
+                // Emit the context-usage snapshot so the footer's meter
+                // reflects this turn's prompt + completion. `unknown` is 0
+                // because openai-compat returns exact counts via `usage`.
+                emit_event(
+                    &app_clone,
+                    &SessionEvent::ContextSnapshot {
+                        known_tokens: used,
+                        unknown_tokens: 0,
+                    },
+                );
+            }
+            Err(e) => {
+                // Surface as a system message so the user sees what failed
+                // without us needing a brand-new event variant.
+                emit_event(
+                    &app_clone,
+                    &SessionEvent::MessageCommitted {
+                        role: MessageRole::System,
+                        text: format!("[chat error] {e}"),
+                    },
+                );
+                tracing::warn!(error = %e, "start_chat_run: adapter.chat failed");
+                // v60.47 — auto-draft a workspace-scope memory card if the
+                // error matches a known-fixable pattern. Skipped silently
+                // when no real workspace has been chosen (the tempdir
+                // case) or when the error doesn't map to a useful note.
+                if let Some(card) = auto_card_for_error(&e) {
+                    match write_workspace_auto_card(workspace_override.as_deref(), &card) {
+                        Ok(Some(path)) => {
+                            tracing::info!(
+                                path = %path.display(),
+                                slug = card.slug,
+                                "start_chat_run: auto-drafted workspace memory card"
+                            );
+                            emit_event(
+                                &app_clone,
+                                &SessionEvent::MessageCommitted {
+                                    role: MessageRole::System,
+                                    text: format!(
+                                        "[auto-memory] drafted workspace card at {} — review in MemoryPane or edit by hand",
+                                        path.display()
+                                    ),
+                                },
+                            );
+                        }
+                        Ok(None) => {
+                            tracing::debug!(
+                                "auto-card skipped: no workspace selected (still on tempdir)"
+                            );
+                        }
+                        Err(io_err) => {
+                            tracing::warn!(
+                                error = %io_err,
+                                "start_chat_run: failed to write auto memory card"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    });
+    Ok(())
+}
+
+/// v60.43 — minimal drop-guard for `start_chat_run`'s spawned task.
+/// Only clears `run_in_flight`; there's no per-run workspace to
+/// remove because the chat path doesn't construct a Runner.
+struct ChatRunCleanup {
+    in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for ChatRunCleanup {
+    fn drop(&mut self) {
+        self.in_flight
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
 }
 
 /// Drop-guard for `start_demo_run`'s spawned task. Clears the

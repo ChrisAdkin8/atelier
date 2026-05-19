@@ -202,7 +202,7 @@
 </script>
 
 <section class="pane">
-  <header class="pane-title">plan</header>
+  <header class="pane-title">Plan</header>
   <form
     class="composer"
     onsubmit={(e) => {

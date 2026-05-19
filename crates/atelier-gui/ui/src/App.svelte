@@ -30,7 +30,6 @@
   } from './lib/state'
   import Header from './lib/components/Header.svelte'
   import ConversationPane from './lib/components/ConversationPane.svelte'
-  import DiffPane from './lib/components/DiffPane.svelte'
   import PlanPane from './lib/components/PlanPane.svelte'
   import MetersPane from './lib/components/MetersPane.svelte'
   import ContextPane from './lib/components/ContextPane.svelte'
@@ -47,6 +46,32 @@
   // future svelte-check version may fix this — if so, feel free to
   // rename, but verify `npm run check` stays clean.
   let app = $state(initialState())
+
+  // v60.49 — right-column collapse toggle. Persists to localStorage
+  // so the user's choice survives a relaunch. When collapsed, the
+  // Conversation pane gets the full window width and the Plan / Memory
+  // / Meters / Context panels are hidden via a class on `.grid`.
+  let rightPanelCollapsed: boolean = $state(
+    (() => {
+      try {
+        return localStorage.getItem('atelier:right-collapsed') === '1'
+      } catch {
+        return false
+      }
+    })(),
+  )
+  function toggleRightPanel() {
+    rightPanelCollapsed = !rightPanelCollapsed
+    try {
+      localStorage.setItem(
+        'atelier:right-collapsed',
+        rightPanelCollapsed ? '1' : '0',
+      )
+    } catch {
+      // localStorage disabled (private browsing, sandboxed webview, etc.);
+      // toggle still works in-session, just doesn't persist.
+    }
+  }
   let unlisten: UnlistenFn | null = null
 
   // Phase C close — §5 mental-model panel visibility. Off by default;
@@ -269,9 +294,8 @@
 
 <div class="app">
   <Header
-    currentState={app.currentState}
-    editStagedCount={app.editStagedCount}
-    scrubOffset={app.scrubOffset}
+    rightCollapsed={rightPanelCollapsed}
+    onToggleRight={toggleRightPanel}
   />
 
   <!-- Phase C close — mental-model panel toggle. Lives in its own
@@ -284,9 +308,9 @@
       onclick={() => void toggleMentalModelPanel()}
       aria-expanded={showMentalModel}
       aria-controls="mental-model-panel"
-      title="show / hide the §5 mental-model panel (off by default)"
+      title="show / hide the mental-model panel (off by default)"
     >
-      §5 mental model {showMentalModel ? '▾' : '▸'}
+      Mental Model {showMentalModel ? '▾' : '▸'}
       {#if app.mentalModel.enabled}
         <span class="enabled-dot" aria-label="enabled">●</span>
       {/if}
@@ -298,7 +322,7 @@
     </div>
   {/if}
 
-  <main class="grid">
+  <main class="grid" class:right-collapsed={rightPanelCollapsed}>
     <div class="pane-slot conversation-slot">
       <ConversationPane conversation={app.conversation} />
     </div>
@@ -313,20 +337,10 @@
         <MemoryPane cards={app.memoryCards} />
       </div>
     </div>
-    <!-- v60.30 — `inert` while the §14 concurrent-edit modal is open
-         so Enter-handling on a stale hunk can't accept pre-edit
-         content while the user is being asked which side wins. -->
-    <div
-      class="pane-slot diff-slot"
-      inert={app.concurrentEditModal ? true : null}
-      aria-hidden={app.concurrentEditModal ? 'true' : null}
-    >
-      <DiffPane
-        recentEdits={app.recentEdits}
-        pendingApproval={app.pendingApproval}
-        claimedChanges={app.claimedChanges}
-      />
-    </div>
+    <!-- v60.43 — DiffPane removed. The §3 staging surface is no
+         longer reachable from the GUI's chat-only Composer path;
+         Conversation now spans both rows of the left column so the
+         transcript gets the breathing room the diff used to occupy. -->
     <div class="pane-slot meters-slot">
       <!-- v53: the bottom-right slot stacks the aggregate Meters
            (cost + context-window gauge) above the per-item Context
@@ -358,6 +372,33 @@
       <span class="hint">[pinned: g returns to HEAD]</span>
     {/if}
 
+    <!-- v60.43 — context-window usage. Tokens-known divided by the
+         active model's `context_window_tokens`, rendered as both a
+         progress bar and a percent for at-a-glance status. Hidden
+         until at least one turn has landed (window denominator > 0). -->
+    {#if app.contextWindowTokens > 0}
+      {@const used = app.contextTokens.known}
+      {@const cap = app.contextWindowTokens}
+      {@const pct = Math.min(100, Math.round((used / cap) * 100))}
+      <span class="ctx-meter" title="context window usage">
+        <span class="ctx-label">ctx</span>
+        <span class="ctx-bar"
+          ><span class="ctx-fill" style="width: {pct}%"></span></span>
+        <span class="ctx-text">{used.toLocaleString()} / {cap.toLocaleString()} ({pct}%)</span>
+      </span>
+    {/if}
+
+    <!-- v60.44 — cost meter moved out of the right-column MetersPane
+         and into the footer alongside the context-usage gauge. Always
+         rendered (even at $0.0000) so the user has a stable place to
+         look for cost; the value updates as LedgerAppended events
+         land (today only the Runner path emits those — chat mode
+         leaves it at $0 until cost wiring is added there too). -->
+    <span class="cost-meter" title="session cost (USD)">
+      <span class="cost-label">cost</span>
+      <span class="cost-value">${app.totalCostUsd.toFixed(4)}</span>
+    </span>
+
     <!-- v52 — active BYOM model on the right side. Empty until the
          Runner emits its one-shot `ModelProfileLoaded` event at session
          start; populated thereafter for the lifetime of the run.
@@ -387,7 +428,7 @@
           </span>
         {/if}
       {:else}
-        <span class="model-pending">no model</span>
+        <span class="model-pending">MODEL</span>
       {/if}
       <!-- v60.10 B2 follow-on — provider swap dropdown. Stub UI;
            sends `{ kind, model_id }` to the `swap_adapter` Tauri
@@ -428,13 +469,23 @@
 
 <style>
   .app {
-    display: grid;
-    /* Header / mental-model toggle / [optional mental-model panel]
-       / main grid / Composer / help footer. The mental-model rows
-       collapse to `auto` height so the layout stays compact when
-       the panel is hidden. */
-    grid-template-rows: auto auto auto 1fr auto auto;
+    /* v60.44 — flexbox column instead of grid.
+       Was: `display: grid; grid-template-rows: auto auto auto 1fr auto auto;`.
+       The grid declared 6 row tracks but only 5 children render when the
+       mental-model panel is hidden (its `{#if}` wrapper is absent, not
+       zero-height). Grid auto-placement then shifted every child up by
+       one track, assigning the `1fr` slot to the Composer instead of the
+       main pane grid — so on full-screen the Composer textarea ballooned
+       to fill the screen and the help footer kept the bottom edge.
+       Flexbox sizes each child by content; only `.grid` claims `flex: 1`.
+       The Composer always sits where it's written in the JSX. */
+    display: flex;
+    flex-direction: column;
     height: 100vh;
+    min-height: 0;
+  }
+  .app > :global(.grid) {
+    flex: 1;
     min-height: 0;
   }
   .mental-model-toggle {
@@ -478,6 +529,20 @@
     padding: var(--gap-pane);
     min-height: 0;
   }
+  /* v60.49 — when collapsed, Conversation takes the full width and the
+     right-column slots are pulled out of layout entirely (no reserved
+     gutter). Selectors target the slot classes so other panels that
+     might land in column 2 later inherit the same behaviour for free. */
+  .grid.right-collapsed {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .grid.right-collapsed .plan-slot,
+  .grid.right-collapsed .meters-slot {
+    display: none;
+  }
+  .grid.right-collapsed .conversation-slot {
+    grid-column: 1;
+  }
   .pane-slot {
     min-width: 0;
     min-height: 0;
@@ -486,18 +551,22 @@
   .pane-slot > :global(*) {
     flex: 1;
     min-width: 0;
+    /* v60.43 — without `min-height: 0`, an inner element with
+       `overflow-y: auto` (ConversationPane's `.scroll`) can't shrink
+       below its content height — i.e. it overflows the grid cell
+       instead of scrolling. Setting min-height: 0 lets the cell's
+       fixed height clamp the flex child so the inner scroll engages. */
+    min-height: 0;
   }
+  /* v60.43 — Conversation spans both rows of column 1 since
+     DiffPane was removed. Plan + Meters stay in column 2 as before. */
   .conversation-slot {
-    grid-row: 1;
+    grid-row: 1 / span 2;
     grid-column: 1;
   }
   .plan-slot {
     grid-row: 1;
     grid-column: 2;
-  }
-  .diff-slot {
-    grid-row: 2;
-    grid-column: 1;
   }
   .meters-slot {
     grid-row: 2;
@@ -540,6 +609,61 @@
   .help .hint {
     color: var(--accent-yellow);
   }
+  /* v60.43 — context-window usage meter. `margin-left: auto` pushes
+     it to the right alongside the model badge so left-side scrub keys
+     keep their stable position. */
+  .help .ctx-meter {
+    margin-left: auto;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    color: var(--fg-dim);
+  }
+  .help .ctx-label {
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    font-size: 0.65rem;
+    opacity: 0.85;
+  }
+  .help .ctx-bar {
+    position: relative;
+    display: inline-block;
+    width: 7rem;
+    height: 0.55rem;
+    background: var(--bg-pane-alt, rgba(255, 255, 255, 0.08));
+    border: 1px solid var(--border-pane-strong, rgba(255, 255, 255, 0.18));
+    border-radius: 2px;
+    overflow: hidden;
+  }
+  .help .ctx-fill {
+    position: absolute;
+    inset: 0 auto 0 0;
+    background: var(--accent-cyan, #6cc);
+    transition: width 0.2s ease-out;
+  }
+  .help .ctx-text {
+    font-variant-numeric: tabular-nums;
+    color: var(--fg-default, var(--fg-dim));
+  }
+  /* v60.44 — cost meter, sibling of ctx-meter. No `margin-left:auto`
+     here; the ctx-meter already claimed the auto-margin so cost sits
+     immediately to its right via the parent flex `gap`. */
+  .help .cost-meter {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    color: var(--fg-dim);
+  }
+  .help .cost-label {
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    font-size: 0.65rem;
+    opacity: 0.85;
+  }
+  .help .cost-value {
+    font-variant-numeric: tabular-nums;
+    color: var(--accent-green, #4ec9b0);
+  }
   /* v52 — push the model badge to the right edge of the footer.
      `margin-left: auto` is the canonical flexbox idiom for "all
      siblings hug the left; this one hugs the right." */
@@ -566,7 +690,6 @@
   }
   .help .model-pending {
     color: var(--fg-dim);
-    font-style: italic;
   }
   /* v60.7 — yellow "broken: …" suffix when the §1 capability
      matrix has any `claimed_but_broken` cell. Mirrors the TUI's
