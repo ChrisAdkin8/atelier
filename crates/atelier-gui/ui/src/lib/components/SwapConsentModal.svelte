@@ -13,6 +13,7 @@
   // 120s timeout is the ultimate fallback, not a close box).
 
   import { invoke } from '@tauri-apps/api/core'
+  import { onMount } from 'svelte'
 
   type Props = {
     swapId: string
@@ -24,6 +25,17 @@
 
   let busy = $state(false)
   let error: string | null = $state(null)
+  // v60.37 B3 — focus trap + Escape handler. The first action button
+  // receives focus on mount; Tab cycles between the two buttons; Escape
+  // routes to the safer "Reject" arm (matching ConcurrentEditModal's
+  // Escape-to-pause convention). The 120s timeout is still the ultimate
+  // fallback; this just gives keyboard users a fast path to refuse.
+  let acceptBtn: HTMLButtonElement | undefined = $state()
+  let rejectBtn: HTMLButtonElement | undefined = $state()
+
+  onMount(() => {
+    acceptBtn?.focus()
+  })
 
   async function respond(decision: 'accepted' | 'rejected') {
     if (busy) return
@@ -41,7 +53,36 @@
       busy = false
     }
   }
+
+  function onKey(e: KeyboardEvent) {
+    if (busy) return
+    if (e.key === 'Escape') {
+      e.preventDefault()
+      e.stopPropagation()
+      respond('rejected')
+      return
+    }
+    // Tab-trap between the two action buttons. With only two focusable
+    // elements there's no actual cycle path to manage; we just bounce
+    // focus back to the other button if Tab tries to leave.
+    if (e.key === 'Tab') {
+      const focused = document.activeElement
+      if (focused === acceptBtn && !e.shiftKey) {
+        e.preventDefault()
+        rejectBtn?.focus()
+      } else if (focused === rejectBtn && e.shiftKey) {
+        e.preventDefault()
+        acceptBtn?.focus()
+      } else if (focused !== acceptBtn && focused !== rejectBtn) {
+        // Focus escaped — pull it back.
+        e.preventDefault()
+        acceptBtn?.focus()
+      }
+    }
+  }
 </script>
+
+<svelte:window onkeydown={onKey} />
 
 <div
   class="modal-backdrop"
@@ -70,10 +111,20 @@
     </p>
 
     <div class="actions">
-      <button type="button" disabled={busy} onclick={() => respond('accepted')}>
+      <button
+        bind:this={acceptBtn}
+        type="button"
+        disabled={busy}
+        onclick={() => respond('accepted')}
+      >
         <strong>Accept</strong> — swap in {toModelId}
       </button>
-      <button type="button" disabled={busy} onclick={() => respond('rejected')}>
+      <button
+        bind:this={rejectBtn}
+        type="button"
+        disabled={busy}
+        onclick={() => respond('rejected')}
+      >
         <strong>Reject</strong> — keep the current adapter
       </button>
     </div>

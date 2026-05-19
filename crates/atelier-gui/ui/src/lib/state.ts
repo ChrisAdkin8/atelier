@@ -357,6 +357,34 @@ export function initialState(): AppState {
   }
 }
 
+// v60.37 B6/UI-5 — runtime payload guard. In dev (`import.meta.env.DEV`),
+// asserts that the event payload has every required field; in prod, the
+// existing silent-coerce behaviour is preserved (so a single wire-label
+// drift on a non-critical event doesn't take the whole UI down).
+//
+// Used by the highest-stakes arms (modal triggers, consent-flow events).
+// The lower-stakes arms keep the raw `as X` cast pattern for now; promote
+// them here as they grow new required fields.
+function castPayload<T>(
+  payload: unknown,
+  required: readonly string[],
+  kind: string,
+): T {
+  if (import.meta.env?.DEV && (typeof payload !== 'object' || payload == null)) {
+    throw new Error(
+      `state.ts: ${kind} payload must be an object; got ${typeof payload}`,
+    )
+  }
+  if (import.meta.env?.DEV && typeof payload === 'object' && payload != null) {
+    for (const k of required) {
+      if (!(k in (payload as Record<string, unknown>))) {
+        throw new Error(`state.ts: ${kind} payload missing required field '${k}'`)
+      }
+    }
+  }
+  return payload as T
+}
+
 // ---- applyEvent: pure reducer ----
 //
 // Returns a NEW state object (no in-place mutation) so Svelte's `$state`
@@ -482,7 +510,13 @@ export function applyEvent(state: AppState, evt: BridgedEvent): AppState {
       // already queued the next tool call; we just surface the
       // user-decision modal. Subsequent FilesChanged bursts replace
       // the snapshot (debouncing is the watcher's job).
-      const p = evt.payload as { paths: string[]; observed_at: string }
+      // v60.37 B6 — DEV-mode shape guard. A wire-label drift on this
+      // event would silently break the §14 modal flow.
+      const p = castPayload<{ paths: string[]; observed_at: string }>(
+        evt.payload,
+        ['paths', 'observed_at'],
+        'FilesChanged',
+      )
       return {
         ...state,
         events,
@@ -568,7 +602,13 @@ export function applyEvent(state: AppState, evt: BridgedEvent): AppState {
       // modal renders Accept / Reject buttons that invoke that
       // command. Allowlist-refused swaps never emit `Pending` (they
       // jump straight to `Rejected` with `swap_id: null`).
-      const p = evt.payload as { swap_id: string; to_model_id: string; base_url: string }
+      // v60.37 B6 — DEV-mode shape guard. A renamed field here would
+      // brick the consent flow silently in prod.
+      const p = castPayload<{ swap_id: string; to_model_id: string; base_url: string }>(
+        evt.payload,
+        ['swap_id', 'to_model_id', 'base_url'],
+        'AdapterSwapPending',
+      )
       return {
         ...state,
         events,

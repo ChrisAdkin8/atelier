@@ -10,6 +10,7 @@
   // timer in the runner is the ultimate fallback, not the close box).
 
   import { invoke } from '@tauri-apps/api/core'
+  import { onMount } from 'svelte'
 
   type Props = {
     paths: string[]
@@ -20,6 +21,18 @@
 
   let busy = $state(false)
   let error: string | null = $state(null)
+  // v60.37 B3 — focus trap + Escape handler. The first action button
+  // (Reload) takes focus on mount; Tab cycles between the three
+  // buttons; Escape routes to the safer "Pause" arm (matches the
+  // existing 5-min auto-pause fallback, so Escape == "I'm not ready
+  // to decide yet").
+  let reloadBtn: HTMLButtonElement | undefined = $state()
+  let waitBtn: HTMLButtonElement | undefined = $state()
+  let pauseBtn: HTMLButtonElement | undefined = $state()
+
+  onMount(() => {
+    reloadBtn?.focus()
+  })
 
   async function resolve(choice: 'reload' | 'wait' | 'pause') {
     if (busy) return
@@ -36,7 +49,37 @@
       busy = false
     }
   }
+
+  function onKey(e: KeyboardEvent) {
+    if (busy) return
+    if (e.key === 'Escape') {
+      e.preventDefault()
+      e.stopPropagation()
+      resolve('pause')
+      return
+    }
+    if (e.key === 'Tab') {
+      const focused = document.activeElement
+      const order = [reloadBtn, waitBtn, pauseBtn].filter(
+        (b): b is HTMLButtonElement => b !== undefined,
+      )
+      if (order.length === 0) return
+      const idx = order.indexOf(focused as HTMLButtonElement)
+      if (idx === -1) {
+        e.preventDefault()
+        order[0]?.focus()
+        return
+      }
+      const next = e.shiftKey
+        ? (idx - 1 + order.length) % order.length
+        : (idx + 1) % order.length
+      e.preventDefault()
+      order[next]?.focus()
+    }
+  }
 </script>
+
+<svelte:window onkeydown={onKey} />
 
 <div class="modal-backdrop" role="dialog" aria-modal="true" aria-label="External edit detected">
   <section class="modal">
@@ -60,13 +103,28 @@
     </ul>
 
     <div class="actions">
-      <button type="button" disabled={busy} onclick={() => resolve('reload')}>
+      <button
+        bind:this={reloadBtn}
+        type="button"
+        disabled={busy}
+        onclick={() => resolve('reload')}
+      >
         <strong>Reload</strong> — drop the queued call; re-read the files next turn
       </button>
-      <button type="button" disabled={busy} onclick={() => resolve('wait')}>
+      <button
+        bind:this={waitBtn}
+        type="button"
+        disabled={busy}
+        onclick={() => resolve('wait')}
+      >
         <strong>Wait</strong> — keep the call queued; resolve when you say so
       </button>
-      <button type="button" disabled={busy} onclick={() => resolve('pause')}>
+      <button
+        bind:this={pauseBtn}
+        type="button"
+        disabled={busy}
+        onclick={() => resolve('pause')}
+      >
         <strong>Pause</strong> — same as Wait; auto-Reload after 5 minutes
       </button>
     </div>

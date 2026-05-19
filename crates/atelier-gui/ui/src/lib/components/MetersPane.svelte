@@ -55,13 +55,37 @@
   // v60.9 B1 follow-on — re-render `nowMs` on a 500ms tick so the
   // derived `overflowToastVisible` flips off ~5s after the last
   // overflow without the caller having to push a separate "decay
-  // expired" event. Cheap: one setInterval, no DOM thrash; the
-  // interval is cleared on component destroy.
+  // expired" event.
+  //
+  // v60.37 B4/UI-3 — only schedule the interval when there's a toast
+  // to decay. Before this fix the 500ms ticker ran for the lifetime of
+  // the component regardless of `lastOverflowResolution`, burning
+  // ~7200 needless rerenders per hour while the user did anything but
+  // overflow.
   let nowMs = $state(Date.now())
-  const tick = setInterval(() => {
+  let tick: ReturnType<typeof setInterval> | null = null
+  $effect(() => {
+    if (lastOverflowResolution == null) {
+      if (tick != null) {
+        clearInterval(tick)
+        tick = null
+      }
+      return
+    }
     nowMs = Date.now()
-  }, 500)
-  onDestroy(() => clearInterval(tick))
+    tick = setInterval(() => {
+      nowMs = Date.now()
+    }, 500)
+    return () => {
+      if (tick != null) {
+        clearInterval(tick)
+        tick = null
+      }
+    }
+  })
+  onDestroy(() => {
+    if (tick != null) clearInterval(tick)
+  })
 
   let overflowToastVisible = $derived(
     lastOverflowResolution != null &&

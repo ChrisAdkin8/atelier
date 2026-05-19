@@ -706,8 +706,19 @@ pub fn is_base_url_allowed(base_url: Option<&str>) -> bool {
 
 /// Bare host extraction matching `atelier_core::mcp::mcp_tool::host_of_url`
 /// (kept local to avoid pulling in the mcp module for this single helper).
+///
+/// v60.37 B1 — now requires an explicit `http://` or `https://` prefix.
+/// Without this, `host_of_url("localhost")` returned `Some("localhost")`
+/// which the allowlist happily accepted, and `host_of_url("gopher://api.anthropic.com/x")`
+/// returned `Some("api.anthropic.com")` — both defence-in-depth thinness
+/// that a copy-paste of this helper into a future adapter could exploit.
+/// Scheme comparison is case-insensitive.
 fn host_of_url(url: &str) -> Option<String> {
-    let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    let (scheme, rest) = url.split_once("://")?;
+    let scheme_lc = scheme.to_ascii_lowercase();
+    if scheme_lc != "http" && scheme_lc != "https" {
+        return None;
+    }
     let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
     let authority = authority
         .rsplit_once('@')
@@ -780,8 +791,17 @@ async fn swap_adapter(
     // v60.28 H2 — base_url allowlist gate. Refuses the swap before any
     // credential build / event emission so a hostile webview message
     // can't peel `OPENAI_API_KEY` to an arbitrary host.
+    //
+    // v60.37 B2 — resolve the EFFECTIVE base_url (wire-format value OR
+    // `OPENAI_BASE_URL` env fallback) BEFORE the allowlist check.
+    // Without this, a malicious .envrc setting `OPENAI_BASE_URL=http://attacker.test/v1`
+    // would let an OpenAiCompat swap with `base_url: None` route past the
+    // allowlist (which saw None) and then exfiltrate OPENAI_API_KEY to the
+    // attacker URL via build_swap_adapter's env-fallback.
     let pending_base_url = match &provider {
-        SwapProviderWire::OpenAiCompat { base_url, .. } => base_url.clone(),
+        SwapProviderWire::OpenAiCompat { base_url, .. } => base_url
+            .clone()
+            .or_else(|| std::env::var("OPENAI_BASE_URL").ok()),
         SwapProviderWire::Anthropic { .. } | SwapProviderWire::Mock { .. } => None,
     };
     let pending_to_id = match &provider {
@@ -1972,6 +1992,23 @@ mod tests {
         assert!(is_base_url_allowed(Some("http://localhost:11434/v1")));
         assert!(is_base_url_allowed(Some("http://127.0.0.1:8080/v1")));
         assert!(is_base_url_allowed(None));
+    }
+
+    #[test]
+    fn swap_allowlist_refuses_non_http_scheme() {
+        // v60.37 B1 — `host_of_url` now requires an explicit `http://`
+        // or `https://` prefix. Without this, `localhost` (no scheme)
+        // was accepted, and `gopher://api.anthropic.com/x` was accepted
+        // because the parsed host matched the allowlist. Both are
+        // defence-in-depth thinness — reqwest fails on non-http schemes
+        // today, but a copy-paste of this helper would inherit the bug.
+        assert!(!is_base_url_allowed(Some("localhost")));
+        assert!(!is_base_url_allowed(Some("127.0.0.1")));
+        assert!(!is_base_url_allowed(Some("gopher://api.anthropic.com/x")));
+        assert!(!is_base_url_allowed(Some("file:///etc/passwd")));
+        assert!(!is_base_url_allowed(Some("ftp://api.openai.com/v1")));
+        // Mixed-case schemes still validated (lowered before compare).
+        assert!(is_base_url_allowed(Some("HTTPS://api.anthropic.com/v1")));
     }
 
     #[test]

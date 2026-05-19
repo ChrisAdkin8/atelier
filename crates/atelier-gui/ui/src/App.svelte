@@ -111,6 +111,11 @@
   // travel; v45 records intent the same way the TUI does so the
   // contract is established.
   function onKeyDown(e: KeyboardEvent) {
+    // v60.37 B3/UI-2 — early-return when ANY modal is open. The modals
+    // (ConcurrentEditModal, SwapConsentModal) attach their own keydown
+    // handler and the scrub handler must not race them — pressing `g`
+    // mid-modal would scrub the conversation behind the modal.
+    if (app.concurrentEditModal || app.pendingSwap) return
     // Ignore when focus is in a Composer-style input. Limitation: this
     // check is by `tagName` only — a future component built from a
     // contenteditable div or a custom Svelte element would leak
