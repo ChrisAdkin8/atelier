@@ -398,47 +398,24 @@
       </span>
     </span>
 
-    <!-- Right column: model badge + swap dropdown. -->
+    <!-- Right column: provider swap dropdown only. -->
     <span class="footer-right">
-      <span class="model-badge" aria-label="active model">
-        {#if app.currentModel}
-          <span class="model-id" title={modelBadgeTooltip(app.currentModel)}>
-            {app.currentModel.modelId}
-          </span>
-          <span class="model-sep">·</span>
-          <span class="model-strategy" title="§2 emission strategy">
-            {app.currentModel.strategy}
-          </span>
-          <span class="model-sep">·</span>
-          <span class="model-outcome" title="probe outcome">
-            {app.currentModel.outcome}
-          </span>
-          {#if capabilityBrokenLabel(app.currentModel.capabilityRow)}
-            <span class="model-sep">·</span>
-            <span class="model-broken" title="§1 capability matrix · auto-degraded">
-              {capabilityBrokenLabel(app.currentModel.capabilityRow)}
-            </span>
-          {/if}
-        {:else}
-          <span class="model-pending">MODEL</span>
-        {/if}
-        <select
-          class="swap-select"
-          value={String(dropdownIndex)}
-          onchange={onSwapChange}
-          disabled={app.pendingSwap != null}
-          title={app.pendingSwap != null
-            ? 'swap pending consent — respond to the modal first'
-            : 'swap adapter (§1 BYOM)'}
-          data-testid="swap-adapter-select"
-        >
-          {#each swapOptions as opt, i (opt.model_id)}
-            <option value={String(i)}>
-              {opt.is_default ? '★ ' : ''}{opt.label}
-            </option>
-          {/each}
-        </select>
-      </span>
+      <select
+        class="swap-select"
+        value={String(dropdownIndex)}
+        onchange={onSwapChange}
+        disabled={app.pendingSwap != null}
+        title={app.pendingSwap != null
+          ? 'swap pending consent — respond to the modal first'
+          : 'swap adapter (§1 BYOM)'}
+        data-testid="swap-adapter-select"
+      >
+        {#each swapOptions as opt, i (opt.model_id)}
+          <option value={String(i)}>
+            {opt.is_default ? '★ ' : ''}{opt.label}
+          </option>
+        {/each}
+      </select>
     </span>
   </footer>
 
@@ -681,41 +658,8 @@
     font-variant-numeric: tabular-nums;
     color: var(--accent-green, #4ec9b0);
   }
-  .help .model-badge {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.35rem;
-    color: var(--fg-default, var(--fg-dim));
-  }
-  .help .model-id {
-    color: var(--accent-cyan, #6cc);
-    font-weight: 500;
-  }
-  .help .model-strategy {
-    color: var(--accent-green, #9c9);
-  }
-  .help .model-outcome {
-    color: var(--fg-dim);
-  }
-  .help .model-sep {
-    color: var(--fg-dim);
-    opacity: 0.6;
-  }
-  .help .model-pending {
-    color: var(--fg-dim);
-  }
-  /* v60.7 — yellow "broken: …" suffix when the §1 capability
-     matrix has any `claimed_but_broken` cell. Mirrors the TUI's
-     yellow-bold styling for the same hint. */
-  .help .model-broken {
-    color: var(--accent-yellow, #cc6);
-    font-weight: 600;
-  }
-  /* v60.10 B2 follow-on — provider swap dropdown. Minimal styling
-     so the affordance reads as a control without overpowering the
-     model badge text. */
   .help .swap-select {
-    margin-left: 0.5rem;
+    margin-left: 0;
     background: var(--bg-pane-alt);
     color: var(--fg-default);
     border: 1px solid var(--border-pane);

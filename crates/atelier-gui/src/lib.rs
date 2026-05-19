@@ -2057,15 +2057,19 @@ fn start_chat_run(
             }
         };
         let mut final_resp: Option<atelier_core::adapter::ChatResponse> = None;
+        let mut chunk_count: u32 = 0;
         loop {
             match stream.next().await {
                 Some(atelier_core::adapter::StreamChunk::Text { delta }) => {
+                    chunk_count += 1;
+                    tracing::warn!(chunk = chunk_count, len = delta.len(), "stream text chunk");
                     emit_event(
                         &app_clone,
                         &SessionEvent::AssistantTextDelta { delta },
                     );
                 }
                 Some(atelier_core::adapter::StreamChunk::Complete { response }) => {
+                    tracing::warn!(chunks = chunk_count, "stream complete");
                     final_resp = Some(response);
                     break;
                 }

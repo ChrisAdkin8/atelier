@@ -380,9 +380,14 @@ export function applyEvent(state: AppState, evt: BridgedEvent): AppState {
       const role: ConversationRole = isConversationRole(p.role) ? p.role : 'system'
       const line: ConversationLine = { role, text: p.text }
       const conversation = pushBounded(state.conversation, line, MAX_CONVERSATION_LINES)
-      // Clear the streaming buffer when the assistant turn finalises.
+      // Clear streaming buffer when assistant turn finalises.
+      // Reset token meter to 0 when a new user turn starts so the
+      // incremental completion count is visible from zero.
       const streamingAssistant = role === 'assistant' ? '' : state.streamingAssistant
-      return { ...state, events, conversation, streamingAssistant }
+      const lastTurnTokens = role === 'user'
+        ? { prompt: 0, completion: 0, cached: 0 }
+        : state.lastTurnTokens
+      return { ...state, events, conversation, streamingAssistant, lastTurnTokens }
     }
     case 'AssistantTextDelta': {
       const p = evt.payload as { delta: string }

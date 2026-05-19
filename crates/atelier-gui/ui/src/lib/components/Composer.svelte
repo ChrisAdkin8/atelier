@@ -105,7 +105,7 @@
       if (slash) {
         await invoke('invoke_skill', { name: slash.name, args: slash.args })
       } else {
-        await invoke('start_agent_run', { prompt: trimmed })
+        await invoke('start_chat_run', { prompt: trimmed })
       }
       prompt = ''
     } catch (e) {
