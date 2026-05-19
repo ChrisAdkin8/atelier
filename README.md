@@ -225,6 +225,37 @@ For the exhaustive tree with one-line annotations on every subdirectory, see [`d
 
 ---
 
+## Memory
+
+Atelier remembers things across sessions — your preferences, project conventions, gotchas you hit once and don't want to hit again — by writing **memory cards** to disk and replaying them as a system-prompt prefix on every chat turn. There are two places cards live, and that's deliberate: some things you want to follow you everywhere (your favourite languages, your code-review tone), others belong to one repo and would be noise outside it (this project's pinned Rust version, the local server's port).
+
+| Action in the GUI | Where the card ends up | When to use it |
+|---|---|---|
+| **Promote** an in-session card from the Memory panel | `~/.atelier/memory/<slug>.md` — your personal "atelier root" | For facts that apply across every project — your name, your tone preferences, your standard tooling, anything you'd otherwise re-explain in each new session. |
+| **Add** a card in the Memory panel and leave it un-promoted | In-session only (memory, not disk) | For one-off notes you want during the current chat but don't need to survive a relaunch. |
+| **Auto-drafted** when the harness hits a recognised error | `<workspace>/.atelier/memory/auto_<slug>.md` — scoped to the current project | Happens for you: when `adapter.chat()` returns an `Auth` / `Unreachable` / `ContextOverflow` / `RateLimited` / etc. error, the harness drops a markdown card describing what went wrong and the likely fix, then mentions it in the chat. Repeat occurrences overwrite the same file. |
+| **Hand-written** at `<workspace>/.atelier/memory/<your-slug>.md` | Same as auto-drafted — workspace-scope | For facts you want the agent to know in *this* repo but nowhere else — its quirks, its conventions, its decision history. |
+
+On every chat turn the agent loads both directories (workspace **and** atelier root), strips the Jekyll-style frontmatter, and includes them as a system message before your prompt. Total memory is capped at 16 KiB so a runaway memory directory can't blow the context window; older / lexicographically-later cards are dropped first with a `tracing::warn`.
+
+**The format.** A memory card is just a markdown file with a small frontmatter block:
+
+```markdown
+---
+name: my-card-slug
+description: One-liner summary the agent sees as the TL;DR.
+metadata:
+  type: feedback
+---
+
+Body of the card. The agent reads this verbatim. Write it as if you were
+briefing a colleague who just walked into the room.
+```
+
+**Picking your workspace.** The Memory feature only works once you've pointed the GUI at a real folder (otherwise the workspace is a throwaway tempdir and any cards written there are deleted on shutdown). Use the **`Browse…`** button in the top-right of the GUI to open a native folder picker; the choice persists to `~/.atelier/gui.toml` so the next launch picks up where you left off. Auto-drafting is skipped silently while the workspace is still the tempdir, so you'll never end up with orphan cards in `/var/folders/`.
+
+---
+
 ## Build
 
 The toolchain is **pinned Rust 1.85.0** via `rust-toolchain.toml` — the first `cargo` call inside this repo silently fetches it. See [`docs/toolchain.md`](docs/toolchain.md) for the reason and for troubleshooting the `edition2024` error if it surfaces.
