@@ -81,6 +81,18 @@
     })
     listenerReady = true
     window.addEventListener('keydown', onKeyDown)
+    // v60.37 B5 — hydrate the swap dropdown from
+    // `.atelier/providers.toml`. The Rust command falls back to the
+    // built-in default list when no file is found, so this never
+    // produces an empty array; on a malformed TOML it logs a `warn!`
+    // on the backend and we get the defaults too. A network/IPC
+    // failure leaves the inline single-mock fallback in place.
+    try {
+      const opts = await invoke<SwapOption[]>('list_provider_profiles')
+      if (opts.length > 0) swapOptions = opts
+    } catch (err) {
+      console.warn('list_provider_profiles failed; keeping inline fallback', err)
+    }
   })
 
   // Phase C close — hydrate the mental-model panel on demand. The
@@ -184,17 +196,22 @@
   // the round-trip is recorded as a system `MessageCommitted` in the
   // conversation pane until the full B2 bundle (mid-run swap on the
   // Rust side) merges to main.
-  type SwapOption = { kind: 'mock' | 'anthropic' | 'openai_compat'; model_id: string; label: string }
-  const swapOptions: SwapOption[] = [
+  // v60.37 B5 — `base_url` carried through so OpenAiCompat profiles
+  // route their swap through the configured endpoint instead of the
+  // server-side OPENAI_BASE_URL env fallback.
+  type SwapOption = {
+    kind: 'mock' | 'anthropic' | 'openai_compat'
+    model_id: string
+    label: string
+    base_url?: string | null
+  }
+  // Hydrated on mount from the Rust-side `list_provider_profiles`
+  // command, which reads `.atelier/providers.toml`. Until that
+  // round-trip lands, the dropdown shows an inline fallback so the
+  // first paint isn't blank.
+  let swapOptions: SwapOption[] = $state([
     { kind: 'mock', model_id: 'mock:default', label: 'mock' },
-    { kind: 'anthropic', model_id: 'anthropic:claude-opus-4-7', label: 'anthropic · claude-opus-4-7' },
-    { kind: 'anthropic', model_id: 'anthropic:claude-sonnet-4-6', label: 'anthropic · claude-sonnet-4-6' },
-    {
-      kind: 'openai_compat',
-      model_id: 'local:qwen2.5-coder:7b',
-      label: 'openai-compat · local qwen2.5-coder:7b',
-    },
-  ]
+  ])
 
   // Pick the dropdown's selected option from the current model id when
   // possible; otherwise fall back to the first entry so the `<select>`
@@ -233,10 +250,15 @@
     // succeeds; on rejection the AdapterSwapRejected event leaves
     // `currentModel` unchanged and the effect snaps the dropdown back.
     dropdownIndex = idx
+    // v60.37 B5 — forward `base_url` for OpenAiCompat profiles so the
+    // server-side allowlist gate (and the resulting adapter) routes to
+    // the configured endpoint, not the OPENAI_BASE_URL env fallback.
+    const provider: Record<string, string> = { kind: opt.kind, model_id: opt.model_id }
+    if (opt.kind === 'openai_compat' && opt.base_url) {
+      provider.base_url = opt.base_url
+    }
     try {
-      await invoke('swap_adapter', {
-        provider: { kind: opt.kind, model_id: opt.model_id },
-      })
+      await invoke('swap_adapter', { provider })
     } catch (err) {
       // Surface failures via console; the system `MessageCommitted`
       // event the Rust side emits on success is the happy-path feedback.

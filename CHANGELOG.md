@@ -1,5 +1,27 @@
 # Atelier Spec — Changelog
 
+## v60.39 — 2026-05-19 (Bundle B5 closeout — GUI swap dropdown hydrates from providers.toml)
+
+Closes the last outstanding Medium item from the 2026-05-19 deep-scan response (v60.37 Bundle B item 5). The GUI's swap dropdown was previously a hardcoded four-row constant in `App.svelte`; now it hydrates from `<workspace>/.atelier/providers.toml` on mount via a new `list_provider_profiles` Tauri command.
+
+New `#[tauri::command] fn list_provider_profiles(state) -> Vec<SwapOptionWire>` in `crates/atelier-gui/src/lib.rs`. Delegates to a test-visible inner helper `list_provider_profiles_in(repo_root: &Path)` that:
+
+* loads via `atelier_core::config::ProvidersConfig::load` (already 1 MiB capped per v60.37 A2);
+* projects each named profile into a `{ kind, model_id, label, base_url }` wire row;
+* skips rows where `provider` or `model` is `None` (incomplete profiles can't drive a swap);
+* falls back to a built-in default list when no file is loadable, so first-run UX is unchanged;
+* never returns an error — a malformed `providers.toml` is logged via `tracing::warn!` and we still surface the defaults.
+
+`App.svelte`: `swapOptions` switched from `const` to `$state`, hydrated in `onMount` via `await invoke('list_provider_profiles')`. A one-row inline mock keeps the first paint non-blank during the round-trip. `onSwapChange` now forwards `base_url` for OpenAiCompat profiles so the swap routes to the configured endpoint instead of falling through to the `OPENAI_BASE_URL` env fallback in `build_swap_adapter`.
+
+Four new tests in `atelier-gui::tests`:
+* `list_provider_profiles_returns_defaults_when_no_file`
+* `list_provider_profiles_hydrates_from_toml`
+* `list_provider_profiles_skips_incomplete_rows`
+* `list_provider_profiles_falls_back_on_malformed_toml`
+
+Verification: `cargo test -p atelier-gui --lib` (46 passed, was 42), `cargo clippy --workspace --all-targets -D warnings` clean, `svelte-check` 0/0 across 289 files, `make check` green.
+
 ## v60.38 — 2026-05-19 (Deep-scan low-severity hygiene sweep)
 
 Eighth and final commit in the 2026-05-19 deep-scan response. Closes 8 of 10 Low-severity findings; L9 (mcp_catalog `requires_secrets[*].where` enum extension) deferred to when the catalog grows beyond the bundled five; L10 (`InlineRenderers.svelte` `<script module>` migration) deferred — the existing `export function` on the instance script is functional and the rewrite cost exceeds the convention-only benefit while there's a single internal consumer.

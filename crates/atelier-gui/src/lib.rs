@@ -170,6 +170,8 @@ pub fn run() {
             swap_adapter,
             // v60.28 H2 follow-on — renderer reply for the consent modal.
             respond_to_swap,
+            // v60.37 B5 — hydrate the dropdown from .atelier/providers.toml.
+            list_provider_profiles,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -737,6 +739,128 @@ fn host_of_url(url: &str) -> Option<String> {
     } else {
         Some(host.to_ascii_lowercase())
     }
+}
+
+/// v60.37 B5 — wire shape returned by [`list_provider_profiles`]. One
+/// row per resolved named profile in `<workspace>/.atelier/providers.toml`
+/// (or `~/.atelier/providers.toml` per [`ProvidersConfig::load`]'s
+/// discovery order). The webview hydrates its swap dropdown from this
+/// list on mount; no profile match → built-in defaults.
+///
+/// `base_url` is propagated so OpenAiCompat profiles route their swap
+/// through the configured endpoint (not the env fallback). Anthropic +
+/// Mock profiles carry `None` (the consent-modal allowlist gate ignores
+/// it for those kinds).
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct SwapOptionWire {
+    /// Matches `SwapProviderWire`'s tag values (snake_case): `mock`,
+    /// `anthropic`, `openai_compat`.
+    pub kind: String,
+    /// Model id as the wire would render it (`anthropic:claude-…`,
+    /// `local:qwen2.5-coder:7b`, `mock:default`, …).
+    pub model_id: String,
+    /// Human label for the `<option>`. Includes the profile name so a
+    /// user with two openai-compat profiles can tell them apart.
+    pub label: String,
+    /// Resolved base_url for OpenAiCompat profiles. `None` for
+    /// Anthropic and Mock (the swap-allowlist gate rejects a `base_url`
+    /// on those kinds anyway).
+    pub base_url: Option<String>,
+}
+
+/// v60.37 B5 — hydrate the GUI's swap dropdown from
+/// `.atelier/providers.toml`. Called on mount by `App.svelte`.
+///
+/// Behaviour:
+///
+/// * Loads via [`ProvidersConfig::load`], which already consults
+///   `<workspace>/.atelier/providers.toml` then `~/.atelier/providers.toml`
+///   and is capped at 1 MiB per v60.37 A2.
+/// * Skips profiles where `provider` or `model` is `None` (incomplete
+///   profiles can't drive a swap without further CLI flags; surfacing
+///   them in the dropdown would invite a swap that fails halfway).
+/// * Falls back to a built-in default list when no profile is
+///   loadable, so first-run UX matches the pre-B5 hardcoded array.
+///
+/// Never returns an error: a malformed `providers.toml` is logged via
+/// `tracing::warn!` and we fall back to defaults. The dropdown is
+/// "polish + convenience" — failing it shouldn't disable the GUI.
+#[tauri::command]
+fn list_provider_profiles(state: tauri::State<'_, SessionState>) -> Vec<SwapOptionWire> {
+    list_provider_profiles_in(state.workspace_root())
+}
+
+/// Test-visible inner helper for [`list_provider_profiles`]. Splitting
+/// the `tauri::State` wrapper out makes the projection logic exercisable
+/// without booting a Tauri runtime.
+pub fn list_provider_profiles_in(repo_root: &std::path::Path) -> Vec<SwapOptionWire> {
+    use atelier_core::config::{ProviderKind, ProvidersConfig};
+
+    let mut out = Vec::new();
+    match ProvidersConfig::load(repo_root) {
+        Ok(Some(loaded)) => {
+            for (name, prof) in &loaded.config.providers {
+                let (Some(kind), Some(model)) = (prof.provider, prof.model.as_ref()) else {
+                    // Incomplete profile — skip rather than ship a row
+                    // that would fail downstream when the user clicks it.
+                    continue;
+                };
+                let (kind_str, base_url) = match kind {
+                    ProviderKind::Mock => ("mock", None),
+                    ProviderKind::Anthropic => ("anthropic", None),
+                    ProviderKind::OpenaiCompat => ("openai_compat", prof.base_url.clone()),
+                };
+                out.push(SwapOptionWire {
+                    kind: kind_str.to_string(),
+                    model_id: model.clone(),
+                    label: format!("{name} · {model}"),
+                    base_url,
+                });
+            }
+        }
+        Ok(None) => {
+            // No file on disk; fall through to defaults below.
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "list_provider_profiles: providers.toml malformed; falling back to built-in defaults");
+        }
+    }
+    if out.is_empty() {
+        out.extend(builtin_swap_defaults());
+    }
+    out
+}
+
+/// v60.37 B5 — built-in fallback set used when `providers.toml` is
+/// absent or unparseable. Matches the pre-B5 hardcoded list in
+/// `App.svelte` so first-run UX is unchanged.
+fn builtin_swap_defaults() -> Vec<SwapOptionWire> {
+    vec![
+        SwapOptionWire {
+            kind: "mock".into(),
+            model_id: "mock:default".into(),
+            label: "mock".into(),
+            base_url: None,
+        },
+        SwapOptionWire {
+            kind: "anthropic".into(),
+            model_id: "anthropic:claude-opus-4-7".into(),
+            label: "anthropic · claude-opus-4-7".into(),
+            base_url: None,
+        },
+        SwapOptionWire {
+            kind: "anthropic".into(),
+            model_id: "anthropic:claude-sonnet-4-6".into(),
+            label: "anthropic · claude-sonnet-4-6".into(),
+            base_url: None,
+        },
+        SwapOptionWire {
+            kind: "openai_compat".into(),
+            model_id: "local:qwen2.5-coder:7b".into(),
+            label: "openai-compat · local qwen2.5-coder:7b".into(),
+            base_url: None,
+        },
+    ]
 }
 
 /// v60.10 §1 BYOM — build a fresh `Arc<dyn Adapter>` from a
@@ -1992,6 +2116,98 @@ mod tests {
         assert!(is_base_url_allowed(Some("http://localhost:11434/v1")));
         assert!(is_base_url_allowed(Some("http://127.0.0.1:8080/v1")));
         assert!(is_base_url_allowed(None));
+    }
+
+    // ---------- v60.37 B5 list_provider_profiles ----------
+
+    #[test]
+    fn list_provider_profiles_returns_defaults_when_no_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = super::list_provider_profiles_in(tmp.path());
+        // Built-in fallback list is non-empty and starts with mock.
+        assert!(!out.is_empty(), "expected built-in defaults");
+        assert_eq!(out[0].kind, "mock");
+        assert!(out.iter().any(|o| o.kind == "anthropic"));
+        assert!(out.iter().any(|o| o.kind == "openai_compat"));
+    }
+
+    #[test]
+    fn list_provider_profiles_hydrates_from_toml() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dot_atelier = tmp.path().join(".atelier");
+        std::fs::create_dir_all(&dot_atelier).unwrap();
+        std::fs::write(
+            dot_atelier.join("providers.toml"),
+            r#"
+[providers.local-codestral]
+provider = "openai-compat"
+base_url = "http://localhost:11434/v1"
+model = "local:codestral:22b"
+
+[providers.cloud]
+provider = "anthropic"
+model = "anthropic:claude-opus-4-7"
+"#,
+        )
+        .unwrap();
+        let out = super::list_provider_profiles_in(tmp.path());
+        // Two named profiles → two rows, alphabetical by name (BTreeMap).
+        assert_eq!(out.len(), 2, "got {out:?}");
+        assert_eq!(out[0].kind, "anthropic");
+        assert!(out[0].label.contains("cloud"));
+        assert_eq!(out[0].base_url, None);
+        assert_eq!(out[1].kind, "openai_compat");
+        assert!(out[1].label.contains("local-codestral"));
+        assert_eq!(
+            out[1].base_url.as_deref(),
+            Some("http://localhost:11434/v1")
+        );
+    }
+
+    #[test]
+    fn list_provider_profiles_skips_incomplete_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dot_atelier = tmp.path().join(".atelier");
+        std::fs::create_dir_all(&dot_atelier).unwrap();
+        std::fs::write(
+            dot_atelier.join("providers.toml"),
+            r#"
+[providers.complete]
+provider = "anthropic"
+model = "anthropic:claude-opus-4-7"
+
+[providers.no-model]
+provider = "anthropic"
+
+[providers.no-provider]
+model = "anthropic:claude-opus-4-7"
+"#,
+        )
+        .unwrap();
+        let out = super::list_provider_profiles_in(tmp.path());
+        // Only the complete row survives the skip-incomplete filter.
+        assert_eq!(out.len(), 1, "got {out:?}");
+        assert!(out[0].label.contains("complete"));
+    }
+
+    #[test]
+    fn list_provider_profiles_falls_back_on_malformed_toml() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dot_atelier = tmp.path().join(".atelier");
+        std::fs::create_dir_all(&dot_atelier).unwrap();
+        std::fs::write(
+            dot_atelier.join("providers.toml"),
+            "this = is = not = valid = toml\n",
+        )
+        .unwrap();
+        let out = super::list_provider_profiles_in(tmp.path());
+        // Malformed file logs a warn but doesn't kill the dropdown —
+        // user gets the built-in fallback.
+        assert!(
+            !out.is_empty(),
+            "malformed providers.toml must still surface the default list"
+        );
+        assert_eq!(out[0].kind, "mock");
     }
 
     #[test]
