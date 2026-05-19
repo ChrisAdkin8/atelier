@@ -36,7 +36,9 @@ use atelier_core::{
     protocol::Envelope,
     protocol_strategy::{parse_json_sentinel, parse_native_tool, NativeToolCall, Strategy},
     sandbox::SandboxPolicy,
-    session::{self, Command as SessionCommand, ConcurrentEditOutcome, Event, MessageRole},
+    session::{
+        self, try_emit, Command as SessionCommand, ConcurrentEditOutcome, Event, MessageRole,
+    },
     state::NoopHook,
     tools::register_builtins,
     SessionHandle, SessionId, State, Transition,
@@ -1166,13 +1168,16 @@ impl Runner {
             );
             atelier_core::adapter::capability_matrix::crosswalk_with_profile(base_row, &profile)
         };
-        let _ = bus.send(Event::ModelProfileLoaded {
-            model_id: profile.model_id.clone(),
-            base_url: profile.base_url.clone(),
-            strategy: profile.strategy,
-            outcome,
-            capability_row: Some(capability_row),
-        });
+        let _ = try_emit(
+            &bus,
+            Event::ModelProfileLoaded {
+                model_id: profile.model_id.clone(),
+                base_url: profile.base_url.clone(),
+                strategy: profile.strategy,
+                outcome,
+                capability_row: Some(capability_row),
+            },
+        );
         // v60.10 §1 BYOM — consume the swap announcement queued by an
         // earlier `swap_adapter` call (if any). Emit
         // `Event::AdapterSwapped` AFTER the initial
@@ -1182,11 +1187,14 @@ impl Runner {
         // just folded in. The pair is followed by no further bus
         // events until the first turn proper.
         if let Some(swap) = self.pending_swap.lock().take() {
-            let _ = bus.send(Event::AdapterSwapped {
-                from_model_id: swap.from_model_id,
-                to_model_id: swap.to_model_id,
-                swapped_at: swap.swapped_at,
-            });
+            let _ = try_emit(
+                &bus,
+                Event::AdapterSwapped {
+                    from_model_id: swap.from_model_id,
+                    to_model_id: swap.to_model_id,
+                    swapped_at: swap.swapped_at,
+                },
+            );
         }
         // The profile recommends the starting §2 strategy; the
         // runtime conformance tracker downshifts it (one-way) if the
@@ -1311,10 +1319,13 @@ impl Runner {
                     Role::Tool => MessageRole::Tool,
                     Role::System => MessageRole::System,
                 };
-                let _ = bus.send(Event::MessageCommitted {
-                    role: role_bus,
-                    text: entry.content,
-                });
+                let _ = try_emit(
+                    &bus,
+                    Event::MessageCommitted {
+                        role: role_bus,
+                        text: entry.content,
+                    },
+                );
                 messages.push(msg);
             }
             // Surface every recovery_log entry to UIs as a system
@@ -1323,23 +1334,29 @@ impl Runner {
             // we re-write them to the next save so the audit trail is
             // never erased.
             for rec in &on_disk.recovery_log {
-                let _ = bus.send(Event::MessageCommitted {
-                    role: MessageRole::System,
-                    text: format!(
-                        "[recovery] turn={} reason={:?} captured_at={} partial={:?}",
-                        rec.turn_id, rec.reason, rec.captured_at, rec.partial_content
-                    ),
-                });
+                let _ = try_emit(
+                    &bus,
+                    Event::MessageCommitted {
+                        role: MessageRole::System,
+                        text: format!(
+                            "[recovery] turn={} reason={:?} captured_at={} partial={:?}",
+                            rec.turn_id, rec.reason, rec.captured_at, rec.partial_content
+                        ),
+                    },
+                );
             }
             resumed_session = Some(on_disk);
             if !prompt.trim().is_empty() {
                 context_manager
                     .lock()
                     .add(context_item_for_user_prompt(&prompt, &prompt_now));
-                let _ = bus.send(Event::MessageCommitted {
-                    role: MessageRole::User,
-                    text: prompt.clone(),
-                });
+                let _ = try_emit(
+                    &bus,
+                    Event::MessageCommitted {
+                        role: MessageRole::User,
+                        text: prompt.clone(),
+                    },
+                );
                 messages.push(Message::text(Role::User, prompt.clone()));
             }
         } else {
@@ -1351,10 +1368,13 @@ impl Runner {
             // Broadcast the initial user prompt so the conversation pane
             // catches up before the first turn. Best-effort send (no
             // subscribers is fine — see SessionDispatcher::dispatch).
-            let _ = bus.send(Event::MessageCommitted {
-                role: MessageRole::User,
-                text: prompt.clone(),
-            });
+            let _ = try_emit(
+                &bus,
+                Event::MessageCommitted {
+                    role: MessageRole::User,
+                    text: prompt.clone(),
+                },
+            );
         }
         // v57 (M-bug-3 fix) — emit one ContextItems snapshot before
         // entering the turn loop so a UI subscriber that joins
@@ -1364,9 +1384,12 @@ impl Runner {
         // still fires per-turn; this pre-loop emission is the
         // per-item snapshot only.
         let initial_items = context_manager.lock().summarise();
-        let _ = bus.send(Event::ContextItems {
-            items: initial_items,
-        });
+        let _ = try_emit(
+            &bus,
+            Event::ContextItems {
+                items: initial_items,
+            },
+        );
         let mut turns = 0;
         let mut final_state = State::Idle;
 
@@ -1537,11 +1560,14 @@ impl Runner {
                                         // compaction arm can do.
                                         // Surface so the user can
                                         // intervene (unpin, edit, etc).
-                                        let _ = bus.send(Event::ContextOverflowResolved {
-                                            resolution: "surfaced",
-                                            freed_tokens: None,
-                                            items_compacted: None,
-                                        });
+                                        let _ = try_emit(
+                                            &bus,
+                                            Event::ContextOverflowResolved {
+                                                resolution: "surfaced",
+                                                freed_tokens: None,
+                                                items_compacted: None,
+                                            },
+                                        );
                                         return Err(RunError::ContextOverflow {
                                             needed_tokens,
                                             limit_tokens,
@@ -1585,31 +1611,24 @@ impl Runner {
                                     .await
                                     {
                                         Ok(out) => {
-                                            let _ = bus.send(Event::ContextOverflowResolved {
-                                                resolution: "compacted",
-                                                freed_tokens: Some(out.freed_tokens),
-                                                items_compacted: Some(picks.len()),
-                                            });
-                                            // v60.32 M03 — drop the
-                                            // history entries the
-                                            // compaction consumed so
-                                            // the next
-                                            // `project_messages_for_call`
-                                            // builds a smaller
-                                            // payload. We only trim
-                                            // User / Assistant rows
-                                            // (the rolling prose
-                                            // history); Tool rows
-                                            // stay so a pending
-                                            // tool_use → tool_result
-                                            // pair isn't orphaned.
-                                            // The atelier system
-                                            // prompt is never a
-                                            // compaction target — the
-                                            // picker filters pinned
-                                            // items and the system
-                                            // prompt isn't a context
-                                            // item to begin with.
+                                            let _ = try_emit(
+                                                &bus,
+                                                Event::ContextOverflowResolved {
+                                                    resolution: "compacted",
+                                                    freed_tokens: Some(out.freed_tokens),
+                                                    items_compacted: Some(picks.len()),
+                                                },
+                                            );
+                                            // v60.32 M03 — drop the history entries the
+                                            // compaction consumed so the next
+                                            // `project_messages_for_call` builds a smaller
+                                            // payload. We only trim User / Assistant rows
+                                            // (the rolling prose history); Tool rows stay
+                                            // so a pending tool_use → tool_result pair
+                                            // isn't orphaned. The atelier system prompt is
+                                            // never a compaction target — the picker
+                                            // filters pinned items and the system prompt
+                                            // isn't a context item to begin with.
                                             if !picked_texts.is_empty() {
                                                 messages.retain(|m| {
                                                     !(matches!(
@@ -1628,11 +1647,14 @@ impl Runner {
                                                 error = %e,
                                                 "context-overflow auto-compaction failed; surfacing the original overflow"
                                             );
-                                            let _ = bus.send(Event::ContextOverflowResolved {
-                                                resolution: "surfaced",
-                                                freed_tokens: None,
-                                                items_compacted: None,
-                                            });
+                                            let _ = try_emit(
+                                                &bus,
+                                                Event::ContextOverflowResolved {
+                                                    resolution: "surfaced",
+                                                    freed_tokens: None,
+                                                    items_compacted: None,
+                                                },
+                                            );
                                             return Err(RunError::ContextOverflow {
                                                 needed_tokens,
                                                 limit_tokens,
@@ -1649,21 +1671,27 @@ impl Runner {
                                     // and surface a typed config error
                                     // so the caller knows the policy
                                     // arm hasn't been wired yet.
-                                    let _ = bus.send(Event::ContextOverflowResolved {
-                                        resolution: "rerouted",
-                                        freed_tokens: None,
-                                        items_compacted: None,
-                                    });
+                                    let _ = try_emit(
+                                        &bus,
+                                        Event::ContextOverflowResolved {
+                                            resolution: "rerouted",
+                                            freed_tokens: None,
+                                            items_compacted: None,
+                                        },
+                                    );
                                     return Err(RunError::Config(
                                         "reroute not yet implemented".into(),
                                     ));
                                 }
                                 ContextOverflowPolicy::Surface => {
-                                    let _ = bus.send(Event::ContextOverflowResolved {
-                                        resolution: "surfaced",
-                                        freed_tokens: None,
-                                        items_compacted: None,
-                                    });
+                                    let _ = try_emit(
+                                        &bus,
+                                        Event::ContextOverflowResolved {
+                                            resolution: "surfaced",
+                                            freed_tokens: None,
+                                            items_compacted: None,
+                                        },
+                                    );
                                     return Err(RunError::ContextOverflow {
                                         needed_tokens,
                                         limit_tokens,
@@ -1777,11 +1805,14 @@ impl Runner {
                         "{} of last {} envelope parses malformed",
                         self.degradation_threshold, self.degradation_window,
                     );
-                    let _ = bus.send(Event::StrategyDegraded {
-                        from: previous,
-                        to: next,
-                        reason,
-                    });
+                    let _ = try_emit(
+                        &bus,
+                        Event::StrategyDegraded {
+                            from: previous,
+                            to: next,
+                            reason,
+                        },
+                    );
                 }
             }
 
@@ -1809,10 +1840,13 @@ impl Runner {
                 &response.text,
                 &now_rfc3339(),
             ));
-            let _ = bus.send(Event::MessageCommitted {
-                role: MessageRole::Assistant,
-                text: response.text.clone(),
-            });
+            let _ = try_emit(
+                &bus,
+                Event::MessageCommitted {
+                    role: MessageRole::Assistant,
+                    text: response.text.clone(),
+                },
+            );
             // Apply the envelope's plan_update (if any) and broadcast a
             // fresh snapshot so the plan pane converges. `apply_envelope`
             // is idempotent — re-applying the same update produces the
@@ -1824,7 +1858,7 @@ impl Runner {
                     let _report = canvas.apply_envelope(plan_update);
                     canvas.to_vec()
                 };
-                let _ = bus.send(Event::PlanSnapshot { steps });
+                let _ = try_emit(&bus, Event::PlanSnapshot { steps });
             }
             // v56 — surface the envelope's per-file rationale so the
             // §3 "Why this change?" UI can render it. The bus event
@@ -1843,7 +1877,7 @@ impl Runner {
                         summary: c.summary.clone(),
                     })
                     .collect();
-                let _ = bus.send(Event::ClaimedChanges { changes });
+                let _ = try_emit(&bus, Event::ClaimedChanges { changes });
             }
             let real_tool_calls: Vec<_> = response
                 .tool_calls
@@ -1916,10 +1950,13 @@ impl Runner {
                         Ok(r) => serde_json::to_string(&r.output).unwrap_or_default(),
                         Err(e) => serde_json::json!({ "error": e.to_string() }).to_string(),
                     };
-                    let _ = bus.send(Event::MessageCommitted {
-                        role: MessageRole::Tool,
-                        text: result_str.clone(),
-                    });
+                    let _ = try_emit(
+                        &bus,
+                        Event::MessageCommitted {
+                            role: MessageRole::Tool,
+                            text: result_str.clone(),
+                        },
+                    );
                     context_manager.lock().add(context_item_for_tool_result(
                         &result_str,
                         &outcome.tool_call_id,
@@ -1955,24 +1992,33 @@ impl Runner {
             // operate on this store; the dispatcher (Step 2) shares
             // the Arc to mutate it from UI handlers.
             if let Ok(token_count) = self.adapter.count_tokens(&messages).await {
-                let _ = bus.send(Event::ContextSnapshot {
-                    known_tokens: token_count.count,
-                    unknown_tokens: 0,
-                });
+                let _ = try_emit(
+                    &bus,
+                    Event::ContextSnapshot {
+                        known_tokens: token_count.count,
+                        unknown_tokens: 0,
+                    },
+                );
             }
             let context_items = context_manager.lock().summarise();
-            let _ = bus.send(Event::ContextItems {
-                items: context_items,
-            });
+            let _ = try_emit(
+                &bus,
+                Event::ContextItems {
+                    items: context_items,
+                },
+            );
 
             // v55 — §5 Memory panel snapshot. The MemoryStore is now
             // mutable from the UI via SessionDispatcher's add /
             // delete / promote mutators (Step 3). The runner still
             // re-emits at each turn boundary so a late-joining
             // subscriber converges to the live state.
-            let _ = bus.send(Event::MemoryCards {
-                cards: memory_store.lock().summarise(),
-            });
+            let _ = try_emit(
+                &bus,
+                Event::MemoryCards {
+                    cards: memory_store.lock().summarise(),
+                },
+            );
 
             // v60.8 A2 follow-on — stash the most recent envelope for
             // the §7 verify pass below. The envelope is small (no
@@ -2001,13 +2047,16 @@ impl Runner {
             // so the driver can decide whether to nudge, swap adapter,
             // or abort — there's nothing the loop alone can do.
             if !made_tool_calls {
-                let _ = bus.send(Event::AgentStalled {
-                    turn: turn + 1,
-                    reason: "assistant turn produced no tool calls and no \
-                             claimed_done=true; conversation cannot advance \
-                             without a §2 protocol violation"
-                        .to_string(),
-                });
+                let _ = try_emit(
+                    &bus,
+                    Event::AgentStalled {
+                        turn: turn + 1,
+                        reason: "assistant turn produced no tool calls and no \
+                                 claimed_done=true; conversation cannot advance \
+                                 without a §2 protocol violation"
+                            .to_string(),
+                    },
+                );
                 advance(&session_handle, State::Streaming, State::AwaitingUser).await?;
                 final_state = State::AwaitingUser;
                 break;
@@ -2356,9 +2405,12 @@ fn spawn_concurrent_edit_resolver(
                 Ok(Event::FilesChanged { .. }) => match policy {
                     ConcurrentEditPolicy::AutoReload => {
                         // Headless: auto-resolve immediately.
-                        let _ = bus.send(Event::FilesChangedAcknowledged {
-                            outcome: ConcurrentEditOutcome::AutoReload,
-                        });
+                        let _ = try_emit(
+                            &bus,
+                            Event::FilesChangedAcknowledged {
+                                outcome: ConcurrentEditOutcome::AutoReload,
+                            },
+                        );
                     }
                     ConcurrentEditPolicy::Modal => {
                         // Interactive: start the 5-minute auto-pause
@@ -2370,9 +2422,12 @@ fn spawn_concurrent_edit_resolver(
                         loop {
                             tokio::select! {
                                 _ = &mut timer => {
-                                    let _ = bus.send(Event::FilesChangedAcknowledged {
-                                        outcome: ConcurrentEditOutcome::PauseTimedOut,
-                                    });
+                                    let _ = try_emit(
+                                        &bus,
+                                        Event::FilesChangedAcknowledged {
+                                            outcome: ConcurrentEditOutcome::PauseTimedOut,
+                                        },
+                                    );
                                     break;
                                 }
                                 ev = local_rx.recv() => match ev {

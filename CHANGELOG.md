@@ -1,5 +1,49 @@
 # Atelier Spec — Changelog
 
+## v60.35 — 2026-05-19 (Supply-chain gates + broadcast-lag instrumentation, M27–M31)
+
+Lands the v60.35 bundle from `tasks/plan_medium_severity_fixes.md`. Five items, file-disjoint from the other v60.32–v60.34 bundles.
+
+### M27 — `make audit` Makefile target
+
+New phony `audit` + `audit-install` targets in `Makefile`. `audit` runs `cargo audit --deny warnings` (with the workspace's documented `--ignore` set carried over from `quality-cheap` plus the long-tail Tauri/gtk-rs unmaintained rows) then `cd crates/atelier-gui/ui && npm audit --audit-level=high`. Both stages must exit 0. `audit-install` installs `cargo-audit --locked` for the helper-missing path.
+
+### M28 — `audit` job in `.github/workflows/check.yml`
+
+New ubuntu-only `audit` job that mirrors the existing `quality` job's shape but invokes `make audit`. Caches the `cargo-audit` binary across runs via `actions/cache@v4` (keyed `${{ runner.os }}-cargo-audit-v1`) so subsequent runs skip the install. The CI action versions still use floating tags; v60.33's SHA-pin sweep will replace them.
+
+### M29 — Broadcast-lag instrumentation (`try_emit` + `BROADCAST_LAGGED`)
+
+New helper `try_emit(bus, ev)` in `crates/atelier-core/src/session.rs`. Wraps `broadcast::Sender::send`; on `Err(SendError(_))` it increments `pub static BROADCAST_LAGGED: AtomicU64` and CAS-throttles a `tracing::warn!` to at most one per 1-second window via `BROADCAST_LAG_LAST_WARNED_SEC`. Returns the underlying `Result` so callers that need the receiver count still see it.
+
+Swept 46 broadcast-send call sites across the workspace from `let _ = bus.send(...)` / `let _ = self.events.send(...)` to `let _ = try_emit(&bus, ...)`:
+
+- 4 sites in `crates/atelier-core/src/session.rs` (the actor's own Transitioned / IllegalTransitionAttempted / Cancelled / Shutdown emits).
+- 18 sites in `crates/atelier-core/src/dispatcher.rs` (verify-pass, staging approval, ledger appends, mental-model snapshots, compaction / expansion, commit decisions).
+- 1 site in `crates/atelier-core/src/file_watcher.rs` (FilesChanged debounced emit).
+- 23 sites in `crates/atelier-cli/src/runner.rs` (model-profile / adapter-swap, message-committed across the resume / fresh-run / assistant / tool / recovery paths, context-overflow resolution arms, strategy-degradation, plan + claimed-changes snapshots, per-turn context + memory snapshots, agent-stalled, file-watcher acknowledgement paths).
+
+The single `let _ = session_handle.send(SessionCommand::Shutdown).await` is mpsc and stays as-is per the constraint.
+
+New `session::broadcast_tests::try_emit_increments_broadcast_lagged_when_no_receivers` saturates a fresh broadcast channel with the receiver dropped, sends 16 events through `try_emit`, and asserts `BROADCAST_LAGGED` advanced by at least 16. Robust to baseline drift from other tests via "advanced by at least N" rather than absolute load.
+
+### M30 — `atomic_write` doc sweep
+
+Pure documentation pass in `crates/atelier-core/src/init.rs`. The `atomic_write` doc comment now enumerates every atomic-write site in the workspace — `persistence.rs`, `hooks.rs`, `mcp_config.rs`, `lsp/approval.rs`, `staging.rs`, `adapter/model_profile.rs`, `compaction_blob.rs`, `memory_promote.rs`, `instrumentation.rs`, `bin/conformance_status.rs`, `bin/phase_a_gate_status.rs` — and pins the five-step canonical pattern (tempfile in target dir → write → fsync(file) → persist → fsync(dir)). The LSP-approval + audit-appender sites are documented with a note that v60.34 M15 + M16 align the actual implementations with the pattern.
+
+### M31 — `CONTRIBUTING.md` audit reminder
+
+Adds a line to the Dev-loop section: *"Before opening a PR, run `make audit` and confirm both gates are green. … If `cargo-audit` isn't on your `$PATH`, install it with `make audit-install`."*
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo clippy --workspace --all-targets -- -D warnings`
+- `cargo test -p atelier-core` — 828 pass (+1 new `try_emit_increments_broadcast_lagged_when_no_receivers`).
+- `cargo test --workspace` — every existing suite still green.
+- `make check` — schemas + artifacts + rig + dry-run all green.
+- `make audit` — `cargo audit --deny warnings` exits 0 against the documented `--ignore` set; `npm audit --audit-level=high` reports 0 vulnerabilities.
+
 ## v60.34 — 2026-05-19 (Durability, audit polish, hardening — M15–M26)
 
 Bundle from `tasks/plan_medium_severity_fixes.md` v60.34. Twelve items, all `atelier-core` + one `atelier-gui`, with new tests per item and no schema bumps:

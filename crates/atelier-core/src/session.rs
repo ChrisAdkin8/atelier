@@ -20,7 +20,9 @@
 //! cancellation primitive ([`Handle::cancel_token`]) is shared with the
 //! eventual turn-driver so drop-on-cancel works without a bespoke protocol.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::sync::{broadcast, mpsc, Semaphore};
 use tokio_util::sync::CancellationToken;
@@ -45,6 +47,62 @@ pub const EVENT_BUFFER: usize = 256;
 /// Default inbox depth. Producers `.await` when full — backpressure is
 /// intentional: a full inbox means the actor is wedged on a transition.
 pub const INBOX_CAPACITY: usize = 32;
+
+/// Counter incremented every time [`try_emit`] observes a broadcast
+/// send that returned `Err(SendError(_))` (no live receivers, or the
+/// channel was closed before the send landed). Public so tests and a
+/// future metrics sink can read it; never reset in production.
+pub static BROADCAST_LAGGED: AtomicU64 = AtomicU64::new(0);
+
+/// Unix-second timestamp of the most recent throttled lag warning,
+/// updated via CAS in [`try_emit`] so concurrent lag observations
+/// emit at most one `warn!` per 1-second window.
+static BROADCAST_LAG_LAST_WARNED_SEC: AtomicU64 = AtomicU64::new(0);
+
+/// Best-effort broadcast emit with lag instrumentation.
+///
+/// Wraps `bus.send(ev)`; every previously-bare `let _ = bus.send(...)`
+/// call site funnels through here so a slow / absent subscriber is
+/// observable rather than silently dropped. On `Err(SendError(_))`:
+///
+/// * Increments [`BROADCAST_LAGGED`] (saturating-add semantics; we
+///   wrap at `u64::MAX` only after >5 quintillion lags).
+/// * Fires `tracing::warn!` at most once per 1-second window, gated
+///   by a CAS on [`BROADCAST_LAG_LAST_WARNED_SEC`]. The first lag in
+///   any window wins the warn; concurrent lags inside the window
+///   silently bump the counter and rely on the next window to flush.
+///
+/// Returns the underlying `Result` so callers that need the receiver
+/// count can still use it. `Event` is large enough (128+ bytes for
+/// some variants) to trigger `clippy::result_large_err`; the err carries
+/// the unsent value by design, so we allow it here rather than boxing
+/// every emit on the happy path.
+#[allow(clippy::result_large_err)]
+pub fn try_emit(
+    bus: &broadcast::Sender<Event>,
+    ev: Event,
+) -> Result<usize, broadcast::error::SendError<Event>> {
+    let result = bus.send(ev);
+    if result.is_err() {
+        BROADCAST_LAGGED.fetch_add(1, Ordering::Relaxed);
+        let now_sec = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let last = BROADCAST_LAG_LAST_WARNED_SEC.load(Ordering::Relaxed);
+        if now_sec > last
+            && BROADCAST_LAG_LAST_WARNED_SEC
+                .compare_exchange(last, now_sec, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            tracing::warn!(
+                broadcast_lagged_total = BROADCAST_LAGGED.load(Ordering::Relaxed),
+                "session event dropped: no live subscribers (broadcast send returned SendError)"
+            );
+        }
+    }
+    result
+}
 
 /// Stable per-session identifier. Persisted on disk under
 /// `.atelier/sessions/<id>/` (spec §14).
@@ -778,7 +836,7 @@ async fn run_actor(
                     // state from disk needs the checkpoint already written.
                     checkpoint.on_transition(&t);
                     ledger.on_transition(&t);
-                    let _ = events.send(Event::Transitioned { from: state, to });
+                    let _ = try_emit(&events, Event::Transitioned { from: state, to });
                     state = to;
                     if state.is_terminal() {
                         tracing::debug!(session = %id, terminal = %state, "session reached terminal state");
@@ -787,14 +845,14 @@ async fn run_actor(
                 }
                 Err(IllegalTransition { from, to }) => {
                     tracing::warn!(session = %id, %from, %to, "illegal transition rejected");
-                    let _ = events.send(Event::IllegalTransitionAttempted { from, to });
+                    let _ = try_emit(&events, Event::IllegalTransitionAttempted { from, to });
                 }
             },
 
             Command::Cancel => {
                 tracing::debug!(session = %id, current = %state, "cancel requested");
                 cancel.cancel();
-                let _ = events.send(Event::Cancelled);
+                let _ = try_emit(&events, Event::Cancelled);
                 // Per spec §2.5, the driver is responsible for advancing
                 // through the legal path to `AwaitingUser`. The actor only
                 // trips the token and notifies subscribers.
@@ -802,7 +860,7 @@ async fn run_actor(
 
             Command::Shutdown => {
                 tracing::debug!(session = %id, "session actor shutdown requested");
-                let _ = events.send(Event::Shutdown);
+                let _ = try_emit(&events, Event::Shutdown);
                 break;
             }
         }
@@ -1334,5 +1392,34 @@ mod tests {
             hunks: Hunks::Same,
         };
         assert!(matches!(synthesised, Event::EditStaged { .. }));
+    }
+}
+
+#[cfg(test)]
+mod broadcast_tests {
+    use super::*;
+
+    /// v60.35 M29 — `try_emit` increments [`BROADCAST_LAGGED`] whenever
+    /// the underlying broadcast send returns `Err(SendError(_))`. The
+    /// observable shape we drive here is "no live receivers": creating
+    /// a fresh channel and dropping the lone receiver before any send
+    /// puts every emit on the error arm. Saturating-add past the
+    /// capacity makes the assertion sturdy under any baseline counter
+    /// value (other tests in the workspace may have already bumped it).
+    #[test]
+    fn try_emit_increments_broadcast_lagged_when_no_receivers() {
+        let (tx, rx) = broadcast::channel::<Event>(4);
+        drop(rx);
+
+        let before = BROADCAST_LAGGED.load(Ordering::Relaxed);
+        for _ in 0..16 {
+            let _ = try_emit(&tx, Event::Cancelled);
+        }
+        let after = BROADCAST_LAGGED.load(Ordering::Relaxed);
+
+        assert!(
+            after >= before + 16,
+            "BROADCAST_LAGGED should have advanced by at least 16; before={before} after={after}"
+        );
     }
 }

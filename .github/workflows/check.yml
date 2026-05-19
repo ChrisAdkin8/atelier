@@ -137,3 +137,45 @@ jobs:
 
       - name: Run quality-cheap
         run: make quality-cheap
+
+  # Stricter supply-chain gate (v60.35 M28). Pairs the existing
+  # `quality` job (`cargo audit` informational + `cargo machete`)
+  # with `cargo audit --deny warnings` plus the atelier-gui
+  # `npm audit --audit-level=high` surface that `quality` doesn't
+  # touch. The audit DB fetch is the slow step (~5s); the npm
+  # audit reads the lockfile only, no `npm install`.
+  audit:
+    name: audit (cargo audit + npm audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: "1.85.0"
+
+      - name: Set up Node (for npm audit)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # Cache the cargo-audit binary so subsequent runs skip the
+      # install. Key includes the action's choice of tool version
+      # (cargo-audit) so a bump invalidates the cache. v60.33's
+      # SHA-pin sweep will replace the @v2 tag.
+      - name: Cache cargo-audit binary
+        id: cache-cargo-audit
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-audit
+          key: ${{ runner.os }}-cargo-audit-v1
+
+      - name: Install cargo-audit
+        if: steps.cache-cargo-audit.outputs.cache-hit != 'true'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - name: Run make audit
+        run: make audit

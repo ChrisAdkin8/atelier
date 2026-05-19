@@ -51,7 +51,7 @@ use crate::error::ToolError;
 use crate::hooks::{HookEvent, HookManifest, HookSet};
 use crate::ledger::{local_cost_usd, LedgerEntry, DEFAULT_LOCAL_RATE_USD_PER_SEC};
 use crate::sandbox::SandboxPolicy;
-use crate::session::{edit_staged_events, Event};
+use crate::session::{edit_staged_events, try_emit, Event};
 
 /// Spec §8 trust-budget side-effect classification. Mirrors the
 /// `tool_manifest.v1.json` enum exactly so a Rust `Tool` impl and its bundled
@@ -916,10 +916,13 @@ impl ApprovalGate for PendingApprovalGate {
                 hunks: f.hunks.clone(),
             })
             .collect();
-        let _ = self.events.send(Event::StagingPendingApproval {
-            commit_id,
-            files: pending_files,
-        });
+        let _ = try_emit(
+            &self.events,
+            Event::StagingPendingApproval {
+                commit_id,
+                files: pending_files,
+            },
+        );
 
         // If the sender is dropped (consumer crashed mid-decision)
         // the receiver errors. Treat that as full reject — safer than
@@ -1307,17 +1310,17 @@ impl SessionDispatcher {
 
     fn emit_context_items(&self) {
         let items = self.context_manager.lock().summarise();
-        let _ = self.events.send(Event::ContextItems { items });
+        let _ = try_emit(&self.events, Event::ContextItems { items });
     }
 
     fn emit_memory_cards(&self) {
         let cards = self.memory_store.lock().summarise();
-        let _ = self.events.send(Event::MemoryCards { cards });
+        let _ = try_emit(&self.events, Event::MemoryCards { cards });
     }
 
     fn emit_plan_snapshot(&self) {
         let steps = self.plan_canvas.lock().to_vec();
-        let _ = self.events.send(Event::PlanSnapshot { steps });
+        let _ = try_emit(&self.events, Event::PlanSnapshot { steps });
     }
 
     /// v61 — surface a user's §14 concurrent-edit modal choice onto
@@ -1363,7 +1366,7 @@ impl SessionDispatcher {
         let event = self.context_manager.lock().evict(item_id, evicted_at)?;
         let entry = crate::ledger::LedgerEntry::cache_bust_from(&event);
         self.ledger.append(entry.clone());
-        let _ = self.events.send(Event::LedgerAppended { entry });
+        let _ = try_emit(&self.events, Event::LedgerAppended { entry });
         self.emit_context_items();
         Ok(event)
     }
@@ -1493,10 +1496,13 @@ impl SessionDispatcher {
         m.set(text, enabled, now)?;
         let snap = m.snapshot();
         drop(m);
-        let _ = self.events.send(Event::MentalModelSnapshot {
-            enabled: snap.enabled,
-            text_tokens: snap.text_tokens,
-        });
+        let _ = try_emit(
+            &self.events,
+            Event::MentalModelSnapshot {
+                enabled: snap.enabled,
+                text_tokens: snap.text_tokens,
+            },
+        );
         Ok(snap)
     }
 
@@ -1541,16 +1547,22 @@ impl SessionDispatcher {
         // of the two terminal-marker events so consumers can rely on
         // the per-run contract.
         if run.discrepancies.is_empty() {
-            let _ = self.events.send(Event::VerificationPassed {
-                tier: run.tier,
-                file_count: run.file_count,
-                claim_count: run.claim_count,
-            });
+            let _ = try_emit(
+                &self.events,
+                Event::VerificationPassed {
+                    tier: run.tier,
+                    file_count: run.file_count,
+                    claim_count: run.claim_count,
+                },
+            );
         } else {
-            let _ = self.events.send(Event::VerificationFailed {
-                tier: run.tier,
-                discrepancies: run.discrepancies.clone(),
-            });
+            let _ = try_emit(
+                &self.events,
+                Event::VerificationFailed {
+                    tier: run.tier,
+                    discrepancies: run.discrepancies.clone(),
+                },
+            );
         }
         run
     }
@@ -1581,16 +1593,22 @@ impl SessionDispatcher {
             tier1_discrepancies,
         );
         if run.discrepancies.is_empty() {
-            let _ = self.events.send(Event::VerificationPassed {
-                tier: run.tier,
-                file_count: run.file_count,
-                claim_count: run.claim_count,
-            });
+            let _ = try_emit(
+                &self.events,
+                Event::VerificationPassed {
+                    tier: run.tier,
+                    file_count: run.file_count,
+                    claim_count: run.claim_count,
+                },
+            );
         } else {
-            let _ = self.events.send(Event::VerificationFailed {
-                tier: run.tier,
-                discrepancies: run.discrepancies.clone(),
-            });
+            let _ = try_emit(
+                &self.events,
+                Event::VerificationFailed {
+                    tier: run.tier,
+                    discrepancies: run.discrepancies.clone(),
+                },
+            );
         }
         run
     }
@@ -1601,11 +1619,14 @@ impl SessionDispatcher {
     /// gray badge so absence is unambiguous rather than the user
     /// inferring it from a missing event.
     pub fn emit_verify_not_run(&self) {
-        let _ = self.events.send(Event::VerificationPassed {
-            tier: crate::verify::VerificationTier::NotRun,
-            file_count: 0,
-            claim_count: 0,
-        });
+        let _ = try_emit(
+            &self.events,
+            Event::VerificationPassed {
+                tier: crate::verify::VerificationTier::NotRun,
+                file_count: 0,
+                claim_count: 0,
+            },
+        );
     }
 
     /// v60.5 — append a single ledger entry and broadcast the matching
@@ -1617,7 +1638,7 @@ impl SessionDispatcher {
     /// where they need other side effects in the same atomic step.
     pub fn append_ledger_entry(&self, entry: crate::ledger::LedgerEntry) {
         self.ledger.append(entry.clone());
-        let _ = self.events.send(Event::LedgerAppended { entry });
+        let _ = try_emit(&self.events, Event::LedgerAppended { entry });
     }
 
     /// v60.5 — snapshot a subset of `ContextManager` items without
@@ -1720,14 +1741,17 @@ impl SessionDispatcher {
             expansion_blob_path,
         };
         self.ledger.append(entry.clone());
-        let _ = self.events.send(Event::LedgerAppended { entry });
+        let _ = try_emit(&self.events, Event::LedgerAppended { entry });
         self.emit_context_items();
         self.emit_memory_cards();
-        let _ = self.events.send(Event::CompactionExecuted {
-            freed_tokens,
-            replaced_item_count: cache_bust_events.len(),
-            summary_card_id: summary_card_id.clone(),
-        });
+        let _ = try_emit(
+            &self.events,
+            Event::CompactionExecuted {
+                freed_tokens,
+                replaced_item_count: cache_bust_events.len(),
+                summary_card_id: summary_card_id.clone(),
+            },
+        );
 
         Ok(CompactionOutput {
             summary_card_id,
@@ -1837,14 +1861,17 @@ impl SessionDispatcher {
             cache_rewarm_tokens,
         };
         self.ledger.append(entry.clone());
-        let _ = self.events.send(Event::LedgerAppended { entry });
+        let _ = try_emit(&self.events, Event::LedgerAppended { entry });
         self.emit_context_items();
         self.emit_memory_cards();
-        let _ = self.events.send(Event::ExpansionExecuted {
-            restored_item_count,
-            summary_card_id: card_id.clone(),
-            cache_rewarm_tokens,
-        });
+        let _ = try_emit(
+            &self.events,
+            Event::ExpansionExecuted {
+                restored_item_count,
+                summary_card_id: card_id.clone(),
+                cache_rewarm_tokens,
+            },
+        );
 
         Ok(ExpansionOutput {
             restored_item_count,
@@ -1887,17 +1914,23 @@ impl SessionDispatcher {
         // subscribers; we ignore that — the on-disk session is the
         // recoverable source of truth (§14), the bus is for live UI.
         for event in &outcome.events {
-            let _ = self.events.send(event.clone());
+            let _ = try_emit(&self.events, event.clone());
         }
-        let _ = self.events.send(crate::session::Event::LedgerAppended {
-            entry: outcome.ledger_entry.clone(),
-        });
+        let _ = try_emit(
+            &self.events,
+            crate::session::Event::LedgerAppended {
+                entry: outcome.ledger_entry.clone(),
+            },
+        );
         if let Some(summary) = &outcome.approval_summary {
-            let _ = self.events.send(crate::session::Event::CommitDecision {
-                commit_id: summary.commit_id,
-                committed: summary.committed.clone(),
-                dropped: summary.dropped.clone(),
-            });
+            let _ = try_emit(
+                &self.events,
+                crate::session::Event::CommitDecision {
+                    commit_id: summary.commit_id,
+                    committed: summary.committed.clone(),
+                    dropped: summary.dropped.clone(),
+                },
+            );
         }
         outcome
     }

@@ -147,6 +147,71 @@ fn gitignore_has_atelier_entry(contents: &str) -> bool {
 /// Atomic write via tempfile+rename in the same directory. Used for
 /// ATELIER.md so a crash mid-write doesn't leave a truncated file that
 /// the next `init` would skip recreating.
+///
+/// # Canonical pattern (v60.35 M30)
+///
+/// This helper is the workspace's reference implementation of the
+/// "tempfile in target dir → write → fsync(file) → persist → fsync(dir)"
+/// pattern. Every on-disk artifact that has to survive a crash mid-write
+/// follows the same shape (modulo error-type plumbing):
+///
+/// 1. `tempfile::NamedTempFile::new_in(target.parent())` — the tempfile
+///    lives next to its eventual home so the rename is same-filesystem
+///    (cross-fs rename returns `EXDEV` and tempfile silently falls back
+///    to copy+delete, defeating atomicity).
+/// 2. `write_all(&bytes)` — payload first.
+/// 3. `sync_all()` on the file — flush data + metadata before rename.
+/// 4. `tmp.persist(&target)` — `rename(2)`, atomic for content.
+/// 5. `fsync_dir_best_effort(parent)` — the directory entry's update
+///    is buffered until the next natural fsync; without this a power
+///    loss after `persist` returns can leave the dir in its pre-rename
+///    state on stable storage and the next read sees the old file.
+///
+/// ## Sites in the workspace
+///
+/// Every one of these uses the same pattern. New persistence sites
+/// should follow it.
+///
+/// **`crates/atelier-core/`**
+///
+/// * `src/init.rs` (this fn) — `ATELIER.md` seed write + `.gitignore`
+///   read-modify-write under `atomic_append_atelier_entry`.
+/// * `src/persistence.rs` — `OnDiskSession` save (`session.json`) and
+///   the recovery-log appender for `recovery_log.jsonl`.
+/// * `src/hooks.rs` — hook manifest persistence under
+///   `.atelier/hooks/`.
+/// * `src/mcp_config.rs` — first-use approval store for MCP servers
+///   under `.atelier/mcp/approvals.json`.
+/// * `src/lsp/approval.rs` — LSP first-use approval store (v60.34 M15
+///   aligns this with the rest of the pattern; commit landing in that
+///   bundle replaces the in-place write with the persist+fsync_dir
+///   pair).
+/// * `src/staging.rs` — per-staging temp dir + rename for §3 writes;
+///   uses an in-tree `fsync_dir_best_effort` mirror because staging
+///   builds a staging dir then renames out of it (different shape
+///   from the single-file persist).
+/// * `src/adapter/model_profile.rs` — probe cache write under
+///   `~/.atelier/model_profiles/<hash>.json`.
+///
+/// **`crates/atelier-cli/`**
+///
+/// * `src/compaction_blob.rs` — §5 compaction blob writer
+///   (`.atelier/sessions/<sid>/compactions/<comp-uuid>.json`).
+/// * `src/memory_promote.rs` — memory promotion to
+///   `~/.atelier/memory/`.
+/// * `src/instrumentation.rs` — `PaneVisibilityRecord` +
+///   `FindProbeLog` on-disk records and the v60.34 M16 audit
+///   appenders (the M16 commit aligns the audit appender with this
+///   pattern; before it lands the audit writes use `OpenOptions::append`
+///   which is line-atomic on local POSIX filesystems but doesn't survive
+///   a crash mid-line).
+/// * `src/bin/conformance_status.rs` +
+///   `src/bin/phase_a_gate_status.rs` — nightly-gate result writers.
+///
+/// `fsync_dir_best_effort` is a Unix-only helper (no-op on non-Unix);
+/// staging.rs and persistence.rs ship their own copies for the same
+/// reason — keeping init dependency-light so it runs before the rest
+/// of the crate is reachable.
 fn atomic_write(dir: &Path, target: &Path, bytes: &[u8]) -> io::Result<()> {
     // The temp file lives next to the target so the rename is
     // same-filesystem (cross-fs rename returns EXDEV and silently falls

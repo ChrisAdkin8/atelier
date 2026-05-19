@@ -33,6 +33,8 @@ make check          # schemas + artifacts + rig self-tests + workload dry-run
 
 `make check` must be green. CI runs the same pipeline on every push and PR; a red CI run is a merge blocker.
 
+Before opening a PR, run `make audit` and confirm both gates are green. The target runs `cargo audit --deny warnings` against the Rust workspace and `npm audit --audit-level=high` against the atelier-gui Svelte deps; CI runs the same target. If `cargo-audit` isn't on your `$PATH`, install it with `make audit-install`.
+
 For Rust changes:
 
 ```sh

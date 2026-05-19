@@ -27,7 +27,7 @@ use notify::{Event as NotifyEvent, EventKind, RecursiveMode, Watcher};
 use parking_lot::Mutex;
 use tokio::sync::{broadcast, mpsc};
 
-use crate::session::Event;
+use crate::session::{try_emit, Event};
 use crate::time::now_rfc3339;
 
 /// PROVISIONAL — debounce window before an external-edit burst surfaces
@@ -262,10 +262,13 @@ pub fn spawn(
             }
             // best-effort send; no subscribers is OK (the on-disk
             // session is the source of truth per §14).
-            let _ = bus.send(Event::FilesChanged {
-                paths: hits,
-                observed_at: now_rfc3339(),
-            });
+            let _ = try_emit(
+                &bus,
+                Event::FilesChanged {
+                    paths: hits,
+                    observed_at: now_rfc3339(),
+                },
+            );
         }
     });
 

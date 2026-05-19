@@ -21,7 +21,7 @@ else
 PY ?= python3
 endif
 
-.PHONY: check schemas artifacts rig-tests dry-run summary install-rig quality-cheap clean
+.PHONY: check schemas artifacts rig-tests dry-run summary install-rig quality-cheap audit audit-install clean
 
 check: schemas artifacts rig-tests summary
 
@@ -72,6 +72,58 @@ quality-cheap:
 		echo "cargo-machete missing; install with: cargo install --locked --version 0.7.0 cargo-machete"; exit 1; }
 	cargo audit --ignore RUSTSEC-2026-0009
 	cargo machete crates/
+
+# Full supply-chain gate (v60.35 M27). Stricter than `quality-cheap`:
+#   * `cargo audit --deny warnings` fails on any advisory that isn't
+#     explicitly ignored — unmaintained / informational rows included.
+#   * `npm audit --audit-level=high` covers the atelier-gui Svelte
+#     deps that `quality-cheap` doesn't touch.
+# Both gates must exit 0. CONTRIBUTING.md requires this target before
+# opening a PR; CI runs it via `.github/workflows/check.yml`.
+#
+# The `--ignore` set carries the same documented exemptions as
+# `quality-cheap` (`RUSTSEC-2026-0009`) plus the long-tail unmaintained
+# rows that reach us only through Tauri's GTK3 transitives (gtk-rs
+# family, atk, gdk*, soup2, glib, javascriptcore-rs, webkit2gtk family,
+# pango, cairo-rs, gio, gdk-pixbuf, libappindicator) and a few orphaned
+# proc-macro / util crates (instant, paste, proc-macro-error,
+# unic-char-property/range/runtime_macros, derivative, fxhash, lru
+# 0.12.5's unsound IterMut). Removal triggers:
+#   * The gtk-rs / Tauri-transitive rows lift when Tauri publishes a
+#     GTK4 backend or the workspace moves off `atelier-gui` on Linux.
+#   * `RUSTSEC-2026-0009` lifts when the workspace rustc pin moves to
+#     >= 1.88 (see `quality-cheap` comment for the long form).
+#   * Each unmaintained shim lifts when its upstream is retired or
+#     when the depending crate cuts a release that no longer pulls it.
+audit:
+	@command -v cargo-audit >/dev/null 2>&1 || { \
+		echo "cargo-audit missing; install with: make audit-install"; exit 1; }
+	cargo audit --deny warnings \
+		--ignore RUSTSEC-2024-0370 \
+		--ignore RUSTSEC-2024-0384 \
+		--ignore RUSTSEC-2024-0411 \
+		--ignore RUSTSEC-2024-0412 \
+		--ignore RUSTSEC-2024-0413 \
+		--ignore RUSTSEC-2024-0414 \
+		--ignore RUSTSEC-2024-0415 \
+		--ignore RUSTSEC-2024-0416 \
+		--ignore RUSTSEC-2024-0417 \
+		--ignore RUSTSEC-2024-0418 \
+		--ignore RUSTSEC-2024-0419 \
+		--ignore RUSTSEC-2024-0420 \
+		--ignore RUSTSEC-2024-0429 \
+		--ignore RUSTSEC-2024-0436 \
+		--ignore RUSTSEC-2025-0075 \
+		--ignore RUSTSEC-2025-0080 \
+		--ignore RUSTSEC-2025-0081 \
+		--ignore RUSTSEC-2025-0098 \
+		--ignore RUSTSEC-2025-0100 \
+		--ignore RUSTSEC-2026-0002 \
+		--ignore RUSTSEC-2026-0009
+	cd crates/atelier-gui/ui && npm audit --audit-level=high
+
+audit-install:
+	cargo install cargo-audit --locked
 
 clean:
 	find . -type d -name "__pycache__" -prune -exec rm -rf {} +
