@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "name": "audit",
+  "description": "Focused audit pass against a named subsystem: security, performance, hygiene, schemas, or CI.",
+  "prompt_template": "Audit the codebase against the ${scope} scope.\n\nScope-specific rubric:\n\n- **security** — credential handling, input validation at trust boundaries, injection vectors, sandbox bypasses, hardcoded URLs, secrets in source. Spec §8/§11/§12 are authoritative.\n- **performance** — hot paths, allocations in tight loops, missing async opportunities, redundant work, unnecessary clones. Focus on measured or measurable wins.\n- **hygiene** — naming, doc drift, dead code, ATELIER.md conventions, unidiomatic patterns, panics that should be `Result`, fallible code that should not be.\n- **schemas** — `additionalProperties: false`, `required` lists, version pins, cross-schema `$ref` integrity, wire-label vs serde agreement.\n- **CI** — workflow privilege boundaries, secret leakage, artifact-commit safety, missing gates, redundant jobs.\n\nReport findings with: severity (critical / high / medium / low), file:line, the issue, a concrete fix, and whether it should ride in this PR or be tracked separately. Group by severity. If nothing significant, say so plainly and explain what you looked at to be confident.",
+  "args": [
+    {
+      "name": "scope",
+      "description": "Audit scope: 'security', 'performance', 'hygiene', 'schemas', or 'CI'.",
+      "required": true
+    }
+  ],
+  "pinned_context": ["ATELIER.md", "coding-harness-spec.md"],
+  "side_effect_class": "local-safe"
+}

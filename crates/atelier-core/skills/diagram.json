@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "name": "diagram",
+  "description": "Draw an architecture / dataflow / state-machine diagram of a named scope as Mermaid or D2.",
+  "prompt_template": "Produce a ${kind} diagram for ${scope} in ${format} syntax.\n\nGuidelines:\n\n- **Truth over completeness.** Show the load-bearing relationships, not every type. A diagram that fits on screen and names the actual flow is more useful than a 50-node graph.\n- **Label the edges.** A node-and-arrow diagram with unlabeled edges hides exactly the thing readers want to know — the *kind* of relationship.\n- **Group by cohesion.** Use Mermaid's `subgraph` or D2's container syntax to cluster nodes that belong together (e.g., 'agent loop', 'persistence', 'driver').\n- **Cite the source.** Each node should map to a real file / module / type — name them in the label or in a short legend below.\n\nFence the output in a ```${format} block so the conversation pane's inline renderer picks it up. If anything in the scope is ambiguous (e.g., a name resolves to multiple modules), surface the ambiguity *before* drawing.",
+  "args": [
+    {
+      "name": "scope",
+      "description": "What to diagram — module path, subsystem name, or free-text description.",
+      "required": true
+    },
+    {
+      "name": "kind",
+      "description": "Kind of diagram: 'architecture', 'dataflow', 'state-machine', 'sequence', or 'er'.",
+      "default": "architecture"
+    },
+    {
+      "name": "format",
+      "description": "Diagram language: 'mermaid' or 'd2'. Both render inline in the conversation pane.",
+      "default": "mermaid"
+    }
+  ],
+  "pinned_context": ["ATELIER.md"],
+  "side_effect_class": "local-safe"
+}

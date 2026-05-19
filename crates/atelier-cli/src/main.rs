@@ -162,6 +162,7 @@ fn main() -> ExitCode {
         "run" => run_run(args),
         "protocol-overhead" => run_protocol_overhead(args),
         "find" => run_find(args),
+        "skills" => run_skills(args),
         other => {
             eprintln!("atelier: unknown subcommand `{other}`\n");
             eprintln!("{USAGE}");
@@ -195,6 +196,619 @@ fn run_init(mut args: impl Iterator<Item = String>) -> ExitCode {
             eprintln!("atelier init: {e}");
             ExitCode::from(1)
         }
+    }
+}
+
+// ---------- `atelier skills` ----------
+//
+// Catalogue inspection + user-authoring verbs for §15 skills.
+//
+//   `atelier skills`              — print the resolved catalogue in
+//                                   spec `/help` format.
+//   `atelier skills new <name>`   — scaffold a new manifest at the
+//                                   right scope.
+//   `atelier skills validate`     — lint manifests without running them.
+//   `atelier skills edit <name>`  — open the resolved manifest in $EDITOR.
+//   `atelier skills delete <name>`— remove a user/repo-scope manifest.
+//   `atelier skills show <name>`  — print the resolved manifest + source.
+
+const SKILLS_USAGE: &str = "atelier skills [VERB] [ARGS]\n\
+\n\
+With no VERB, prints the registered skill catalogue (bundled + \
+~/.atelier/skills/ + <repo>/.atelier/skills/) in `/help` format.\n\
+\n\
+VERBs:\n\
+    new <name> [--scope user|repo] [--from <name>]\n\
+                  Scaffold a starter manifest. --scope user writes to\n\
+                  ~/.atelier/skills/; --scope repo (default) writes to\n\
+                  <workspace>/.atelier/skills/. --from <existing> seeds\n\
+                  the body from an already-registered skill.\n\
+    validate [path]\n\
+                  Lint a manifest (or every manifest in the registry\n\
+                  when no path is given). Exits non-zero on any failure.\n\
+    edit <name>   Resolve <name> through the registry and open the\n\
+                  winning manifest in $EDITOR. Refuses to edit a bundled\n\
+                  manifest in place — use `new --from <name>` instead.\n\
+    delete <name> Remove a user- or per-repo-scope manifest.\n\
+    show <name>   Print the resolved manifest + its source path.\n";
+
+fn run_skills(mut args: impl Iterator<Item = String>) -> ExitCode {
+    let verb = args.next();
+    match verb.as_deref() {
+        Some("-h" | "--help") => {
+            print!("{SKILLS_USAGE}");
+            ExitCode::SUCCESS
+        }
+        Some("new") => skills::run_new(args),
+        Some("validate") => skills::run_validate(args),
+        Some("edit") => skills::run_edit(args),
+        Some("delete") => skills::run_delete(args),
+        Some("show") => skills::run_show(args),
+        Some(unknown) => {
+            eprintln!("atelier skills: unknown verb `{unknown}`\n");
+            eprintln!("{SKILLS_USAGE}");
+            ExitCode::from(2)
+        }
+        None => skills::run_list(),
+    }
+}
+
+mod skills {
+    //! `atelier skills` subcommand implementations.
+    //!
+    //! All verbs share the same registry-load + path-resolution logic
+    //! kept private to this module. Errors print to stderr; exit codes
+    //! follow the rest of the CLI (1 = runtime error, 2 = bad usage).
+
+    use std::env;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::process::{Command as StdCommand, ExitCode, Stdio};
+
+    use atelier_core::skills::{Skill, SkillRegistry, SkillSource};
+
+    /// Where to write a new manifest. `Repo` is the spec-recommended
+    /// default — sharing skills via git is the most common workflow.
+    enum Scope {
+        Repo,
+        User,
+    }
+
+    fn workspace_or_exit(verb: &str) -> Result<PathBuf, ExitCode> {
+        env::current_dir().map_err(|e| {
+            eprintln!("atelier skills {verb}: cannot read current directory: {e}");
+            ExitCode::from(1)
+        })
+    }
+
+    fn registry_or_exit(workspace: &Path, verb: &str) -> Result<SkillRegistry, ExitCode> {
+        let home = env::var_os("HOME").map(PathBuf::from);
+        SkillRegistry::load(workspace, home.as_deref()).map_err(|e| {
+            eprintln!("atelier skills {verb}: {}", friendly_load_error(&e));
+            ExitCode::from(1)
+        })
+    }
+
+    /// S22 — map the most common authoring mistakes to friendlier
+    /// one-liners. The default `jsonschema` formatter is verbose and
+    /// JSON-Pointer-heavy; users authoring their first manifest deserve
+    /// "name must be lowercase letters / digits / `_-`" not
+    /// "/name does not match pattern …".
+    fn friendly_load_error(e: &atelier_core::skills::SkillLoadError) -> String {
+        let raw = e.to_string();
+        if raw.contains("does not match") && raw.contains("name") {
+            return format!(
+                "name must be lowercase letters / digits / `_-`, starting with a letter (raw: {raw})"
+            );
+        }
+        if raw.contains("required") {
+            return format!(
+                "missing required field — see examples/skills/explain.v1.json for a complete manifest (raw: {raw})"
+            );
+        }
+        raw
+    }
+
+    fn validate_slug(name: &str) -> Result<(), String> {
+        if name.is_empty() {
+            return Err("skill name must not be empty".into());
+        }
+        let mut chars = name.chars();
+        let first = chars.next().unwrap();
+        if !first.is_ascii_lowercase() {
+            return Err(format!(
+                "skill name must start with a lowercase letter, got `{name}`"
+            ));
+        }
+        for c in chars {
+            if !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-') {
+                return Err(format!(
+                    "skill name must be [a-z0-9_-]+, got `{name}` (offending char `{c}`)"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn scope_dir(scope: &Scope, workspace: &Path) -> Result<PathBuf, String> {
+        match scope {
+            Scope::Repo => Ok(workspace.join(".atelier/skills")),
+            Scope::User => {
+                let home = env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .ok_or_else(|| "HOME is not set; cannot resolve user scope".to_string())?;
+                Ok(home.join(".atelier/skills"))
+            }
+        }
+    }
+
+    /// S20 helper — render a `Skill` to a `(text, source_path)` pair
+    /// for `show`. The text is canonical JSON; the path is `None` for
+    /// bundled skills (they live inside the binary).
+    fn render_skill_for_show(workspace: &Path, skill: &Skill) -> (String, Option<PathBuf>) {
+        let value = serde_json::json!({
+            "version": skill.version,
+            "name": skill.name,
+            "description": skill.description,
+            "prompt_template": skill.prompt_template,
+            "args": skill.args,
+            "pinned_context": skill.pinned_context,
+            "tools_required": skill.tools_required,
+            "proactive_trigger": skill.proactive_trigger,
+            "side_effect_class": skill.side_effect_class.as_str(),
+            "source": skill.source.as_str(),
+        });
+        let path = match skill.source {
+            SkillSource::Bundled => None,
+            SkillSource::UserHome => env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|h| h.join(format!(".atelier/skills/{}.json", skill.name))),
+            SkillSource::RepoLocal => {
+                Some(workspace.join(format!(".atelier/skills/{}.json", skill.name)))
+            }
+        };
+        (serde_json::to_string_pretty(&value).unwrap(), path)
+    }
+
+    // ---------- verbs ----------
+
+    pub fn run_list() -> ExitCode {
+        let workspace = match workspace_or_exit("") {
+            Ok(p) => p,
+            Err(c) => return c,
+        };
+        let registry = match registry_or_exit(&workspace, "") {
+            Ok(r) => r,
+            Err(c) => return c,
+        };
+        print!("{}", registry.format_help());
+        ExitCode::SUCCESS
+    }
+
+    /// S16 — scaffold a new manifest.
+    pub fn run_new(args: impl Iterator<Item = String>) -> ExitCode {
+        let mut name: Option<String> = None;
+        let mut scope = Scope::Repo;
+        let mut from: Option<String> = None;
+        let mut iter = args.peekable();
+        while let Some(a) = iter.next() {
+            match a.as_str() {
+                "-h" | "--help" => {
+                    println!(
+                        "atelier skills new <name> [--scope user|repo] [--from <existing>]\n\nScaffold a starter manifest. Refuses to overwrite. Opens the new file in $EDITOR if set; otherwise prints the path."
+                    );
+                    return ExitCode::SUCCESS;
+                }
+                "--scope" => match iter.next().as_deref() {
+                    Some("user") => scope = Scope::User,
+                    Some("repo") => scope = Scope::Repo,
+                    other => {
+                        eprintln!(
+                            "atelier skills new: --scope requires `user` or `repo`, got {other:?}"
+                        );
+                        return ExitCode::from(2);
+                    }
+                },
+                "--from" => match iter.next() {
+                    Some(v) => from = Some(v),
+                    None => {
+                        eprintln!("atelier skills new: --from requires a skill name");
+                        return ExitCode::from(2);
+                    }
+                },
+                _ => {
+                    if name.is_some() {
+                        eprintln!("atelier skills new: unexpected argument `{a}`");
+                        return ExitCode::from(2);
+                    }
+                    name = Some(a);
+                }
+            }
+        }
+        let Some(name) = name else {
+            eprintln!("atelier skills new: <name> is required\n");
+            eprintln!("{}", super::SKILLS_USAGE);
+            return ExitCode::from(2);
+        };
+        if let Err(e) = validate_slug(&name) {
+            eprintln!("atelier skills new: {e}");
+            return ExitCode::from(2);
+        }
+        let workspace = match workspace_or_exit("new") {
+            Ok(p) => p,
+            Err(c) => return c,
+        };
+        let dir = match scope_dir(&scope, &workspace) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("atelier skills new: {e}");
+                return ExitCode::from(1);
+            }
+        };
+        let target = dir.join(format!("{name}.json"));
+        if target.exists() {
+            eprintln!(
+                "atelier skills new: {} already exists; refusing to overwrite",
+                target.display()
+            );
+            return ExitCode::from(1);
+        }
+        // Seed body — either from an existing skill or from a minimal
+        // starter template that demonstrates the substitution surface.
+        let seed = match from {
+            Some(parent) => {
+                let registry = match registry_or_exit(&workspace, "new") {
+                    Ok(r) => r,
+                    Err(c) => return c,
+                };
+                let Some(skill) = registry.get(&parent) else {
+                    eprintln!(
+                        "atelier skills new: --from `{parent}` not found; available: {}",
+                        registry.names().cloned().collect::<Vec<_>>().join(", ")
+                    );
+                    return ExitCode::from(1);
+                };
+                let mut value = serde_json::json!({
+                    "version": skill.version,
+                    "name": name,
+                    "description": skill.description,
+                    "prompt_template": skill.prompt_template,
+                    "side_effect_class": skill.side_effect_class.as_str(),
+                });
+                if !skill.args.is_empty() {
+                    value["args"] = serde_json::to_value(&skill.args).unwrap();
+                }
+                if !skill.pinned_context.is_empty() {
+                    value["pinned_context"] = serde_json::to_value(&skill.pinned_context).unwrap();
+                }
+                if !skill.tools_required.is_empty() {
+                    value["tools_required"] = serde_json::to_value(&skill.tools_required).unwrap();
+                }
+                if let Some(p) = &skill.proactive_trigger {
+                    value["proactive_trigger"] = serde_json::Value::String(p.clone());
+                }
+                serde_json::to_string_pretty(&value).unwrap()
+            }
+            None => serde_json::to_string_pretty(&serde_json::json!({
+                "version": 1,
+                "name": name,
+                "description": "<one-line description shown in /help>",
+                "prompt_template": "Describe what you want done. ${target} is a sample arg.",
+                "args": [
+                    {
+                        "name": "target",
+                        "description": "What this skill should operate on.",
+                        "required": true
+                    }
+                ],
+                "pinned_context": ["ATELIER.md"],
+                "side_effect_class": "local-safe"
+            }))
+            .unwrap(),
+        };
+        // Capture the pre-existing entry (if any) before writing so
+        // we can give a "this shadows X" heads-up — that's only
+        // meaningful when the skill already existed in a *different*
+        // layer (post-write the new file always wins its scope).
+        let prior_layer: Option<SkillSource> = registry_or_exit(&workspace, "new")
+            .ok()
+            .and_then(|r| r.get(&name).map(|s| s.source.clone()));
+        if let Err(e) = fs::create_dir_all(&dir) {
+            eprintln!("atelier skills new: mkdir {}: {e}", dir.display());
+            return ExitCode::from(1);
+        }
+        if let Err(e) = fs::write(&target, format!("{seed}\n")) {
+            eprintln!("atelier skills new: write {}: {e}", target.display());
+            return ExitCode::from(1);
+        }
+        // S25 — naming-conflict heads-up (Open Question #5). Show
+        // shadowing only when the pre-existing skill was in a
+        // different layer than the one we just wrote.
+        let new_layer = match scope {
+            Scope::Repo => SkillSource::RepoLocal,
+            Scope::User => SkillSource::UserHome,
+        };
+        match prior_layer {
+            Some(layer) if layer != new_layer => println!(
+                "atelier skills new: created {} (shadows existing /{} from {})",
+                target.display(),
+                name,
+                layer.help_tag(),
+            ),
+            _ => println!("atelier skills new: created {}", target.display()),
+        }
+        // Open in $EDITOR if set — friendlier UX than asking the user
+        // to find the path. Failure is non-fatal.
+        if let Some(editor) = env::var_os("EDITOR") {
+            let status = StdCommand::new(&editor)
+                .arg(&target)
+                .stdin(Stdio::inherit())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit())
+                .status();
+            if let Err(e) = status {
+                eprintln!(
+                    "atelier skills new: $EDITOR ({:?}) failed: {e}; manifest is at {}",
+                    editor,
+                    target.display()
+                );
+            }
+        }
+        ExitCode::SUCCESS
+    }
+
+    /// S17 — lint a manifest, or every manifest in the registry when
+    /// no path is given. Exits non-zero on any failure so pre-commit
+    /// hooks can adopt it.
+    pub fn run_validate(mut args: impl Iterator<Item = String>) -> ExitCode {
+        let first = args.next();
+        if matches!(first.as_deref(), Some("-h" | "--help")) {
+            println!(
+                "atelier skills validate [path]\n\nLint a manifest file, or every manifest in the resolved registry when no path is given. Exits non-zero on any failure."
+            );
+            return ExitCode::SUCCESS;
+        }
+        if let Some(path) = first {
+            return validate_one_file(Path::new(&path));
+        }
+        // Walk the resolved registry.
+        let workspace = match workspace_or_exit("validate") {
+            Ok(p) => p,
+            Err(c) => return c,
+        };
+        let registry = match registry_or_exit(&workspace, "validate") {
+            Ok(r) => r,
+            Err(c) => return c,
+        };
+        let mut failures = 0;
+        for skill in registry.iter() {
+            // Pinned-context existence check (S23) — warn, don't fail.
+            for pin in &skill.pinned_context {
+                let absolute = if Path::new(pin).is_absolute() {
+                    PathBuf::from(pin)
+                } else {
+                    workspace.join(pin)
+                };
+                if !absolute.exists() {
+                    eprintln!(
+                        "atelier skills validate: warn: skill `/{}` pins {} which doesn't exist in this workspace",
+                        skill.name, pin
+                    );
+                }
+            }
+            // Substitution lint — every `${name}` in prompt_template
+            // must resolve to a declared arg, `${repo_root}`, or
+            // `${atelier_md}`.
+            for var in scan_template_vars(&skill.prompt_template) {
+                if var == "repo_root" || var == "atelier_md" {
+                    continue;
+                }
+                if !skill.args.iter().any(|a| a.name == var) {
+                    eprintln!(
+                        "atelier skills validate: skill `/{}` references ${{{var}}} but no arg `{var}` is declared",
+                        skill.name
+                    );
+                    failures += 1;
+                }
+            }
+        }
+        if failures == 0 {
+            println!("atelier skills validate: {} skill(s) ok", registry.len());
+            ExitCode::SUCCESS
+        } else {
+            eprintln!("atelier skills validate: {failures} failure(s)");
+            ExitCode::from(1)
+        }
+    }
+
+    fn validate_one_file(path: &Path) -> ExitCode {
+        let body = match fs::read_to_string(path) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("atelier skills validate: read {}: {e}", path.display());
+                return ExitCode::from(1);
+            }
+        };
+        match Skill::from_manifest_json(&body, SkillSource::RepoLocal) {
+            Ok(_) => {
+                println!("atelier skills validate: {} ok", path.display());
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!(
+                    "atelier skills validate: {}: {}",
+                    path.display(),
+                    friendly_load_error(&e)
+                );
+                ExitCode::from(1)
+            }
+        }
+    }
+
+    fn scan_template_vars(template: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let bytes = template.as_bytes();
+        let mut i = 0;
+        while i + 1 < bytes.len() {
+            if bytes[i] == b'$' && bytes[i + 1] == b'{' {
+                if let Some(rel_end) = template[i + 2..].find('}') {
+                    let name = &template[i + 2..i + 2 + rel_end];
+                    out.push(name.to_string());
+                    i += 2 + rel_end + 1;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        out
+    }
+
+    /// S18 — open the resolved manifest in $EDITOR. Refuses bundled
+    /// (immutable in-binary); user must `new --from <name>` to fork.
+    pub fn run_edit(args: impl Iterator<Item = String>) -> ExitCode {
+        let mut iter = args;
+        let Some(name) = iter.next() else {
+            eprintln!("atelier skills edit: <name> is required");
+            return ExitCode::from(2);
+        };
+        if name == "-h" || name == "--help" {
+            println!("atelier skills edit <name>\n\nOpen the resolved manifest in $EDITOR. Refuses bundled — use `atelier skills new --from <name> --scope user` to fork.");
+            return ExitCode::SUCCESS;
+        }
+        let workspace = match workspace_or_exit("edit") {
+            Ok(p) => p,
+            Err(c) => return c,
+        };
+        let registry = match registry_or_exit(&workspace, "edit") {
+            Ok(r) => r,
+            Err(c) => return c,
+        };
+        let Some(skill) = registry.get(&name) else {
+            eprintln!("atelier skills edit: unknown skill `{name}`");
+            return ExitCode::from(1);
+        };
+        let (_, path) = render_skill_for_show(&workspace, skill);
+        let Some(path) = path else {
+            eprintln!(
+                "atelier skills edit: `/{name}` is bundled — fork via `atelier skills new --from {name} --scope user`"
+            );
+            return ExitCode::from(1);
+        };
+        let editor = match env::var_os("EDITOR") {
+            Some(e) => e,
+            None => {
+                eprintln!(
+                    "atelier skills edit: $EDITOR is not set; manifest is at {}",
+                    path.display()
+                );
+                return ExitCode::from(1);
+            }
+        };
+        let status = StdCommand::new(&editor)
+            .arg(&path)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status();
+        match status {
+            Ok(s) if s.success() => ExitCode::SUCCESS,
+            Ok(s) => {
+                eprintln!("atelier skills edit: $EDITOR exited with {s}");
+                ExitCode::from(1)
+            }
+            Err(e) => {
+                eprintln!("atelier skills edit: spawn $EDITOR ({editor:?}): {e}");
+                ExitCode::from(1)
+            }
+        }
+    }
+
+    /// S19 — delete a user- or per-repo-scope manifest. Refuses
+    /// bundled (those are in-binary). On shadow removal, prints which
+    /// skill will be active afterwards.
+    pub fn run_delete(args: impl Iterator<Item = String>) -> ExitCode {
+        let mut iter = args;
+        let Some(name) = iter.next() else {
+            eprintln!("atelier skills delete: <name> is required");
+            return ExitCode::from(2);
+        };
+        if name == "-h" || name == "--help" {
+            println!("atelier skills delete <name>\n\nRemove a user- or per-repo-scope manifest. Refuses bundled.");
+            return ExitCode::SUCCESS;
+        }
+        let workspace = match workspace_or_exit("delete") {
+            Ok(p) => p,
+            Err(c) => return c,
+        };
+        let registry = match registry_or_exit(&workspace, "delete") {
+            Ok(r) => r,
+            Err(c) => return c,
+        };
+        let Some(skill) = registry.get(&name) else {
+            eprintln!("atelier skills delete: unknown skill `{name}`");
+            return ExitCode::from(1);
+        };
+        let (_, path) = render_skill_for_show(&workspace, skill);
+        let Some(path) = path else {
+            eprintln!("atelier skills delete: `/{name}` is bundled and cannot be deleted");
+            return ExitCode::from(1);
+        };
+        if let Err(e) = fs::remove_file(&path) {
+            eprintln!("atelier skills delete: unlink {}: {e}", path.display());
+            return ExitCode::from(1);
+        }
+        // Reload to see what wins next.
+        let registry2 = registry_or_exit(&workspace, "delete").ok();
+        if let Some(reg2) = registry2 {
+            match reg2.get(&name) {
+                Some(s) => println!(
+                    "atelier skills delete: removed {}; `/{name}` from {} is now active",
+                    path.display(),
+                    s.source.help_tag()
+                ),
+                None => println!(
+                    "atelier skills delete: removed {}; no `/{name}` remains",
+                    path.display()
+                ),
+            }
+        } else {
+            println!("atelier skills delete: removed {}", path.display());
+        }
+        ExitCode::SUCCESS
+    }
+
+    /// S20 — print the resolved manifest + its source path + a
+    /// `[shadows: <other>]` line if a lower-precedence skill of the
+    /// same name exists.
+    pub fn run_show(args: impl Iterator<Item = String>) -> ExitCode {
+        let mut iter = args;
+        let Some(name) = iter.next() else {
+            eprintln!("atelier skills show: <name> is required");
+            return ExitCode::from(2);
+        };
+        if name == "-h" || name == "--help" {
+            println!("atelier skills show <name>\n\nPrint the resolved manifest + source path.");
+            return ExitCode::SUCCESS;
+        }
+        let workspace = match workspace_or_exit("show") {
+            Ok(p) => p,
+            Err(c) => return c,
+        };
+        let registry = match registry_or_exit(&workspace, "show") {
+            Ok(r) => r,
+            Err(c) => return c,
+        };
+        let Some(skill) = registry.get(&name) else {
+            eprintln!("atelier skills show: unknown skill `{name}`");
+            return ExitCode::from(1);
+        };
+        let (text, path) = render_skill_for_show(&workspace, skill);
+        match path {
+            Some(p) => println!("# source: {}", p.display()),
+            None => println!("# source: bundled (in-binary)"),
+        }
+        println!("{text}");
+        ExitCode::SUCCESS
     }
 }
 
@@ -447,6 +1061,32 @@ fn run_run(args: impl Iterator<Item = String>) -> ExitCode {
         }
     };
 
+    // v60.51 §15 — load the skill registry before we move
+    // `workspace` into `Runner::new`. `$HOME` (the same env var used
+    // by the profile store) is the canonical home-dir lookup; missing
+    // is OK and just means only bundled + per-repo layers contribute.
+    let home_dir = std::env::var_os("HOME").map(PathBuf::from);
+    let registry = match atelier_core::skills::SkillRegistry::load(&workspace, home_dir.as_deref())
+    {
+        Ok(r) => std::sync::Arc::new(r),
+        Err(e) => {
+            eprintln!("atelier run: skills: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    // v60.51 §15 — `/help` is a harness-intercepted CLI verb (spec
+    // §15 line 785). Print the help block and exit cleanly without
+    // building the rest of the runtime so the model never sees the
+    // help text in its context window.
+    {
+        let trimmed = prompt.trim();
+        if trimmed == "/help" || trimmed.starts_with("/help ") {
+            print!("{}", registry.format_help());
+            return ExitCode::SUCCESS;
+        }
+    }
+
     let mut runner =
         match runner::Runner::new(workspace, provider_choice, runner::EventSink::Stdout) {
             Ok(r) => r,
@@ -455,6 +1095,7 @@ fn run_run(args: impl Iterator<Item = String>) -> ExitCode {
                 return ExitCode::from(1);
             }
         };
+    runner = runner.with_skill_registry(registry);
     if let Some(n) = max_turns {
         runner = runner.with_max_turns(n);
     }

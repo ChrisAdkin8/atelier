@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "name": "changelog",
+  "description": "Draft a CHANGELOG.md entry for the current branch's commits.",
+  "prompt_template": "Draft a `CHANGELOG.md` entry covering the commits on the current branch (`git log main..HEAD --oneline`).\n\nMatch the existing format: skim the last ~80 lines of `CHANGELOG.md` to pick up the version-prefix convention, the section headings, and the line voice. Don't invent a new shape.\n\nDistil the commits into a coherent narrative, not a verbatim list. Each line should tell a future reader *why* something landed, not just *what*. Group related commits under one bullet when they belong together; split a single commit into multiple bullets when its diff covers genuinely independent changes.\n\nIf the branch has no commits ahead of `main`, say so and don't fabricate an entry.",
+  "pinned_context": ["ATELIER.md", "CHANGELOG.md"],
+  "side_effect_class": "local-safe"
+}

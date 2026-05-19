@@ -107,7 +107,7 @@
 </script>
 
 <header class="header">
-  <h1>Atelier</h1>
+  <h1 class="brand">atelier</h1>
   <div class="meta">
     <span class="meta-item workspace">
       <span class="meta-label">workspace</span>
@@ -167,7 +167,11 @@
 <style>
   .header {
     display: flex;
-    align-items: center;
+    /* v60.55 — top-align every header item so the wordmark cap-line
+       and the meta-row baselines share the same upper edge. Pre-v60.55
+       used `align-items: center`, which left the small meta text
+       floating mid-height next to the larger wordmark. */
+    align-items: flex-start;
     gap: 1.5rem;
     padding: 0.6rem 1rem;
     border-bottom: 1px solid var(--border-pane);
@@ -176,9 +180,8 @@
   /* v60.49 — wordmark matches `assets/banner.svg`:
        font-family Iowan Old Style serif, weight 400,
        cream `#f0ead6`, slight negative tracking.
-     The banner renders lowercase; we keep title case here since the
-     header is a single word — easier to read at small sizes. */
-  h1 {
+     v60.55 — rendered lowercase to match the banner. */
+  .brand {
     margin: 0;
     font-family: 'Iowan Old Style', Georgia, 'Times New Roman', serif;
     font-size: 1.6rem;

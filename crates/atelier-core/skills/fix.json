@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "name": "fix",
+  "description": "Diagnose and propose a fix for a named error message, failing test, or compiler diagnostic.",
+  "prompt_template": "Diagnose and propose a fix for the following error or failing assertion:\n\n```\n${error}\n```\n\nWalk the diagnosis:\n\n1. **Reproduce** — name the exact command (or test) that triggers it. If you can't reproduce, say so before guessing.\n2. **Localize** — point at the file:line that's wrong, not just where the error surfaces.\n3. **Reduce** — explain the underlying cause in one or two sentences. No multi-paragraph essays.\n4. **Fix** — propose the smallest change that resolves the root cause. Reject patches that paper over symptoms.\n5. **Guard** — name the regression test (existing or new) that would have caught this; add it if missing.\n\nObey ATELIER.md's conventions in the patch (smallest change that works, no speculative refactors).",
+  "args": [
+    {
+      "name": "error",
+      "description": "The error message, failing-test traceback, or compiler diagnostic to fix.",
+      "required": true
+    }
+  ],
+  "pinned_context": ["ATELIER.md"],
+  "side_effect_class": "local-risky"
+}

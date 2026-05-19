@@ -207,6 +207,9 @@ pub fn run() {
             // v60.45 — workspace selector (set + read live workspace path).
             get_workspace,
             set_workspace,
+            // v60.52 §15 Skills surface.
+            list_skills,
+            invoke_skill,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -801,6 +804,13 @@ pub struct SwapOptionWire {
     /// Anthropic and Mock (the swap-allowlist gate rejects a `base_url`
     /// on those kinds anyway).
     pub base_url: Option<String>,
+    /// v60.55 — `true` iff this row matches `providers.toml`'s
+    /// `default = "<name>"` selector. The webview renders a `★` next
+    /// to default rows so the user can tell at a glance which profile
+    /// the CLI / lazy-default chat path would pick. For the built-in
+    /// fallback set (no `providers.toml` at all), the `mock` row is
+    /// marked default since that's what `Runner::new` would pick.
+    pub is_default: bool,
 }
 
 /// v60.37 B5 — hydrate the GUI's swap dropdown from
@@ -829,11 +839,30 @@ fn list_provider_profiles(state: tauri::State<'_, SessionState>) -> Vec<SwapOpti
 /// the `tauri::State` wrapper out makes the projection logic exercisable
 /// without booting a Tauri runtime.
 pub fn list_provider_profiles_in(repo_root: &std::path::Path) -> Vec<SwapOptionWire> {
+    list_provider_profiles_with_home(repo_root, None)
+}
+
+/// Variant that accepts an explicit home-dir override. `None` disables
+/// the user scope (only `<repo>/.atelier/providers.toml` is read);
+/// `Some(path)` reads `<path>/.atelier/providers.toml` as the
+/// home-scope fallback. Production paths go through the no-override
+/// helper above; tests pin a tempdir so they don't depend on the
+/// developer's `~/.atelier/providers.toml` state.
+pub fn list_provider_profiles_with_home(
+    repo_root: &std::path::Path,
+    home_override: Option<&std::path::Path>,
+) -> Vec<SwapOptionWire> {
     use atelier_core::config::{ProviderKind, ProvidersConfig};
 
+    // When tests opt into the override path with `None`, we mean
+    // "skip user scope entirely". The `None` arm of
+    // `ProvidersConfig::load_with_home` already does that; we just
+    // pass the override through.
+    let loaded = ProvidersConfig::load_with_home(repo_root, home_override);
     let mut out = Vec::new();
-    match ProvidersConfig::load(repo_root) {
+    match loaded {
         Ok(Some(loaded)) => {
+            let default_name = loaded.config.default.as_deref();
             for (name, prof) in &loaded.config.providers {
                 let (Some(kind), Some(model)) = (prof.provider, prof.model.as_ref()) else {
                     // Incomplete profile — skip rather than ship a row
@@ -850,6 +879,7 @@ pub fn list_provider_profiles_in(repo_root: &std::path::Path) -> Vec<SwapOptionW
                     model_id: model.clone(),
                     label: format!("{name} · {model}"),
                     base_url,
+                    is_default: default_name == Some(name.as_str()),
                 });
             }
         }
@@ -876,26 +906,125 @@ fn builtin_swap_defaults() -> Vec<SwapOptionWire> {
             model_id: "mock:default".into(),
             label: "mock".into(),
             base_url: None,
+            // v60.55 — mock is what `Runner::new` falls back to in the
+            // absence of `providers.toml`, so the dropdown's default
+            // marker should match.
+            is_default: true,
         },
         SwapOptionWire {
             kind: "anthropic".into(),
             model_id: "anthropic:claude-opus-4-7".into(),
             label: "anthropic · claude-opus-4-7".into(),
             base_url: None,
+            is_default: false,
         },
         SwapOptionWire {
             kind: "anthropic".into(),
             model_id: "anthropic:claude-sonnet-4-6".into(),
             label: "anthropic · claude-sonnet-4-6".into(),
             base_url: None,
+            is_default: false,
         },
         SwapOptionWire {
             kind: "openai_compat".into(),
             model_id: "local:qwen2.5-coder:7b".into(),
             label: "openai-compat · local qwen2.5-coder:7b".into(),
             base_url: None,
+            is_default: false,
         },
     ]
+}
+
+// ---------- v60.52 §15 Skills (GUI) ----------
+
+/// Wire shape for [`list_skills`]. One row per registered skill,
+/// override-resolved per [`atelier_core::skills::SkillRegistry`]'s
+/// layered semantics. `prompt_template` is intentionally not
+/// projected — the model never sees it from the webview side
+/// (expansion happens server-side in [`invoke_skill`]).
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct SkillWire {
+    pub name: String,
+    pub description: String,
+    pub proactive: bool,
+    /// One of `"bundled"`, `"home"`, `"repo"` — matches
+    /// `SkillSource::as_str()`. Stable wire labels so future renames
+    /// of the Rust enum don't break Svelte consumers.
+    pub source: String,
+    /// `args[*].name` projected so the Composer's autocomplete can
+    /// show what fields a skill takes without round-tripping the
+    /// full manifest.
+    pub args: Vec<String>,
+}
+
+/// v60.52 S09 — hydrate the Composer's slash-autocomplete dropdown.
+/// Loads bundled + `~/.atelier/skills/` + `<workspace>/.atelier/skills/`
+/// via the same loader the CLI uses; tolerates missing layers; never
+/// returns an error (a malformed user manifest logs `warn!` and is
+/// skipped via the registry's tolerant-load semantics — same shape as
+/// `list_provider_profiles`).
+#[tauri::command]
+fn list_skills(state: tauri::State<'_, SessionState>) -> Vec<SkillWire> {
+    list_skills_in(&state.workspace_root())
+}
+
+/// Test-visible inner helper for [`list_skills`].
+pub fn list_skills_in(repo_root: &std::path::Path) -> Vec<SkillWire> {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let registry = match atelier_core::skills::SkillRegistry::load(repo_root, home.as_deref()) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, "list_skills: registry load failed; returning empty");
+            return Vec::new();
+        }
+    };
+    registry
+        .iter()
+        .map(|s| SkillWire {
+            name: s.name.clone(),
+            description: s.description.clone(),
+            proactive: s.is_proactive(),
+            source: s.source.as_str().to_string(),
+            args: s.args.iter().map(|a| a.name.clone()).collect(),
+        })
+        .collect()
+}
+
+/// v60.52 S10 — invoke a skill: expand its `prompt_template` from the
+/// supplied args + repo context, then route the expansion through the
+/// existing `start_chat_run` pipeline. The user sees the expanded
+/// body in the conversation pane as the User message (the plan's
+/// open question #2 — landing on "show the expansion" for v1; flip
+/// to "show the literal slash" later if user feedback asks).
+///
+/// Errors map to a stringified message so the Composer can surface
+/// them inline.
+#[tauri::command]
+fn invoke_skill(
+    app: AppHandle,
+    state: tauri::State<'_, SessionState>,
+    name: String,
+    args: std::collections::HashMap<String, String>,
+) -> Result<(), String> {
+    let workspace = state.workspace_root();
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let registry = atelier_core::skills::SkillRegistry::load(&workspace, home.as_deref())
+        .map_err(|e| format!("skills: {e}"))?;
+    let skill = registry
+        .get(&name)
+        .ok_or_else(|| format!("unknown skill `/{name}`"))?;
+    let core_args: std::collections::BTreeMap<String, String> = args.into_iter().collect();
+    let ctx = atelier_core::skills::SkillSubstitutionContext {
+        repo_root: &workspace,
+        args: &core_args,
+        atelier_md: None,
+    };
+    let expanded = atelier_core::skills::substitute(skill, &ctx)
+        .map_err(|e| format!("skill `/{name}`: {e}"))?;
+    // Delegate to the same chat pipeline the Composer's plain Send
+    // uses. `start_chat_run` enforces the 1-in-flight guard + emits
+    // MessageCommitted{User} for the expanded body.
+    start_chat_run(app, state, expanded)
 }
 
 /// v60.10 §1 BYOM — build a fresh `Arc<dyn Adapter>` from a
@@ -1522,10 +1651,7 @@ fn get_workspace(state: tauri::State<'_, SessionState>) -> String {
 /// Returns the canonicalised path on success so the frontend can
 /// display the resolved form (e.g. `~` expanded, `..` collapsed).
 #[tauri::command]
-fn set_workspace(
-    state: tauri::State<'_, SessionState>,
-    path: String,
-) -> Result<String, String> {
+fn set_workspace(state: tauri::State<'_, SessionState>, path: String) -> Result<String, String> {
     if path.is_empty() {
         return Err("workspace path is empty".to_string());
     }
@@ -1617,9 +1743,8 @@ fn load_persisted_workspace() -> Option<std::path::PathBuf> {
 }
 
 fn persist_workspace(path: &std::path::Path) -> std::io::Result<()> {
-    let settings = gui_settings_path().ok_or_else(|| {
-        std::io::Error::other("HOME not set; cannot resolve ~/.atelier/gui.toml")
-    })?;
+    let settings = gui_settings_path()
+        .ok_or_else(|| std::io::Error::other("HOME not set; cannot resolve ~/.atelier/gui.toml"))?;
     if let Some(parent) = settings.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -1712,7 +1837,9 @@ fn load_promoted_memory(workspace_root: Option<&std::path::Path>) -> Option<Stri
         let rendered = strip_frontmatter(&body);
         let chunk = format!(
             "## {}\n\n{}\n\n",
-            path.file_stem().and_then(|s| s.to_str()).unwrap_or("memory"),
+            path.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("memory"),
             rendered.trim()
         );
         if out.len() + chunk.len() > MEMORY_RECALL_BYTE_CAP {
@@ -1791,9 +1918,15 @@ fn resolve_default_adapter(
     // first profile in iteration order (HashMap iteration is unstable
     // but the singleton case is what matters here).
     let (name, prof) = match cfg.default.as_deref() {
-        Some(name) => cfg.providers.get(name).map(|p| (name.to_string(), p)).ok_or_else(|| {
-            format!("providers.toml `default = {name:?}` but no `[providers.{name}]` table defined")
-        })?,
+        Some(name) => cfg
+            .providers
+            .get(name)
+            .map(|p| (name.to_string(), p))
+            .ok_or_else(|| {
+                format!(
+                    "providers.toml `default = {name:?}` but no `[providers.{name}]` table defined"
+                )
+            })?,
         None => cfg
             .providers
             .iter()
@@ -1890,11 +2023,7 @@ fn start_chat_run(
     // v60.47 — capture the real workspace path (the override, if set)
     // before spawning so the async task can write workspace-scope
     // auto-cards without re-locking `state.workspace_override`.
-    let workspace_override = state
-        .workspace_override
-        .lock()
-        .ok()
-        .and_then(|g| g.clone());
+    let workspace_override = state.workspace_override.lock().ok().and_then(|g| g.clone());
     let app_clone = app.clone();
     let run_in_flight = state.run_in_flight.clone();
     tauri::async_runtime::spawn(async move {
@@ -1913,13 +2042,14 @@ fn start_chat_run(
                 atelier_core::protocol_strategy::Strategy::JsonSentinel
             };
             let now = now_rfc3339();
-            let profile = atelier_core::adapter::model_profile::ModelProfile::skipped_for_well_known(
-                adapter.model_id(),
-                strategy,
-                caps.context_window_tokens,
-                atelier_core::adapter::model_profile::DEFAULT_PROFILE_MAX_TOKENS,
-                now.clone(),
-            );
+            let profile =
+                atelier_core::adapter::model_profile::ModelProfile::skipped_for_well_known(
+                    adapter.model_id(),
+                    strategy,
+                    caps.context_window_tokens,
+                    atelier_core::adapter::model_profile::DEFAULT_PROFILE_MAX_TOKENS,
+                    now.clone(),
+                );
             let capability_row = {
                 let base = atelier_core::adapter::capability_matrix::matrix_row_for(
                     adapter.model_id(),
@@ -1933,8 +2063,7 @@ fn start_chat_run(
                     model_id: profile.model_id.clone(),
                     base_url: profile.base_url.clone(),
                     strategy: profile.strategy,
-                    outcome:
-                        atelier_core::adapter::model_profile::ProbeLoadOutcome::CacheHit,
+                    outcome: atelier_core::adapter::model_profile::ProbeLoadOutcome::CacheHit,
                     capability_row: Some(capability_row),
                 },
             );
@@ -2896,7 +3025,11 @@ mod tests {
     #[test]
     fn list_provider_profiles_returns_defaults_when_no_file() {
         let tmp = tempfile::tempdir().unwrap();
-        let out = super::list_provider_profiles_in(tmp.path());
+        // v60.55 — pin `home_override = None` so the test doesn't pick
+        // up the developer's `~/.atelier/providers.toml`. Pre-v60.55
+        // this assertion was latently broken whenever the developer
+        // had a configured home-scope profile.
+        let out = super::list_provider_profiles_with_home(tmp.path(), None);
         // Built-in fallback list is non-empty and starts with mock.
         assert!(!out.is_empty(), "expected built-in defaults");
         assert_eq!(out[0].kind, "mock");
@@ -2923,7 +3056,7 @@ model = "anthropic:claude-opus-4-7"
 "#,
         )
         .unwrap();
-        let out = super::list_provider_profiles_in(tmp.path());
+        let out = super::list_provider_profiles_with_home(tmp.path(), None);
         // Two named profiles → two rows, alphabetical by name (BTreeMap).
         assert_eq!(out.len(), 2, "got {out:?}");
         assert_eq!(out[0].kind, "anthropic");
@@ -2957,10 +3090,70 @@ model = "anthropic:claude-opus-4-7"
 "#,
         )
         .unwrap();
-        let out = super::list_provider_profiles_in(tmp.path());
+        let out = super::list_provider_profiles_with_home(tmp.path(), None);
         // Only the complete row survives the skip-incomplete filter.
         assert_eq!(out.len(), 1, "got {out:?}");
         assert!(out[0].label.contains("complete"));
+    }
+
+    #[test]
+    fn list_provider_profiles_marks_default_from_toml() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dot_atelier = tmp.path().join(".atelier");
+        std::fs::create_dir_all(&dot_atelier).unwrap();
+        std::fs::write(
+            dot_atelier.join("providers.toml"),
+            r#"
+default = "cloud"
+
+[providers.local]
+provider = "openai-compat"
+base_url = "http://localhost:11434/v1"
+model = "local:qwen2.5-coder:7b"
+
+[providers.cloud]
+provider = "anthropic"
+model = "anthropic:claude-opus-4-7"
+"#,
+        )
+        .unwrap();
+        let out = super::list_provider_profiles_with_home(tmp.path(), None);
+        // Exactly one row must be flagged default; it must be the
+        // one whose profile name matches `default = "cloud"`.
+        let defaults: Vec<_> = out.iter().filter(|o| o.is_default).collect();
+        assert_eq!(defaults.len(), 1, "got {out:?}");
+        assert!(defaults[0].label.contains("cloud"), "got {defaults:?}");
+    }
+
+    #[test]
+    fn list_provider_profiles_no_default_when_field_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dot_atelier = tmp.path().join(".atelier");
+        std::fs::create_dir_all(&dot_atelier).unwrap();
+        std::fs::write(
+            dot_atelier.join("providers.toml"),
+            r#"
+[providers.cloud]
+provider = "anthropic"
+model = "anthropic:claude-opus-4-7"
+"#,
+        )
+        .unwrap();
+        let out = super::list_provider_profiles_with_home(tmp.path(), None);
+        // No `default = ...` field → no row is starred.
+        assert!(out.iter().all(|o| !o.is_default), "got {out:?}");
+    }
+
+    #[test]
+    fn list_provider_profiles_marks_mock_default_in_fallback() {
+        // No `providers.toml` → built-in fallback. `Runner::new` would
+        // construct a Mock adapter; the dropdown's default marker must
+        // match so the user knows where chat would land.
+        let tmp = tempfile::tempdir().unwrap();
+        let out = super::list_provider_profiles_with_home(tmp.path(), None);
+        let defaults: Vec<_> = out.iter().filter(|o| o.is_default).collect();
+        assert_eq!(defaults.len(), 1, "got {out:?}");
+        assert_eq!(defaults[0].kind, "mock");
     }
 
     #[test]
@@ -2973,7 +3166,7 @@ model = "anthropic:claude-opus-4-7"
             "this = is = not = valid = toml\n",
         )
         .unwrap();
-        let out = super::list_provider_profiles_in(tmp.path());
+        let out = super::list_provider_profiles_with_home(tmp.path(), None);
         // Malformed file logs a warn but doesn't kill the dropdown —
         // user gets the built-in fallback.
         assert!(
@@ -3121,6 +3314,33 @@ model = "anthropic:claude-opus-4-7"
         assert!(bogus.is_none(), "stale swap_id must not pop any sender");
         // The real entry is still there waiting for a reply.
         assert!(registry.lock().await.contains_key(&real_id));
+    }
+
+    // ---------- v60.52 §15 Skills ----------
+
+    #[test]
+    fn list_skills_returns_bundled_set_in_a_clean_workspace() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let skills = super::list_skills_in(dir.path());
+        // 19 bundled skills land via SkillRegistry::load (3 original +
+        // 11 from v60.50.5 + 5 from v60.55).
+        assert!(
+            skills.len() >= 19,
+            "expected ≥19 skills, got {}",
+            skills.len()
+        );
+        let names: Vec<_> = skills.iter().map(|s| s.name.as_str()).collect();
+        for required in ["review", "security-review", "test"] {
+            assert!(
+                names.contains(&required),
+                "bundled skill `{required}` missing from list_skills_in"
+            );
+        }
+        // The proactive flag is honoured on `security-review`.
+        let sr = skills.iter().find(|s| s.name == "security-review").unwrap();
+        assert!(sr.proactive);
+        // Source is the kebab-case wire label.
+        assert!(skills.iter().all(|s| s.source == "bundled"));
     }
 
     #[tokio::test]

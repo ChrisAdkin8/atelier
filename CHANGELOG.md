@@ -1,5 +1,74 @@
 # Atelier Spec — Changelog
 
+## v60.50–v60.55 — 2026-05-19 (§15 Skills — bundled-manifest catalogue + slash interception across CLI / GUI / TUI, plus GUI polish)
+
+The §15 Skills surface lands end-to-end: an `atelier-core::skills` module that loads + override-resolves manifests, slash-command interception in the CLI runner + binary, a Tauri `list_skills`/`invoke_skill` pair + Composer autocomplete in the GUI, and a `skills_completion` state machine in the TUI. The bundled catalogue grows from 3 (`/review`, `/security-review`, `/test`) to 19, adding the cross-harness staples + atelier-specific shortcuts the changelog history begged for, plus a second wave of higher-leverage skills surfaced after the foundation landed.
+
+### v60.55 — additions on top of v60.50–v60.54
+
+- **5 more bundled skills.** `/plan` (draft a §5 plan canvas with verification per step), `/diagram` (Mermaid or D2 — exploits the conversation pane's inline renderer), `/triage` (the spec's Reproduce→Localize→Reduce→Fix→Guard→Verify pipeline; `tools_required: ["read_file","grep","shell"]`), `/release` (pre-cut checklist: tests + diff audit + changelog draft + commit subject), `/document-sweep` (full-workspace doc-gap survey; complement to per-target `/document`). Catalogue size 14 → 19; the bundled-count assertion in `bundled_only_load` + `bundled_help_renders_all_nineteen` is bumped.
+- **GUI default-model badge** (`SwapOptionWire.is_default`). The footer's swap dropdown now prefixes the row matching `providers.toml`'s `default = "<name>"` with `★`. On hydration and on torn-down sessions, `dropdownIndex` snaps to the default row so the visible selection matches the model the backend's `resolve_default_adapter` would pick on the first chat submit. Built-in fallback set marks `mock` as default (matches `Runner::new`'s fallback choice).
+- **`ProvidersConfig::load_with_home(repo, home_override)` + `paths_searched_with_home(...)`** on `atelier-core` so tests can pin home explicitly. Production `load(repo)` delegates to the new helper. Fixes a latent test flake in `list_provider_profiles_*` where the developer's `~/.atelier/providers.toml` shadowed the test's tempdir.
+- **GUI wordmark** — lowercase "atelier" (was "Atelier"); header items vertical-aligned to the top of the row (was centred). The earlier 'a'-icon-next-to-wordmark experiment was reverted at user request.
+- **Composer slash menu polish** — dropped the 8-row cap on the autocomplete (the CSS already gives the popup `max-height: 14rem` + `overflow-y: auto`, so the full set scrolls); the selected row now `scrollIntoView({ block: 'nearest' })` follows ↑/↓ so the highlight stays visible past the viewport edge. Mirror change in `crates/atelier-tui/src/skills_completion.rs` for symmetry.
+- **`.atelier/hooks/bounded-reads.sh` hardened.** Dropped `set -u` (an optional missing JSON field tripped nounset on some edge paths); added `2>/dev/null` on every `jq` invocation including the final emit; stopped writing the "jq absent" hint to stderr (Claude Code's host surfaces any hook stderr as a hook-error banner); numeric-guard around the arithmetic `(( lines > 500 ))` so a corrupt `wc -l` output can't trip a non-zero exit; explicit `|| true` on the final emit. Verified against 7 payload variants — rc=0 + empty stderr on every codepath; nudges still fire on the actual rule triggers.
+
+### v60.50–v60.54 foundation
+
+### `crates/atelier-core/src/skills.rs` (new) + `crates/atelier-core/skills/*.json`
+
+- New module `skills` exporting `Skill`, `SkillRegistry`, `SkillSource`, `SkillArg`, `SkillSubstitutionContext`, `SubstitutionError`, `SkillLoadError`, `parse_args`, and `substitute`.
+- `SkillRegistry::load(repo_root, home_dir)` walks three layers in spec-mandated order — bundled (`include_str!`'d from `crates/atelier-core/skills/`) → `~/.atelier/skills/` → `<repo>/.atelier/skills/` — with later wins on name collisions.
+- Manifest body parses through `schemas/config/skill_manifest.v1.json` validation *first*, then serde with `deny_unknown_fields` — mirrors `BuiltInToolWrapper`'s two-stage check.
+- `substitute()` resolves `${arg}`, `${repo_root}`, and `${atelier_md}`; rejects unknown variable refs and missing required args loudly (silent passthrough would hide manifest typos).
+- `parse_args()` understands `key=value` plus a positional-fallback when the skill declares exactly one arg and the tail has no top-level `=`.
+- `SkillRegistry::format_help()` renders the spec §15 lines 786–797 `/help` format (left-justified name, `[proactive]` marker, `[bundled]`/`[~/.atelier/skills/]`/`[<repo>/.atelier/skills/]` source tag, footer naming harness-intercepted verbs).
+- Bundled set grows to 14 with new manifests: `/explain`, `/fix`, `/document`, `/refactor`, `/optimize`, `/commit`, `/changelog`, `/audit`, `/spec`, `/sweep`, `/scan` — chosen from a scan of `CHANGELOG.md`'s most-repeated workflows (audit × 97, spec × 88, fix × 50, commit × 50) intersected with what other coding harnesses ship out of the box.
+
+### `crates/atelier-cli/src/runner.rs` + `tests/run_integration.rs`
+
+- New `Runner::with_skill_registry(Arc<SkillRegistry>)` builder + `expand_skill_prompt(prompt)` private method that runs *before* hooks / DoD / sandbox load so a `/foo` typo bails cleanly. The first `ModelCall` ledger entry after a slash invocation carries `note: Some("skill: <name>")` per spec §15 line 805; subsequent turns get `None`.
+- New `RunError::SkillUnknown { name, available }` and `RunError::SkillSubstitution { name, source }` variants.
+- `/help` short-circuits to `registry.format_help()` rendered as the next user-turn text (the CLI binary catches this earlier; this branch matters for programmatic callers).
+- New integration tests: `skill_invocation_expands_prompt_and_annotates_ledger`, `skill_unknown_returns_typed_error`, `skill_help_short_circuits_to_help_text`, `binary_skills_subcommand_lists_bundled_set`.
+
+### `crates/atelier-cli/src/main.rs`
+
+- New `atelier skills` subcommand surface: bare invocation prints the resolved catalogue; `new`/`validate`/`edit`/`delete`/`show` verbs handle user authoring. `--scope user|repo` picks where `new` writes; `--from <existing>` seeds the body from an already-registered skill.
+- `atelier run` resolves the skill registry from `<workspace>` + `$HOME` and threads it to the Runner; a `/help` prompt is intercepted before the Tauri runtime is built and prints to stdout.
+- Schema-aware error messages (S22): bad slugs and missing-required-field errors map to one-liners pointing at `examples/skills/explain.v1.json`.
+- `atelier skills validate` walks the resolved registry and reports any `pinned_context` paths that don't exist in the workspace as `warn:` lines (S23, soft) and any `${var}` in `prompt_template` that doesn't resolve to a declared arg as a hard failure (substitution lint).
+
+### `examples/skills/`
+
+- Three new authoring examples cover the full schema surface: `standup.v1.json` (no args), `bench.v1.json` (required + optional with defaults + free-text default), `triage.v1.json` (`tools_required` + `proactive_trigger`).
+
+### `crates/atelier-gui/src/lib.rs` + `ui/src/lib/components/Composer.svelte`
+
+- New Tauri commands `list_skills` → `Vec<SkillWire>` and `invoke_skill(name, args)`. `SkillWire` carries `name`, `description`, `proactive`, `source` (kebab-case wire label), and `args` (the declared arg names) so the autocomplete dropdown can show what fields a skill takes without round-tripping the full manifest.
+- Composer detects a leading `/` on the textarea and surfaces a transient menu of up to 8 matching skills below the input; `Tab` accepts the highlighted match, `↑/↓` navigate, `Enter` commits, `Esc` clears. `invoke_skill` resolves through the same chat pipeline `start_chat_run` uses.
+
+### `crates/atelier-tui/src/skills_completion.rs` (new)
+
+- New `pub mod skills_completion` module with `SlashState` + `SlashEvent` + `SlashOutcome`. The state machine is self-contained — no IO, no ratatui — so it tests deterministically. Eight apply-style unit tests pin behaviour for typing → filter, Tab → accept, ↓ → wrap, Enter → commit, Esc → cancel, backspace-to-empty → cancel, and whitespace → menu-hides.
+
+### `coding-harness-spec.md`
+
+- No changes; the spec at §15 lines 765–810 already described the contract — this bundle implements it.
+
+### `README.md` / `CAPABILITIES.md`
+
+- New **Skills** section under Memory in `README.md` covering the 14 bundled skills, the layered override semantics, the substitution variables, and the authoring CLI verbs.
+- New **Skills (§15)** row in `CAPABILITIES.md` between Hooks and Sub-agent delegation. Proactive triggers are noted as deferred.
+
+### Deferred (tracked in `tasks/plan_skills_implementation.md`)
+
+- **S15** — `proactive_trigger` evaluation + §9 "Run /<name>?" UI. The bundled `security-review.json` carries the trigger string and it's loaded into the `Skill` struct; the evaluation surface lands after the §9 uncertainty UI exists.
+- **S21** — hot reload via the existing `file_watcher`. Lifting `~/.atelier/skills/` + `<workspace>/.atelier/skills/` into the dispatcher's read-set and emitting `Event::SkillsReloaded` is a focused follow-up.
+- **S24** — `tools_required` runtime check at invocation time. The seven built-in tools are always present in any standard run, so this rarely fires; adding the gate is straightforward once `expand_skill_prompt` can see the live tool registry.
+
+---
+
 ## v60.43–v60.49 — 2026-05-19 (GUI chat-mode pivot — Composer talks to a real adapter, no Runner / DiffPane / scripted Mock)
 
 Bundle of GUI-side changes that turn the panel into a working chat REPL backed by the user's BYOM adapter. Originally the GUI's `start_demo_run` hard-coded a `ProviderChoice::Mock` with a scripted `write_file` + `harness_meta` envelope to exercise the §3 staging + AwaitApproval flow against the DiffPane; that demo path was the *only* way prompts reached an adapter. This bundle replaces it with a `start_chat_run` direct-to-adapter path and reshapes the GUI around the new flow.

@@ -237,7 +237,20 @@ impl ProvidersConfig {
     /// ignoring a malformed config would let a typo (`max_turns =
     /// "32"` instead of `32`) silently shift the runtime to defaults.
     pub fn load(repo_root: &Path) -> Result<Option<LoadedConfig>, ConfigError> {
-        for path in Self::paths_searched(repo_root) {
+        Self::load_with_home(repo_root, home_dir().as_deref())
+    }
+
+    /// Variant of [`Self::load`] that takes an explicit home-dir
+    /// override. Production callers go through [`Self::load`] (which
+    /// reads `$HOME` / `%USERPROFILE%`); tests use this entry to pin
+    /// a tempdir so they don't depend on the developer's
+    /// `~/.atelier/providers.toml` state. `None` disables the user
+    /// scope entirely (only the project file is consulted).
+    pub fn load_with_home(
+        repo_root: &Path,
+        home_override: Option<&Path>,
+    ) -> Result<Option<LoadedConfig>, ConfigError> {
+        for path in Self::paths_searched_with_home(repo_root, home_override) {
             match Self::try_load_one(&path)? {
                 Some(config) => return Ok(Some(LoadedConfig { path, config })),
                 None => continue,
@@ -251,9 +264,18 @@ impl ProvidersConfig {
     /// `no config found (searched: <paths>)` instead of silently
     /// running on defaults.
     pub fn paths_searched(repo_root: &Path) -> Vec<PathBuf> {
+        Self::paths_searched_with_home(repo_root, home_dir().as_deref())
+    }
+
+    /// `paths_searched` with an explicit home override. See
+    /// [`Self::load_with_home`].
+    pub fn paths_searched_with_home(
+        repo_root: &Path,
+        home_override: Option<&Path>,
+    ) -> Vec<PathBuf> {
         let mut out = Vec::with_capacity(2);
         out.push(repo_root.join(PROJECT_CONFIG_DIR).join(CONFIG_FILE_NAME));
-        if let Some(home) = home_dir() {
+        if let Some(home) = home_override {
             out.push(home.join(USER_CONFIG_DIR).join(CONFIG_FILE_NAME));
         }
         out

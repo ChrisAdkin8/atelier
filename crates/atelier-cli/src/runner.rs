@@ -440,6 +440,14 @@ pub struct Runner {
     /// both observe it and unwind. `None` means the run is on its own
     /// (test and GUI/TUI driver entry points today).
     external_cancel: Option<tokio_util::sync::CancellationToken>,
+    /// v60.51 §15 — skill registry consulted before the first user
+    /// turn fires. When `None` the runner does no slash expansion; a
+    /// `/foo` prompt reaches the model verbatim (matches pre-v60.51
+    /// behaviour). The CLI wires this from
+    /// `atelier_core::SkillRegistry::load(workspace, home)` so a fresh
+    /// repo with no `.atelier/skills/` directory still gets the
+    /// bundled set.
+    skill_registry: Option<Arc<atelier_core::skills::SkillRegistry>>,
 }
 
 /// v60.10 §1 BYOM — record of a pending mid-session adapter swap that
@@ -645,7 +653,20 @@ impl Runner {
             starting_strategy_override: None,
             tier1_diagnostics_for_test: Vec::new(),
             external_cancel: None,
+            skill_registry: None,
         })
+    }
+
+    /// v60.51 §15 — install a skill registry so the runner expands a
+    /// leading `/<name>` prompt via its `prompt_template`. Skipping
+    /// this leaves the slash literal in the prompt — useful for tests
+    /// that want to drive the raw text through the loop.
+    pub fn with_skill_registry(
+        mut self,
+        registry: Arc<atelier_core::skills::SkillRegistry>,
+    ) -> Self {
+        self.skill_registry = Some(registry);
+        self
     }
 
     /// v60.37 A3 — public accessor for the runner's [`ModelCostPolicy`]
@@ -961,12 +982,84 @@ impl Runner {
         self
     }
 
+    /// v60.51 §15 — pre-turn slash-command expansion.
+    ///
+    /// Returns `(expanded_prompt, pending_skill_note)`:
+    ///
+    /// * If `prompt` does not start with `/`, the input is returned
+    ///   unchanged and the note is `None`.
+    /// * If the runner has no [`SkillRegistry`] installed, slashes are
+    ///   left in place (so tests can still drive a literal `/foo`
+    ///   prompt through the model).
+    /// * If the slash is `/help`, expansion is short-circuited: the
+    ///   registry's `format_help()` output is returned in place of the
+    ///   prompt with no note. (The CLI binary intercepts `/help` at
+    ///   parse time so the model is never asked to digest the help
+    ///   text; this branch matters for programmatic callers that drive
+    ///   `Runner::run` directly.)
+    /// * Otherwise: parse args, substitute, return the expansion plus
+    ///   `Some("skill: <name>")` so the next `ModelCall` ledger entry
+    ///   can carry the §15 attribution.
+    fn expand_skill_prompt(&self, prompt: String) -> Result<(String, Option<String>), RunError> {
+        let Some(rest) = prompt.strip_prefix('/') else {
+            return Ok((prompt, None));
+        };
+        let Some(registry) = self.skill_registry.as_ref() else {
+            return Ok((prompt, None));
+        };
+        // Strip the leading `/`, split into name + args.
+        let (name, raw_args) = match rest.find(char::is_whitespace) {
+            Some(i) => (&rest[..i], rest[i..].trim_start()),
+            None => (rest, ""),
+        };
+
+        // `/help` is harness-intercepted per spec §15 line 785. The
+        // returned string is rendered as the next user message; in
+        // practice the CLI short-circuits earlier so the model never
+        // sees this.
+        if name == "help" {
+            return Ok((registry.format_help(), None));
+        }
+
+        let Some(skill) = registry.get(name) else {
+            let available: Vec<String> = registry.names().cloned().collect();
+            return Err(RunError::SkillUnknown {
+                name: name.to_string(),
+                available,
+            });
+        };
+        let args = atelier_core::skills::parse_args(skill, raw_args).map_err(|e| {
+            RunError::SkillSubstitution {
+                name: name.to_string(),
+                source: e,
+            }
+        })?;
+        let ctx = atelier_core::skills::SkillSubstitutionContext {
+            repo_root: &self.workspace,
+            args: &args,
+            atelier_md: None,
+        };
+        let expanded = atelier_core::skills::substitute(skill, &ctx).map_err(|e| {
+            RunError::SkillSubstitution {
+                name: name.to_string(),
+                source: e,
+            }
+        })?;
+        Ok((expanded, Some(format!("skill: {name}"))))
+    }
+
     /// Drive the loop until `claims_done` or `max_turns`. Returns when:
     ///   * a turn carried `claims_done: true` (success path; runs DoD next),
     ///   * `max_turns` reached (timeout; `final_state = AwaitingUser`),
     ///   * the adapter errored irrecoverably (propagated).
     pub async fn run(&self, prompt: String) -> Result<RunReport, RunError> {
         let workspace = self.workspace.clone();
+
+        // v60.51 §15 — slash-command expansion. Runs *before* hooks /
+        // DoD / sandbox so a `/foo` typo bails cleanly without leaving
+        // half-loaded state behind. `pending_skill_note` is consumed
+        // by the first `ModelCall` ledger append below.
+        let (prompt, mut pending_skill_note) = self.expand_skill_prompt(prompt)?;
 
         // 1. Load config: hooks + DoD. Both are tolerant of missing files —
         //    a fresh repo with no .atelier/hooks/ or .atelier/dod.json
@@ -1754,7 +1847,10 @@ impl Runner {
                 count_source: response.usage.count_source,
                 cost_usd,
                 latency_ms: latency_f64,
-                note: None,
+                // v60.51 §15 — the first `ModelCall` after a slash
+                // invocation carries `note: Some("skill: <name>")`;
+                // `take()` ensures only that first call is annotated.
+                note: pending_skill_note.take(),
             });
 
             // 6. Parse envelope from response per the *active* strategy
@@ -2270,6 +2366,23 @@ pub enum RunError {
     ContextOverflow {
         needed_tokens: u32,
         limit_tokens: u32,
+    },
+    /// v60.51 §15 — the prompt began with `/` but no skill of that
+    /// name is registered. Caller surfaces the available names so the
+    /// user can fix the typo.
+    #[error("unknown skill `/{name}`; available: {}", available.join(", "))]
+    SkillUnknown {
+        name: String,
+        available: Vec<String>,
+    },
+    /// v60.51 §15 — the skill exists but expansion failed (a required
+    /// arg was missing, or `prompt_template` referenced an unknown
+    /// `${variable}`). The wrapped error names the specific cause.
+    #[error("skill `/{name}`: {source}")]
+    SkillSubstitution {
+        name: String,
+        #[source]
+        source: atelier_core::skills::SubstitutionError,
     },
 }
 

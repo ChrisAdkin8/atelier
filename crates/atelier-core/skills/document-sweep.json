@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "name": "document-sweep",
+  "description": "Full-workspace documentation pass — find gaps + drift across every module, not a single target.",
+  "prompt_template": "Run a documentation sweep across ${target}.\n\nLook for, in order of severity:\n\n1. **Public items with no doc comment.** Cite file:line for each.\n2. **Doc-comment drift** — comments that describe behaviour the code no longer has (renamed fields, removed branches, refactored ownership).\n3. **Module-level (`//!`) blocks** that are missing or describe an outdated job. The module-level block should explain the module's *job* and the invariants it owns — not a line-by-line gloss of its types.\n4. **Spec-section references** that have moved (e.g., a module says 'Spec §15' but the relevant section is now §16).\n5. **Sloppy doc patterns** — multi-paragraph blocks that paraphrase the obvious, references to functions that no longer exist, copy-pasted boilerplate.\n\nUnlike `/document` (which is target-scoped), this is a *survey*: produce a punch-list grouped by severity, not a stream of patches. Prioritise the items where a future contributor would re-derive context from scratch.\n\nFor Rust code, the conventions are: module-level `//!` explains the job + invariants; public items get one short `///` summary line + optional details block; example blocks only when the call shape is non-obvious from the signature. Match the project's existing voice (see ATELIER.md).",
+  "args": [
+    {
+      "name": "target",
+      "description": "Where to sweep. Defaults to the whole workspace; scope to a crate or path when triaging.",
+      "default": "the whole workspace"
+    }
+  ],
+  "pinned_context": ["ATELIER.md"],
+  "side_effect_class": "local-safe"
+}

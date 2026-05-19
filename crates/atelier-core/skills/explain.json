@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "name": "explain",
+  "description": "Explain a file, function, or 'diff' at a chosen level of detail.",
+  "prompt_template": "Explain ${target} at a ${detail_level} level. Cover:\n\n1. **What it does** — the contract, not the line-by-line gloss.\n2. **Why it exists** — the constraint or design intent it satisfies. Cite ATELIER.md if the rationale is recorded there.\n3. **Where it sits** — call out the surrounding modules / callers / data flow.\n4. **Non-obvious behaviour** — edge cases, invariants, hidden ordering requirements.\n\nUse concrete file paths and line numbers. Skip the obvious; lean into the why.\n\nIf `target` is `diff`, explain the pending workspace diff instead — what changed, why each hunk exists, what's load-bearing vs cosmetic.",
+  "args": [
+    {
+      "name": "target",
+      "description": "File path, function name, or 'diff' for the pending workspace diff.",
+      "required": true
+    },
+    {
+      "name": "detail_level",
+      "description": "How deep to go: 'brief', 'normal', or 'deep'.",
+      "default": "normal"
+    }
+  ],
+  "pinned_context": ["ATELIER.md"],
+  "side_effect_class": "local-safe"
+}

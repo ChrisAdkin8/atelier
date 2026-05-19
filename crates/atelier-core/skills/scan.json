@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "name": "scan",
+  "description": "Security scan focused on a known threat class: supply-chain, secrets, egress, or IaC misconfig.",
+  "prompt_template": "Run a focused security scan against the ${vector} threat class.\n\nVector-specific rubric:\n\n- **supply-chain** — IoC sweep against the Shai-Hulud / npm worm patterns: `shai-hulud-workflow.yml` files, postinstall / preinstall lifecycle scripts, non-`registry.npmjs.org` tarball URLs, suspicious Cargo `[patch]` overrides, unpinned Git dependencies. Cite `tasks/shai_hulud_sweep_2026-05-19.md` for the established gate.\n- **secrets** — any plaintext API key, token, password, private key, connection string in source. Spec §11 forbids plaintext; everything must reference `${env:NAME}` or `${keychain:NAME}`. Include gitignored locations that *might* leak (`.env`, `*.tfstate`, build artifacts).\n- **egress** — any code path that opens an outbound network connection. Reconcile against the §12 sandbox / `allow_net` declarations. Flag any path that escapes sandboxing.\n- **iac-misconfig** — overly-permissive IAM bindings, public-default storage buckets, missing encryption-at-rest, default-deny missing on firewall rules. CIS-benchmark style.\n\nReport each finding with severity (critical / high / medium / low), file:line, the issue, and a concrete fix. If nothing significant, say so plainly and explain what you scanned to be confident.",
+  "args": [
+    {
+      "name": "vector",
+      "description": "Threat class: 'supply-chain', 'secrets', 'egress', or 'iac-misconfig'.",
+      "required": true
+    }
+  ],
+  "pinned_context": ["ATELIER.md"],
+  "side_effect_class": "local-safe"
+}

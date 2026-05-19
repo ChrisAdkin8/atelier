@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "name": "triage",
+  "description": "Triage a failing test or paged-alert: reproduce, localise, propose the smallest fix. Uses tooling explicitly.",
+  "prompt_template": "Triage the following report:\n\n```\n${report}\n```\n\nFollow the ATELIER.md 'Triage pipeline': Reproduce → Localize → Reduce → Fix → Guard with regression coverage → Verify end-to-end.\n\nUse the read_file, grep, and shell tools to confirm — do not speculate. If reproduction requires standing up a service or running a long-running command, say so and stop rather than guessing.",
+  "args": [
+    {
+      "name": "report",
+      "description": "The failing-test output, paged alert, or bug report to triage.",
+      "required": true
+    }
+  ],
+  "pinned_context": ["ATELIER.md"],
+  "tools_required": ["read_file", "grep", "shell"],
+  "proactive_trigger": "Suggest when the user pastes a stack trace, a failing-test output block, an alert page, or asks to 'debug' / 'reproduce' a named issue.",
+  "side_effect_class": "local-risky"
+}

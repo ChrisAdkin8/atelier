@@ -34,7 +34,9 @@ pub mod protocol_conformance;
 pub mod protocol_strategy;
 pub mod sandbox;
 pub mod session;
+pub mod skills;
 pub mod staging;
+pub mod subagents;
 pub mod state;
 pub mod subprocess;
 pub mod text_safety;
@@ -116,6 +118,10 @@ pub use session::{
     edit_staged_events, spawn as spawn_session, spawn_with_capacity as spawn_session_with_capacity,
     Command, ConcurrentEditOutcome, Event, Handle as SessionHandle, SessionId, EVENT_BUFFER,
     INBOX_CAPACITY, TOOL_PARALLELISM_CAP,
+};
+pub use skills::{
+    parse_args as parse_skill_args, substitute as substitute_skill, Skill, SkillArg,
+    SkillLoadError, SkillRegistry, SkillSource, SkillSubstitutionContext, SubstitutionError,
 };
 pub use staging::{
     sha256, CommitReport, FileOutcome, NoopSyntaxCheck, StagedWrite, Staging, StagingError,

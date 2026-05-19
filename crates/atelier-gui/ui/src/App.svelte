@@ -114,7 +114,16 @@
     // failure leaves the inline single-mock fallback in place.
     try {
       const opts = await invoke<SwapOption[]>('list_provider_profiles')
-      if (opts.length > 0) swapOptions = opts
+      if (opts.length > 0) {
+        swapOptions = opts
+        // v60.55 — point the dropdown at the default row on hydration
+        // so the visible selection matches the model the backend's
+        // `resolve_default_adapter` would actually use. Without this,
+        // the dropdown starts at index 0 (alphabetical first), which
+        // can disagree with `providers.toml`'s `default = "<name>"`.
+        const defaultIdx = opts.findIndex((o) => o.is_default)
+        if (defaultIdx >= 0) dropdownIndex = defaultIdx
+      }
     } catch (err) {
       console.warn('list_provider_profiles failed; keeping inline fallback', err)
     }
@@ -229,13 +238,19 @@
     model_id: string
     label: string
     base_url?: string | null
+    // v60.55 — `true` iff this row matches `providers.toml`'s
+    // `default = "<name>"` selector (or, in the built-in fallback,
+    // the row `Runner::new` would pick). The dropdown prefixes a
+    // ★ glyph so the user can tell at a glance which model the
+    // chat path falls back to.
+    is_default?: boolean
   }
   // Hydrated on mount from the Rust-side `list_provider_profiles`
   // command, which reads `.atelier/providers.toml`. Until that
   // round-trip lands, the dropdown shows an inline fallback so the
   // first paint isn't blank.
   let swapOptions: SwapOption[] = $state([
-    { kind: 'mock', model_id: 'mock:default', label: 'mock' },
+    { kind: 'mock', model_id: 'mock:default', label: 'mock', is_default: true },
   ])
 
   // Pick the dropdown's selected option from the current model id when
@@ -256,7 +271,12 @@
   $effect(() => {
     const id = app.currentModel?.modelId
     if (!id) {
-      dropdownIndex = 0
+      // v60.55 — when no model is active yet (first paint, pre-hydration,
+      // or a torn-down session), point at the default row so the visible
+      // selection matches what `resolve_default_adapter` would pick on
+      // the first chat submit.
+      const defaultIdx = swapOptions.findIndex((o) => o.is_default)
+      dropdownIndex = defaultIdx >= 0 ? defaultIdx : 0
       return
     }
     const idx = swapOptions.findIndex((o) => o.model_id === id)
@@ -445,7 +465,9 @@
         data-testid="swap-adapter-select"
       >
         {#each swapOptions as opt, i (opt.model_id)}
-          <option value={String(i)}>{opt.label}</option>
+          <option value={String(i)}>
+            {opt.is_default ? '★ ' : ''}{opt.label}
+          </option>
         {/each}
       </select>
     </span>
@@ -595,6 +617,12 @@
     width: 100%;
     min-height: 0;
   }
+  /* v60.50 — every direct child of `.help` inherits the same
+     0.75rem font-size + line-height: 1 so the labels, values, and
+     controls share a single typographic baseline. The earlier mix
+     (0.65rem for tracked-caps labels, 0.7rem for the swap-select)
+     drifted text vertically by ~1-2px. `align-items: center` plus a
+     unified line-height fixes the v-align without per-element hacks. */
   .help {
     display: flex;
     gap: 1rem;
@@ -605,6 +633,11 @@
     color: var(--fg-dim);
     font-family: var(--font-mono);
     font-size: 0.75rem;
+    line-height: 1;
+  }
+  .help * {
+    font-size: inherit;
+    line-height: inherit;
   }
   .help .hint {
     color: var(--accent-yellow);
@@ -622,7 +655,6 @@
   .help .ctx-label {
     text-transform: uppercase;
     letter-spacing: 0.05em;
-    font-size: 0.65rem;
     opacity: 0.85;
   }
   .help .ctx-bar {
@@ -657,7 +689,6 @@
   .help .cost-label {
     text-transform: uppercase;
     letter-spacing: 0.05em;
-    font-size: 0.65rem;
     opacity: 0.85;
   }
   .help .cost-value {
@@ -670,7 +701,7 @@
   .help .model-badge {
     margin-left: auto;
     display: inline-flex;
-    align-items: baseline;
+    align-items: center;
     gap: 0.35rem;
     color: var(--fg-default, var(--fg-dim));
   }
@@ -708,7 +739,8 @@
     border: 1px solid var(--border-pane);
     border-radius: 3px;
     font-family: var(--font-mono);
-    font-size: 0.7rem;
-    padding: 0.1rem 0.3rem;
+    /* v60.50 — sized via inherited 0.75rem from `.help *`; padding bumped
+       slightly so the box height matches the adjacent text-only spans. */
+    padding: 0.15rem 0.35rem;
   }
 </style>

@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "name": "triage",
+  "description": "Triage a failing test, paged alert, or bug report: reproduce, localise, propose the smallest fix.",
+  "prompt_template": "Triage the following report:\n\n```\n${report}\n```\n\nFollow the ATELIER.md 'Triage pipeline': Reproduce → Localize → Reduce → Fix → Guard with regression coverage → Verify end-to-end.\n\n1. **Reproduce.** Name the exact command (or test) that triggers it. If you can't reproduce — because the report's missing context, or repro needs infra you don't have — say so and stop. Don't guess.\n2. **Localize.** Point at the file:line that's actually wrong, not just where the error surfaces. Use read_file / grep / ast_grep to confirm; don't speculate.\n3. **Reduce.** Explain the underlying cause in one or two sentences. No multi-paragraph essays.\n4. **Fix.** Propose the smallest change that resolves the root cause. Reject patches that paper over symptoms.\n5. **Guard.** Name the regression test (existing or new) that would have caught this; add it if missing.\n6. **Verify.** Confirm the fix passes the original failing test AND the new regression test.\n\nObey ATELIER.md's conventions in the patch (smallest change that works, no speculative refactors).",
+  "args": [
+    {
+      "name": "report",
+      "description": "The failing-test output, paged alert, stack trace, or bug report to triage.",
+      "required": true
+    }
+  ],
+  "pinned_context": ["ATELIER.md"],
+  "tools_required": ["read_file", "grep", "shell"],
+  "side_effect_class": "local-risky"
+}

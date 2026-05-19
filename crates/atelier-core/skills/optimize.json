@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "name": "optimize",
+  "description": "Performance pass on a named target — propose optimisations + estimated impact.",
+  "prompt_template": "Look for performance improvements in ${target} focused on ${metric}.\n\nWalk the analysis:\n\n1. **Baseline** — what does the hot path currently look like? Name the function, the data shape, the call frequency.\n2. **Hotspots** — point at the line(s) you believe are dominating ${metric}. Distinguish *measured* from *suspected*.\n3. **Proposed change** — describe the optimisation. Include the new asymptotic shape (O(n) → O(log n)) or constant-factor improvement.\n4. **Estimated impact** — quantify before/after where possible. \"~2× faster on n=10K\" beats \"faster\".\n5. **Tradeoffs** — what gets worse? More memory? More code? A new dependency? Be explicit.\n\nReject optimisations that hurt readability without measurable upside. Don't optimise paths that aren't load-bearing. ATELIER.md's 'Simplicity self-check' applies.",
+  "args": [
+    {
+      "name": "target",
+      "description": "File path, function, or module to optimise.",
+      "required": true
+    },
+    {
+      "name": "metric",
+      "description": "What to optimise for: 'latency', 'tokens', or 'memory'.",
+      "default": "latency"
+    }
+  ],
+  "pinned_context": ["ATELIER.md"],
+  "side_effect_class": "local-risky"
+}

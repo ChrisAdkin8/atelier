@@ -830,6 +830,30 @@ fn binary_run_anthropic_rejects_misprefixed_model() {
     );
 }
 
+// v60.51 §15 — `atelier skills` prints the registered catalogue
+// without spinning up a Runner. Smoke test that the bundled set is
+// listed and the harness-verbs footer appears.
+#[test]
+fn binary_skills_subcommand_lists_bundled_set() {
+    let mut cmd = assert_cmd::Command::cargo_bin("atelier").unwrap();
+    cmd.arg("skills");
+    let out = cmd.output().unwrap();
+    assert!(out.status.success(), "atelier skills should exit 0");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for name in [
+        "/review",
+        "/security-review",
+        "/test",
+        "/explain",
+        "/audit",
+        "/commit",
+    ] {
+        assert!(stdout.contains(name), "missing {name} in: {stdout}");
+    }
+    assert!(stdout.contains("[proactive]"), "stdout: {stdout}");
+    assert!(stdout.contains("Harness verbs"), "stdout: {stdout}");
+}
+
 #[test]
 fn binary_run_rejects_empty_prompt() {
     let mut cmd = assert_cmd::Command::cargo_bin("atelier").unwrap();
@@ -4772,4 +4796,159 @@ async fn compact_retry_rebuilds_messages_for_call_from_post_mutation_context() {
         !retry_contains_prompt,
         "post-compaction retry payload must not contain the original prompt"
     );
+}
+
+// ---------- v60.51 §15 skill dispatch ----------
+//
+// Drives a `/review` invocation through the §2.5 loop against a Mock
+// scripted to return `claimed_done` immediately. Asserts:
+//   * the bundled review template body appears on the bus as the User
+//     message (proving the runner expanded the slash before the first
+//     turn);
+//   * the first `ModelCall` ledger entry carries
+//     `note = Some("skill: review")` (per spec §15 line 805).
+
+#[tokio::test]
+async fn skill_invocation_expands_prompt_and_annotates_ledger() {
+    use atelier_core::ledger::LedgerEntry;
+    use atelier_core::session::Event as CoreEvent;
+
+    let workspace = tempfile::TempDir::new().unwrap();
+
+    let responses = vec![MockResponse {
+        assistant_text: "ack".into(),
+        tool_calls: vec![mock_envelope_tool_call(&envelope_done())],
+        overflow: None,
+    }];
+
+    let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let registry = Arc::new(
+        atelier_core::skills::SkillRegistry::load(workspace.path(), None)
+            .expect("bundled-only skill registry"),
+    );
+
+    let runner = Runner::new(
+        workspace.path().to_path_buf(),
+        ProviderChoice::Mock { responses },
+        EventSink::Capture(events.clone()),
+    )
+    .expect("mock runner construction is infallible")
+    .with_max_turns(2)
+    .with_skill_registry(registry);
+
+    let report = runner.run("/review".into()).await.unwrap();
+    assert_eq!(report.final_state, State::Done);
+
+    let captured = events.lock();
+
+    // 1. The expanded template — not the literal "/review" — must be
+    //    on the bus as the user message that opened the conversation.
+    let user_text = captured
+        .iter()
+        .filter_map(|e| match e {
+            CoreEvent::MessageCommitted {
+                role: atelier_core::session::MessageRole::User,
+                text,
+            } => Some(text.clone()),
+            _ => None,
+        })
+        .next()
+        .expect("a User MessageCommitted must fire");
+    assert!(
+        user_text.contains("Identify"),
+        "expected the review template body on the bus, got: {user_text}"
+    );
+    assert_ne!(
+        user_text.trim(),
+        "/review",
+        "raw slash should not reach the bus"
+    );
+
+    // 2. The first ModelCall ledger entry must carry `note = Some("skill: review")`.
+    let mut first_model_call_note: Option<Option<String>> = None;
+    for e in captured.iter() {
+        if let CoreEvent::LedgerAppended {
+            entry: LedgerEntry::ModelCall { note, .. },
+        } = e
+        {
+            first_model_call_note = Some(note.clone());
+            break;
+        }
+    }
+    let note = first_model_call_note.expect("at least one LedgerAppended { ModelCall } must fire");
+    assert_eq!(note.as_deref(), Some("skill: review"));
+}
+
+#[tokio::test]
+async fn skill_unknown_returns_typed_error() {
+    let workspace = tempfile::TempDir::new().unwrap();
+    let registry = Arc::new(
+        atelier_core::skills::SkillRegistry::load(workspace.path(), None)
+            .expect("bundled-only skill registry"),
+    );
+
+    let runner = Runner::new(
+        workspace.path().to_path_buf(),
+        // Empty responses — we should error out before hitting the adapter.
+        ProviderChoice::Mock { responses: vec![] },
+        EventSink::Null,
+    )
+    .expect("mock runner construction is infallible")
+    .with_skill_registry(registry);
+
+    let result = runner.run("/nonsense".into()).await;
+    let err = match result {
+        Ok(_) => panic!("expected SkillUnknown error, got ok"),
+        Err(e) => e,
+    };
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("nonsense"),
+        "expected SkillUnknown surface; got {msg}"
+    );
+}
+
+#[tokio::test]
+async fn skill_help_short_circuits_to_help_text() {
+    // With a registry installed, `/help` produces the registry's
+    // format_help() output as the next user-turn text rather than
+    // hitting the model. The CLI binary intercepts `/help` even
+    // earlier, but the Runner path is what programmatic callers see.
+    let workspace = tempfile::TempDir::new().unwrap();
+    let registry =
+        Arc::new(atelier_core::skills::SkillRegistry::load(workspace.path(), None).unwrap());
+
+    // One scripted response — enough for the loop to complete one
+    // turn after the expanded "user message" goes out.
+    let responses = vec![MockResponse {
+        assistant_text: "ack".into(),
+        tool_calls: vec![mock_envelope_tool_call(&envelope_done())],
+        overflow: None,
+    }];
+    let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+
+    let runner = Runner::new(
+        workspace.path().to_path_buf(),
+        ProviderChoice::Mock { responses },
+        EventSink::Capture(events.clone()),
+    )
+    .unwrap()
+    .with_max_turns(2)
+    .with_skill_registry(registry);
+
+    let _ = runner.run("/help".into()).await.unwrap();
+    let captured = events.lock();
+    let user_text = captured
+        .iter()
+        .filter_map(|e| match e {
+            atelier_core::session::Event::MessageCommitted {
+                role: atelier_core::session::MessageRole::User,
+                text,
+            } => Some(text.clone()),
+            _ => None,
+        })
+        .next()
+        .unwrap();
+    assert!(user_text.contains("/review"));
+    assert!(user_text.contains("[bundled]"));
 }

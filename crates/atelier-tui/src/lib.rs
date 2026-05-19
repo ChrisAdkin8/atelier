@@ -21,6 +21,8 @@
 //! reaches the terminal is the `EditStaged` count + an event log. Adding
 //! widgets without that working first is premature.
 
+pub mod skills_completion;
+
 use std::collections::VecDeque;
 use std::io::{self, stdout, Stdout};
 use std::path::PathBuf;

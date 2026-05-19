@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "name": "spec",
+  "description": "Author or update a section of coding-harness-spec.md.",
+  "prompt_template": "Author or update spec section ${section} in `coding-harness-spec.md`.\n\nGuiding principles (match the existing spec's voice):\n\n- **Normative not narrative.** Spec language describes the contract a conforming implementation must satisfy, not the journey to get there.\n- **One concept per heading.** Subsections are cheap; nested run-on paragraphs are expensive.\n- **Mechanical gates.** Each section that can have one should declare an *acceptance gate* — the minimum mechanical check that proves an implementation satisfies the section.\n- **Cite cross-references.** When this section depends on another (§5, §15, etc.), name it explicitly.\n- **No code.** The spec describes contracts; implementations live in the crates.\n\nIf the section already exists, propose a diff. If it's new, slot it under the appropriate parent heading. Update the table of contents if there is one.",
+  "args": [
+    {
+      "name": "section",
+      "description": "Spec section to author or update (e.g., '§7', '§15.Skills', '§5.MemoryCard').",
+      "required": true
+    }
+  ],
+  "pinned_context": ["ATELIER.md", "coding-harness-spec.md"],
+  "side_effect_class": "local-risky"
+}

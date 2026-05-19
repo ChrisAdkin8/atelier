@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "name": "refactor",
+  "description": "Targeted refactor for a named function / module / pattern with explicit intent.",
+  "prompt_template": "Refactor ${target} to ${intent}.\n\nBefore touching code, write down:\n\n1. **The current shape** — one paragraph summarising what's there now and why it grew that way.\n2. **The target shape** — one paragraph describing what it should look like after the refactor.\n3. **Behaviour preservation** — what tests / call sites guarantee no behaviour change. Name them.\n\nThen propose the smallest change set that gets from (1) to (2) without altering observable behaviour. If a test gap means you *can't* be confident behaviour is preserved, surface that explicitly and propose adding the test first.\n\nDon't bundle unrelated cleanup. Don't refactor adjacent code unless it materially reduces risk. ATELIER.md's 'Smallest change that works' applies.",
+  "args": [
+    {
+      "name": "target",
+      "description": "File, module, function, or pattern to refactor.",
+      "required": true
+    },
+    {
+      "name": "intent",
+      "description": "What the refactor should accomplish (e.g., 'extract the parsing into its own module', 'replace the recursive walk with a worklist').",
+      "required": true
+    }
+  ],
+  "pinned_context": ["ATELIER.md"],
+  "side_effect_class": "local-risky"
+}

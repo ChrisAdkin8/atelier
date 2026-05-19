@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "name": "commit",
+  "description": "Draft a Conventional-Commits-shaped message from the staged diff.",
+  "prompt_template": "Draft a commit message for the currently-staged changes.\n\nFollow this repo's existing voice: scan the last ten commit subjects (`git log --oneline -10`) to pick up the prefix conventions (e.g., `v60.NN:`, `hotfix:`, `docs(README):`). Match what's there; don't invent a new shape.\n\nShape of the output:\n\n- **Subject line (≤72 chars)** — start with the appropriate prefix. Imperative mood. Summarise the *why*, not a wall of *what*.\n- **Optional body** — only if the change has non-obvious motivation or touches multiple subsystems. One short paragraph. The reader has the diff; don't paraphrase it.\n- **No `Co-Authored-By` lines** unless I add them.\n\nIf the staged diff is empty, say so plainly and don't fabricate a message.",
+  "pinned_context": ["ATELIER.md"],
+  "side_effect_class": "local-safe"
+}

@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "name": "standup",
+  "description": "Generate a standup-style summary of the current branch's recent activity. Takes no args.",
+  "prompt_template": "Summarise the activity on this branch since it diverged from main. Cover:\n\n1. **What was accomplished** — group commits by theme, not chronologically.\n2. **What's in flight** — uncommitted edits, half-finished work surfaced in `tasks/todo.md`.\n3. **What's blocked** — anything waiting on a decision, a teammate, or external infra.\n\nKeep it short — three to six bullets. Match the tone of an engineer talking to teammates, not a status report to management.",
+  "pinned_context": ["ATELIER.md"],
+  "side_effect_class": "local-safe"
+}

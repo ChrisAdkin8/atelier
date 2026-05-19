@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "name": "sweep",
+  "description": "Hygiene-pass: rename inconsistencies, dead code, doc drift, ATELIER.md conventions not respected.",
+  "prompt_template": "Run a hygiene sweep across ${target}.\n\nLook for:\n\n- **Naming inconsistencies** — same concept named differently in different files, capitalisation drift, snake_case vs camelCase boundary errors.\n- **Dead code** — unused functions, unreachable branches, `_` prefixed names that aren't actually unused, leftover `// removed` comments.\n- **Doc drift** — comments that no longer describe the code they sit above, stale spec-section references, function names in docs that don't exist anymore.\n- **Convention violations against ATELIER.md** — paths that should be `.atelier/` and aren't, environment variables that should be `ATELIER_*` and aren't, conventions the file declares that the code ignores.\n- **Sloppy patterns** — `.unwrap()` where a `?` would do, `clone()`s that could be borrows, panic paths in library code.\n\nDo NOT bundle behavioural changes into a sweep. If you spot a bug, surface it separately rather than fixing it inline. ATELIER.md's 'Smallest change that works' applies here too — a sweep should be N small, independent changes, not one giant churn.",
+  "args": [
+    {
+      "name": "target",
+      "description": "Path or crate to sweep. Omit (defaults to whole workspace) or scope to a directory.",
+      "default": "."
+    }
+  ],
+  "pinned_context": ["ATELIER.md"],
+  "side_effect_class": "local-risky"
+}

@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "name": "document",
+  "description": "Generate or update doc comments / module rustdoc / panel-level READMEs for a target.",
+  "prompt_template": "Generate or update documentation for ${target}.\n\nMatch the project's existing voice and shape (see ATELIER.md for the conventions). For Rust code, the conventions are:\n\n- Module-level `//!` blocks explain the module's *job* and the invariants it owns — not a line-by-line gloss of its types.\n- Public items get one short `///` summary line + a blank line + an optional details block. Skip the comment entirely if the name + signature already say everything.\n- Use the `//!` block to cite the spec section the module implements (e.g., `Spec §15 — Skills`) when applicable.\n- Example blocks only when the call shape is non-obvious from the signature.\n\nDo not paraphrase the obvious. Document the *why* and the load-bearing invariants — the ones a future contributor would otherwise have to re-derive from the code.",
+  "args": [
+    {
+      "name": "target",
+      "description": "File path, module path, or symbol name to document.",
+      "required": true
+    }
+  ],
+  "pinned_context": ["ATELIER.md"],
+  "side_effect_class": "local-risky"
+}

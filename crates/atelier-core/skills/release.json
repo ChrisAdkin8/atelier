@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "name": "release",
+  "description": "Pre-cut release checklist: tests + changelog draft + commit message draft, in order.",
+  "prompt_template": "Run the pre-cut release checklist for the current branch.\n\nIn order:\n\n1. **Verify the tests are green.** Use the project's test command (from ATELIER.md's 'Useful commands'). Surface pass/fail counts + any flake.\n2. **Audit the diff for unintended scope.** `git diff main..HEAD` and call out anything that looks like it shouldn't be in this release (debug prints, half-finished refactors, feature flags left on).\n3. **Draft a CHANGELOG.md entry.** Match the existing format (skim the last ~80 lines of `CHANGELOG.md` for voice / version-prefix convention). Group related commits under one bullet; split a single commit into multiple bullets when it covers genuinely independent changes.\n4. **Draft a commit-message subject** for the eventual roll-up commit. Match the repo's conventional-commit-shaped prefix (`v60.NN: ...`).\n5. **Open questions / blockers.** Anything that should land before the cut — broken docs, missing tests, an unresolved review comment.\n\nReport each step as a short paragraph. Don't fabricate test runs or commits you didn't actually invoke. If a step's command isn't available in this run (sandbox, missing tool, ATELIER.md doesn't declare the test command), surface that explicitly.",
+  "pinned_context": ["ATELIER.md", "CHANGELOG.md"],
+  "tools_required": ["shell"],
+  "side_effect_class": "local-risky"
+}

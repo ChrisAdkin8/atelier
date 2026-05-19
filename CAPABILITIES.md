@@ -126,6 +126,25 @@ Each hook needs explicit first-use approval, persisted to `.atelier/hook_approva
 
 ---
 
+## Skills (§15)
+
+Skills are named slash-invoked prompt expansions. The harness ships 14 bundled (`/review`, `/security-review`, `/test`, `/explain`, `/fix`, `/document`, `/refactor`, `/optimize`, `/commit`, `/changelog`, `/audit`, `/spec`, `/sweep`, `/scan`) and you can override or add new ones in `~/.atelier/skills/` (your scope) or `<workspace>/.atelier/skills/` (per-repo, checked into git).
+
+Typing `/review` in the GUI Composer (or `atelier run /review` on the CLI) expands the skill's `prompt_template` with `${arg}` substitution and routes the expanded text as the next user turn. The §2.5 agent loop runs unchanged — skills are a prompt-expansion layer, not a new transport. Cost-ledger discipline: every skill invocation is annotated as `note: "skill: <name>"` on the next `model_call` ledger entry.
+
+Authoring shortcuts:
+
+```
+atelier skills                 # list every registered skill (resolved + grouped)
+atelier skills new my-helper   # scaffold a starter manifest in <repo>/.atelier/skills/
+atelier skills validate        # lint every manifest in the registry
+atelier skills show review     # print the resolved manifest + source path
+```
+
+The proactive-trigger surface (model self-suggests a skill via the §9 uncertainty UI) is **deferred** to a later bundle; bundled manifests that carry a `proactive_trigger` (e.g. `/security-review`) still work manually today.
+
+---
+
 ## Sub-agent delegation (contract only today)
 
 The §10.1 surface for spawning specialised sub-agents (researcher, test-runner, general-purpose, code-reviewer) is locked in via the bundled `spawn_subagent` tool. The schemas, manifests, and session-state slots all exist; the runtime that actually launches a sub-agent and gathers its findings lands in Phase D/E.

@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "name": "plan",
+  "description": "Draft or refine a §5 plan canvas for the current task before any edits land.",
+  "prompt_template": "Draft a plan for the following task:\n\n${task}\n\nProduce a concrete, ordered list of steps. Each step should:\n\n1. **State the outcome** — what's true after the step that wasn't true before.\n2. **Name the verification** — the command, test, or observable signal that proves the step landed (per ATELIER.md's 'Goal-Driven Execution').\n3. **Declare its constraints** — anything that must hold across the step (e.g., 'no behaviour change', 'one bundled PR', 'no new deps').\n\nReject speculative scope. Resist the urge to bundle unrelated cleanups. ATELIER.md's 'Smallest change that works' applies — the plan should be the minimum set of steps that takes us from the current state to the desired one.\n\nIf the task is too large to fit in one plan, surface that and propose how to split it. If the spec / ATELIER.md is unclear about an aspect you need, name the ambiguity rather than guessing.\n\nWhen the plan is ready, emit it through the §5 plan-canvas mutator surface so it lands in the Plan panel. The user can then accept, reorder, or amend before any code changes happen.",
+  "args": [
+    {
+      "name": "task",
+      "description": "The task to plan. Free-text — the broader the description, the looser the plan; specific tasks get tighter plans.",
+      "required": true
+    }
+  ],
+  "pinned_context": ["ATELIER.md"],
+  "side_effect_class": "local-safe"
+}

@@ -256,6 +256,31 @@ briefing a colleague who just walked into the room.
 
 ---
 
+## Skills
+
+Skills are named, slash-invoked prompt expansions — `/review`, `/fix`, `/audit`, etc. The harness ships 14 bundled skills out of the box; you can override any of them in `~/.atelier/skills/` (your scope) or `<workspace>/.atelier/skills/` (per-repo, checked into git so the team shares the same shortcut).
+
+When you type `/review` in the GUI Composer (or `atelier run /review` on the CLI), the harness looks up the skill's manifest, expands `${arg}` substitutions against any args you passed, and sends the expanded body as your next user turn. The §2.5 agent loop runs unchanged — skills don't introduce a new state, they just save you typing the same prompt repeatedly.
+
+| Action | Where it lands | When to use it |
+|---|---|---|
+| **Type `/<name>`** in the Composer | The model sees the expanded `prompt_template` | The everyday case — type `/review` and the model gets the bundled review prompt. |
+| **`atelier skills new <name>` (CLI)** | Per-repo (`--scope repo`, default) or user-home (`--scope user`) | Author a new skill. Use `--from <existing>` to fork the bundled body and customise it. |
+| **`atelier skills validate`** | Lints every registered manifest (or one path) | Pre-commit hook–friendly. Catches typos in `${arg}` references and bad slugs. |
+| **`atelier skills show <name>`** | Prints the resolved manifest + its source path | "Is *this* the one I edited?" |
+
+The full bundled set: `/review`, `/security-review`, `/test`, `/explain`, `/fix`, `/document`, `/refactor`, `/optimize`, `/commit`, `/changelog`, `/audit`, `/spec`, `/sweep`, `/scan`. Run `atelier skills` for the live list with descriptions + override sources.
+
+**Substitution variables** available in `prompt_template`:
+
+- `${<arg_name>}` — declared args from the manifest's `args` list.
+- `${repo_root}` — absolute path of the repo root.
+- `${atelier_md}` — contents of `<repo>/ATELIER.md`, or empty if absent.
+
+**Layered override**: per-repo wins over user-home, which wins over bundled. `atelier skills delete <name>` removes a user/repo manifest and unshadows whatever was below it. See `crates/atelier-core/skills/` for the bundled manifests and `examples/skills/` for hand-rolled examples covering the full schema surface.
+
+---
+
 ## Build
 
 The toolchain is **pinned Rust 1.85.0** via `rust-toolchain.toml` — the first `cargo` call inside this repo silently fetches it. See [`docs/toolchain.md`](docs/toolchain.md) for the reason and for troubleshooting the `edition2024` error if it surfaces.

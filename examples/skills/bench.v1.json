@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "name": "bench",
+  "description": "Run the project's benchmarks and summarise the result, with optional iteration count + warmup overrides.",
+  "prompt_template": "Run the project's benchmark suite${suffix_hint}.\n\nUse iteration count = ${iterations}; warmup = ${warmup}. If ATELIER.md declares a different benchmark command, use that instead.\n\nReport:\n\n- Per-bench wall-clock (mean + p95).\n- Throughput where the harness reports it.\n- Any regression vs. the previous run if a baseline file exists at `tests/baselines/`.\n\nFlag any bench that took >2x the baseline as a regression.",
+  "args": [
+    {
+      "name": "iterations",
+      "description": "Iterations per benchmark.",
+      "default": "100"
+    },
+    {
+      "name": "warmup",
+      "description": "Warmup iterations (untimed).",
+      "default": "10"
+    },
+    {
+      "name": "suffix_hint",
+      "description": "Optional free-text suffix appended to the first sentence (e.g., ' on the parser module only').",
+      "default": ""
+    }
+  ],
+  "pinned_context": ["ATELIER.md"],
+  "side_effect_class": "local-risky"
+}
