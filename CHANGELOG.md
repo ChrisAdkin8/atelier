@@ -1,5 +1,15 @@
 # Atelier Spec — Changelog
 
+## v60.42 — 2026-05-19 (atelier-gui: `custom-protocol` feature so `cargo build --release` produces a working binary)
+
+Plain `cargo build [--release] -p atelier-gui` was producing a binary that opened a blank window because the `tauri` dependency was declared with `features = []`. Without the `custom-protocol` feature, the binary dials `devUrl` (Vite at `localhost:1420`) on startup instead of serving the embedded `frontendDist` — and with no Vite dev server running, the webview's resource fetch fails (`Failed to load resource: Could not connect to the server`) and renders nothing.
+
+`cargo tauri build` would have set `custom-protocol` automatically; plain `cargo build --release` does not. Anyone packaging atelier-gui outside of `tauri-cli` (CI, distro maintainers, or a contributor following the workspace's standard `cargo build` workflow) would hit the exact same trap.
+
+Fix: declare `tauri = { workspace = true, features = ["custom-protocol", "devtools"] }` in `crates/atelier-gui/Cargo.toml`. Binary size grows by ~760 KB (13.0 MB → 13.8 MB) from the embedded-asset serving path. `devtools` rides along so Inspect Element / WKWebView `isInspectable` stays available — cheap and useful while the GUI is still stabilising; consider gating behind `#[cfg(debug_assertions)]` later.
+
+Verification: `cargo build --release -p atelier-gui` then launch the binary; the GUI renders the full multi-pane workspace (header / Conversation+Plan / Diff+Meters / Composer) and the swap-adapter dropdown in the footer hydrates from `~/.atelier/providers.toml` / `<repo>/.atelier/providers.toml`.
+
 ## v60.40 — 2026-05-19 (Shai-Hulud / npm supply-chain IoC sweep gate)
 
 Implements the standing IoC battery proposed in `tasks/shai_hulud_sweep_2026-05-19.md`. The Sep 2025 Shai-Hulud worm and its Nov 2025 Mini Shai-Hulud / v2 variants rely on three mechanical footholds: a `preinstall`/`postinstall` lifecycle script, a tarball resolved from a non-`registry.npmjs.org` host, or the literal `shai-hulud-workflow.yml` GitHub Actions file. v60.40 codifies all three as a pre-PR gate.

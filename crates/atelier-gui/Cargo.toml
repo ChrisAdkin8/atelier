@@ -22,7 +22,17 @@ atelier-core = { workspace = true }
 # v47: GUI drives a turn loop via the atelier-cli library. Pulls in
 # Runner, ProviderChoice, MockResponse, EventSink, DispatcherHandle.
 atelier-cli = { workspace = true }
-tauri = { workspace = true }
+# `custom-protocol` makes the binary serve the embedded `frontendDist`
+# instead of dialing `devUrl` (Vite dev server). Without it, plain
+# `cargo build [--release]` produces a binary that's stuck in dev mode
+# and shows a blank window when the dev server isn't running.
+# `cargo tauri build` would set this automatically; we set it
+# unconditionally so `cargo build --release` produces a working binary.
+#
+# `devtools` keeps Inspect Element + WKWebView `isInspectable` on macOS
+# available while we still need to diagnose. Cheap to leave on; consider
+# gating behind a feature flag once the GUI is stable.
+tauri = { workspace = true, features = ["custom-protocol", "devtools"] }
 # v60.28 H2 follow-on — consent gate awaits the renderer's accept/reject
 # reply via `tokio::sync::oneshot`, bounded by `tokio::time::timeout`.
 tokio = { workspace = true }
