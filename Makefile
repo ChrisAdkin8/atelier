@@ -21,7 +21,7 @@ else
 PY ?= python3
 endif
 
-.PHONY: check schemas artifacts rig-tests dry-run summary install-rig quality-cheap audit audit-install clean
+.PHONY: check schemas artifacts rig-tests dry-run summary install-rig quality-cheap audit audit-install npm-ioc-sweep clean
 
 check: schemas artifacts rig-tests summary
 
@@ -32,7 +32,7 @@ artifacts:
 	$(PY) tests/validate_artifacts.py
 
 rig-tests:
-	$(PY) -m pytest tests/test_schemas.py tests/test_validators.py tests/test_runner.py tests/test_ci.py -q
+	$(PY) -m pytest tests/test_schemas.py tests/test_validators.py tests/test_runner.py tests/test_ci.py tests/test_npm_ioc_sweep.py -q
 
 dry-run:
 	$(PY) tests/workload/runner/runner.py --task all --dry-run
@@ -121,6 +121,23 @@ audit:
 		--ignore RUSTSEC-2026-0002 \
 		--ignore RUSTSEC-2026-0009
 	cd crates/atelier-gui/ui && npm audit --audit-level=high
+	$(MAKE) npm-ioc-sweep
+
+# v60.40 — Shai-Hulud / npm supply-chain IoC sweep.
+#
+# Three cheap, sub-second checks covering the worm's mechanical
+# footholds (see tasks/shai_hulud_sweep_2026-05-19.md):
+#
+#   1. No `shai-hulud-workflow.yml` GH Actions file anywhere in tree.
+#   2. No `preinstall` / `postinstall` script in any lockfile entry.
+#   3. Every npm `resolved` URL points at `registry.npmjs.org`.
+#
+# Folds into `make audit` (so the per-PR `audit` job picks it up) and
+# is also callable standalone. Runs Python only — no jq, no npm. Safe
+# to run without `node_modules/` present because it reads the lockfile
+# directly.
+npm-ioc-sweep:
+	$(PY) scripts/npm_ioc_sweep.py
 
 audit-install:
 	cargo install cargo-audit --locked

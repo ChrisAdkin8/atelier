@@ -40,6 +40,10 @@ Six scan agents (three Rust + two non-Rust, two stalled and reran), synthesised 
 - **v60.37** (Bundle A `de26b90`, B `febaddf`, C `3019b6d`, D `33183e6`) + **v60.39** (B5 closeout) — Medium: **31/31** complete. v60.39 lands the `list_provider_profiles` Tauri command + `App.svelte` mount-time hydration with built-in defaults fallback and `OPENAI_BASE_URL` env-fallback prevention by carrying `base_url` through the swap dropdown rows. Otherwise: atomic-write discipline + io_caps + compaction cost; GUI scheme validation + env-fallback gate + modal a11y; CI timeouts + concurrency + heredoc safety + cache + jq surfacing; rig UTF-8 + fixture-managed M10 + dynamic nightly discovery + schema field constraints.
 - **v60.38** (`c7f2e1c`) — Low: 8/10. L9 (mcp_catalog enum extension) deferred per plan. L10 (InlineRenderers `<script module>` migration) deferred — convention-only with one internal consumer.
 
+## v60.40 — Shai-Hulud / npm supply-chain IoC battery (2026-05-19)
+
+Implements the standing IoC battery proposed in `tasks/shai_hulud_sweep_2026-05-19.md`. `scripts/npm_ioc_sweep.py` runs three sub-second checks (no `shai-hulud-workflow.yml`, no `preinstall`/`postinstall` lifecycle scripts in any lockfile, every `resolved` URL on `registry.npmjs.org`). Wired into `make audit` (per-PR gate via `.github/workflows/check.yml::audit`) and `make check` (rig-test sweep includes `tests/test_npm_ioc_sweep.py`'s 14 unit tests). The IoC battery catches the Sep 2025 Shai-Hulud worm and its Nov 2025 Mini Shai-Hulud / v2 variants at the mechanical-foothold layer — before a malicious dep with a `postinstall` payload, a git+ tarball, or an attacker-host substitution can land on `main`.
+
 Outstanding: H1 (rotate the leaked Anthropic API key) is operator action, separate from this code series.
 
 ## Working notes

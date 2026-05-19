@@ -300,6 +300,12 @@ def test_no_claude_paths_in_tracked_source():
         "tests/README.md",
         "coding-harness-spec.md",
         "tasks/todo.md",
+        # v60.40 — Shai-Hulud sweep record. References `.claude/worktrees/`
+        # in the "out-of-scope checks" section because those agent
+        # worktrees, when present, share lockfile content with the main
+        # tree and need the same IoC battery. The string is descriptive,
+        # not a code path the harness reads from.
+        "tasks/shai_hulud_sweep_2026-05-19.md",
     }
     offenders = []
     for path in ROOT.rglob("*"):

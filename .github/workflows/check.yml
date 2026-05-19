@@ -50,7 +50,7 @@ jobs:
         run: python tests/validate_artifacts.py
 
       - name: Rig self-tests
-        run: pytest tests/test_schemas.py tests/test_validators.py tests/test_runner.py tests/test_ci.py -q
+        run: pytest tests/test_schemas.py tests/test_validators.py tests/test_runner.py tests/test_ci.py tests/test_npm_ioc_sweep.py -q
 
       - name: Workload dry-run (every task's starting state matches declared expected_starting_returncode)
         run: python tests/workload/runner/runner.py --task all --dry-run --summary

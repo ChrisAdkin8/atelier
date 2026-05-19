@@ -26,6 +26,12 @@ This file is volatile — entries are pruned when the underlying class of mistak
 
 **Prevention**: build CI artifacts via Python (or `jq -n`) with structured field-by-field assignment, not via shell heredoc string concatenation. Step outputs flow through `env:` block + `os.environ.get(...)` so quoting is handled by the JSON encoder. The pattern also lets you use `allow_nan=False` to fail loudly on producer NaN.
 
+### `make check` rig-tests is the right place to lock in security-script behaviour
+
+**Failure**: when `scripts/npm_ioc_sweep.py` first shipped (v60.40) it would have been easy to ship just the Makefile + CI wiring without unit tests — the script is short and the live-repo case is "always clean". But a regression in any of its helpers (e.g., a future host added to `ALLOWED_RESOLVED_HOSTS` accidentally) would be silent against a clean tree.
+
+**Prevention**: every security-gate script needs both a positive test (clean tree → exit 0 + per-check `OK` line on stdout) AND a negative test per IoC (synthetic offender → exit 1 + `FAIL` on stderr + the offender path in the message). The negative tests are cheap (`tmp_path` + a minimal lockfile of ~5 lines per case) and they verify the offender-surfacing wiring, not just the happy path. Pattern proven in `tests/test_npm_ioc_sweep.py`.
+
 ---
 
 ## v50 — OpenAI-compatible adapter

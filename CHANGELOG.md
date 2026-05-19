@@ -1,5 +1,29 @@
 # Atelier Spec — Changelog
 
+## v60.40 — 2026-05-19 (Shai-Hulud / npm supply-chain IoC sweep gate)
+
+Implements the standing IoC battery proposed in `tasks/shai_hulud_sweep_2026-05-19.md`. The Sep 2025 Shai-Hulud worm and its Nov 2025 Mini Shai-Hulud / v2 variants rely on three mechanical footholds: a `preinstall`/`postinstall` lifecycle script, a tarball resolved from a non-`registry.npmjs.org` host, or the literal `shai-hulud-workflow.yml` GitHub Actions file. v60.40 codifies all three as a pre-PR gate.
+
+New `scripts/npm_ioc_sweep.py` (~210 lines, pure stdlib — no jq, no npm dep). Three sub-second checks:
+
+1. No `shai-hulud-workflow.yml` anywhere in the tree (skipping `.git`, `target`, `node_modules`, `__pycache__`, `.venv`).
+2. No `preinstall` or `postinstall` lifecycle script in any npm `package-lock.json` package entry. Walks `packages.<key>.scripts.{preinstall,postinstall}` so transitive deps are covered too. Works on the lockfile alone — does not require `node_modules/` to be present.
+3. Every `resolved` URL in every lockfile points at `https://registry.npmjs.org/` (banning `git+`, `file:`, `http://`, `ssh:`, and attacker-host substitutions). Workspace-root and peer-only entries that legitimately omit `resolved` are skipped per the npm lockfile-v3 spec.
+
+Wired into:
+
+* `Makefile`: new phony `npm-ioc-sweep` target; `make audit` calls it after `npm audit --audit-level=high`; `make check` includes the new `tests/test_npm_ioc_sweep.py` in its rig-test sweep.
+* `.github/workflows/check.yml::rig` step picks up the new pytest file automatically.
+
+New `tests/test_npm_ioc_sweep.py` (14 unit tests):
+* Per-check clean/fire pairs against synthetic lockfiles built in `tmp_path`.
+* End-to-end smoke that asserts the real repo passes the script.
+* Subprocess test that confirms a synthetic offender produces exit 1 + a `FAIL` line on stderr.
+
+`tests/test_runner.py::test_no_claude_paths_in_tracked_source` allowlist gains `tasks/shai_hulud_sweep_2026-05-19.md` with rationale — the sweep doc references `.claude/worktrees/` in its "out-of-scope checks" section because those agent worktrees, when present, share lockfile content with the main tree and need the same battery applied.
+
+Verification: 14 IoC tests pass; `make check` (163 rig + 14 canonical dry-runs) green; `make npm-ioc-sweep` green standalone.
+
 ## v60.39 — 2026-05-19 (Bundle B5 closeout — GUI swap dropdown hydrates from providers.toml)
 
 Closes the last outstanding Medium item from the 2026-05-19 deep-scan response (v60.37 Bundle B item 5). The GUI's swap dropdown was previously a hardcoded four-row constant in `App.svelte`; now it hydrates from `<workspace>/.atelier/providers.toml` on mount via a new `list_provider_profiles` Tauri command.

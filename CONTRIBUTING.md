@@ -33,7 +33,7 @@ make check          # schemas + artifacts + rig self-tests + workload dry-run
 
 `make check` must be green. CI runs the same pipeline on every push and PR; a red CI run is a merge blocker.
 
-Before opening a PR, run `make audit` and confirm both gates are green. The target runs `cargo audit --deny warnings` against the Rust workspace and `npm audit --audit-level=high` against the atelier-gui Svelte deps; CI runs the same target. If `cargo-audit` isn't on your `$PATH`, install it with `make audit-install`.
+Before opening a PR, run `make audit` and confirm all three gates are green. The target runs `cargo audit --deny warnings` against the Rust workspace, `npm audit --audit-level=high` against the atelier-gui Svelte deps, and `make npm-ioc-sweep` — a Shai-Hulud / supply-chain IoC battery added in v60.40 that fails on a `shai-hulud-workflow.yml` GitHub Actions file anywhere in the tree, any `preinstall` / `postinstall` lifecycle script in a lockfile, or a `resolved` URL pointing at anything other than `registry.npmjs.org`. CI runs the same target. If `cargo-audit` isn't on your `$PATH`, install it with `make audit-install`. The IoC sweep is pure Python stdlib — no extra install step.
 
 For Rust changes:
 
