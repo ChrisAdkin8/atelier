@@ -217,15 +217,24 @@ def extract_meta(stdout):
         payload = json.loads(match.group(1))
     except json.JSONDecodeError as e:
         return None, f"atelier-meta block was not valid JSON: {e}"
+    # v60.36 H3 — guard against the import succeeding partially (editable
+    # install with a broken re-export → the `except jsonschema.ValidationError`
+    # in the original single-try structure would raise NameError because
+    # `jsonschema` was never bound, crashing the entire workload run). Two
+    # nested try blocks: the import succeeds-or-skips first, then validation
+    # gets a separate handler that also catches SchemaError so a malformed
+    # sentinel schema can't kill the run either.
     try:
         import jsonschema
-        schema = json.loads(SENTINEL_SCHEMA_PATH.read_text())
-        jsonschema.validate(payload, schema)
     except ImportError:
-        # jsonschema not installed; skip validation but still return the payload
-        pass
+        return payload, None
+    try:
+        schema = json.loads(SENTINEL_SCHEMA_PATH.read_text(encoding="utf-8"))
+        jsonschema.validate(payload, schema)
     except jsonschema.ValidationError as e:
         return payload, f"atelier-meta failed sentinel validation: {e.message}"
+    except jsonschema.SchemaError as e:
+        return payload, f"atelier-meta sentinel schema is broken: {e.message}"
     return payload, None
 
 
@@ -251,21 +260,39 @@ def harness_run(task, harness_cmd, timeout_s):
         cmd = harness_cmd.replace("{dir}", tmp)
         argv = shlex.split(cmd)
         start = time.monotonic()
+        # v60.36 H4 — surface stdout AND stderr even on timeout. Before
+        # this fix the harness-result dict dropped stderr entirely, so a
+        # timed-out workload run produced an artifact with empty
+        # `stdout_tail`, no stderr, and no signal about what the harness
+        # was actually doing. `_run_with_pg_timeout` already populates
+        # `TimeoutExpired.{output,stderr}` from the post-kill drain; we
+        # just need to read them off the exception.
+        timeout_stdout = ""
+        timeout_stderr = ""
         try:
             result = _run_with_pg_timeout(
                 argv, cwd=None, timeout_s=timeout_s, stdin_text=task["prompt"]
             )
             elapsed = round(time.monotonic() - start, 3)
             timed_out = False
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as e:
             elapsed = round(time.monotonic() - start, 3)
             result = None
             timed_out = True
+            timeout_stdout = e.output or ""
+            if isinstance(timeout_stdout, bytes):
+                timeout_stdout = timeout_stdout.decode("utf-8", "replace")
+            timeout_stderr = e.stderr or ""
+            if isinstance(timeout_stderr, bytes):
+                timeout_stderr = timeout_stderr.decode("utf-8", "replace")
 
         pt = run_test_command(tmp, task["meta"])
         meta_payload, meta_violation = (None, None)
-        if result and result.stdout:
-            meta_payload, meta_violation = extract_meta(result.stdout)
+        # Even on timeout, the harness may have produced a meta block
+        # before being killed. Probe whatever stdout we captured.
+        stdout_for_meta = (result.stdout if result else "") or timeout_stdout
+        if stdout_for_meta:
+            meta_payload, meta_violation = extract_meta(stdout_for_meta)
 
         check_results = []
         fixture_path = Path(task["fixture"])
@@ -276,6 +303,16 @@ def harness_run(task, harness_cmd, timeout_s):
         all_checks_ok = all(c["ok"] for c in check_results) if check_results else True
         overall_ok = (not timed_out) and pt["returncode"] == 0 and all_checks_ok and meta_violation is None
 
+        # Build the two tail snippets. On a normal run we use the result
+        # struct's pipes; on a timeout we use the snippets captured off
+        # `TimeoutExpired`.
+        if result:
+            stdout_tail = result.stdout[-1000:] if result.stdout else ""
+            stderr_tail = result.stderr[-1000:] if result.stderr else ""
+        else:
+            stdout_tail = timeout_stdout[-1000:]
+            stderr_tail = timeout_stderr[-1000:]
+
         return {
             "mode": "harness",
             "task_id": task["task_id"],
@@ -284,7 +321,8 @@ def harness_run(task, harness_cmd, timeout_s):
                 "returncode": None if timed_out else result.returncode,
                 "elapsed_s": elapsed,
                 "timed_out": timed_out,
-                "stdout_tail": (result.stdout[-1000:] if result and result.stdout else ""),
+                "stdout_tail": stdout_tail,
+                "stderr_tail": stderr_tail,
                 "meta": meta_payload,
                 "meta_schema_violation": meta_violation,
             },

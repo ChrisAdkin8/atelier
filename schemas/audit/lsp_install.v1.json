@@ -20,14 +20,16 @@
     "language": {
       "type": "string",
       "minLength": 1,
+      "maxLength": 64,
       "pattern": "^[a-z][a-z0-9_-]*$",
-      "description": "The LSP language identifier (e.g. `typescript`, `python`, `rust`). Stable lowercase identifier — matches the `language` field carried on `Event::RequestLspInstall`."
+      "description": "The LSP language identifier (e.g. `typescript`, `python`, `rust`). Stable lowercase identifier — matches the `language` field carried on `Event::RequestLspInstall`. v60.36 H5 — capped at 64 bytes."
     },
     "candidate_packages": {
       "type": "array",
       "minItems": 1,
-      "items": {"type": "string", "minLength": 1},
-      "description": "The packages the install flow proposed. For TypeScript today: `[\"typescript-language-server\"]`. Multiple entries when a language requires several packages (e.g. python: `pyright` alongside `python-lsp-server`)."
+      "maxItems": 16,
+      "items": {"type": "string", "minLength": 1, "maxLength": 256},
+      "description": "The packages the install flow proposed. For TypeScript today: `[\"typescript-language-server\"]`. Multiple entries when a language requires several packages (e.g. python: `pyright` alongside `python-lsp-server`). v60.36 H5 — capped at 16 items × 256 bytes."
     },
     "outcome": {
       "$ref": "#/$defs/LspInstallOutcome",
@@ -45,7 +47,8 @@
     },
     "version_installed": {
       "type": "string",
-      "description": "The package version actually installed, when `outcome` is `installed` or `already_present`. Free-form (e.g. `typescript-language-server@4.3.4`). Omitted otherwise."
+      "maxLength": 256,
+      "description": "The package version actually installed, when `outcome` is `installed` or `already_present`. Free-form (e.g. `typescript-language-server@4.3.4`). Omitted otherwise. v60.36 H5 — capped at 256 bytes."
     },
     "reason": {
       "type": "string",

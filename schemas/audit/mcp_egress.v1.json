@@ -33,7 +33,9 @@
     "url": {
       "type": "string",
       "minLength": 1,
-      "description": "Full endpoint URL the request was directed at. Query strings + fragments are kept (they're routing data — secrets-in-URL is an anti-pattern the redaction layer flags separately)."
+      "maxLength": 2048,
+      "pattern": "^https?://",
+      "description": "Full endpoint URL the request was directed at. Query strings + fragments are kept (they're routing data — secrets-in-URL is an anti-pattern the redaction layer flags separately). v60.36 H5/SCH-M6 — capped at 2 KiB and constrained to http(s) so a misconfigured registration (e.g. `file:///etc/passwd`) can't slip into the audit log."
     },
     "phase": {
       "type": "string",
@@ -47,10 +49,12 @@
     },
     "reason": {
       "type": "string",
-      "description": "Free-form diagnostic note. For `blocked`, names the policy (`allow_net=false`). For `failure`, a short error category (`http-status`, `sse-stream`, `transport-io`). Omitted for `success`."
+      "maxLength": 1024,
+      "description": "Free-form diagnostic note. For `blocked`, names the policy (`allow_net=false`). For `failure`, a short error category (`http-status`, `sse-stream`, `transport-io`). Omitted for `success`. v60.36 H5 — capped at 1 KiB."
     },
     "tool_name": {
       "type": "string",
+      "maxLength": 256,
       "description": "When `phase == call-tool`, the name of the invoked tool. Omitted otherwise."
     }
   }

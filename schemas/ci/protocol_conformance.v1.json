@@ -23,8 +23,8 @@
     },
     "git_sha": {
       "type": "string",
-      "pattern": "^[0-9a-f]{7,40}$",
-      "description": "Commit the gate ran against. Short or full sha both accepted."
+      "pattern": "^[0-9a-fA-F]{7,40}$",
+      "description": "Commit the gate ran against. Short or full sha both accepted. v60.36 H6 — accepts mixed case so historic artifacts and `gh`-CLI-sourced output (whose case-normalisation isn't guaranteed across versions) validate without prior lowercase normalisation."
     },
     "workflow_run_url": {
       "type": "string",

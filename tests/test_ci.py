@@ -116,3 +116,105 @@ def test_nightly_workflows_rebase_before_push(name):
     assert "rebase --abort" in text and "exit 1" in text, (
         f"{name}: rebase failure path missing — must `rebase --abort` and `exit 1`"
     )
+
+
+# ---- v60.36 H1/H2 — privilege separation across the nightly commit boundary --
+#
+# The nightlies commit refreshed gate artifacts back to `main`. Before
+# v60.36, a single job both installed transitive deps (`pip install ".[rig]"`,
+# Cargo registry resolution) and held `${{ secrets.GITHUB_TOKEN }}` with
+# `contents: write`. A compromise of any transitive dep granted push access
+# to a protected branch. v60.36 splits the workflows into a `measure` job
+# (no token, no write permission) and a `commit` job (write permission,
+# but only `actions/checkout` + `actions/download-artifact` + stock git
+# — no dependency resolution). These tests lock in the split.
+
+_DEP_INSTALL_TOKENS = (
+    "pip install",
+    "cargo test",
+    "cargo build",
+    "cargo run",
+    "cargo clippy",
+    "cargo fmt",
+    "npm install",
+    "npm ci",
+    "yarn install",
+    "pnpm install",
+    "make check",
+    "make schemas",
+    "make artifacts",
+    "make rig-tests",
+)
+
+
+@pytest.mark.parametrize("name", [
+    "nightly_phase_a_gate.yml",
+    "nightly_phase_b_gate.yml",
+    "nightly_protocol_overhead.yml",
+])
+def test_nightly_workflows_default_to_read_only_permissions(name):
+    """v60.36 H1: every nightly that commits to `main` must default the top-level
+    `permissions:` to `contents: read`. Jobs that need write permission opt in
+    per-job, so transitive-dep compromise in a dependency-installing job can't
+    push back to main.
+    """
+    doc = _parse(WORKFLOWS_DIR / name)
+    perms = doc.get("permissions")
+    assert perms == {"contents": "read"}, (
+        f"{name}: expected top-level permissions = {{contents: read}}, got {perms!r}; "
+        "see v60.36 H1 privilege-split"
+    )
+
+
+@pytest.mark.parametrize("name", [
+    "nightly_phase_a_gate.yml",
+    "nightly_phase_b_gate.yml",
+    "nightly_protocol_overhead.yml",
+])
+def test_nightly_write_jobs_do_not_install_deps(name):
+    """v60.36 H1/H2: any job with `permissions: contents: write` must not run
+    any dependency-installing step (pip install, cargo test/build, npm install,
+    make check/schemas/artifacts/rig-tests, etc.). The commit job is restricted
+    to `actions/checkout` + `actions/download-artifact` + stock `git`.
+
+    Without this gate, a malicious transitive dep installed in the commit job
+    would run with `contents: write` and a valid `GITHUB_TOKEN`.
+    """
+    doc = _parse(WORKFLOWS_DIR / name)
+    offenders = []
+    for job_name, job in (doc.get("jobs") or {}).items():
+        job_perms = job.get("permissions") or {}
+        if job_perms.get("contents") != "write":
+            continue
+        for step in job.get("steps", []) or []:
+            run = step.get("run") if isinstance(step, dict) else None
+            if not run:
+                continue
+            for token in _DEP_INSTALL_TOKENS:
+                if token in run:
+                    offenders.append(f"{name}: job `{job_name}` step runs `{token}`")
+    assert not offenders, (
+        "jobs with `contents: write` must not install untrusted dependencies; "
+        "offenders: " + "; ".join(offenders)
+    )
+
+
+@pytest.mark.parametrize("name", [
+    "nightly_phase_a_gate.yml",
+    "nightly_phase_b_gate.yml",
+    "nightly_protocol_overhead.yml",
+])
+def test_nightly_has_separate_commit_job(name):
+    """v60.36 H1: every nightly must have a dedicated commit job that holds
+    `contents: write` — confirming the privilege split actually shipped, not
+    just the read-only default.
+    """
+    doc = _parse(WORKFLOWS_DIR / name)
+    writers = [
+        n for n, j in (doc.get("jobs") or {}).items()
+        if (j.get("permissions") or {}).get("contents") == "write"
+    ]
+    assert len(writers) == 1, (
+        f"{name}: expected exactly one job with `permissions: contents: write`; "
+        f"found {writers!r}"
+    )

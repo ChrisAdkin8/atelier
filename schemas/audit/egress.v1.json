@@ -13,10 +13,10 @@
       "description": "Discriminator. Distinct from `subprocess-egress` and `mcp-http-request` rows sharing the same `audit.log`."
     },
     "timestamp": {"type": "string", "format": "date-time"},
-    "provider": {"type": "string"},
-    "model_id": {"type": "string"},
-    "content_hash": {"type": "string", "description": "SHA-256 of the post-redaction payload sent"},
-    "redaction_policy_id": {"type": "string", "description": "Pointer to the redaction config in effect at call time"},
+    "provider": {"type": "string", "maxLength": 256, "pattern": "^[a-z][a-z0-9_-]*$", "description": "Lowercase provider name. v60.36 H5/L7 — capped + pattern-constrained to match the `mcp_egress.v1.json::provider` shape so audit-log queries can rely on a uniform field across model-call and mcp-http-request rows."},
+    "model_id": {"type": "string", "maxLength": 256},
+    "content_hash": {"type": "string", "maxLength": 128, "description": "SHA-256 of the post-redaction payload sent"},
+    "redaction_policy_id": {"type": "string", "maxLength": 256, "description": "Pointer to the redaction config in effect at call time"},
     "redactions_applied": {
       "type": "array",
       "items": {
@@ -24,7 +24,7 @@
         "required": ["pattern", "count"],
         "additionalProperties": false,
         "properties": {
-          "pattern": {"type": "string"},
+          "pattern": {"type": "string", "maxLength": 512, "description": "Redaction pattern (regex or literal). Capped at 512 bytes so a misbehaving producer can't bloat the audit log with multi-megabyte patterns (also bounds the ReDoS surface a downstream consumer would face)."},
           "count": {"type": "integer", "minimum": 1}
         }
       }

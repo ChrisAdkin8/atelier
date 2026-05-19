@@ -33,6 +33,11 @@ Change history in `../CHANGELOG.md`.
 
 **Phase A implementation order (per spec §"Phased build plan"):** §2.5 skeleton → §11 sandbox → §14 recovery scaffold → §15 MCP + built-in tools → §1 Anthropic adapter → §1 LiteLLM adapter → §15 hooks → §1 mechanical gate → §14 modal + §11 gate + crash test → Phase A gate.
 
+## v60.36+ deep scan (in progress, 2026-05-19)
+- Four parallel scan agents launched; three Rust scans (core/cli/gui+tui) stalled on the watchdog after producing partial output; CI/SH/UI scan completed; Python rig + schemas scan still running.
+- Recovering Rust findings via direct targeted greps + reads (this session). Synthesis → four bucketed plan files in `tasks/`: `plan_v60.36_critical.md` / `plan_v60.36_high.md` / `plan_v60.36_medium.md` / `plan_v60.36_low.md`.
+- Then implement in critical → high → medium → low order; finally update CHANGELOG.md, ATELIER.md, tasks/lessons.md.
+
 ## Working notes
 - Schemas live under `../schemas/`. Spec references them by path.
 - The Rust workspace scaffold compiles in principle (atelier-core has lib.rs + error.rs); the GUI and TUI crates are intentionally minimal stubs until `cargo tauri init` is run (see `crates/atelier-gui/README.md`).

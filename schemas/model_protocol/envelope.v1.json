@@ -6,6 +6,10 @@
   "type": "object",
   "additionalProperties": false,
   "properties": {
+    "version": {
+      "const": 1,
+      "description": "Schema version. v60.36 H7 — pinned so a v2 envelope rolling out can be distinguished from a v1 envelope structurally. NOT in `required` so existing in-flight session.json files with envelopes missing the field still validate (the missing field is interpreted as v1 by the const-pin convention used elsewhere)."
+    },
     "claimed_changes": {
       "type": "array",
       "items": {

@@ -67,6 +67,104 @@ def test_envelope_bad_grounding_source_rejected():
         }, schema)
 
 
+def test_envelope_version_const_pinned():
+    """v60.36 H7 — envelope schema must pin `version: {const: 1}` so a v2
+    envelope can be distinguished from a v1 envelope structurally. Missing
+    `version` still validates (back-compat); explicit `version: 1` validates;
+    `version: 2` is rejected.
+    """
+    schema = load("model_protocol/envelope.v1.json")
+    # back-compat: missing version is OK (not in required)
+    jsonschema.validate({"claimed_done": True}, schema)
+    # explicit v1 is OK
+    jsonschema.validate({"version": 1, "claimed_done": True}, schema)
+    # v2 is rejected
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate({"version": 2, "claimed_done": True}, schema)
+
+
+def test_audit_schemas_cap_free_form_strings():
+    """v60.36 H5 — audit schemas must cap every free-form string field so a
+    misbehaving producer can't bloat the audit log. Probes a representative
+    set: `egress.v1.json::redactions_applied[].pattern`, `mcp_egress.v1.json::url`,
+    `mcp_egress.v1.json::reason`, `subprocess_egress.v1.json::destination`.
+    """
+    # egress: redactions_applied[].pattern capped at 512.
+    egress = load("audit/egress.v1.json")
+    base = {
+        "version": 1,
+        "kind": "model-call",
+        "timestamp": "2026-05-19T00:00:00Z",
+        "provider": "anthropic",
+        "model_id": "claude-haiku",
+        "content_hash": "sha256-abc",
+        "redaction_policy_id": "default",
+        "tokens": {"prompt": 1, "completion": 1},
+    }
+    # 512-byte pattern is OK; 513-byte rejected.
+    ok = dict(base, redactions_applied=[{"pattern": "x" * 512, "count": 1}])
+    jsonschema.validate(ok, egress)
+    bad = dict(base, redactions_applied=[{"pattern": "x" * 513, "count": 1}])
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(bad, egress)
+
+    # mcp_egress: url capped at 2048 + http(s) only.
+    mcp = load("audit/mcp_egress.v1.json")
+    base = {
+        "version": 1,
+        "kind": "mcp-http-request",
+        "timestamp": "2026-05-19T00:00:00Z",
+        "provider": "filesystem",
+        "url": "https://example.test/mcp",
+        "phase": "handshake",
+        "outcome": "success",
+    }
+    jsonschema.validate(base, mcp)
+    # non-http scheme rejected
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(dict(base, url="file:///etc/passwd"), mcp)
+    # 2049-byte URL rejected
+    big = "https://example.test/" + ("a" * 2048)
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(dict(base, url=big), mcp)
+
+    # subprocess_egress: destination capped at 1024.
+    sub = load("audit/subprocess_egress.v1.json")
+    base = {
+        "version": 1,
+        "kind": "subprocess-egress",
+        "timestamp": "2026-05-19T00:00:00Z",
+        "tool_call_id": "tc-1",
+        "tool_name": "shell",
+        "destination": "evil.example",
+        "outcome": "blocked",
+        "reason": "sandbox-deny-net",
+    }
+    jsonschema.validate(base, sub)
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(dict(base, destination="x" * 1025), sub)
+
+
+def test_ci_git_sha_accepts_mixed_case():
+    """v60.36 H6 — phase_a_gate and protocol_conformance both accept mixed-case
+    git SHAs. Historic artifacts and certain `gh`-CLI outputs aren't guaranteed
+    lowercase.
+    """
+    for name in ("ci/phase_a_gate.v1.json", "ci/protocol_conformance.v1.json"):
+        schema = load(name)
+        # Extract the git_sha subschema to validate it in isolation
+        git_sha_schema = schema["properties"]["git_sha"]
+        # Mixed case is OK
+        jsonschema.validate("AbC1234", git_sha_schema)
+        # All lowercase is OK
+        jsonschema.validate("abc1234", git_sha_schema)
+        # All uppercase is OK
+        jsonschema.validate("ABCDEF1", git_sha_schema)
+        # Non-hex rejected
+        with pytest.raises(jsonschema.ValidationError):
+            jsonschema.validate("xyz1234", git_sha_schema)
+
+
 # ---- session: tool_fixtures oneOf result/error ----
 
 def _minimal_session(tool_fixtures):

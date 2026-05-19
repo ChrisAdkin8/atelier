@@ -19,6 +19,17 @@ name: nightly_phase_a_gate
 # wires the secret in. The OpenAI-compat half of Track B is still
 # deferred (the local OSS models we'd test against don't reliably
 # claim_done on the canonical workload; hosted OpenAI is paid-tier).
+#
+# v60.36 H1/H2 — privilege-split:
+#   * `measure` job runs with `permissions: contents: read`, downloads
+#     the Rust + Python toolchains and resolves Cargo + PyPI deps. A
+#     malicious transitive dep here can read the workspace and inspect
+#     runtime URLs but cannot push back to `main`.
+#   * `commit` job runs with `permissions: contents: write` and is
+#     restricted to `actions/checkout` + `actions/download-artifact` +
+#     stock `git` from the runner image. No untrusted dep resolution.
+#   * The artifact + the `all_passed` flag cross the job boundary via
+#     `actions/upload-artifact` and a job output, respectively.
 
 on:
   schedule:
@@ -27,9 +38,10 @@ on:
     - cron: "30 6 * * *"
   workflow_dispatch:
 
-# Write permission so the refreshed last_run.json gets committed.
+# Default to the safest permission. The `commit` job re-declares
+# `contents: write` for itself only.
 permissions:
-  contents: write
+  contents: read
 
 # Serialise the three nightlies that commit to main (phase A + phase B +
 # protocol-overhead). `cancel-in-progress: false` lets the earlier-scheduled
@@ -40,13 +52,15 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  phase_a_gate:
-    name: phase A gate
+  measure:
+    name: measure phase A gates
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      all_passed: ${{ steps.compose.outputs.all_passed }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
@@ -280,7 +294,34 @@ jobs:
       - name: Validate fresh artifact against schema
         run: python tests/validate_artifacts.py
 
+      - name: Upload refreshed last_run.json
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: phase-a-gate-last-run
+          path: tests/phase_a_gate/last_run.json
+          if-no-files-found: error
+          retention-days: 1
+
+  commit:
+    name: commit refreshed last_run.json
+    needs: measure
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download refreshed last_run.json
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: phase-a-gate-last-run
+          path: tests/phase_a_gate/
+
       - name: Commit refreshed last_run.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           if git diff --quiet tests/phase_a_gate/last_run.json; then
             echo "No change to tests/phase_a_gate/last_run.json; skipping commit."
@@ -301,7 +342,7 @@ jobs:
           git push origin HEAD:main
 
       - name: Surface failure
-        if: steps.compose.outputs.all_passed != 'true'
+        if: needs.measure.outputs.all_passed != 'true'
         run: |
           echo "::error::Phase A gate red — at least one of fmt/clippy/cargo_test/rig/phase_a_live_anthropic failed. See per-step logs above and tests/phase_a_gate/last_run.json on main."
           exit 1

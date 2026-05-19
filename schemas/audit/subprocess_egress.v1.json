@@ -29,17 +29,20 @@
     "tool_call_id": {
       "type": "string",
       "minLength": 1,
-      "description": "ID of the originating ToolCallRequest. Matches the id persisted in `session.json` so an audit row can be traced back to the originating model turn."
+      "maxLength": 256,
+      "description": "ID of the originating ToolCallRequest. Matches the id persisted in `session.json` so an audit row can be traced back to the originating model turn. v60.36 H5 — capped at 256 bytes."
     },
     "tool_name": {
       "type": "string",
       "minLength": 1,
+      "maxLength": 256,
       "description": "Name of the originating built-in or MCP-routed tool (e.g., `shell`)."
     },
     "destination": {
       "type": "string",
       "minLength": 1,
-      "description": "Host (optionally with port) the subprocess attempted to reach. Parsed out of the command string. The full command is deliberately NOT recorded — see spec §12 privacy guarantees and the redaction policy."
+      "maxLength": 1024,
+      "description": "Host (optionally with port) the subprocess attempted to reach. Parsed out of the command string. The full command is deliberately NOT recorded — see spec §12 privacy guarantees and the redaction policy. v60.36 H5 — capped at 1 KiB."
     },
     "outcome": {
       "type": "string",

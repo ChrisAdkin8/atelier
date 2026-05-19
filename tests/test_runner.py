@@ -77,6 +77,40 @@ def test_extract_meta_reports_schema_violation():
     assert violation is not None and "sentinel validation" in violation
 
 
+def test_extract_meta_survives_partial_jsonschema_import(monkeypatch):
+    """v60.36 H3 — if `import jsonschema` raises something other than
+    ImportError (e.g. a broken editable install re-export), or the import
+    succeeds but `validate` raises `SchemaError`, `extract_meta` must NOT
+    crash the workload run. Before the fix the `except jsonschema.ValidationError`
+    arm hit `NameError` because `jsonschema` was never bound.
+    """
+    import sys
+    rn = _import_runner()
+    stdout = '<<<atelier-meta>>>{"turn_count": 3}<<<end>>>'
+
+    # Case 1: ImportError on import → returns payload + no violation.
+    monkeypatch.setitem(sys.modules, "jsonschema", None)
+    payload, violation = rn.extract_meta(stdout)
+    assert payload == {"turn_count": 3}
+    assert violation is None
+    monkeypatch.delitem(sys.modules, "jsonschema", raising=False)
+
+    # Case 2: import succeeds but `validate` raises `SchemaError` (broken
+    # sentinel schema). Patch the real jsonschema with a stub that raises
+    # SchemaError-compatible errors. Use the real jsonschema module's
+    # SchemaError class so the except clause matches.
+    import jsonschema as real_jsonschema
+    class _StubJsonschema:
+        ValidationError = real_jsonschema.ValidationError
+        SchemaError = real_jsonschema.SchemaError
+        def validate(self, payload, schema):  # noqa: D401
+            raise real_jsonschema.SchemaError("intentionally broken sentinel")
+    monkeypatch.setitem(sys.modules, "jsonschema", _StubJsonschema())
+    payload, violation = rn.extract_meta(stdout)
+    assert payload == {"turn_count": 3}
+    assert violation is not None and "sentinel schema is broken" in violation
+
+
 # ---- run_check ----
 
 def test_run_check_command_exit_code_match(tmp_path):
@@ -409,6 +443,57 @@ def test_run_with_pg_timeout_kills_grandchildren():
             f"grandchild pid={grandchild_pid} survived the parent's timeout — "
             "process-group kill leaked"
         )
+
+
+def test_harness_run_timeout_surfaces_stderr(tmp_path):
+    """v60.36 H4 — `harness_run` must surface BOTH stdout and stderr tails
+    even when the subprocess times out. Before the fix, the harness-result
+    dict dropped stderr entirely on timeout, leaving a "hung gate" with no
+    debugging signal.
+    """
+    import platform
+    import pytest
+
+    if platform.system() == "Windows":
+        pytest.skip("process-group kill is a Unix discipline; harness_run timeout uses it")
+    rn = _import_runner()
+
+    # Synthesise a minimal task that lives entirely in tmp_path.
+    fixture = tmp_path / "fixture"
+    fixture.mkdir()
+    # The runner copies the fixture root into a workdir and runs the
+    # harness with $task["prompt"] piped to stdin. Use a tiny meta.json
+    # with the absent-test_command default; run_test_command(default)
+    # will succeed trivially.
+    (fixture / "meta.json").write_text('{"expected_starting_returncode": 0}', encoding="utf-8")
+
+    task = {
+        "task_id": "t-timeout-stderr",
+        "fixture": str(fixture),
+        "prompt": "ignored",
+        "meta": {"expected_starting_returncode": 0},
+        "checks": [],
+    }
+    # A harness that emits identifiable strings on both stdout and stderr,
+    # then hangs forever. The 1-second timeout forces the harness_run
+    # timeout branch.
+    harness = (
+        sys.executable
+        + ' -c "import sys, time; '
+        + 'sys.stdout.write(\\"OUT_MARKER\\"); sys.stdout.flush(); '
+        + 'sys.stderr.write(\\"ERR_MARKER\\"); sys.stderr.flush(); '
+        + 'time.sleep(60)"'
+    )
+
+    out = rn.harness_run(task, harness, timeout_s=1)
+    assert out["harness"]["timed_out"] is True
+    # H4: both fields populated post-timeout.
+    assert "ERR_MARKER" in out["harness"]["stderr_tail"], (
+        f"expected ERR_MARKER in stderr_tail, got {out['harness']['stderr_tail']!r}"
+    )
+    assert "OUT_MARKER" in out["harness"]["stdout_tail"], (
+        f"expected OUT_MARKER in stdout_tail, got {out['harness']['stdout_tail']!r}"
+    )
 
 
 def test_atelier_sessions_is_gitignored():
