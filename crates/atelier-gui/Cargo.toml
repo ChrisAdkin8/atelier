@@ -31,6 +31,7 @@ tauri-plugin-dialog = "2"
 # v60.28 H2 follow-on — consent gate awaits the renderer's accept/reject
 # reply via `tokio::sync::oneshot`, bounded by `tokio::time::timeout`.
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 serde = { workspace = true }

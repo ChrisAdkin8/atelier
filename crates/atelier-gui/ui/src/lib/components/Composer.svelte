@@ -95,6 +95,15 @@
     return { name, args }
   }
 
+  async function stopRun() {
+    try {
+      await invoke('cancel_run')
+    } catch (e) {
+      // Non-fatal — run may have already finished by the time this fires.
+      console.warn('cancel_run failed', e)
+    }
+  }
+
   async function commit() {
     const trimmed = prompt.trim()
     if (!trimmed || busy || starting) return
@@ -204,6 +213,11 @@
     >
       {starting ? 'starting…' : 'Send'}
     </button>
+    {#if busy || thinking}
+      <button class="stop" onclick={stopRun} title="Stop current run">
+        &#9632; Stop
+      </button>
+    {/if}
   </div>
   {#if error}
     <p class="error">{error}</p>
@@ -313,6 +327,19 @@
   .send:disabled {
     opacity: 0.4;
     cursor: not-allowed;
+  }
+  .stop {
+    padding: 0.3rem 0.9rem;
+    border-radius: 4px;
+    border: 1px solid var(--accent-red, #e06c75);
+    background: var(--accent-red, #e06c75);
+    color: #fff;
+    font-weight: 600;
+    cursor: pointer;
+    font-size: 0.85rem;
+  }
+  .stop:hover {
+    filter: brightness(1.15);
   }
   .error {
     margin: 0;

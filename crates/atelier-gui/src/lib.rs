@@ -93,6 +93,9 @@ pub struct SessionState {
     /// submits. Cleared when the workspace changes (new session context).
     /// Arc so the spawned async task can clone it without a raw-pointer hack.
     pub active_session_id: Arc<std::sync::Mutex<Option<uuid::Uuid>>>,
+    /// Cancellation token for the currently running `start_agent_run` task.
+    /// `cancel_run` calls `token.cancel()` on it; cleared when the run exits.
+    pub cancel_token: Arc<std::sync::Mutex<Option<tokio_util::sync::CancellationToken>>>,
 }
 
 /// v60.28 H2 follow-on — wire-format decision the renderer's consent
@@ -175,6 +178,7 @@ pub fn run() {
                 workspace_override,
                 pending_swaps: tokio::sync::Mutex::new(std::collections::HashMap::new()),
                 active_session_id: Arc::new(std::sync::Mutex::new(None)),
+                cancel_token: Arc::new(std::sync::Mutex::new(None)),
             });
             Ok(())
         })
@@ -185,6 +189,7 @@ pub fn run() {
             start_chat_run,
             // §10 — Runner-backed agent path (tools + sub-agents).
             start_agent_run,
+            cancel_run,
             // v55 §5 mutator commands.
             pin_context_item,
             unpin_context_item,
@@ -2266,6 +2271,14 @@ fn start_agent_run(
     // without needing to hold a reference to `state` across an await point.
     let session_id_arc = Arc::clone(&state.active_session_id);
     let prior_session_id = session_id_arc.lock().ok().and_then(|g| *g);
+    // Create a fresh cancellation token for this run and park it in the
+    // shared slot so `cancel_run` can reach it.
+    let cancel_token = tokio_util::sync::CancellationToken::new();
+    let cancel_token_arc: Arc<std::sync::Mutex<Option<tokio_util::sync::CancellationToken>>> =
+        Arc::clone(&state.cancel_token);
+    if let Ok(mut guard) = cancel_token_arc.lock() {
+        *guard = Some(cancel_token.clone());
+    }
 
     let app_clone = app.clone();
     let cb = Arc::new(move |evt: &SessionEvent| {
@@ -2296,7 +2309,8 @@ fn start_agent_run(
     let runner = runner
         .with_adapter(adapter)
         .with_dispatcher_handle(handle)
-        .with_adapter_handle(adapter_handle);
+        .with_adapter_handle(adapter_handle)
+        .with_external_cancel(cancel_token);
 
     // Emit immediately so the frontend shows a spinner before the first
     // real event (model probe can take 10-30s on a local model).
@@ -2324,6 +2338,11 @@ fn start_agent_run(
                 tracing::warn!(error = %e, "agent run failed");
             }
         }
+        // Release the cancellation token so cancel_run no longer fires
+        // against a dead run.
+        if let Ok(mut guard) = cancel_token_arc.lock() {
+            *guard = None;
+        }
         let _ = app_for_finish.emit(
             "atelier://event",
             BridgedEvent {
@@ -2333,6 +2352,18 @@ fn start_agent_run(
         );
     });
     Ok(())
+}
+
+/// Cancel the currently running agent turn. No-op if no run is in flight.
+/// The runner's `CancellationToken` is triggered; the async task will exit
+/// at the next cancellation-aware await point and emit `RunFinished`.
+#[tauri::command]
+fn cancel_run(state: tauri::State<'_, SessionState>) {
+    if let Ok(guard) = state.cancel_token.lock() {
+        if let Some(ref token) = *guard {
+            token.cancel();
+        }
+    }
 }
 
 /// v60.43 — minimal drop-guard for `start_chat_run`'s spawned task.
