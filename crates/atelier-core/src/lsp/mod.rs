@@ -21,13 +21,22 @@
 //! have no `async-lsp` dep — they're consumable today by the GUI/TUI sinks
 //! that already carry the `RequestLspInstall` / `LspInstallResolved`
 //! variants from v60.22 (Day-0 prep).
+//!
+//! U07/U08 (v60.71) — the `receiver` + `launcher` modules add the live
+//! `async-lsp`-backed [`receiver::LspSession`] and
+//! [`launcher::LspLauncher::spawn`]. The `typescript-language-server` binary
+//! must be on PATH; the launcher checks [`LspApprovals`] before spawning.
 
 pub mod approval;
 pub mod install;
+pub mod launcher;
+pub mod receiver;
 pub mod typescript;
 
 pub use approval::{lsp_approvals_path, LspApprovals, LSP_APPROVALS_DIR, LSP_APPROVALS_FILE};
 pub use install::{install_env_allowlist, LSP_INSTALL_ENV_EXTRAS};
+pub use launcher::{LspLaunchError, LspLauncher};
+pub use receiver::{LspSession, RawDiagnostic};
 pub use typescript::{map_diagnostic_to_discrepancy, DiagnosticInput, MAX_LSP_MESSAGE_BYTES};
 
 /// Outcome of an LSP install attempt — surfaced on the bus via

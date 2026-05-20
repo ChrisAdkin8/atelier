@@ -4200,6 +4200,179 @@ f.nonExistentMethod();
 }
 
 // =====================================================================
+// U09 — §7 Tier-1 live LSP path tests (v60.71).
+//
+// Test 1: When `.ts` files are in the change set but no `LspApprovals`
+// entry exists for `"typescript"`, the runner emits
+// `Event::RequestLspInstall` and falls back to Tier-3 textual verify
+// (`VerificationPassed { tier: Tier3Textual }`).
+//
+// Test 2: `#[ignore]`-gated live integration — requires
+// `typescript-language-server` on PATH. Scripted MockAdapter writes a
+// `.ts` file with a hallucinated method; runner exercises the live LSP
+// path and asserts `VerificationFailed { tier: Tier1Lsp }`.
+// =====================================================================
+
+/// U09-1: When `"typescript"` is not approved in `LspApprovals`, the runner
+/// emits `RequestLspInstall` and falls through to Tier-3 textual verify.
+/// The existing hallucinating-agent test seam (`with_tier1_diagnostics_for_test`)
+/// is NOT used here — this exercises the live approval-check path.
+#[tokio::test]
+async fn runner_lsp_not_approved_emits_request_install_and_falls_through_to_tier3() {
+    use atelier_core::verify::VerificationTier;
+
+    // Workspace with a committed .ts file but NO LspApprovals entry.
+    let td = tempfile::TempDir::new().expect("tempdir");
+    let workspace = td.path().to_path_buf();
+
+    // Write a .ts file to the workspace so it appears in observed_changes.
+    let src_dir = workspace.join("src");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    let foo_ts = src_dir.join("foo.ts");
+    std::fs::write(&foo_ts, "export const x = 1;\n").unwrap();
+
+    // Mock: write the file and claim it as an edit.
+    let write_foo = ToolCallRequest {
+        id: "tc-u09-1".into(),
+        name: "write_file".into(),
+        arguments: serde_json::json!({
+            "path": "src/foo.ts",
+            "content": "export const x = 1;\n"
+        }),
+    };
+    let envelope = envelope_done_claiming_edits(&["src/foo.ts"]);
+    let responses = vec![MockResponse::new(
+        "u09 test: write .ts with no lsp approval",
+        vec![write_foo, mock_envelope_tool_call(&envelope)],
+    )];
+
+    let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let runner = Runner::new(
+        workspace,
+        ProviderChoice::Mock { responses },
+        EventSink::Capture(events.clone()),
+    )
+    .expect("mock runner construction is infallible")
+    .with_max_turns(2);
+
+    let report = runner
+        .run("write foo.ts".into())
+        .await
+        .expect("run must succeed");
+    assert_eq!(report.final_state, atelier_core::State::Done);
+
+    let captured = events.lock();
+
+    // Must have emitted RequestLspInstall for typescript.
+    let install_requests: Vec<_> = captured
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                Event::RequestLspInstall { language, .. } if language == "typescript"
+            )
+        })
+        .collect();
+    assert_eq!(
+        install_requests.len(),
+        1,
+        "expected exactly one RequestLspInstall(typescript); events={captured:?}"
+    );
+
+    // Must have fallen through to Tier-3 textual (not Tier-1 LSP).
+    let tier3_pass: Vec<_> = captured
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                Event::VerificationPassed {
+                    tier: VerificationTier::Tier3Textual,
+                    ..
+                }
+            )
+        })
+        .collect();
+    assert!(
+        !tier3_pass.is_empty(),
+        "expected VerificationPassed(Tier3Textual) after RequestLspInstall; events={captured:?}"
+    );
+}
+
+/// U09-2: Live LSP integration gate — requires `typescript-language-server`
+/// on PATH. When a MockAdapter writes a `.ts` file with a hallucinated method
+/// AND `LspApprovals` has `"typescript"` approved, the runner runs the live
+/// LSP receiver and emits `VerificationFailed { tier: Tier1Lsp }`.
+#[tokio::test]
+#[ignore = "requires typescript-language-server on PATH"]
+async fn runner_lsp_live_detects_hallucinated_symbol() {
+    use atelier_core::lsp::{lsp_approvals_path, LspApprovals};
+    use atelier_core::verify::VerificationTier;
+
+    let td = tempfile::TempDir::new().expect("tempdir");
+    let workspace = td.path().to_path_buf();
+
+    // Write the approval so the launcher proceeds.
+    let approvals_path = lsp_approvals_path(&workspace);
+    let mut approvals = LspApprovals::default();
+    approvals.approve("typescript", "2026-05-20T00:00:00Z");
+    approvals.save(&approvals_path).expect("save approvals");
+
+    // Source content with a hallucinated method call.
+    let foo_ts = r#"export class Foo {
+    bar(): number { return 42; }
+}
+const f = new Foo();
+f.nonExistentMethod();
+"#;
+    let write_foo = ToolCallRequest {
+        id: "tc-u09-live".into(),
+        name: "write_file".into(),
+        arguments: serde_json::json!({
+            "path": "src/foo.ts",
+            "content": foo_ts
+        }),
+    };
+    let envelope = envelope_done_claiming_edits(&["src/foo.ts"]);
+    let responses = vec![MockResponse::new(
+        "u09 live: write .ts with hallucinated method",
+        vec![write_foo, mock_envelope_tool_call(&envelope)],
+    )];
+
+    let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let runner = Runner::new(
+        workspace,
+        ProviderChoice::Mock { responses },
+        EventSink::Capture(events.clone()),
+    )
+    .expect("mock runner construction is infallible")
+    .with_max_turns(2);
+
+    let report = runner
+        .run("write foo.ts with hallucination".into())
+        .await
+        .expect("run must succeed");
+    assert_eq!(report.final_state, atelier_core::State::Done);
+
+    let captured = events.lock();
+    let tier1_failures: Vec<_> = captured
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                Event::VerificationFailed {
+                    tier: VerificationTier::Tier1Lsp,
+                    ..
+                }
+            )
+        })
+        .collect();
+    assert!(
+        !tier1_failures.is_empty(),
+        "live LSP must detect hallucinated symbol and emit Tier1Lsp failure; events={captured:?}"
+    );
+}
+
+// =====================================================================
 // Phase A close — Track B: live-API canonical gates (`#[ignore]`-gated).
 //
 // Closes the live half of `tasks/todo.md:151, 162, 174` and the §2

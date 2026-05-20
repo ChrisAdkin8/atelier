@@ -309,6 +309,11 @@ export type AppState = {
   /// True from RunStarted until RunFinished. Covers the dead zone before the
   /// first real event arrives (model probe, session setup, etc.).
   runInFlight: boolean
+  /// v60.71 U10 — §7 Tier-1 LSP first-use install request. `null` when no
+  /// install prompt is pending; populated by `RequestLspInstall`, cleared by
+  /// `LspInstallResolved` or when the user approves / declines. The webview
+  /// renders `LspInstallModal.svelte` (or an inline prompt) when non-null.
+  lspInstallRequest: { language: string; candidates: string[] } | null
 }
 
 export function initialState(): AppState {
@@ -334,6 +339,7 @@ export function initialState(): AppState {
     subagents: [],
     stalledAt: null,
     runInFlight: false,
+    lspInstallRequest: null,
   }
 }
 
@@ -623,12 +629,26 @@ export function applyEvent(state: AppState, evt: BridgedEvent): AppState {
       // any stale modal from a previous swap is cleared too.
       return { ...state, events, pendingSwap: null }
     }
-    // Phase B Track C1 prep — §7 Tier-1 LSP first-use install events.
-    // Lands as event-log entries today; the approval modal surface in
-    // App.svelte arrives with Track C1 proper.
-    case 'RequestLspInstall':
+    // v60.71 U10 — §7 Tier-1 LSP first-use install events.
+    // `RequestLspInstall` populates `lspInstallRequest` so the
+    // `LspInstallModal.svelte` can render the approval prompt.
+    // `LspInstallResolved` clears it.
+    case 'RequestLspInstall': {
+      const p = evt.payload as {
+        language?: string
+        candidate_packages?: string[]
+      }
+      return {
+        ...state,
+        events,
+        lspInstallRequest: {
+          language: p.language ?? '',
+          candidates: p.candidate_packages ?? [],
+        },
+      }
+    }
     case 'LspInstallResolved':
-      return { ...state, events }
+      return { ...state, events, lspInstallRequest: null }
     // §10 sub-agent panel reducer arms.
     case 'SubagentSpawned': {
       const p = evt.payload as {

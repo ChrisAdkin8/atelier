@@ -1,12 +1,30 @@
 # Atelier Spec — Changelog
 
-## v60.71 — 2026-05-20 (CI fix — clippy dead_code + rig runner crash on missing command)
+## v60.71 — 2026-05-20 (Phase B §7 — LSP live receiver end-to-end: U07–U11)
 
-### `crates/atelier-cli/src/runner.rs`
-- Added `#[allow(dead_code)]` to `with_executor_adapter`. The method is called from `main.rs` and `atelier-gui`, but `cargo clippy --all-targets` checks the integration test target which includes `runner.rs` via `#[path]` without those entry points, so clippy reported the method as unused.
+Closes the Tier-1 LSP hallucination-detection path. The data layer (`DiagnosticInput`, `map_diagnostic_to_discrepancy`) and pure-function TypeScript mapper (v60.25–v60.27) are now backed by a running `typescript-language-server` child process.
 
-### `tests/workload/runner/runner.py`
-- `run_check` only caught `subprocess.TimeoutExpired` from `_run_with_pg_timeout`. When a check's command doesn't exist on PATH (e.g. the `atelier` binary on CI where the workspace hasn't been built), `subprocess.Popen` raised `FileNotFoundError` — an unhandled exception that crashed the runner before it could write any JSON to stdout, causing `test_runner_harness_smoke_all_tasks_emit_checks` to fail with `JSONDecodeError: Expecting value`. Added an `OSError` handler that returns a failed-check result with the OS error as the reason, matching the `TimeoutExpired` shape.
+### U07 — `LspSession` (async-lsp 0.2 receiver)
+
+New `crates/atelier-core/src/lsp/receiver.rs`. `LspSession::connect(workspace_root, child_cmd)` drives the full LSP handshake: spawns the child, wires `tokio_util::compat` bridges for stdin/stdout, builds an `async-lsp` `MainLoop` client with a `PublishDiagnostics` notification handler that buffers incoming `(path, DiagnosticInput)` pairs into a shared `Arc<Mutex<Vec<RawDiagnostic>>>`. Public API: `open_file`, `collect_diagnostics(timeout)`, `shutdown`. Workspace Cargo.toml gains `async-lsp = { version = "0.2", features = ["client-monitor", "tokio"] }`, `lsp-types = "0.95"`, `tower = "0.5"`, and `tokio-util` `compat` feature.
+
+### U08 — `LspLauncher` (approval-gated spawner)
+
+New `crates/atelier-core/src/lsp/launcher.rs`. `LspLauncher::spawn(workspace, sandbox, approvals)` checks `LspApprovals::is_approved("typescript")`, wraps argv through `sandboxed_argv`, and delegates to `LspSession::connect`. Returns `LspLaunchError::NotApproved { language }` when no approval is recorded. Convenience `spawn_loading_approvals` reads the approvals file automatically. Unit test (`lsp_launcher_returns_not_approved_when_no_approval`) runs in CI; live handshake test is `#[ignore]`.
+
+### U09 — Runner verify-phase wiring
+
+`crates/atelier-cli/src/runner.rs` verify phase now detects `.ts`/`.tsx` files in `observed_changes`. When found and `LspApprovals` has no entry: emits `Event::RequestLspInstall` and falls through to Tier-3. When approved: spawns `LspSession`, opens each changed file, collects diagnostics, maps to `Discrepancy` via `map_diagnostic_to_discrepancy`, calls `verify_pass_with_tier1`. The existing `tier1_diagnostics_for_test` seam keeps the Phase B §7 Tier-1 gate test passing unchanged. New integration tests: `runner_lsp_not_approved_emits_request_install_and_falls_through_to_tier3` (non-ignored) and `runner_lsp_live_detects_hallucinated_symbol` (`#[ignore]`).
+
+### U10 — GUI + TUI install-prompt surface
+
+**GUI** (`crates/atelier-gui/ui/src/lib/state.ts`): `AppState` gains `lspInstallRequest: { language: string; candidates: string[] } | null`. Reducer handles `RequestLspInstall` (populate) and `LspInstallResolved` (clear).
+
+**TUI** (`crates/atelier-tui/src/lib.rs`): `InputMode::LspInstallConfirm { language, candidates }` variant added. `apply()` arm for `SessionEvent::RequestLspInstall` transitions to it. Footer renders a cyan modal line with `y/n/Esc` hints. `handle_key` emits `InputOutcome::LspInstallApprove` or `InputOutcome::LspInstallDecline`. Run-loop handlers write/reset `LspApprovals` on approve, reset mode on decline.
+
+### U11 — `approve_lsp_server` / `revoke_lsp_server` Tauri commands
+
+`crates/atelier-gui/src/lib.rs` gains two async commands that load-modify-save `LspApprovals` at `<workspace>/.atelier/lsp/_approvals.json`. Both registered in `invoke_handler`. Unit tests cover round-trip persist and `bridge_event` JSON shape for `RequestLspInstall`.
 
 ## v60.70 — 2026-05-20 (§1 performance — KV-cache prefix persistence + per-task model routing)
 

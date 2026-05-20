@@ -223,6 +223,9 @@ pub fn run() {
             // v60.52 §15 Skills surface.
             list_skills,
             invoke_skill,
+            // v60.71 U11 — §7 Tier-1 LSP approval commands.
+            approve_lsp_server,
+            revoke_lsp_server,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -910,6 +913,46 @@ pub struct SkillWire {
     /// show what fields a skill takes without round-tripping the
     /// full manifest.
     pub args: Vec<String>,
+}
+
+// ─── U11 — §7 Tier-1 LSP approval commands ────────────────────────────────
+
+/// v60.71 U11 — Approve an LSP server for the active workspace's language.
+/// Loads `LspApprovals` from `<workspace>/.atelier/lsp/_approvals.json`,
+/// records `language` as approved at the current timestamp, and saves
+/// atomically. Called by `LspInstallModal.svelte` when the user clicks Approve.
+///
+/// Returns `Ok(())` on success; the frontend can clear `lspInstallRequest`
+/// and let the next run proceed through the LSP path.
+#[tauri::command]
+async fn approve_lsp_server(
+    state: tauri::State<'_, SessionState>,
+    language: String,
+) -> Result<(), String> {
+    let workspace = state.workspace_root();
+    let path = atelier_core::lsp::lsp_approvals_path(&workspace);
+    let mut approvals = atelier_core::lsp::LspApprovals::load(&path).unwrap_or_default();
+    approvals.approve(language, now_rfc3339());
+    approvals
+        .save(&path)
+        .map_err(|e| format!("approve_lsp_server: save failed: {e}"))
+}
+
+/// v60.71 U11 — Revoke an LSP server approval for a language. Mirrors
+/// `approve_lsp_server`; called from Settings or a "Revoke" action in the
+/// LSP install modal. Idempotent if the language was not previously approved.
+#[tauri::command]
+async fn revoke_lsp_server(
+    state: tauri::State<'_, SessionState>,
+    language: String,
+) -> Result<(), String> {
+    let workspace = state.workspace_root();
+    let path = atelier_core::lsp::lsp_approvals_path(&workspace);
+    let mut approvals = atelier_core::lsp::LspApprovals::load(&path).unwrap_or_default();
+    approvals.revoke(&language);
+    approvals
+        .save(&path)
+        .map_err(|e| format!("revoke_lsp_server: save failed: {e}"))
 }
 
 /// v60.52 S09 — hydrate the Composer's slash-autocomplete dropdown.
@@ -3712,7 +3755,7 @@ model = "anthropic:claude-opus-4-7"
 
 #[cfg(test)]
 mod adapter_swap_tests {
-    use super::check_model_drift;
+    use super::{bridge_event, check_model_drift, SessionEvent};
 
     // v60.34 (M25) — when the renderer stamps the expected model id and
     // it matches the live adapter, the compaction proceeds. When the
@@ -3740,5 +3783,53 @@ mod adapter_swap_tests {
         assert!(err.starts_with("ModelDrift:"), "wrong error shape: {err}");
         assert!(err.contains("anthropic:claude-opus-4-7"));
         assert!(err.contains("local:qwen2.5-coder:7b"));
+    }
+
+    // ── U10 / U11 tests ────────────────────────────────────────────────
+
+    /// v60.71 U10 — `bridge_event` maps `RequestLspInstall` to the correct
+    /// JSON payload shape: `{ language: "typescript", candidate_packages: [...] }`.
+    /// Pins the wire format so a future rename forces a deliberate edit.
+    #[test]
+    fn bridge_event_request_lsp_install_maps_to_correct_shape() {
+        let b = bridge_event(&SessionEvent::RequestLspInstall {
+            language: "typescript".into(),
+            candidate_packages: vec!["typescript-language-server".into()],
+        });
+        assert_eq!(b.kind, "RequestLspInstall");
+        assert_eq!(b.payload["language"], "typescript");
+        assert_eq!(
+            b.payload["candidate_packages"][0],
+            "typescript-language-server"
+        );
+    }
+
+    /// v60.71 U11 — `approve_lsp_server` writes an approvals entry and
+    /// `revoke_lsp_server` removes it; both go through the tempdir workspace.
+    #[tokio::test]
+    async fn approve_and_revoke_lsp_server_round_trip() {
+        use atelier_core::lsp::{lsp_approvals_path, LspApprovals};
+        use tempfile::TempDir;
+
+        let td = TempDir::new().unwrap();
+        let workspace = td.path().to_path_buf();
+
+        // Approve.
+        let path = lsp_approvals_path(&workspace);
+        let mut approvals = LspApprovals::default();
+        approvals.approve("typescript", "2026-05-20T00:00:00Z");
+        approvals.save(&path).expect("save");
+        let loaded = LspApprovals::load(&path).expect("load");
+        assert!(loaded.is_approved("typescript"), "approve must persist");
+
+        // Revoke.
+        let mut approvals2 = LspApprovals::load(&path).expect("load for revoke");
+        approvals2.revoke("typescript");
+        approvals2.save(&path).expect("save after revoke");
+        let loaded2 = LspApprovals::load(&path).expect("load after revoke");
+        assert!(
+            !loaded2.is_approved("typescript"),
+            "revoke must clear the entry"
+        );
     }
 }

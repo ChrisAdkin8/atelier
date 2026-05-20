@@ -698,12 +698,7 @@ impl Runner {
     /// `Role::Tool` use this adapter instead of the primary one. Lets
     /// a small local model handle follow-through tool calls while the
     /// primary (larger) model handles planning / user-facing turns.
-    ///
-    /// `#[allow(dead_code)]`: called from `main.rs` and `atelier-gui`
-    /// which are binary / cdylib crates; the integration test target
-    /// includes this file via `#[path]` without those entry points,
-    /// so clippy --all-targets sees it as unused from the test's POV.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // used by main.rs and atelier-gui; not exercised in integration tests
     pub fn with_executor_adapter(mut self, adapter: Arc<dyn Adapter>) -> Self {
         self.executor_adapter = Some(adapter);
         self
@@ -2399,19 +2394,122 @@ impl Runner {
                 .map(|c| !c.is_empty())
                 .unwrap_or(false);
             if has_claims || !observed_changes.is_empty() {
-                // Phase B Track C3 — when the test seam supplies
-                // Tier-1 LSP discrepancies (or, once async-lsp lands,
-                // the runner gathered them from the live receiver),
-                // use the merged-tier verify path. Otherwise the
-                // legacy Tier-3-only `verify_pass` keeps the v60.12
-                // behaviour.
-                if self.tier1_diagnostics_for_test.is_empty() {
+                // U09 — §7 Tier-1 live LSP path.
+                //
+                // Priority (highest to lowest):
+                //   1. Test seam (tier1_diagnostics_for_test) — bypasses the
+                //      launcher entirely, used by the hallucinating-agent gate.
+                //   2. Live LSP receiver — fires when `.ts` files are in the
+                //      change set AND `LspApprovals` says "typescript" is approved.
+                //   3. Tier-3 textual verify_pass — fallback.
+                let tier1_discrepancies: Vec<atelier_core::verify::Discrepancy> = if !self
+                    .tier1_diagnostics_for_test
+                    .is_empty()
+                {
+                    // Test seam: pre-mapped discrepancies bypass the launcher.
+                    self.tier1_diagnostics_for_test.clone()
+                } else {
+                    // Live path: detect TypeScript files in the change set.
+                    let ts_paths: Vec<String> = observed_changes
+                        .iter()
+                        .filter(|o| o.path.ends_with(".ts") || o.path.ends_with(".tsx"))
+                        .map(|o| o.path.clone())
+                        .collect();
+
+                    if ts_paths.is_empty() {
+                        // No TypeScript files — skip LSP entirely.
+                        Vec::new()
+                    } else {
+                        // Load approvals for this workspace.
+                        let approvals_path = atelier_core::lsp::lsp_approvals_path(&workspace);
+                        let approvals = atelier_core::lsp::LspApprovals::load(&approvals_path)
+                            .unwrap_or_default();
+
+                        if !approvals.is_approved("typescript") {
+                            // Not approved yet — emit the install prompt so
+                            // the GUI/TUI can ask the user. Fall through to
+                            // Tier-3 textual for this run.
+                            let _ = try_emit(
+                                &bus,
+                                Event::RequestLspInstall {
+                                    language: "typescript".into(),
+                                    candidate_packages: vec!["typescript-language-server".into()],
+                                },
+                            );
+                            Vec::new()
+                        } else {
+                            // Approved — spawn the LSP server and gather
+                            // diagnostics for all modified `.ts` files.
+                            match atelier_core::lsp::LspLauncher::spawn(
+                                &workspace, &sandbox, &approvals,
+                            )
+                            .await
+                            {
+                                Ok(mut session) => {
+                                    // Open each TypeScript file.
+                                    for rel_path in &ts_paths {
+                                        let abs_path = workspace.join(rel_path);
+                                        if let Ok(content) = std::fs::read_to_string(&abs_path) {
+                                            let _ = session.open_file(&abs_path, &content);
+                                        }
+                                    }
+                                    // Collect diagnostics (10-second budget).
+                                    let raw = session
+                                        .collect_diagnostics(std::time::Duration::from_secs(10))
+                                        .await;
+                                    session.shutdown().await;
+                                    // Map raw diagnostics to discrepancies.
+                                    raw.into_iter()
+                                        .filter_map(|(abs_path, diag)| {
+                                            // Rebase absolute path to
+                                            // workspace-relative.
+                                            let rel = abs_path
+                                                .strip_prefix(workspace.to_string_lossy().as_ref())
+                                                .unwrap_or(abs_path.as_str())
+                                                .trim_start_matches('/')
+                                                .to_string();
+                                            atelier_core::lsp::map_diagnostic_to_discrepancy(
+                                                &rel, &diag,
+                                            )
+                                        })
+                                        .collect()
+                                }
+                                Err(atelier_core::lsp::LspLaunchError::NotApproved { .. }) => {
+                                    // Should not happen (we checked above), but
+                                    // belt-and-suspenders: emit the install
+                                    // prompt and fall through.
+                                    let _ = try_emit(
+                                        &bus,
+                                        Event::RequestLspInstall {
+                                            language: "typescript".into(),
+                                            candidate_packages: vec![
+                                                "typescript-language-server".into()
+                                            ],
+                                        },
+                                    );
+                                    Vec::new()
+                                }
+                                Err(e) => {
+                                    // Non-approval launch error: warn + fall
+                                    // through to Tier 3.
+                                    tracing::warn!(
+                                        error = %e,
+                                        "LSP launcher failed; falling through to Tier-3 verify"
+                                    );
+                                    Vec::new()
+                                }
+                            }
+                        }
+                    }
+                };
+
+                if tier1_discrepancies.is_empty() && self.tier1_diagnostics_for_test.is_empty() {
                     let _ = session_dispatcher.verify_pass(&last_envelope, &observed_changes);
                 } else {
                     let _ = session_dispatcher.verify_pass_with_tier1(
                         &last_envelope,
                         &observed_changes,
-                        self.tier1_diagnostics_for_test.clone(),
+                        tier1_discrepancies,
                     );
                 }
             } else {
