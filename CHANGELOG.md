@@ -1,5 +1,24 @@
 # Atelier Spec — Changelog
 
+## v60.74 — 2026-05-20 (performance-track polish + README architecture)
+
+Follow-on documentation and low-risk runtime polish for the v60.73 performance track.
+
+### Documentation
+
+- README now includes the high-resolution harness architecture diagram at `assets/harness-architecture.png`, covering UI drivers, `Runner`, BYOM adapters, `atelier-core`, tool transport, verification, persistence, MCP, LSP, and external systems.
+- README `Layout` now includes a full Rust-stack table covering the workspace crates, Rust 1.85 toolchain, async/runtime stack, serialization/config/schema stack, HTTP/MCP, Tauri/Svelte GUI shell, ratatui TUI, LSP verification, filesystem/process safety, diff/syntax helpers, logging/state, credentials, test seams, and spike crates.
+- Added `tasks/plan_performance_track_v60.73.md` as the near-term performance-track plan for UI event churn, duplicate snapshot emission, token-count caching, and future incremental persistence work.
+
+### Runtime/UI polish
+
+- `ContextManager::panel_snapshot()` now builds context-row summaries and aggregate token-meter data in one pass for runner/UI use.
+- `Runner` now suppresses unchanged `PlanSnapshot`, `ContextItems`, `MemoryCards`, and `ContextSnapshot` events at turn boundaries, and caches adapter token counts by message-history fingerprint until the message history changes.
+- GUI event-log state is stored newest-first to avoid cloning/reversing the full bounded log on every render invalidation.
+- GUI sub-agent progress updates now patch the matching row by id instead of rebuilding every row with `map`.
+- GUI conversation auto-scroll now only follows the tail when the user is already near the bottom, and coalesces scroll writes through `requestAnimationFrame`.
+- TUI event storage now uses `VecDeque`, avoiding `remove(0)` churn while preserving the bounded event-log contract.
+
 ## v60.73 — 2026-05-20 (hardening + documentation sweep)
 
 Security and schema hardening pass, followed by a documentation sweep to align the public docs with the current GUI/TUI split and the eight-tool dispatcher surface.
