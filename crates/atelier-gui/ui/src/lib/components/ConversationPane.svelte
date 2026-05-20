@@ -18,13 +18,21 @@
   let { conversation, streamingAssistant = '' }: Props = $props()
 
   let scrollEl: HTMLDivElement | null = $state(null)
+  let scrollFrame: number | null = null
 
-  // Re-pin to the bottom whenever a new line or streaming delta arrives.
+  // Re-pin to the bottom only when the user is already following the tail.
+  // Streaming deltas can arrive quickly, so coalesce writes through rAF to
+  // avoid forcing layout once per token.
   $effect(() => {
     const _len = conversation.length
     const _stream = streamingAssistant
-    queueMicrotask(() => {
+    if (!scrollEl) return
+    const distanceFromBottom = scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight
+    if (distanceFromBottom > 96) return
+    if (scrollFrame !== null) cancelAnimationFrame(scrollFrame)
+    scrollFrame = requestAnimationFrame(() => {
       if (scrollEl) scrollEl.scrollTop = scrollEl.scrollHeight
+      scrollFrame = null
     })
   })
 </script>

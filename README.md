@@ -196,6 +196,27 @@ Atelier is a **Rust workspace**. Four crates under [`crates/`](crates/):
 | [`atelier-gui`](crates/atelier-gui/) | Tauri 2.x + Svelte 5 shell. Chat-REPL composer that talks to the adapter with Context, Memory, and Plan side panels, inline Mermaid / image rendering, drag-and-drop plan reorder, concurrent-run guard, and per-run UUID workspaces. |
 | [`atelier-tui`](crates/atelier-tui/) | `ratatui` + `crossterm` driver. Live agent workspace with conversation, context/memory/plan, diff, meters, scrubber keys `[` `]` `g`, and file-level accept/reject from the diff pane. Run with `cargo run -p atelier-tui -- "<prompt>"` for driver mode, no argument for viewer mode. |
 
+### Rust stack
+
+| Area | Components | Role in Atelier |
+|---|---|---|
+| **Toolchain / workspace** | Rust 1.85, edition 2021, Cargo workspace resolver 2, `Cargo.lock`, thin-LTO release profile | Pins the build across all crates and keeps shared dependency versions centralised in the root `Cargo.toml`. |
+| **Internal crates** | `atelier-core`, `atelier-cli`, `atelier-gui`, `atelier-tui` | Splits the harness into a UI-free core, a reusable runner/CLI, a Tauri desktop shell, and a terminal UI. |
+| **Async runtime** | `tokio`, `tokio-util`, `futures`, `async-trait` | Drives the agent loop, adapter calls, cancellation tokens, channels, subagents, MCP/LSP subprocesses, and async trait boundaries. |
+| **Serialization / config / schemas** | `serde`, `serde_json`, `toml`, `jsonschema` | Loads provider/config TOML, parses typed envelopes, persists sessions/ledgers/audit records, validates tool manifests and schema-backed artifacts. |
+| **HTTP and streaming IO** | `reqwest`, `bytes` | Talks to Anthropic, OpenAI-compatible endpoints, and HTTP/SSE MCP servers; handles streaming response bodies. |
+| **MCP transport** | `rmcp` | Provides the Model Context Protocol client, stdio child-process transport, and SSE transport used by external tool servers. |
+| **GUI shell** | `tauri`, `tauri-build`, `tauri-plugin-dialog` | Hosts the Svelte desktop frontend, exposes Rust commands, embeds production assets via `custom-protocol`, and opens native folder-picker dialogs. |
+| **Terminal UI** | `ratatui`, `crossterm` | Renders the TUI workspace and handles terminal input, alternate-screen mode, key events, and live pane updates. |
+| **LSP verification** | `async-lsp`, `lsp-types`, `tower` | Launches language-server sessions and converts diagnostics into verification discrepancies for the Tier-1 hallucination detector. |
+| **Filesystem and process safety** | `notify`, `tempfile`, `sha2`, `libc` | Watches concurrent edits, performs atomic writes/staging, hashes pre-edit content and checkpoints, and hard-kills timed-out Unix process groups. |
+| **Diff and syntax checks** | `similar`, `tree-sitter`, `tree-sitter-json` | Produces incremental diff/hunk data and runs pre-commit syntax checks before staged edits are committed. |
+| **Built-in tool helpers** | `regex`, `walkdir` | Implements repository grep and recursive directory traversal for built-in search/listing tools. |
+| **Errors, logging, shared state** | `anyhow`, `thiserror`, `tracing`, `tracing-subscriber`, `parking_lot`, `uuid` | Provides typed errors, contextual errors, structured logs, non-poisoning locks for shared state, and IDs for sessions/commits/events. |
+| **Credentials** | `keyring` | Supports OS-backed credential storage for provider credentials and future auth surfaces. |
+| **Rust tests / test seams** | `assert_cmd`, `predicates`, `wiremock` | Spawns CLI integration tests, asserts stdout/stderr/exit behaviour, and stubs provider HTTP APIs without live credentials. |
+| **Spike crates** | `experiments/rmcp_spike`, `experiments/lsp_spike` | Captures dependency maturity checks for rmcp/MCP and async-lsp before those paths are promoted into `atelier-core`. |
+
 Top-level tree:
 
 ```

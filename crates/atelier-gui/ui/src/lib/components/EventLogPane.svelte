@@ -7,17 +7,18 @@
 
   let { events }: Props = $props()
 
-  // Show newest-first so the latest event is always visible at the top.
-  let reversed = $derived([...events].reverse())
+  // State stores newest-first so the latest event is visible without
+  // cloning/reversing the full bounded log on every invalidation.
+  let newestFirst = $derived(events)
 </script>
 
 <section class="event-log-pane">
   <h3 class="pane-title">Event Log</h3>
-  {#if reversed.length === 0}
+  {#if newestFirst.length === 0}
     <p class="empty">no events yet</p>
   {:else}
     <ul class="log-list">
-      {#each reversed as entry (entry.ts + entry.kind + entry.detail)}
+      {#each newestFirst as entry (entry.ts + entry.kind + entry.detail)}
         <li class="log-row">
           <span class="ts">{entry.ts}</span>
           <span class="kind">{entry.kind}</span>

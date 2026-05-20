@@ -67,7 +67,7 @@ use tokio::sync::broadcast::error::RecvError;
 pub struct AppState {
     /// Event log, newest-last. Bounded so a long-running session doesn't
     /// blow up the terminal redraw cost.
-    pub events: Vec<EventLine>,
+    pub events: VecDeque<EventLine>,
     /// Cumulative `EditStaged` count — the §3 first-milestone indicator.
     pub edit_staged_count: usize,
     /// Last `Transitioned` event's `to` field, rendered via
@@ -849,11 +849,13 @@ impl AppState {
                 }
             }
         }
-        self.events.push(line);
-        if self.events.len() > MAX_EVENT_LOG {
-            // Drop oldest. `remove(0)` is O(n) but the bound is small and
-            // this only runs on the very long tail.
-            self.events.remove(0);
+        self.push_event_line(line);
+    }
+
+    fn push_event_line(&mut self, line: EventLine) {
+        self.events.push_back(line);
+        while self.events.len() > MAX_EVENT_LOG {
+            self.events.pop_front();
         }
     }
 
@@ -2962,7 +2964,7 @@ async fn run_async(prompt: Option<String>) -> io::Result<()> {
                     // explicitly quit. The `event_stream_ended` flag
                     // permanently disables this select arm, so the
                     // loop only waits on key input from here on.
-                    state.events.push(EventLine {
+                    state.push_event_line(EventLine {
                         kind: "RunEnded",
                         detail: "press q to quit".into(),
                     });
@@ -3198,7 +3200,7 @@ async fn run_async(prompt: Option<String>) -> io::Result<()> {
                                                 ConversationRole::User,
                                                 raw.clone(),
                                             );
-                                            state.events.push(EventLine {
+                                            state.push_event_line(EventLine {
                                                 kind: "SlashCommit",
                                                 detail: raw.clone(),
                                             });
@@ -3677,10 +3679,14 @@ mod tests {
     #[test]
     fn apply_bounds_event_log_to_max() {
         let mut s = AppState::new();
-        for _ in 0..(MAX_EVENT_LOG + 50) {
+        for i in 0..(MAX_EVENT_LOG + 50) {
             s.apply(&SessionEvent::Cancelled);
+            if i == 0 {
+                assert_eq!(s.events.front().map(|line| line.kind), Some("Cancelled"));
+            }
         }
         assert_eq!(s.events.len(), MAX_EVENT_LOG);
+        assert_eq!(s.events.back().map(|line| line.kind), Some("Cancelled"));
     }
 
     #[test]
@@ -5333,7 +5339,7 @@ mod tests {
         assert_eq!(s.verification_status.file_count, 5);
         assert_eq!(s.verification_status.claim_count, 3);
         // Event log got an entry too.
-        assert_eq!(s.events.last().map(|e| e.kind), Some("VerificationPassed"));
+        assert_eq!(s.events.back().map(|e| e.kind), Some("VerificationPassed"));
     }
 
     #[test]

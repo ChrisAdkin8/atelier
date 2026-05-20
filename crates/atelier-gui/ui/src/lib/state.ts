@@ -73,7 +73,7 @@ export const DEFAULT_CONTEXT_WINDOW_TOKENS = 200_000
 /// `MAX_CONVERSATION_LINES`.
 export const MAX_CONVERSATION_LINES = 1_000
 
-/// Cap on the raw event log (newest-last). Matches `MAX_EVENT_LOG`.
+/// Cap on the raw event log (newest-first). Matches `MAX_EVENT_LOG`.
 export const MAX_EVENT_LOG = 1_000
 
 export type EventLogEntry = {
@@ -379,7 +379,7 @@ function castPayload<T>(
 
 export function applyEvent(state: AppState, evt: BridgedEvent): AppState {
   const logged = { ...projectEvent(evt), ts: nowTimestamp() }
-  const events = pushBounded(state.events, logged, MAX_EVENT_LOG)
+  const events = pushBoundedNewest(state.events, logged, MAX_EVENT_LOG)
 
   switch (evt.kind) {
     case 'Transitioned': {
@@ -669,8 +669,8 @@ export function applyEvent(state: AppState, evt: BridgedEvent): AppState {
     }
     case 'SubagentTurnAdvanced': {
       const p = evt.payload as { id: string; turn: number }
-      const subagents = state.subagents.map((e) =>
-        e.id === p.id ? { ...e, turn: p.turn ?? e.turn } : e,
+      const subagents = updateSubagentById(state.subagents, p.id, (e) =>
+        ({ ...e, turn: p.turn ?? e.turn }),
       )
       return { ...state, events, subagents }
     }
@@ -679,16 +679,14 @@ export function applyEvent(state: AppState, evt: BridgedEvent): AppState {
       return { ...state, events }
     case 'SubagentCompleted': {
       const p = evt.payload as { id: string; status: string; turns_used: number }
-      const subagents = state.subagents.map((e) =>
-        e.id === p.id ? { ...e, status: p.status ?? 'completed', turn: p.turns_used ?? e.turn } : e,
+      const subagents = updateSubagentById(state.subagents, p.id, (e) =>
+        ({ ...e, status: p.status ?? 'completed', turn: p.turns_used ?? e.turn }),
       )
       return { ...state, events, subagents }
     }
     case 'SubagentCancelled': {
       const p = evt.payload as { id: string }
-      const subagents = state.subagents.map((e) =>
-        e.id === p.id ? { ...e, status: 'cancelled' } : e,
-      )
+      const subagents = updateSubagentById(state.subagents, p.id, (e) => ({ ...e, status: 'cancelled' }))
       return { ...state, events, subagents }
     }
     case 'AgentStalled':
@@ -764,6 +762,24 @@ function pushBounded<T>(arr: T[], item: T, cap: number): T[] {
   const next = [...arr, item]
   if (next.length <= cap) return next
   return next.slice(next.length - cap)
+}
+
+function pushBoundedNewest<T>(arr: T[], item: T, cap: number): T[] {
+  if (cap <= 0) return []
+  if (arr.length < cap) return [item, ...arr]
+  return [item, ...arr.slice(0, cap - 1)]
+}
+
+function updateSubagentById(
+  subagents: SubagentEntry[],
+  id: string,
+  update: (entry: SubagentEntry) => SubagentEntry,
+): SubagentEntry[] {
+  const idx = subagents.findIndex((entry) => entry.id === id)
+  if (idx < 0) return subagents
+  const next = subagents.slice()
+  next[idx] = update(subagents[idx])
+  return next
 }
 
 function ledgerEntryCost(entry: LedgerEntry): number | null {

@@ -13,11 +13,12 @@
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::{collections::hash_map::DefaultHasher, hash::Hasher};
 
 use atelier_core::{
     adapter::{
         anthropic::AnthropicAdapter, Adapter, AdapterError, Message, MockAdapter, Role,
-        ToolCallRequest,
+        TokenCount as AdapterTokenCount, ToolCallRequest,
     },
     context::{
         ContextItem, ContextItemId, ContextManager, Payload, Provenance, TokenCount, TokenSource,
@@ -1605,13 +1606,20 @@ impl Runner {
         // happens for max_turns=0). The aggregate `ContextSnapshot`
         // still fires per-turn; this pre-loop emission is the
         // per-item snapshot only.
-        let initial_items = context_manager.lock().summarise();
+        let mut last_context_items: Option<Vec<atelier_core::context::ContextItemSummary>>;
+        let mut last_context_meter: Option<(u32, u32)> = None;
+        let mut last_memory_cards: Option<Vec<atelier_core::memory::MemoryCardSummary>> = None;
+        let mut last_plan_steps: Option<Vec<atelier_core::plan::PlanStep>> = None;
+        let mut token_count_cache: Option<(u64, AdapterTokenCount)> = None;
+
+        let initial_items = context_manager.lock().panel_snapshot().items;
         let _ = try_emit(
             &bus,
             Event::ContextItems {
-                items: initial_items,
+                items: initial_items.clone(),
             },
         );
+        last_context_items = Some(initial_items);
         let mut turns = 0;
         let mut final_state = State::Idle;
 
@@ -1780,15 +1788,11 @@ impl Runner {
                                     // compaction publishes the
                                     // resolution event then retries
                                     // the turn; a failure surfaces.
-                                    let current_total: u32 = context_manager
-                                        .lock()
-                                        .summarise()
-                                        .iter()
-                                        .map(|s| s.tokens)
-                                        .sum();
-                                    let summaries = context_manager.lock().summarise();
+                                    let snapshot = context_manager.lock().panel_snapshot();
+                                    let current_total: u32 =
+                                        snapshot.items.iter().map(|s| s.tokens).sum();
                                     let picks = pick_overflow_compaction_targets(
-                                        &summaries,
+                                        &snapshot.items,
                                         needed_tokens,
                                         limit_tokens,
                                         current_total,
@@ -1882,6 +1886,7 @@ impl Runner {
                                                         .any(|t| t == &m.content))
                                                 });
                                             }
+                                            token_count_cache = None;
                                             overflow_retries += 1;
                                             continue;
                                         }
@@ -2105,7 +2110,15 @@ impl Runner {
                     let _report = canvas.apply_envelope(plan_update);
                     canvas.to_vec()
                 };
-                let _ = try_emit(&bus, Event::PlanSnapshot { steps });
+                if last_plan_steps.as_ref() != Some(&steps) {
+                    let _ = try_emit(
+                        &bus,
+                        Event::PlanSnapshot {
+                            steps: steps.clone(),
+                        },
+                    );
+                    last_plan_steps = Some(steps);
+                }
             }
             // v56 — surface the envelope's per-file rationale so the
             // §3 "Why this change?" UI can render it. The bus event
@@ -2238,34 +2251,60 @@ impl Runner {
             // aggregate meter. Pin / unpin / evict from the §5 panel
             // operate on this store; the dispatcher (Step 2) shares
             // the Arc to mutate it from UI handlers.
-            if let Ok(token_count) = self.adapter.count_tokens(&messages).await {
+            let message_fingerprint = message_history_fingerprint(&messages);
+            let counted = match token_count_cache.as_ref() {
+                Some((cached_fingerprint, token_count))
+                    if *cached_fingerprint == message_fingerprint =>
+                {
+                    Some(*token_count)
+                }
+                _ => match self.adapter.count_tokens(&messages).await {
+                    Ok(token_count) => {
+                        token_count_cache = Some((message_fingerprint, token_count));
+                        Some(token_count)
+                    }
+                    Err(_) => None,
+                },
+            };
+            if let Some(token_count) = counted {
+                let meter = (token_count.count, 0);
+                if last_context_meter != Some(meter) {
+                    last_context_meter = Some(meter);
+                    let _ = try_emit(
+                        &bus,
+                        Event::ContextSnapshot {
+                            known_tokens: token_count.count,
+                            unknown_tokens: 0,
+                        },
+                    );
+                }
+            }
+            let context_items = context_manager.lock().panel_snapshot().items;
+            if last_context_items.as_ref() != Some(&context_items) {
                 let _ = try_emit(
                     &bus,
-                    Event::ContextSnapshot {
-                        known_tokens: token_count.count,
-                        unknown_tokens: 0,
+                    Event::ContextItems {
+                        items: context_items.clone(),
                     },
                 );
+                last_context_items = Some(context_items);
             }
-            let context_items = context_manager.lock().summarise();
-            let _ = try_emit(
-                &bus,
-                Event::ContextItems {
-                    items: context_items,
-                },
-            );
 
             // v55 — §5 Memory panel snapshot. The MemoryStore is now
             // mutable from the UI via SessionDispatcher's add /
             // delete / promote mutators (Step 3). The runner still
             // re-emits at each turn boundary so a late-joining
             // subscriber converges to the live state.
-            let _ = try_emit(
-                &bus,
-                Event::MemoryCards {
-                    cards: memory_store.lock().summarise(),
-                },
-            );
+            let memory_cards = memory_store.lock().summarise();
+            if last_memory_cards.as_ref() != Some(&memory_cards) {
+                let _ = try_emit(
+                    &bus,
+                    Event::MemoryCards {
+                        cards: memory_cards.clone(),
+                    },
+                );
+                last_memory_cards = Some(memory_cards);
+            }
 
             // v60.8 A2 follow-on — stash the most recent envelope for
             // the §7 verify pass below. The envelope is small (no
@@ -2814,6 +2853,41 @@ fn build_atelier_system_prompt(
 fn is_openai_cloud_base_url(base: &str) -> bool {
     let lower = base.to_ascii_lowercase();
     lower.starts_with("https://api.openai.com") || lower.starts_with("http://api.openai.com")
+}
+
+fn message_history_fingerprint(messages: &[Message]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    hasher.write_usize(messages.len());
+    for message in messages {
+        let role = match message.role {
+            Role::System => 0u8,
+            Role::User => 1,
+            Role::Assistant => 2,
+            Role::Tool => 3,
+        };
+        hasher.write_u8(role);
+        hasher.write_usize(message.content.len());
+        hasher.write(message.content.as_bytes());
+        match &message.tool_call_id {
+            Some(id) => {
+                hasher.write_u8(1);
+                hasher.write_usize(id.len());
+                hasher.write(id.as_bytes());
+            }
+            None => hasher.write_u8(0),
+        }
+        hasher.write_usize(message.tool_calls.len());
+        for call in &message.tool_calls {
+            hasher.write_usize(call.id.len());
+            hasher.write(call.id.as_bytes());
+            hasher.write_usize(call.name.len());
+            hasher.write(call.name.as_bytes());
+            let args = serde_json::to_string(&call.arguments).unwrap_or_default();
+            hasher.write_usize(args.len());
+            hasher.write(args.as_bytes());
+        }
+    }
+    hasher.finish()
 }
 
 /// Lift an `AdapterError` raised at construction time (so far only

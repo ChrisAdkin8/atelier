@@ -596,6 +596,31 @@ impl ContextManager {
             .collect()
     }
 
+    /// Build the aggregate token meter and per-row UI projection in one
+    /// pass. Runner turn-boundary emission needs both snapshots together;
+    /// using this helper avoids a duplicate walk over the context store.
+    pub fn panel_snapshot(&self) -> ContextPanelSnapshot {
+        let mut total: u64 = 0;
+        let mut unknown = 0usize;
+        let mut items = Vec::with_capacity(self.items.len());
+        for item in self.items.values() {
+            if matches!(item.tokens.source, TokenSource::Unavailable) {
+                unknown += 1;
+            } else {
+                total += item.tokens.count as u64;
+            }
+            items.push(ContextItemSummary::from_item(item));
+        }
+        ContextPanelSnapshot {
+            token_snapshot: TokenSnapshot {
+                total_known_tokens: total,
+                items_with_unknown_tokens: unknown,
+                item_count: self.items.len(),
+            },
+            items,
+        }
+    }
+
     fn with_mut<F: FnOnce(&mut ContextItem)>(
         &mut self,
         id: ContextItemId,
@@ -623,6 +648,12 @@ pub struct TokenSnapshot {
     pub total_known_tokens: u64,
     pub items_with_unknown_tokens: usize,
     pub item_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextPanelSnapshot {
+    pub token_snapshot: TokenSnapshot,
+    pub items: Vec<ContextItemSummary>,
 }
 
 #[cfg(test)]
@@ -806,6 +837,18 @@ mod tests {
         assert_eq!(snap.total_known_tokens, 150);
         assert_eq!(snap.items_with_unknown_tokens, 1);
         assert_eq!(snap.item_count, 3);
+    }
+
+    #[test]
+    fn panel_snapshot_matches_summary_and_token_snapshot() {
+        let mut m = ContextManager::new();
+        m.add(file_item("a", 100));
+        m.add(file_item("b", 50));
+
+        let snapshot = m.panel_snapshot();
+
+        assert_eq!(snapshot.items, m.summarise());
+        assert_eq!(snapshot.token_snapshot, m.token_snapshot());
     }
 
     #[test]
