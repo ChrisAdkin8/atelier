@@ -319,18 +319,24 @@ impl Adapter for AnthropicAdapter {
 fn split_system_and_messages(messages: &[Message]) -> (String, Vec<Value>) {
     let mut system = String::new();
     let mut out = Vec::with_capacity(messages.len());
-    for m in messages {
+    let mut i = 0;
+    while i < messages.len() {
+        let m = &messages[i];
         match m.role {
             Role::System => {
                 if !system.is_empty() {
                     system.push_str("\n\n");
                 }
                 system.push_str(&m.content);
+                i += 1;
             }
-            Role::User => out.push(json!({
-                "role": "user",
-                "content": m.content,
-            })),
+            Role::User => {
+                out.push(json!({
+                    "role": "user",
+                    "content": m.content,
+                }));
+                i += 1;
+            }
             Role::Assistant => {
                 // If the assistant turn included tool_use blocks, re-emit
                 // them alongside any text in the order: text first, then
@@ -365,18 +371,28 @@ fn split_system_and_messages(messages: &[Message]) -> (String, Vec<Value>) {
                         "content": blocks,
                     }));
                 }
+                i += 1;
             }
             Role::Tool => {
-                // Anthropic represents tool results as a user-role message
-                // whose content is a `tool_result` block.
-                let id = m.tool_call_id.clone().unwrap_or_default();
-                out.push(json!({
-                    "role": "user",
-                    "content": [{
+                // Coalesce consecutive Role::Tool messages into one user-role
+                // message whose content is an array of tool_result blocks.
+                // Anthropic's API requires all results from one assistant
+                // tool_use turn in a single user message; separate messages
+                // produce a 400 invalid_request_error.
+                let mut blocks: Vec<Value> = Vec::new();
+                while i < messages.len() && messages[i].role == Role::Tool {
+                    let tm = &messages[i];
+                    let id = tm.tool_call_id.clone().unwrap_or_default();
+                    blocks.push(json!({
                         "type": "tool_result",
                         "tool_use_id": id,
-                        "content": m.content,
-                    }],
+                        "content": tm.content,
+                    }));
+                    i += 1;
+                }
+                out.push(json!({
+                    "role": "user",
+                    "content": blocks,
                 }));
             }
         }
@@ -1679,6 +1695,76 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.text, "done");
+    }
+
+    #[tokio::test]
+    async fn multiple_tool_results_coalesced_into_one_user_message() {
+        // Regression: when the runner dispatches N tool calls in parallel and
+        // pushes N consecutive Role::Tool messages, split_system_and_messages
+        // must emit them as a single user-role message with N tool_result
+        // blocks. Sending separate user messages triggers a 400 from Anthropic.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(wiremock::matchers::body_partial_json(json!({
+                "messages": [
+                    {"role": "user", "content": "run both"},
+                    {"role": "assistant", "content": [
+                        {"type": "tool_use", "id": "toolu_a", "name": "read_file", "input": {}},
+                        {"type": "tool_use", "id": "toolu_b", "name": "list_dir",  "input": {}},
+                    ]},
+                    // Must be ONE user message with TWO blocks, not two separate messages.
+                    {"role": "user", "content": [
+                        {"type": "tool_result", "tool_use_id": "toolu_a", "content": "file-content"},
+                        {"type": "tool_result", "tool_use_id": "toolu_b", "content": "dir-listing"},
+                    ]},
+                ],
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "msg_z",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "both done"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 2, "output_tokens": 2},
+            })))
+            .mount(&server)
+            .await;
+
+        let assistant_turn = Message {
+            role: Role::Assistant,
+            content: String::new(),
+            tool_call_id: None,
+            tool_calls: vec![
+                ToolCallRequest {
+                    id: "toolu_a".into(),
+                    name: "read_file".into(),
+                    arguments: json!({}),
+                },
+                ToolCallRequest {
+                    id: "toolu_b".into(),
+                    name: "list_dir".into(),
+                    arguments: json!({}),
+                },
+            ],
+        };
+        let result_a = Message {
+            role: Role::Tool,
+            content: "file-content".into(),
+            tool_call_id: Some("toolu_a".into()),
+            tool_calls: Vec::new(),
+        };
+        let result_b = Message {
+            role: Role::Tool,
+            content: "dir-listing".into(),
+            tool_call_id: Some("toolu_b".into()),
+            tool_calls: Vec::new(),
+        };
+        let r = adapter_for(&server)
+            .chat(&[user("run both"), assistant_turn, result_a, result_b], &[])
+            .await
+            .unwrap();
+        assert_eq!(r.text, "both done");
     }
 
     #[tokio::test]

@@ -14,9 +14,10 @@
 
   type Props = {
     busy: boolean
+    thinking: boolean
   }
 
-  let { busy }: Props = $props()
+  let { busy, thinking }: Props = $props()
 
   type SkillEntry = {
     name: string
@@ -170,7 +171,7 @@
   })
 </script>
 
-<section class="composer">
+<section class="composer" class:thinking>
   <textarea
     placeholder={busy
       ? 'a turn is in progress — wait for it to finish'
@@ -217,6 +218,15 @@
     padding: 0.6rem 1rem;
     background: var(--bg-pane);
     border-top: 1px solid var(--border-pane);
+    transition: border-top-color 0.2s ease;
+  }
+  .composer.thinking {
+    border-top-color: var(--accent-cyan);
+    animation: thinking-glow 2s ease-in-out infinite;
+  }
+  @keyframes thinking-glow {
+    0%, 100% { box-shadow: 0 -4px 12px -3px rgba(121, 192, 255, 0.15); }
+    50%       { box-shadow: 0 -4px 20px -3px rgba(121, 192, 255, 0.45); }
   }
   textarea {
     width: 100%;

@@ -9,6 +9,10 @@
 //!   - A child `CancellationToken` derived from the parent's token so
 //!     cancellation cascades automatically.
 //!   - The parent's `Arc<dyn Adapter>` (sub-agents share the model).
+//!   - The parent's resolved `ModelProfile` (inherited via `set_profile` so
+//!     child runners skip the probe and use the same emission strategy).
+//!   - An `EventSink::Callback` that forwards `SubagentTurnAdvanced` and
+//!     `SubagentToolCall` events to the parent bus in real time.
 //!   - The sub-agent type's `system_prompt_addendum` injected via a
 //!     synthetic first system turn in the prompt.
 //!   - `max_turns` capped per the effective-max-turns of the spawn request.
@@ -346,7 +350,9 @@ fn run_report_to_subagent_result(id: &SubagentId, report: RunReport, _depth: u8)
 
     SubagentResult {
         id: id.clone(),
-        result: report.final_assistant_text.unwrap_or_default(),
+        result: report
+            .final_assistant_text
+            .unwrap_or_else(|| format!("sub-agent produced no output (status: {status:?})")),
         status,
         turns_used: report.turns_used as u32,
         cost,

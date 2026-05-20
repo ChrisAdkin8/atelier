@@ -89,8 +89,8 @@
   let listenerReady = $state(false)
 
   // A run is "in flight" between the first Transitioned-into-non-Idle
-  // and the next time we land in a terminal app. Used to disable
-  // the Composer's submit button.
+  // and the next time we land in a terminal state. Used to disable
+  // the Composer's submit button and to drive the `runBusy` flag.
   let runBusy = $derived(
     app.currentState !== '' &&
       app.currentState !== 'Idle' &&
@@ -385,14 +385,7 @@
     </div>
   </main>
 
-  {#if app.runInFlight}
-    <div class="thinking-bar" role="status" aria-live="polite">
-      <span class="thinking-dot"></span>
-      thinking…
-    </div>
-  {/if}
-
-  <Composer busy={composerBusy} />
+  <Composer busy={composerBusy} thinking={app.runInFlight} />
 
   <footer class="help">
     <!-- Left column: context window usage + cost. -->
@@ -490,30 +483,6 @@
   .app > :global(.grid) {
     flex: 1;
     min-height: 0;
-  }
-  .thinking-bar {
-    display: flex;
-    align-items: center;
-    gap: 0.4rem;
-    padding: 0.2rem 1rem;
-    font-size: 0.7rem;
-    font-family: var(--font-mono);
-    color: var(--fg-dim);
-    background: var(--bg-pane);
-    border-bottom: 1px solid var(--border-pane);
-    flex-shrink: 0;
-  }
-  .thinking-dot {
-    display: inline-block;
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
-    background: var(--accent-cyan);
-    animation: pulse 1.2s ease-in-out infinite;
-  }
-  @keyframes pulse {
-    0%, 100% { opacity: 0.2; }
-    50% { opacity: 1; }
   }
   .stall-banner {
     position: fixed;
