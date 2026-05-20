@@ -1,5 +1,25 @@
 # Atelier Spec — Changelog
 
+## v60.72 — 2026-05-20 (§10.1 sub-agent hang mitigations)
+
+Four reliability fixes for the sub-agent delegation path, targeting hangs observed when running a two-child fan-out against a single-slot local LLM.
+
+### 1 — `DEFAULT_MAX_TURNS` 25 → 10 (`subagents.rs`)
+
+Sub-agents now default to 10 turns instead of 25. For a two-child fan-out on a single-slot local model this caps the worst-case wall time to ~5 minutes. The constant is in `crates/atelier-core/src/subagents.rs`; the existing unit test was updated.
+
+### 2 — Pre-flight executor adapter check (`main.rs`, `lib.rs`)
+
+`build_executor_adapter` (CLI `main.rs`) and `resolve_executor_adapter` (GUI `lib.rs`) now open a TCP connection to the executor's `base_url` with a 1 s timeout before constructing the full `OpenAiCompatAdapter`. When the probe fails (e.g. mlx-lm on `:8080` is down), the function logs a warning and returns `None` — the runner runs turn-routing-less rather than hanging on the first tool-result turn waiting for a server that is not there.
+
+### 3 — Child-turn progress badge in GUI Composer (`App.svelte`, `Composer.svelte`)
+
+`AppState` gains a `subagentProgress: { id: string; turn: number; maxTurns: number } | null` field. `SubagentTurnStarted` events update it; `SubagentCompleted`/`SubagentFailed` clear it. `Composer.svelte` renders a cyan `"turn N/M"` badge in the bottom-left of the text area while a sub-agent is running, so the UI no longer looks idle during a long child run.
+
+### 4 — Fix spawner insert/immediately-remove anti-pattern (`subagent_spawner.rs`)
+
+`InFlight` previously stored a `JoinHandle` and the map entry was removed before `await` completed, making `cancel()` unable to find the handle. `InFlight` now stores an `AbortHandle`; the map entry persists until `join_handle.await` returns, so `cancel()` can always abort a running child.
+
 ## v60.71 — 2026-05-20 (Phase B §7 LSP live receiver + §15 TUI slash-completion: U03–U11)
 
 Closes the Tier-1 LSP hallucination-detection path and wires the TUI §15 slash-completion run-loop.

@@ -159,8 +159,11 @@ atelier run --provider anthropic --model anthropic:claude-opus-4-7 \
 
 Key constraints:
 - **Recursion depth cap = 3** (PROVISIONAL, spec §10 line 556). A depth-4 spawn is rejected with `ToolError::SchemaViolation`.
+- **Turn budget per sub-agent = 10** (default). The parent's `--max-turns` does not apply to sub-agents; each child gets its own capped budget so a stuck child can't hold the parent hostage indefinitely.
 - Sub-agent cost and turn count are recorded in `session.json` under the `subagents` map with typed fields (`status`, `result`, `turns_used`, `prompt_tokens`, `completion_tokens`, `cached_tokens`).
 - The parent's §7 verification gate runs only *after* all spawned sub-agents have terminated (spec line 548).
+- **Executor pre-flight.** When `[routing].executor` is configured and points at a local server, the harness probes the server with a 1 s TCP connect before building the executor adapter. If the server is unreachable, the harness warns and runs without turn routing rather than hanging on the first tool-result turn.
+- **GUI progress badge.** While a sub-agent is running, the Composer shows a cyan `"turn N/M"` badge so the UI does not look idle during long child runs.
 
 Deferred: GUI sub-agent card, TUI sub-agent line, §4 time-travel checkpointing of sub-agent state, and the explicit trust-budget `reconcile_subagent` helper (spec line 550).
 
