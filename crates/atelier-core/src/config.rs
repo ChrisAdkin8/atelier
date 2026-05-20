@@ -113,6 +113,10 @@ pub struct ProvidersConfig {
     /// v51 probe-on-first-use policy. See [`ProbeSection`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub probe: Option<ProbeSection>,
+
+    /// Per-turn adapter routing. See [`RoutingSection`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing: Option<RoutingSection>,
 }
 
 /// One `[providers.<name>]` table. Every field is optional so a
@@ -138,6 +142,13 @@ pub struct ProviderProfile {
     /// or `"mock"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
+
+    /// When `true`, adds `"cache_prompt": true` to every request body.
+    /// llama.cpp server uses this to save/restore the KV state for the
+    /// stable prompt prefix across turns; mlx-lm ignores the field
+    /// (prefix caching is automatic). Omitted from the wire when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_prompt: Option<bool>,
 }
 
 /// Adapter discriminator. Same values as v52 but the field renamed
@@ -186,6 +197,23 @@ pub struct ProbeSection {
     /// miss for `openai-compat`; skip for `mock` + `anthropic`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy: Option<ProbePolicyName>,
+}
+
+/// Top-level `[routing]` section — per-turn model routing.
+/// `executor` is the profile name for `Role::Tool`-last turns (fast,
+/// cheap model); `planner` is reserved for initial/user-injection turns
+/// (uses the primary adapter when absent). Both fields are optional.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoutingSection {
+    /// Profile name for tool-result turns. When set, the runner uses
+    /// this adapter whenever the last message is a `Role::Tool` result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor: Option<String>,
+    /// Profile name for planner turns. Reserved; not yet consumed at
+    /// runtime (primary adapter is used). `None` = use primary adapter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planner: Option<String>,
 }
 
 /// `[probe].policy` value. Maps onto `atelier_cli::runner::ProbePolicy`.
@@ -664,6 +692,7 @@ base_url = "https://api.anthropic.com/v1"
                 provider: Some(ProviderKind::OpenaiCompat),
                 model: Some("local:m".into()),
                 base_url: Some("http://x/v1".into()),
+                ..Default::default()
             },
         );
         providers.insert(
@@ -672,6 +701,7 @@ base_url = "https://api.anthropic.com/v1"
                 provider: Some(ProviderKind::Anthropic),
                 model: Some("anthropic:m".into()),
                 base_url: None,
+                ..Default::default()
             },
         );
         ProvidersConfig {
@@ -679,6 +709,7 @@ base_url = "https://api.anthropic.com/v1"
             providers,
             runner: None,
             probe: None,
+            routing: None,
         }
     }
 

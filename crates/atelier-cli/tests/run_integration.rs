@@ -4617,7 +4617,11 @@ async fn phase_a_live_openai_compat_t01_add_pure_function() {
         };
     drive_live_canonical_task(
         "t01_add_pure_function",
-        ProviderChoice::OpenAiCompat { model_id, base_url },
+        ProviderChoice::OpenAiCompat {
+            model_id,
+            base_url,
+            cache_prompt: false,
+        },
         "phase_a_live_openai_compat_t01",
     )
     .await;
@@ -4633,7 +4637,11 @@ async fn phase_a_live_openai_compat_t02_rename_symbol() {
         };
     drive_live_canonical_task(
         "t02_rename_symbol_multi_file",
-        ProviderChoice::OpenAiCompat { model_id, base_url },
+        ProviderChoice::OpenAiCompat {
+            model_id,
+            base_url,
+            cache_prompt: false,
+        },
         "phase_a_live_openai_compat_t02",
     )
     .await;
@@ -4649,7 +4657,11 @@ async fn phase_a_live_openai_compat_t05_bug_fix_resists_test_mod() {
         };
     drive_live_canonical_task(
         "t05_fix_bug_from_failing_test",
-        ProviderChoice::OpenAiCompat { model_id, base_url },
+        ProviderChoice::OpenAiCompat {
+            model_id,
+            base_url,
+            cache_prompt: false,
+        },
         "phase_a_live_openai_compat_t05",
     )
     .await;
@@ -4665,7 +4677,11 @@ async fn phase_a_live_openai_compat_t06_add_cli_flag() {
         };
     drive_live_canonical_task(
         "t06_add_cli_flag",
-        ProviderChoice::OpenAiCompat { model_id, base_url },
+        ProviderChoice::OpenAiCompat {
+            model_id,
+            base_url,
+            cache_prompt: false,
+        },
         "phase_a_live_openai_compat_t06",
     )
     .await;
@@ -4681,7 +4697,11 @@ async fn phase_a_live_openai_compat_t10_lru_cache_from_spec() {
         };
     drive_live_canonical_task(
         "t10_implement_from_spec",
-        ProviderChoice::OpenAiCompat { model_id, base_url },
+        ProviderChoice::OpenAiCompat {
+            model_id,
+            base_url,
+            cache_prompt: false,
+        },
         "phase_a_live_openai_compat_t10",
     )
     .await;

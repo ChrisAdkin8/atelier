@@ -1,5 +1,34 @@
 # Atelier Spec — Changelog
 
+## v60.70 — 2026-05-20 (§1 performance — KV-cache prefix persistence + per-task model routing)
+
+Two performance improvements that reduce latency and token cost for local-model runs without any spec-level behaviour change.
+
+### KV-cache prefix persistence (`"cache_prompt": true`)
+
+`OpenAiCompatAdapter` gains a `cache_prompt: bool` field (default `false`) and a `with_cache_prompt(bool) -> Self` builder. When set, every request body includes `"cache_prompt": true`, which tells llama.cpp and mlx-lm to store the KV activations for the unchanged prompt prefix and skip recomputing them on subsequent turns. OpenAI's cloud cache is automatic and ignores the field; servers that don't support it also ignore it silently, so the flag is safe to send unconditionally once the operator opts in.
+
+Wire-up:
+- `ProviderChoice::OpenAiCompat` gets `cache_prompt: bool`; `Runner::new` threads it into the adapter constructor.
+- `main.rs` inherits it from the resolved profile's `cache_prompt` field.
+- GUI: `SwapProviderWire::OpenAiCompat` gets `#[serde(default)] cache_prompt: bool`; `build_swap_adapter` and `resolve_default_adapter` pass it through.
+- `.atelier/providers.toml`: `cache_prompt = true` added to the `qwen3-4b-dwq` (mlx-lm) profile.
+
+### Per-task model routing
+
+`Runner` gains `executor_adapter: Option<Arc<dyn Adapter>>` (default `None`) and a `with_executor_adapter(Arc<dyn Adapter>) -> Self` builder. When set, turns whose last message has `Role::Tool` (tool-result / follow-through turns) are sent to the executor adapter; planning turns and user-facing replies still go to the primary adapter. This lets a small fast local model handle execution turns while a larger model handles reasoning.
+
+Wire-up:
+- `config.rs`: new `RoutingSection { executor: Option<String>, planner: Option<String> }` + `routing: Option<RoutingSection>` on `ProvidersConfig`.
+- `ProviderProfile` gains `cache_prompt: Option<bool>`.
+- `main.rs`: `build_executor_adapter` reads `[routing].executor` from the loaded config and wires the result into the runner after construction.
+- GUI `lib.rs`: `resolve_executor_adapter` does the same for `start_agent_run`.
+- `.atelier/providers.toml`: `[routing]` section added with `executor = "qwen3-4b-dwq"` and `planner = "qwen27b"`.
+
+### Bug fix — provider mismatch when profile has `base_url`
+
+`resolve_provider_choice` was checking `base_url.is_some()` (profile-inherited value) in the Mock and Anthropic arms, which triggered a false "base_url is only valid with openai-compat" error when the resolved default profile was an openai-compat entry but `--provider mock/anthropic` was passed explicitly. Changed to check `cli.base_url.is_some()` so only a CLI-supplied `--base-url` is rejected.
+
 ## v60.68 — 2026-05-20 (CI fix — clippy + rig test)
 
 Two pre-existing CI failures fixed; no spec-level behaviour changed.

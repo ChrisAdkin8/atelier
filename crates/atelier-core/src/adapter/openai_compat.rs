@@ -121,6 +121,7 @@ pub struct OpenAiCompatAdapter {
     capabilities: Capabilities,
     http: Client,
     ring: Arc<Mutex<ConformanceRingBuffer>>,
+    cache_prompt: bool,
 }
 
 impl OpenAiCompatAdapter {
@@ -154,6 +155,7 @@ impl OpenAiCompatAdapter {
                 .build()
                 .expect("reqwest::Client::builder default config is infallible"),
             ring: Arc::new(Mutex::new(ConformanceRingBuffer::new())),
+            cache_prompt: false,
         }
     }
 
@@ -178,6 +180,18 @@ impl OpenAiCompatAdapter {
     /// constant.
     pub fn with_max_tokens(mut self, n: u32) -> Self {
         self.max_tokens = n;
+        self
+    }
+
+    /// Enable llama.cpp / mlx-lm KV-cache prefix reuse. When set, adds
+    /// `"cache_prompt": true` to every request body. The server stores
+    /// the KV activations for the unchanged prefix so subsequent turns
+    /// skip re-computing them. OpenAI's cloud cache is automatic and
+    /// ignores this field; local servers that don't support it also
+    /// ignore it silently, so the flag is safe to send unconditionally
+    /// once the operator opts in.
+    pub fn with_cache_prompt(mut self, v: bool) -> Self {
+        self.cache_prompt = v;
         self
     }
 
@@ -231,6 +245,9 @@ impl OpenAiCompatAdapter {
             // counts. Local servers usually ignore the flag but
             // honour it when supported.
             body["stream_options"] = json!({ "include_usage": true });
+        }
+        if self.cache_prompt {
+            body["cache_prompt"] = json!(true);
         }
         body
     }

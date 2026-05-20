@@ -1096,6 +1096,20 @@ fn run_run(args: impl Iterator<Item = String>) -> ExitCode {
             }
         };
     runner = runner.with_skill_registry(registry);
+    // §1 per-task routing — if [routing] specifies an executor profile,
+    // build a second adapter for tool-result turns.
+    if let Some(exec_name) = config.routing.as_ref().and_then(|r| r.executor.as_deref()) {
+        match build_executor_adapter(exec_name, &config) {
+            Ok(exec) => {
+                runner = runner.with_executor_adapter(exec);
+                tracing::info!(
+                    profile = exec_name,
+                    "per-task routing: executor adapter loaded"
+                );
+            }
+            Err(e) => eprintln!("atelier run: routing.executor: {e}"),
+        }
+    }
     if let Some(n) = max_turns {
         runner = runner.with_max_turns(n);
     }
@@ -1238,8 +1252,11 @@ fn resolve_provider_choice(
 
     match kind {
         ProviderKind::Mock => {
-            if base_url.is_some() {
-                return Err("base_url is only valid with provider `openai-compat`".into());
+            // Only reject --base-url when it came from the CLI; a profile
+            // that has base_url for an openai-compat section is harmless
+            // when --provider mock is used explicitly.
+            if cli.base_url.is_some() {
+                return Err("--base-url is only valid with provider `openai-compat`".into());
             }
             Ok(runner::ProviderChoice::Mock {
                 responses: Vec::new(),
@@ -1253,8 +1270,8 @@ fn resolve_provider_choice(
                      (got {model_id:?}); e.g. anthropic:claude-opus-4-7"
                 ));
             }
-            if base_url.is_some() {
-                return Err("base_url is only valid with provider `openai-compat`".into());
+            if cli.base_url.is_some() {
+                return Err("--base-url is only valid with provider `openai-compat`".into());
             }
             Ok(runner::ProviderChoice::Anthropic { model_id })
         }
@@ -1266,7 +1283,12 @@ fn resolve_provider_choice(
                      sent verbatim to the server."
                     .into());
             };
-            Ok(runner::ProviderChoice::OpenAiCompat { model_id, base_url })
+            let cache_prompt = profile.and_then(|p| p.cache_prompt).unwrap_or(false);
+            Ok(runner::ProviderChoice::OpenAiCompat {
+                model_id,
+                base_url,
+                cache_prompt,
+            })
         }
     }
 }
@@ -1320,6 +1342,47 @@ fn resolve_probe_policy(cli: &CliArgs, config: &ProvidersConfig) -> Option<runne
             ProbePolicyName::Skip => runner::ProbePolicy::Skip,
             ProbePolicyName::Force => runner::ProbePolicy::Force,
         })
+}
+
+/// Build an executor adapter from a named profile in `config`. Used for
+/// §1 per-task routing. Errors are non-fatal — the caller logs a warning
+/// and falls back to the single-adapter path.
+fn build_executor_adapter(
+    profile_name: &str,
+    config: &ProvidersConfig,
+) -> Result<std::sync::Arc<dyn atelier_core::adapter::Adapter>, String> {
+    let (_, profile) = config
+        .resolve_profile(Some(profile_name))
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("profile {profile_name:?} not found in providers.toml"))?;
+    let kind = profile
+        .provider
+        .ok_or_else(|| format!("profile {profile_name:?} has no `provider` field"))?;
+    let model_id = profile
+        .model
+        .clone()
+        .ok_or_else(|| format!("profile {profile_name:?} has no `model` field"))?;
+    match kind {
+        ProviderKind::OpenaiCompat => {
+            let base_url = profile.base_url.clone().unwrap_or_default();
+            let api_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
+            let mut adapter = atelier_core::adapter::openai_compat::OpenAiCompatAdapter::new(
+                api_key, model_id, base_url,
+            );
+            if profile.cache_prompt.unwrap_or(false) {
+                adapter = adapter.with_cache_prompt(true);
+            }
+            Ok(std::sync::Arc::new(adapter))
+        }
+        ProviderKind::Anthropic => {
+            let adapter = atelier_core::adapter::anthropic::AnthropicAdapter::from_env(model_id)
+                .map_err(|e| e.to_string())?;
+            Ok(std::sync::Arc::new(adapter))
+        }
+        ProviderKind::Mock => Err(format!(
+            "profile {profile_name:?}: mock provider is not valid for routing.executor"
+        )),
+    }
 }
 
 // ---------- `atelier protocol-overhead` ----------

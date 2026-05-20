@@ -98,6 +98,10 @@ pub enum ProviderChoice {
     OpenAiCompat {
         model_id: String,
         base_url: Option<String>,
+        /// Enable llama.cpp / mlx-lm KV-cache prefix reuse on every
+        /// request. Maps to `"cache_prompt": true` on the wire. See
+        /// `OpenAiCompatAdapter::with_cache_prompt`.
+        cache_prompt: bool,
     },
 }
 
@@ -328,6 +332,11 @@ pub enum ProbePolicy {
 pub struct Runner {
     workspace: PathBuf,
     adapter: Arc<dyn Adapter>,
+    /// Optional fast/cheap adapter for tool-result turns (§1 per-task
+    /// routing). When `Some`, turns whose last message has `Role::Tool`
+    /// are sent to this adapter instead of `self.adapter`. `None` keeps
+    /// the existing single-adapter behaviour.
+    executor_adapter: Option<Arc<dyn Adapter>>,
     sink: EventSink,
     /// Max turns before bailing — defends against a model that never
     /// emits `claimed_done`. 32 matches a generous canonical-workload
@@ -603,7 +612,11 @@ impl Runner {
                 // `cost_usd` empty so the meter doesn't lie.
                 ModelCostPolicy::UnknownPending,
             ),
-            ProviderChoice::OpenAiCompat { model_id, base_url } => {
+            ProviderChoice::OpenAiCompat {
+                model_id,
+                base_url,
+                cache_prompt,
+            } => {
                 // Empty OPENAI_API_KEY is OK — most local servers
                 // (LM Studio, llama-server, vLLM, Ollama-compat)
                 // don't require auth. A 401 from a server that
@@ -637,23 +650,21 @@ impl Runner {
                 } else {
                     ModelCostPolicy::LatencyWeighted
                 };
-                (
-                    Arc::new(
-                        atelier_core::adapter::openai_compat::OpenAiCompatAdapter::new(
-                            api_key,
-                            model_id,
-                            base.clone(),
-                        ),
-                    ),
-                    ProbePolicy::Auto,
-                    base,
-                    cost,
-                )
+                let mut oa = atelier_core::adapter::openai_compat::OpenAiCompatAdapter::new(
+                    api_key,
+                    model_id,
+                    base.clone(),
+                );
+                if cache_prompt {
+                    oa = oa.with_cache_prompt(true);
+                }
+                (Arc::new(oa), ProbePolicy::Auto, base, cost)
             }
         };
         Ok(Self {
             workspace,
             adapter,
+            executor_adapter: None,
             sink,
             max_turns: 32,
             approval_policy: atelier_core::dispatcher::ApprovalPolicy::AutoApproveAll,
@@ -680,6 +691,16 @@ impl Runner {
             subagent_depth: 0,
             pinned_profile: None,
         })
+    }
+
+    /// §1 per-task routing — install a fast/cheap executor adapter for
+    /// tool-result turns. When set, turns whose last message has
+    /// `Role::Tool` use this adapter instead of the primary one. Lets
+    /// a small local model handle follow-through tool calls while the
+    /// primary (larger) model handles planning / user-facing turns.
+    pub fn with_executor_adapter(mut self, adapter: Arc<dyn Adapter>) -> Self {
+        self.executor_adapter = Some(adapter);
+        self
     }
 
     /// v60.51 §15 — install a skill registry so the runner expands a
@@ -1711,11 +1732,26 @@ impl Runner {
             };
 
             let response = {
+                // §1 per-task routing: if the last message is a tool
+                // result, use the executor adapter (fast/cheap) when
+                // one is configured; otherwise fall back to the primary.
+                let call_adapter: &dyn Adapter = {
+                    let is_tool_turn = messages
+                        .last()
+                        .map(|m| matches!(m.role, Role::Tool))
+                        .unwrap_or(false);
+                    if is_tool_turn {
+                        self.executor_adapter
+                            .as_deref()
+                            .unwrap_or(self.adapter.as_ref())
+                    } else {
+                        self.adapter.as_ref()
+                    }
+                };
                 let mut overflow_retries: usize = 0;
                 loop {
                     let messages_for_call = project_messages_for_call(&messages);
-                    match self
-                        .adapter
+                    match call_adapter
                         .chat(&messages_for_call, &turn_tools_spec)
                         .await
                     {

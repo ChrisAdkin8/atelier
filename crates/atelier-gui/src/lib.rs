@@ -655,6 +655,10 @@ pub enum SwapProviderWire {
         model_id: String,
         #[serde(default)]
         base_url: Option<String>,
+        /// Maps to `"cache_prompt": true` on the wire. See
+        /// `OpenAiCompatAdapter::with_cache_prompt`.
+        #[serde(default)]
+        cache_prompt: bool,
     },
 }
 
@@ -995,15 +999,21 @@ fn build_swap_adapter(
             let a = AnthropicAdapter::from_env(model_id).map_err(|e| e.to_string())?;
             Ok(std::sync::Arc::new(a))
         }
-        SwapProviderWire::OpenAiCompat { model_id, base_url } => {
+        SwapProviderWire::OpenAiCompat {
+            model_id,
+            base_url,
+            cache_prompt,
+        } => {
             let api_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
             let base = base_url.unwrap_or_else(|| {
                 std::env::var("OPENAI_BASE_URL")
                     .unwrap_or_else(|_| "https://api.openai.com/v1".to_string())
             });
-            Ok(std::sync::Arc::new(OpenAiCompatAdapter::new(
-                api_key, model_id, base,
-            )))
+            let mut adapter = OpenAiCompatAdapter::new(api_key, model_id, base);
+            if cache_prompt {
+                adapter = adapter.with_cache_prompt(true);
+            }
+            Ok(std::sync::Arc::new(adapter))
         }
     }
 }
@@ -1901,9 +1911,71 @@ fn resolve_default_adapter(
         ProviderKind::OpenaiCompat => SwapProviderWire::OpenAiCompat {
             model_id: model,
             base_url: prof.base_url.clone(),
+            cache_prompt: prof.cache_prompt.unwrap_or(false),
         },
     };
     build_swap_adapter(wire)
+}
+
+/// §1 per-task routing — build the executor adapter from the profile
+/// named in `[routing].executor`. Returns `None` when routing is not
+/// configured; returns `Err` if the profile exists but is misconfigured.
+fn resolve_executor_adapter(
+    repo_root: &std::path::Path,
+) -> Result<Option<std::sync::Arc<dyn atelier_core::adapter::Adapter>>, String> {
+    use atelier_core::adapter::openai_compat::OpenAiCompatAdapter;
+    use atelier_core::config::{ProviderKind, ProvidersConfig};
+    let loaded = match ProvidersConfig::load(repo_root)
+        .map_err(|e| format!("providers.toml load failed: {e}"))?
+    {
+        Some(l) => l,
+        None => return Ok(None),
+    };
+    let cfg = &loaded.config;
+    let exec_name = match cfg.routing.as_ref().and_then(|r| r.executor.as_deref()) {
+        Some(n) => n,
+        None => return Ok(None),
+    };
+    let (name, prof) = match cfg.providers.get(exec_name) {
+        Some(p) => (exec_name.to_string(), p),
+        None => {
+            return Err(format!(
+                "routing.executor = {exec_name:?} but no [providers.{exec_name}] table defined"
+            ))
+        }
+    };
+    let kind = prof
+        .provider
+        .ok_or_else(|| format!("executor profile {name:?} missing `provider`"))?;
+    let model = prof
+        .model
+        .clone()
+        .ok_or_else(|| format!("executor profile {name:?} missing `model`"))?;
+    let adapter: std::sync::Arc<dyn atelier_core::adapter::Adapter> = match kind {
+        ProviderKind::OpenaiCompat => {
+            let api_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
+            let base = prof.base_url.clone().unwrap_or_else(|| {
+                std::env::var("OPENAI_BASE_URL")
+                    .unwrap_or_else(|_| "https://api.openai.com/v1".to_string())
+            });
+            let mut a = OpenAiCompatAdapter::new(api_key, model, base);
+            if prof.cache_prompt.unwrap_or(false) {
+                a = a.with_cache_prompt(true);
+            }
+            std::sync::Arc::new(a)
+        }
+        ProviderKind::Anthropic => {
+            use atelier_core::adapter::anthropic::AnthropicAdapter;
+            let a = AnthropicAdapter::from_env(model).map_err(|e| e.to_string())?;
+            std::sync::Arc::new(a)
+        }
+        ProviderKind::Mock => {
+            return Err(format!(
+                "executor profile {name:?}: mock provider is not valid for routing.executor"
+            ))
+        }
+    };
+    Ok(Some(adapter))
 }
 
 /// v60.43 — pure chat path. Bypasses the Runner / Mock / §3 staging
@@ -2326,11 +2398,17 @@ fn start_agent_run(
     } else {
         runner
     };
-    let runner = runner
+    let mut runner = runner
         .with_adapter(adapter)
         .with_dispatcher_handle(handle)
         .with_adapter_handle(adapter_handle)
         .with_external_cancel(cancel_token);
+    // §1 per-task routing — wire executor adapter if configured.
+    match resolve_executor_adapter(&state.workspace_root()) {
+        Ok(Some(exec)) => runner = runner.with_executor_adapter(exec),
+        Ok(None) => {}
+        Err(e) => tracing::warn!(error = %e, "routing.executor: skipping"),
+    }
 
     // Emit immediately so the frontend shows a spinner before the first
     // real event (model probe can take 10-30s on a local model).
