@@ -89,8 +89,8 @@
   let listenerReady = $state(false)
 
   // A run is "in flight" between the first Transitioned-into-non-Idle
-  // and the next time we land in a terminal state. Used to disable
-  // the Composer's submit button and to drive the `runBusy` flag.
+  // and the next time we land in a terminal state. Feeds into `composerBusy`
+  // to disable the Composer's submit button during active turns.
   let runBusy = $derived(
     app.currentState !== '' &&
       app.currentState !== 'Idle' &&
