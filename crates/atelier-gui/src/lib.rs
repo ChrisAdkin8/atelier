@@ -340,6 +340,26 @@ const MAX_PLAN_STEP_BYTES: usize = 4 * 1024;
 const MAX_PLAN_CONSTRAINT_BYTES: usize = 1024;
 const MAX_PLAN_STEPS: usize = 256;
 
+/// Returns `true` iff `p` is a safe repo-relative path: non-empty, relative
+/// (no leading `/`), and contains no `..` components. Only compiled in test
+/// mode; retained as a regression guard for path-safety logic.
+#[cfg(test)]
+fn is_safe_repo_relative(p: &str) -> bool {
+    if p.is_empty() {
+        return false;
+    }
+    let path = std::path::Path::new(p);
+    if path.is_absolute() {
+        return false;
+    }
+    path.components().all(|c| {
+        !matches!(
+            c,
+            std::path::Component::ParentDir | std::path::Component::Prefix(_)
+        )
+    })
+}
+
 fn check_bytes(label: &str, s: &str, max: usize) -> Result<(), String> {
     if s.len() > max {
         return Err(format!(

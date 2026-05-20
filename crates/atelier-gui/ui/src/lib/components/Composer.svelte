@@ -206,18 +206,20 @@
     <span class="hint">
       Cmd+Enter to send · `/` for skills (Tab to autocomplete, Esc to clear)
     </span>
-    <button
-      class="send"
-      onclick={commit}
-      disabled={!canSubmit}
-    >
-      {starting ? 'starting…' : 'Send'}
-    </button>
-    {#if busy || thinking}
-      <button class="stop" onclick={stopRun} title="Stop current run">
-        &#9632; Stop
+    <div class="btn-group">
+      <button
+        class="send"
+        onclick={commit}
+        disabled={!canSubmit}
+      >
+        {starting ? 'starting…' : 'Send'}
       </button>
-    {/if}
+      {#if busy || thinking}
+        <button class="stop" onclick={stopRun} title="Stop current run">
+          &#9632; Stop
+        </button>
+      {/if}
+    </div>
   </div>
   {#if error}
     <p class="error">{error}</p>
@@ -309,6 +311,12 @@
     align-items: center;
     justify-content: space-between;
     gap: 1rem;
+  }
+  .btn-group {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    flex-shrink: 0;
   }
   .hint {
     color: var(--fg-dim);

@@ -394,11 +394,14 @@ def test_runner_harness_smoke_all_tasks_emit_checks():
     have an empty checks array.
     """
     r = subprocess.run(
-        [sys.executable, str(RUNNER), "--task", "all", "--harness-cmd", "true", "--out", "/dev/stdout"],
+        [sys.executable, str(RUNNER), "--task", "all", "--harness-cmd", "true"],
         cwd=ROOT, capture_output=True, text=True,
     )
     # Runner exits non-zero because the no-op harness fails every task; that's expected.
     # We care that the JSON output is well-formed and complete.
+    # NOTE: no --out flag — letting the runner write to sys.stdout directly so
+    # capture_output=True reliably intercepts it. --out /dev/stdout opens a
+    # new file descriptor that doesn't reach the subprocess pipe on all platforms.
     payload = json.loads(r.stdout)
     assert payload["runner_version"] == 1
     results = payload["results"]
