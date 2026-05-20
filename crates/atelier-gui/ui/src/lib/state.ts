@@ -77,6 +77,7 @@ export const MAX_CONVERSATION_LINES = 1_000
 export const MAX_EVENT_LOG = 1_000
 
 export type EventLogEntry = {
+  ts: string
   kind: string
   detail: string
 }
@@ -371,7 +372,7 @@ function castPayload<T>(
 // `crates/atelier-tui/src/lib.rs`.
 
 export function applyEvent(state: AppState, evt: BridgedEvent): AppState {
-  const logged = projectEvent(evt)
+  const logged = { ...projectEvent(evt), ts: nowTimestamp() }
   const events = pushBounded(state.events, logged, MAX_EVENT_LOG)
 
   switch (evt.kind) {
@@ -730,6 +731,15 @@ export function applyScrub(state: AppState, cmd: ScrubCommand): AppState {
 
 // ---- helpers ----
 
+function nowTimestamp(): string {
+  const d = new Date()
+  const hh = String(d.getHours()).padStart(2, '0')
+  const mm = String(d.getMinutes()).padStart(2, '0')
+  const ss = String(d.getSeconds()).padStart(2, '0')
+  const ms = String(d.getMilliseconds()).padStart(3, '0')
+  return `${hh}:${mm}:${ss}:${ms}`
+}
+
 function pushBounded<T>(arr: T[], item: T, cap: number): T[] {
   const next = [...arr, item]
   if (next.length <= cap) return next
@@ -779,7 +789,7 @@ export function verificationTierLabel(tier: VerificationTier): string {
   }
 }
 
-export function projectEvent(evt: BridgedEvent): EventLogEntry {
+export function projectEvent(evt: BridgedEvent): Omit<EventLogEntry, 'ts'> {
   // v58 (H7-residual + GUI label-drift fix) — `kind` comes from the
   // BridgedEvent's `kind` field, which is sourced from Rust's
   // `SessionEvent::kind()` (canonical variant names). Pre-v58 this

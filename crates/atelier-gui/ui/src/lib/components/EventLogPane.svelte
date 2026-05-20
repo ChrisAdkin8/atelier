@@ -17,8 +17,9 @@
     <p class="empty">no events yet</p>
   {:else}
     <ul class="log-list">
-      {#each reversed as entry (entry.kind + entry.detail)}
+      {#each reversed as entry (entry.ts + entry.kind + entry.detail)}
         <li class="log-row">
+          <span class="ts">{entry.ts}</span>
           <span class="kind">{entry.kind}</span>
           {#if entry.detail}
             <span class="detail">{entry.detail}</span>
@@ -78,6 +79,12 @@
   }
   .log-row:last-child {
     border-bottom: none;
+  }
+  .ts {
+    color: var(--fg-dim);
+    white-space: nowrap;
+    flex-shrink: 0;
+    opacity: 0.7;
   }
   .kind {
     color: var(--accent-cyan);
