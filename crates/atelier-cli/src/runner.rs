@@ -2250,25 +2250,66 @@ impl Runner {
             // with a 400 `invalid_request_error` on stricter models
             // (Sonnet, Opus); permissive providers (Haiku 4.5) return
             // near-empty completions in a wedge until the turn cap.
-            // Both arms collapse to the same diagnosis: the agent has
-            // abandoned the §2 contract (every well-formed turn either
-            // makes progress via tool calls or terminates via
-            // `claimed_done`). Transition `Streaming → AwaitingUser`
-            // so the driver can decide whether to nudge, swap adapter,
-            // or abort — there's nothing the loop alone can do.
+            //
+            // v60.67 — distinguish two sub-cases:
+            //   • Previous message was NOT a tool result: the model had
+            //     a user turn to work on but chose neither to call tools
+            //     nor claim done. That's a genuine §2 violation → stall.
+            //   • Previous message WAS a tool result: the model just
+            //     received tool outputs and wrote a prose conclusion
+            //     without calling `harness_meta`. This is the common
+            //     wrap-up pattern after sub-agent turns. Treat it as an
+            //     implicit claimed_done so the conversation completes
+            //     naturally rather than blocking with a stall banner.
             if !made_tool_calls {
-                let _ = try_emit(
-                    &bus,
-                    Event::AgentStalled {
-                        turn: turn + 1,
-                        reason: "assistant turn produced no tool calls and no \
-                                 claimed_done=true; conversation cannot advance \
-                                 without a §2 protocol violation"
-                            .to_string(),
-                    },
-                );
-                advance(&session_handle, State::Streaming, State::AwaitingUser).await?;
-                final_state = State::AwaitingUser;
+                // v60.67 — distinguish wrap-up after sub-agents from a true
+                // stall. Walk backwards past the Tool block preceding the
+                // current Assistant turn; if every tool call in the preceding
+                // Assistant turn was `spawn_subagent`, the current prose is
+                // the natural task-completion summary — treat it as an
+                // implicit claimed_done. Any other tool mix (read_file,
+                // list_dir, …) means the model gathered info but didn't
+                // follow through, which is a genuine §2 stall.
+                let all_prev_were_subagent = {
+                    let n = messages.len();
+                    // messages[n-1] = current (just-pushed) Assistant.
+                    // Walk backwards from n-2 to find the start of the
+                    // contiguous Tool block.
+                    let mut tool_block_start = n.saturating_sub(1);
+                    while tool_block_start > 0 && messages[tool_block_start - 1].role == Role::Tool
+                    {
+                        tool_block_start -= 1;
+                    }
+                    // The Assistant turn that issued those tool calls sits at
+                    // tool_block_start - 1 (if any Tool messages were found).
+                    tool_block_start < n.saturating_sub(1)
+                        && tool_block_start > 0
+                        && messages[tool_block_start - 1].role == Role::Assistant
+                        && messages[tool_block_start - 1].tool_calls.iter().all(|tc| {
+                            tc.name == atelier_core::protocol_strategy::SPAWN_SUBAGENT_NAME
+                        })
+                };
+                if all_prev_were_subagent {
+                    // All prior tool calls were spawn_subagent: this prose is
+                    // the natural task-completion summary after delegation.
+                    advance(&session_handle, State::Streaming, State::Verifying).await?;
+                    final_state = State::Verifying;
+                } else {
+                    // True stall: no tool calls and the prior tool block (if
+                    // any) was not a sub-agent delegation.
+                    let _ = try_emit(
+                        &bus,
+                        Event::AgentStalled {
+                            turn: turn + 1,
+                            reason: "assistant turn produced no tool calls and no \
+                                     claimed_done=true; conversation cannot advance \
+                                     without a §2 protocol violation"
+                                .to_string(),
+                        },
+                    );
+                    advance(&session_handle, State::Streaming, State::AwaitingUser).await?;
+                    final_state = State::AwaitingUser;
+                }
                 break;
             }
         }

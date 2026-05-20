@@ -466,6 +466,71 @@ async fn run_stalls_on_second_turn_without_replaying_idle_to_streaming() {
     );
 }
 
+// v60.67: after all spawn_subagent tool calls complete, the model writes a
+// prose wrap-up without calling any further tools and without using
+// harness_meta. The runner must treat this as an implicit claimed_done
+// (transition to Verifying → Done) rather than firing AgentStalled.
+#[tokio::test]
+async fn subagent_wrap_up_prose_is_treated_as_implicit_completion() {
+    let workspace = tempfile::TempDir::new().unwrap();
+
+    // The real `spawn_subagent` built-in IS registered in the dispatcher.
+    // When the parent dispatches it, RunnerSpawner creates a child Runner
+    // that shares the same MockAdapter queue. We therefore need three
+    // responses: (0) parent turn 0 issues spawn_subagent, (1) the child
+    // runner consumes this and completes via harness_meta claimed_done,
+    // (2) parent turn 1 gets the wrap-up prose after the tool result.
+    let sa_call = ToolCallRequest {
+        id: "tc-sa-1".into(),
+        name: "spawn_subagent".into(),
+        arguments: serde_json::json!({"prompt": "do the thing", "subagent_type": "general-purpose", "description": "test"}),
+    };
+    let responses = vec![
+        // Parent turn 0: issues a spawn_subagent tool call.
+        MockResponse::new("I'll delegate this.", vec![sa_call]),
+        // Child turn 0: child agent completes cleanly with harness_meta.
+        MockResponse::new("done", vec![mock_envelope_tool_call(&envelope_done())]),
+        // Parent turn 1: receives spawn_subagent tool result, writes wrap-up
+        // prose — no tools, no harness_meta. Must NOT stall; must go to Verifying.
+        MockResponse::new("Both agents completed. The task is done.", vec![]),
+    ];
+
+    let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let runner = Runner::new(
+        workspace.path().to_path_buf(),
+        ProviderChoice::Mock { responses },
+        EventSink::Capture(events.clone()),
+    )
+    .expect("mock runner construction is infallible")
+    .with_max_turns(10);
+
+    let report = runner
+        .run("do a task".into())
+        .await
+        .expect("run must succeed");
+
+    assert!(
+        matches!(report.final_state, State::Done | State::Verifying),
+        "sub-agent wrap-up must complete (Done or Verifying), not {:?}",
+        report.final_state,
+    );
+    assert_eq!(
+        report.turns, 2,
+        "must use exactly 2 turns; got {}",
+        report.turns
+    );
+
+    let captured = events.lock();
+    let stall_count = captured
+        .iter()
+        .filter(|e| matches!(e, Event::AgentStalled { .. }))
+        .count();
+    assert_eq!(
+        stall_count, 0,
+        "no AgentStalled event expected; got {stall_count}"
+    );
+}
+
 // v60.8 A2 follow-on: the Runner now invokes
 // `SessionDispatcher::verify_pass` when the loop exits in
 // `State::Verifying`. A scripted Mock run with a `write_file` tool

@@ -24,6 +24,9 @@ use crate::protocol::{Envelope, EnvelopeError};
 /// Sentinel name advertised in every emission strategy. Mirrors the spec
 /// (`harness_meta` tool name, `<<<harness_meta>>>` sentinel tag).
 pub const HARNESS_META_NAME: &str = "harness_meta";
+/// Name of the built-in sub-agent delegation tool. Exported so the runner's
+/// stall guard can distinguish a sub-agent wrap-up turn from a genuine stall.
+pub const SPAWN_SUBAGENT_NAME: &str = "spawn_subagent";
 
 /// Opening / closing sentinels for [`Strategy::JsonSentinel`]. Picked so
 /// arbitrary model prose is exceedingly unlikely to contain them
