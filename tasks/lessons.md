@@ -6,6 +6,22 @@ This file is volatile — entries are pruned when the underlying class of mistak
 
 ---
 
+## v60.68 — CI fix lessons
+
+### Removing a function without grepping for its test leaves a ghost
+
+**Failure**: v60.59 deleted `is_safe_repo_relative` (only called from `submit_approval`, which was removed). The test `is_safe_repo_relative_accepts_normal_paths_rejects_escapes` was not removed. Every `cargo clippy` since has emitted `E0425 cannot find function`, failing the CI `rust` job on both macOS and Ubuntu.
+
+**Prevention**: before deleting any named item (function, struct, const, type alias), run `grep -rn "<name>"` across the whole workspace. If the only remaining hits are in `#[cfg(test)]` blocks or tests, either move the item into the test module with `#[cfg(test)]` (preferred — keep the regression guard) or delete both the item and the test together. Never leave call sites pointing at air.
+
+### `--out /dev/stdout` is not a portable alias for subprocess-captured stdout
+
+**Failure**: `test_runner_harness_smoke_all_tasks_emit_checks` passed `--out /dev/stdout` to the runner subprocess and then parsed `r.stdout`. `Path.write_text("/dev/stdout")` opens a fresh OS-level file descriptor. When `subprocess.run(..., capture_output=True)` replaces fd 1 with a pipe, the new fd may or may not be wired to the same pipe (behaviour varies by OS and Python version). On the CI macOS and Linux runners it was not, leaving `r.stdout = ''`.
+
+**Prevention**: any rig test that needs the runner's JSON output on stdout should invoke the runner *without* `--out` — the runner prints to `sys.stdout` (captured by `subprocess.PIPE` reliably) when no `--out` flag is given. Reserve `--out <path>` for tests that need the artifact on disk (e.g. nightly gate artifact commits). If a test genuinely needs both a file and captured stdout, use a temp file + read it back; do not use `/dev/stdout` as an alias.
+
+---
+
 ## v60.36–v60.38 — Deep-scan response
 
 ### Subagent stream-watchdog stalls on large-scope rust-reviewer tasks

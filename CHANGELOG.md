@@ -1,5 +1,18 @@
 # Atelier Spec — Changelog
 
+## v60.68 — 2026-05-20 (CI fix — clippy + rig test)
+
+Two pre-existing CI failures fixed; no spec-level behaviour changed.
+
+### `crates/atelier-gui/src/lib.rs`
+- Restored `is_safe_repo_relative` as `#[cfg(test)]`. The function was deleted in v60.59 when `submit_approval` was removed, but its test `is_safe_repo_relative_accepts_normal_paths_rejects_escapes` was left behind, causing `E0425 cannot find function` on every clippy run since. Marking `#[cfg(test)]` is the right shape: the function is a path-safety regression guard, not a production call site.
+
+### `tests/test_runner.py`
+- `test_runner_harness_smoke_all_tasks_emit_checks`: removed `--out /dev/stdout` from the runner invocation. `Path.write_text("/dev/stdout")` opens a fresh file descriptor that does not reach the `subprocess.PIPE` capture buffer on all CI environments, leaving `r.stdout` empty and causing a `JSONDecodeError`. Without `--out`, the runner falls through to `json.dump(payload, sys.stdout)`, which writes directly to the captured fd reliably on every platform.
+
+### `crates/atelier-gui/ui/src/lib/components/Composer.svelte`
+- Wrapped Send + Stop buttons in a `btn-group` flex div so the two buttons sit flush together and don't wrap when the hint text is long.
+
 ## v60.60 — 2026-05-19 (§10 R-7 — GUI sub-agent pane)
 
 Unblocks R-7 from `tasks/plan_section10_subagents_remaining.md`. Adds a Runner-backed `start_agent_run` Tauri command and a `SubagentPane` component so sub-agent events surface in the GUI.
