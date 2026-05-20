@@ -371,10 +371,12 @@
            to do; Memory reflects what it remembers long-term. The
            two are upstream of every other §5 surface so they
            share the highest-visibility column. -->
-      <div class="plan-stack">
+      <div class="plan-stack" class:has-subagents={app.subagents.length > 0}>
         <PlanPane planSteps={app.planSteps} />
         <MemoryPane cards={app.memoryCards} />
-        <SubagentPane subagents={app.subagents} />
+        {#if app.subagents.length > 0}
+          <SubagentPane subagents={app.subagents} />
+        {/if}
       </div>
     </div>
     <div class="pane-slot context-slot">
@@ -589,6 +591,11 @@
     gap: var(--gap-pane, 0.5rem);
     width: 100%;
     min-height: 0;
+  }
+  /* When sub-agents are running, add a third row capped at 10rem so
+     the sub-agent panel doesn't crowd out Plan and Memory. */
+  .plan-stack.has-subagents {
+    grid-template-rows: auto 1fr minmax(5rem, 10rem);
   }
   .context-stack {
     display: grid;
