@@ -1,5 +1,13 @@
 # Atelier Spec — Changelog
 
+## v60.71 — 2026-05-20 (CI fix — clippy dead_code + rig runner crash on missing command)
+
+### `crates/atelier-cli/src/runner.rs`
+- Added `#[allow(dead_code)]` to `with_executor_adapter`. The method is called from `main.rs` and `atelier-gui`, but `cargo clippy --all-targets` checks the integration test target which includes `runner.rs` via `#[path]` without those entry points, so clippy reported the method as unused.
+
+### `tests/workload/runner/runner.py`
+- `run_check` only caught `subprocess.TimeoutExpired` from `_run_with_pg_timeout`. When a check's command doesn't exist on PATH (e.g. the `atelier` binary on CI where the workspace hasn't been built), `subprocess.Popen` raised `FileNotFoundError` — an unhandled exception that crashed the runner before it could write any JSON to stdout, causing `test_runner_harness_smoke_all_tasks_emit_checks` to fail with `JSONDecodeError: Expecting value`. Added an `OSError` handler that returns a failed-check result with the OS error as the reason, matching the `TimeoutExpired` shape.
+
 ## v60.70 — 2026-05-20 (§1 performance — KV-cache prefix persistence + per-task model routing)
 
 Two performance improvements that reduce latency and token cost for local-model runs without any spec-level behaviour change.
