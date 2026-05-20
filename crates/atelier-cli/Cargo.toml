@@ -54,6 +54,9 @@ uuid = { workspace = true, features = ["v4"] }
 tokio-util = { workspace = true }
 # §10 — `RunnerSpawner` implements `SubagentSpawner` (an async_trait).
 async-trait = { workspace = true }
+# §10 — `join_all` for parallel tool dispatch when the turn contains
+# multiple tool calls (e.g. two concurrent spawn_subagent invocations).
+futures = { workspace = true }
 
 [dev-dependencies]
 assert_cmd = { workspace = true }

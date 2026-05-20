@@ -87,6 +87,12 @@ pub struct SessionState {
     pub pending_swaps: tokio::sync::Mutex<
         std::collections::HashMap<uuid::Uuid, tokio::sync::oneshot::Sender<SwapDecision>>,
     >,
+    /// Session UUID of the most-recently completed `start_agent_run`.
+    /// The next call to `start_agent_run` resumes from this session so
+    /// conversation history, plan, and memory carry over across Composer
+    /// submits. Cleared when the workspace changes (new session context).
+    /// Arc so the spawned async task can clone it without a raw-pointer hack.
+    pub active_session_id: Arc<std::sync::Mutex<Option<uuid::Uuid>>>,
 }
 
 /// v60.28 H2 follow-on — wire-format decision the renderer's consent
@@ -168,6 +174,7 @@ pub fn run() {
                 workspace_tempdir,
                 workspace_override,
                 pending_swaps: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+                active_session_id: Arc::new(std::sync::Mutex::new(None)),
             });
             Ok(())
         })
@@ -940,10 +947,9 @@ fn invoke_skill(
     };
     let expanded = atelier_core::skills::substitute(skill, &ctx)
         .map_err(|e| format!("skill `/{name}`: {e}"))?;
-    // Delegate to the same chat pipeline the Composer's plain Send
-    // uses. `start_chat_run` enforces the 1-in-flight guard + emits
-    // MessageCommitted{User} for the expanded body.
-    start_chat_run(app, state, expanded)
+    // Delegate to the Runner-backed path so sub-agents, tools, and §7
+    // verification are available during skill execution.
+    start_agent_run(app, state, expanded)
 }
 
 /// v60.10 §1 BYOM — build a fresh `Arc<dyn Adapter>` from a
@@ -1614,6 +1620,10 @@ fn set_workspace(state: tauri::State<'_, SessionState>, path: String) -> Result<
             .map_err(|e| format!("workspace_override mutex poisoned: {e}"))?;
         *guard = Some(canonical.clone());
     }
+    // New workspace → new conversation context; clear the resume pointer.
+    if let Ok(mut guard) = state.active_session_id.lock() {
+        *guard = None;
+    }
     if let Err(e) = persist_workspace(&canonical) {
         // Persistence failure is non-fatal — the swap is already in
         // effect; just warn so the user sees it via tracing.
@@ -2062,14 +2072,11 @@ fn start_chat_run(
             match stream.next().await {
                 Some(atelier_core::adapter::StreamChunk::Text { delta }) => {
                     chunk_count += 1;
-                    tracing::warn!(chunk = chunk_count, len = delta.len(), "stream text chunk");
-                    emit_event(
-                        &app_clone,
-                        &SessionEvent::AssistantTextDelta { delta },
-                    );
+                    tracing::debug!(chunk = chunk_count, len = delta.len(), "stream text chunk");
+                    emit_event(&app_clone, &SessionEvent::AssistantTextDelta { delta });
                 }
                 Some(atelier_core::adapter::StreamChunk::Complete { response }) => {
-                    tracing::warn!(chunks = chunk_count, "stream complete");
+                    tracing::debug!(chunks = chunk_count, "stream complete");
                     final_resp = Some(response);
                     break;
                 }
@@ -2084,7 +2091,7 @@ fn start_chat_run(
                     tracing::warn!(error = %error, "start_chat_run: mid-stream error");
                     return;
                 }
-                Some(_) => {} // ToolCall variants — not used in zero-tool chat mode
+                Some(_) => {}  // ToolCall variants — not used in zero-tool chat mode
                 None => break, // stream ended unexpectedly without Complete
             }
         }
@@ -2132,9 +2139,9 @@ fn start_chat_run(
                     Role::User => (
                         "user_attached",
                         "approx",
-                        resp.usage.prompt_tokens.saturating_sub(
-                            (msg.content.len() as u32 + 3) / 4,
-                        ),
+                        resp.usage
+                            .prompt_tokens
+                            .saturating_sub((msg.content.len() as u32 + 3) / 4),
                     ),
                     _ => ("initial", "approx", (msg.content.len() as u32 + 3) / 4),
                 };
@@ -2183,10 +2190,7 @@ fn start_chat_run(
                 token_source: "exact".to_string(),
                 pinned: false,
             });
-            emit_event(
-                &app_clone,
-                &SessionEvent::ContextItems { items },
-            );
+            emit_event(&app_clone, &SessionEvent::ContextItems { items });
         }
     });
     Ok(())
@@ -2258,6 +2262,10 @@ fn start_agent_run(
     let handle = state.dispatcher_handle.clone();
     let adapter_handle = state.adapter_handle.clone();
     let run_in_flight = state.run_in_flight.clone();
+    // Clone the Arc so the spawned task can write the new session UUID back
+    // without needing to hold a reference to `state` across an await point.
+    let session_id_arc = Arc::clone(&state.active_session_id);
+    let prior_session_id = session_id_arc.lock().ok().and_then(|g| *g);
 
     let app_clone = app.clone();
     let cb = Arc::new(move |evt: &SessionEvent| {
@@ -2278,21 +2286,51 @@ fn start_agent_run(
             return Err(format!("Runner::new failed: {e}"));
         }
     };
-    // with_adapter replaces the Mock adapter with the real one;
-    // with_adapter_handle enables mid-session swaps via `swap_adapter`.
+    // Resume from the prior session so conversation history, plan, and
+    // memory carry over across Composer submits.
+    let runner = if let Some(uuid) = prior_session_id {
+        runner.with_resume(uuid)
+    } else {
+        runner
+    };
     let runner = runner
         .with_adapter(adapter)
         .with_dispatcher_handle(handle)
         .with_adapter_handle(adapter_handle);
 
+    // Emit immediately so the frontend shows a spinner before the first
+    // real event (model probe can take 10-30s on a local model).
+    let _ = app.emit(
+        "atelier://event",
+        BridgedEvent {
+            kind: "RunStarted",
+            payload: serde_json::Value::Null,
+        },
+    );
+
+    let app_for_finish = app.clone();
     tauri::async_runtime::spawn(async move {
         let _cleanup = RunCleanup {
             in_flight: run_in_flight,
             workspace_to_remove: cleanup_workspace,
         };
-        if let Err(e) = runner.run(prompt).await {
-            tracing::warn!(error = %e, "agent run failed");
+        match runner.run(prompt).await {
+            Ok(report) => {
+                if let Ok(mut guard) = session_id_arc.lock() {
+                    *guard = Some(report.session_id.0);
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "agent run failed");
+            }
         }
+        let _ = app_for_finish.emit(
+            "atelier://event",
+            BridgedEvent {
+                kind: "RunFinished",
+                payload: serde_json::Value::Null,
+            },
+        );
     });
     Ok(())
 }

@@ -23,8 +23,7 @@ use atelier_core::{
         ContextItem, ContextItemId, ContextManager, Payload, Provenance, TokenCount, TokenSource,
     },
     dispatcher::{
-        ConcurrentEditPolicy, Dispatcher, SessionDispatcher, ShellHookExecutor, ToolContext,
-        ToolRegistry,
+        ConcurrentEditPolicy, Dispatcher, SessionDispatcher, ShellHookExecutor, ToolRegistry,
     },
     dod::DodConfig,
     file_watcher,
@@ -467,6 +466,11 @@ pub struct Runner {
     /// level). Threaded into `ToolContext::subagent_depth` so that
     /// nested `spawn_subagent` calls can enforce the depth cap.
     subagent_depth: u8,
+    /// §10 — pre-resolved `ModelProfile` injected by `RunnerSpawner`
+    /// into child runners. When `Some`, the probe block is bypassed and
+    /// this profile is used directly so children inherit the parent's
+    /// observed emission strategy without an extra model round-trip.
+    pinned_profile: Option<atelier_core::adapter::model_profile::ModelProfile>,
 }
 
 /// v60.10 §1 BYOM — record of a pending mid-session adapter swap that
@@ -674,6 +678,7 @@ impl Runner {
             external_cancel: None,
             skill_registry: None,
             subagent_depth: 0,
+            pinned_profile: None,
         })
     }
 
@@ -1022,6 +1027,20 @@ impl Runner {
         self
     }
 
+    /// Pass a pre-resolved `ModelProfile` from the parent runner so the
+    /// child runner skips the probe entirely and starts with the parent's
+    /// observed emission strategy. Without this, `ProbePolicy::Skip`
+    /// falls back to adapter capability defaults which may diverge from
+    /// what the actual probe measured (e.g. a model that claims
+    /// native-tool support but fails it).
+    pub fn with_model_profile(
+        mut self,
+        profile: atelier_core::adapter::model_profile::ModelProfile,
+    ) -> Self {
+        self.pinned_profile = Some(profile);
+        self
+    }
+
     /// v60.51 §15 — pre-turn slash-command expansion.
     ///
     /// Returns `(expanded_prompt, pending_skill_note)`:
@@ -1165,6 +1184,9 @@ impl Runner {
             None => session::spawn(Arc::new(NoopHook), Arc::new(NoopHook)),
         };
         let bus = session_handle.events_sender();
+        // Wire the parent bus into the spawner so SubagentSpawned /
+        // SubagentCompleted events reach the GUI/TUI sub-agent panel.
+        spawner.set_bus(bus.clone());
 
         // v61 — §14 per-session file watcher. The dispatcher feeds the
         // read-set after each `read_file` / `list_dir` / `grep` / `ast_grep`
@@ -1262,70 +1284,80 @@ impl Runner {
         //     start.
         let profile_now = now_rfc3339();
         let caps = self.adapter.capabilities();
-        let (profile, outcome) = match self.probe_policy {
-            ProbePolicy::Skip => {
-                let strategy = if caps.native_tool_use.is_usable() {
-                    atelier_core::protocol_strategy::Strategy::NativeTool
-                } else {
-                    atelier_core::protocol_strategy::Strategy::JsonSentinel
-                };
-                let p = atelier_core::adapter::model_profile::ModelProfile::skipped_for_well_known(
-                    self.adapter.model_id(),
-                    strategy,
-                    caps.context_window_tokens,
-                    atelier_core::adapter::model_profile::DEFAULT_PROFILE_MAX_TOKENS,
-                    profile_now.clone(),
-                );
-                (
-                    p,
-                    atelier_core::adapter::model_profile::ProbeLoadOutcome::CacheHit,
-                )
-            }
-            ProbePolicy::Auto | ProbePolicy::Force => {
-                let force = matches!(self.probe_policy, ProbePolicy::Force);
-                let store = atelier_core::adapter::model_profile::ProfileStore::user_default();
-                match store
-                    .load_or_probe(
-                        self.adapter.as_ref(),
-                        &self.probe_base_url,
-                        force,
-                        profile_now.clone(),
-                    )
-                    .await
-                {
-                    Ok((p, o)) => (p, o),
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "model probe failed; falling back to a default profile and \
-                             continuing with §1 conformance-tracker-driven strategy selection"
+        let (profile, outcome) = if let Some(pinned) = self.pinned_profile.clone() {
+            // Child runner: use parent's resolved profile so children
+            // inherit the observed emission strategy without re-probing.
+            (
+                pinned,
+                atelier_core::adapter::model_profile::ProbeLoadOutcome::CacheHit,
+            )
+        } else {
+            match self.probe_policy {
+                ProbePolicy::Skip => {
+                    let strategy = if caps.native_tool_use.is_usable() {
+                        atelier_core::protocol_strategy::Strategy::NativeTool
+                    } else {
+                        atelier_core::protocol_strategy::Strategy::JsonSentinel
+                    };
+                    let p =
+                        atelier_core::adapter::model_profile::ModelProfile::skipped_for_well_known(
+                            self.adapter.model_id(),
+                            strategy,
+                            caps.context_window_tokens,
+                            atelier_core::adapter::model_profile::DEFAULT_PROFILE_MAX_TOKENS,
+                            profile_now.clone(),
                         );
-                        let strategy = if caps.native_tool_use.is_usable() {
-                            atelier_core::protocol_strategy::Strategy::NativeTool
-                        } else {
-                            atelier_core::protocol_strategy::Strategy::JsonSentinel
-                        };
-                        let p = atelier_core::adapter::model_profile::ModelProfile::skipped_for_well_known(
+                    (
+                        p,
+                        atelier_core::adapter::model_profile::ProbeLoadOutcome::CacheHit,
+                    )
+                }
+                ProbePolicy::Auto | ProbePolicy::Force => {
+                    let force = matches!(self.probe_policy, ProbePolicy::Force);
+                    let store = atelier_core::adapter::model_profile::ProfileStore::user_default();
+                    match store
+                        .load_or_probe(
+                            self.adapter.as_ref(),
+                            &self.probe_base_url,
+                            force,
+                            profile_now.clone(),
+                        )
+                        .await
+                    {
+                        Ok((p, o)) => (p, o),
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "model probe failed; falling back to a default profile and \
+                                 continuing with §1 conformance-tracker-driven strategy selection"
+                            );
+                            let strategy = if caps.native_tool_use.is_usable() {
+                                atelier_core::protocol_strategy::Strategy::NativeTool
+                            } else {
+                                atelier_core::protocol_strategy::Strategy::JsonSentinel
+                            };
+                            let p = atelier_core::adapter::model_profile::ModelProfile::skipped_for_well_known(
                             self.adapter.model_id(),
                             strategy,
                             caps.context_window_tokens,
                             atelier_core::adapter::model_profile::DEFAULT_PROFILE_MAX_TOKENS,
                             profile_now,
                         );
-                        (
-                            p,
-                            atelier_core::adapter::model_profile::ProbeLoadOutcome::NotCached,
-                        )
+                            (
+                                p,
+                                atelier_core::adapter::model_profile::ProbeLoadOutcome::NotCached,
+                            )
+                        }
                     }
                 }
             }
-        };
-        // v60.7 §1 BYOM — build the capability matrix row for this
-        // model. The static lookup table covers the providers we
-        // already ship; unknown models fall back to the adapter's
-        // runtime `Capabilities` declaration. The probe cross-walk
-        // flips columns to `ClaimedButBroken` if the probe observed
-        // the model failing a capability the table claims.
+        }; // closes else branch / let binding
+           // v60.7 §1 BYOM — build the capability matrix row for this
+           // model. The static lookup table covers the providers we
+           // already ship; unknown models fall back to the adapter's
+           // runtime `Capabilities` declaration. The probe cross-walk
+           // flips columns to `ClaimedButBroken` if the probe observed
+           // the model failing a capability the table claims.
         let capability_row = {
             let base_row = atelier_core::adapter::capability_matrix::matrix_row_for(
                 self.adapter.model_id(),
@@ -1361,6 +1393,9 @@ impl Runner {
                 },
             );
         }
+        // Feed the resolved profile to the spawner so child sub-agents
+        // inherit the parent's observed emission strategy.
+        spawner.set_profile(profile.clone());
         // The profile recommends the starting §2 strategy; the
         // runtime conformance tracker downshifts it (one-way) if the
         // model emits malformed envelopes past the threshold. The
@@ -2072,32 +2107,36 @@ impl Runner {
                     State::ToolExecuting,
                 )
                 .await?;
-                let ctx = ToolContext {
-                    workspace_root: &workspace,
-                    sandbox: &sandbox,
-                    // tool_call_id is set per-call by Dispatcher::dispatch;
-                    // the value here is ignored.
-                    tool_call_id: None,
-                    audit_log_path: Some(audit_log_path.as_path()),
-                    // v60.29 H9 — session-rooted cancel token so a
-                    // SIGINT (`atelier-cli/src/main.rs`) can interrupt
-                    // a long-running tool. Deadline is the workspace
-                    // default; per-tool overrides flow through
-                    // `Tool::deadline_override` at dispatch time.
-                    cancel: session_handle.cancel_token(),
-                    deadline: atelier_core::dispatcher::DEFAULT_TOOL_DEADLINE,
-                    // §10 — depth from the runner; 0 for root, +1 per sub-agent level.
-                    subagent_depth: self.subagent_depth,
-                };
-                for call in real_tool_calls {
-                    let outcome = session_dispatcher.dispatch(&call, &ctx, now_rfc3339).await;
-                    // v60.8 A2 follow-on — harvest the per-file
-                    // `EditStaged` events so the §7 verify pass at
-                    // end-of-run has an `ObservedChange` per committed
-                    // path. Map `Hunks::Created`/`Deleted` directly;
-                    // every other variant collapses to `Modified`
-                    // (the staging layer only emits `Same`/`Lines`/
-                    // `Binary` for files that already existed).
+                // Dispatch all tool calls from this turn concurrently.
+                // When the model emits multiple spawn_subagent calls, they
+                // run in parallel rather than serially, giving N× throughput
+                // on independent sub-agent workloads. Outcomes are processed
+                // in the original call order so message history stays
+                // deterministic. One ToolContext per call: the dispatcher
+                // overrides tool_call_id internally so these are equivalent
+                // to the single shared ctx used in the old sequential path.
+                let ctxs: Vec<atelier_core::dispatcher::ToolContext<'_>> = real_tool_calls
+                    .iter()
+                    .map(|_| atelier_core::dispatcher::ToolContext {
+                        workspace_root: workspace.as_path(),
+                        sandbox: &sandbox,
+                        tool_call_id: None,
+                        audit_log_path: Some(audit_log_path.as_path()),
+                        cancel: session_handle.cancel_token(),
+                        deadline: atelier_core::dispatcher::DEFAULT_TOOL_DEADLINE,
+                        subagent_depth: self.subagent_depth,
+                    })
+                    .collect();
+                let outcomes = futures::future::join_all(
+                    real_tool_calls
+                        .iter()
+                        .zip(ctxs.iter())
+                        .map(|(call, ctx)| session_dispatcher.dispatch(call, ctx, now_rfc3339)),
+                )
+                .await;
+
+                for (_call, outcome) in real_tool_calls.into_iter().zip(outcomes) {
+                    // v60.8 A2 follow-on — harvest per-file EditStaged events.
                     for evt in &outcome.events {
                         if let Event::EditStaged { path, hunks } = evt {
                             let kind = match hunks {
@@ -2117,12 +2156,6 @@ impl Runner {
                             });
                         }
                     }
-                    // Feed the tool result back into the next turn's
-                    // messages so the adapter sees what happened.
-                    // v25.2-F: failure path uses serde_json::json! so an
-                    // error containing quotes/backslashes/newlines is
-                    // properly escaped. Pre-fix `format!("{{\"error\":\"{e}\"}}")`
-                    // produced invalid JSON when `e` contained `"`.
                     let result_str = match &outcome.result {
                         Ok(r) => serde_json::to_string(&r.output).unwrap_or_default(),
                         Err(e) => serde_json::json!({ "error": e.to_string() }).to_string(),

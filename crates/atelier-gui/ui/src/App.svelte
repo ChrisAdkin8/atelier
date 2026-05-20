@@ -35,6 +35,7 @@
   import MemoryPane from './lib/components/MemoryPane.svelte'
   import MentalModelPane from './lib/components/MentalModelPane.svelte'
   import SubagentPane from './lib/components/SubagentPane.svelte'
+  import EventLogPane from './lib/components/EventLogPane.svelte'
   import Composer from './lib/components/Composer.svelte'
   import ConcurrentEditModal from './lib/components/ConcurrentEditModal.svelte'
   import SwapConsentModal from './lib/components/SwapConsentModal.svelte'
@@ -94,11 +95,13 @@
     app.currentState !== '' &&
       app.currentState !== 'Idle' &&
       app.currentState !== 'Done' &&
-      app.currentState !== 'Failed',
+      app.currentState !== 'Failed' &&
+      app.currentState !== 'AwaitingUser',
   )
   // Composer is busy while either a run is in flight OR the bus
-  // listener hasn't subscribed yet.
-  let composerBusy = $derived(!listenerReady || runBusy)
+  // listener hasn't subscribed yet. `runInFlight` covers the dead zone
+  // before the first Transitioned event (model probe, session setup).
+  let composerBusy = $derived(!listenerReady || runBusy || app.runInFlight)
 
   onMount(async () => {
     unlisten = await listen<BridgedEvent>('atelier://event', (e) => {
@@ -128,6 +131,21 @@
       console.warn('list_provider_profiles failed; keeping inline fallback', err)
     }
   })
+
+  // Re-fetch provider profiles after the user sets a new workspace so
+  // the dropdown reflects the new workspace's providers.toml without a reload.
+  async function reloadProviderProfiles() {
+    try {
+      const opts = await invoke<SwapOption[]>('list_provider_profiles')
+      if (opts.length > 0) {
+        swapOptions = opts
+        const defaultIdx = opts.findIndex((o) => o.is_default)
+        if (defaultIdx >= 0) dropdownIndex = defaultIdx
+      }
+    } catch (err) {
+      console.warn('list_provider_profiles reload failed', err)
+    }
+  }
 
   // Phase C close — hydrate the mental-model panel on demand. The
   // dispatcher seeds an empty `MentalModel` per session; we read it
@@ -316,6 +334,7 @@
   <Header
     rightCollapsed={rightPanelCollapsed}
     onToggleRight={toggleRightPanel}
+    onWorkspaceSet={reloadProviderProfiles}
   />
 
   <!-- Phase C close — mental-model panel toggle. Lives in its own
@@ -359,9 +378,19 @@
       </div>
     </div>
     <div class="pane-slot context-slot">
-      <ContextPane items={app.contextItems} />
+      <div class="context-stack">
+        <ContextPane items={app.contextItems} />
+        <EventLogPane events={app.events} />
+      </div>
     </div>
   </main>
+
+  {#if app.runInFlight}
+    <div class="thinking-bar" role="status" aria-live="polite">
+      <span class="thinking-dot"></span>
+      thinking…
+    </div>
+  {/if}
 
   <Composer busy={composerBusy} />
 
@@ -419,6 +448,12 @@
     </span>
   </footer>
 
+  {#if app.stalledAt != null}
+    <div class="stall-banner" role="alert">
+      Model stalled — no tool calls or done signal. Type a follow-up or rephrase your request.
+    </div>
+  {/if}
+
   {#if app.concurrentEditModal}
     <ConcurrentEditModal
       paths={app.concurrentEditModal.paths}
@@ -455,6 +490,44 @@
   .app > :global(.grid) {
     flex: 1;
     min-height: 0;
+  }
+  .thinking-bar {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.2rem 1rem;
+    font-size: 0.7rem;
+    font-family: var(--font-mono);
+    color: var(--fg-dim);
+    background: var(--bg-pane);
+    border-bottom: 1px solid var(--border-pane);
+    flex-shrink: 0;
+  }
+  .thinking-dot {
+    display: inline-block;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--accent-cyan);
+    animation: pulse 1.2s ease-in-out infinite;
+  }
+  @keyframes pulse {
+    0%, 100% { opacity: 0.2; }
+    50% { opacity: 1; }
+  }
+  .stall-banner {
+    position: fixed;
+    bottom: 3rem;
+    left: 50%;
+    transform: translateX(-50%);
+    padding: 0.4rem 1rem;
+    background: var(--accent-amber, #c8a43a);
+    color: #1a1209;
+    font-size: 0.75rem;
+    font-family: var(--font-mono);
+    border-radius: 4px;
+    z-index: 200;
+    pointer-events: none;
   }
   .mental-model-toggle {
     display: flex;
@@ -544,6 +617,13 @@
   .plan-stack {
     display: grid;
     grid-template-rows: auto 1fr;
+    gap: var(--gap-pane, 0.5rem);
+    width: 100%;
+    min-height: 0;
+  }
+  .context-stack {
+    display: grid;
+    grid-template-rows: 1fr 1fr;
     gap: var(--gap-pane, 0.5rem);
     width: 100%;
     min-height: 0;

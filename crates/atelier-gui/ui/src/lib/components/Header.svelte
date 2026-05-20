@@ -15,8 +15,9 @@
   type Props = {
     rightCollapsed?: boolean
     onToggleRight?: () => void
+    onWorkspaceSet?: () => void
   }
-  let { rightCollapsed = false, onToggleRight }: Props = $props()
+  let { rightCollapsed = false, onToggleRight, onWorkspaceSet }: Props = $props()
 
   let workspacePath: string = $state('')
   let editing: boolean = $state(false)
@@ -53,6 +54,7 @@
       const resolved = await invoke<string>('set_workspace', { path: trimmed })
       workspacePath = resolved
       editing = false
+      onWorkspaceSet?.()
     } catch (e) {
       errorMsg = String(e)
     } finally {
@@ -86,6 +88,7 @@
       const resolved = await invoke<string>('set_workspace', { path: picked })
       workspacePath = resolved
       editing = false
+      onWorkspaceSet?.()
     } catch (e) {
       errorMsg = String(e)
     } finally {

@@ -1,14 +1,13 @@
 <script lang="ts">
-  // Prompt composer. v60.43: pure chat REPL. Routes the prompt
-  // through `start_chat_run` — a direct adapter.chat() call with no
-  // tools and no §3 staging plumbing. The model's reply lands in
-  // ConversationPane as a MessageCommitted event.
+  // Prompt composer. Non-slash path routes through `start_agent_run`
+  // (Runner-backed, full tools + sub-agent support). Slash path routes
+  // through `invoke_skill` which also calls `start_agent_run` after
+  // skill expansion. `start_chat_run` is no longer used here.
   //
   // v60.52 §15 — when the input starts with `/`, surface a transient
   // skill autocomplete menu. `Tab` accepts the highlighted match;
   // `Enter` (no Cmd/Ctrl) commits a complete `/<name> [args]` via
-  // `invoke_skill`. The non-slash path still goes through
-  // `start_chat_run`. `Esc` closes the menu without committing.
+  // `invoke_skill`. `Esc` closes the menu without committing.
 
   import { invoke } from '@tauri-apps/api/core'
   import { onMount } from 'svelte'
@@ -105,7 +104,7 @@
       if (slash) {
         await invoke('invoke_skill', { name: slash.name, args: slash.args })
       } else {
-        await invoke('start_chat_run', { prompt: trimmed })
+        await invoke('start_agent_run', { prompt: trimmed })
       }
       prompt = ''
     } catch (e) {

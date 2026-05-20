@@ -301,6 +301,13 @@ export type AppState = {
   /// §10 sub-agent panel rows. Populated by SubagentSpawned, updated by
   /// SubagentTurnAdvanced / SubagentCompleted / SubagentCancelled events.
   subagents: SubagentEntry[]
+  /// AgentStalled timestamp (ms since epoch). Non-null while the runner is
+  /// waiting for the user to nudge after the model replied without tool calls
+  /// or a claimed_done envelope. Cleared when the user submits the next turn.
+  stalledAt: number | null
+  /// True from RunStarted until RunFinished. Covers the dead zone before the
+  /// first real event arrives (model probe, session setup, etc.).
+  runInFlight: boolean
 }
 
 export function initialState(): AppState {
@@ -324,6 +331,8 @@ export function initialState(): AppState {
     verificationStatus: initialVerificationStatus(),
     lastOverflowResolution: null,
     subagents: [],
+    stalledAt: null,
+    runInFlight: false,
   }
 }
 
@@ -387,7 +396,9 @@ export function applyEvent(state: AppState, evt: BridgedEvent): AppState {
       const lastTurnTokens = role === 'user'
         ? { prompt: 0, completion: 0, cached: 0 }
         : state.lastTurnTokens
-      return { ...state, events, conversation, streamingAssistant, lastTurnTokens }
+      // A new user turn clears the stalled banner.
+      const stalledAt = role === 'user' ? null : state.stalledAt
+      return { ...state, events, conversation, streamingAssistant, lastTurnTokens, stalledAt }
     }
     case 'AssistantTextDelta': {
       const p = evt.payload as { delta: string }
@@ -659,6 +670,14 @@ export function applyEvent(state: AppState, evt: BridgedEvent): AppState {
       )
       return { ...state, events, subagents }
     }
+    case 'AgentStalled':
+      // Model replied without tool calls or a claimed_done envelope —
+      // runner is waiting for user input. Surface a banner.
+      return { ...state, events, stalledAt: Date.now() }
+    case 'RunStarted':
+      return { ...state, events, runInFlight: true }
+    case 'RunFinished':
+      return { ...state, events, runInFlight: false }
     // Variants we don't fold into pane state — just the event log.
     case 'IllegalTransitionAttempted':
     case 'Cancelled':
@@ -958,6 +977,14 @@ export function projectEvent(evt: BridgedEvent): EventLogEntry {
       const p = evt.payload as { id?: string; reason?: string }
       return { kind, detail: `[${p.id ?? '?'}] cancelled: ${p.reason ?? '?'}` }
     }
+    case 'AgentStalled': {
+      const p = evt.payload as { turn?: number; reason?: string }
+      return { kind, detail: `turn ${p.turn ?? '?'}: ${p.reason ?? 'no tool calls or claimed_done'}` }
+    }
+    case 'RunStarted':
+      return { kind, detail: 'runner starting…' }
+    case 'RunFinished':
+      return { kind, detail: 'runner done' }
     default:
       return { kind, detail: '' }
   }

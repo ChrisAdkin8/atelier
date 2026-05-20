@@ -804,6 +804,8 @@ impl AppState {
                 }
             }
             SessionEvent::SubagentToolCall { .. } => {}
+            // TUI renders committed messages only; streaming deltas are no-ops.
+            SessionEvent::AssistantTextDelta { .. } => {}
             SessionEvent::SubagentCompleted {
                 ref id,
                 ref status,
@@ -1167,6 +1169,7 @@ pub fn project_event(evt: &SessionEvent) -> EventLine {
         SessionEvent::SubagentCancelled { id, reason } => {
             format!("[subagent] {id} cancelled: {reason}")
         }
+        SessionEvent::AssistantTextDelta { .. } => String::new(),
     };
     EventLine { kind, detail }
 }

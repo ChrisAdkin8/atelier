@@ -28,6 +28,9 @@ use parking_lot::Mutex;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use atelier_core::adapter::model_profile::ModelProfile;
+use atelier_core::session::{try_emit, Event as SessionEvent};
+use atelier_core::state::State as ActorState;
 use atelier_core::subagents::{
     CancelError, SpawnError, SpawnRequest, SubagentCost, SubagentId, SubagentResult,
     SubagentSpawner, SubagentStatus, SubagentTypeRegistry,
@@ -70,6 +73,14 @@ pub struct RunnerSpawner {
     /// Completed sub-agent records keyed by sub-agent ID string. Drained by
     /// the parent runner after each `run()` to persist into `session.json`.
     completed: Mutex<Vec<CompletedSubagentRecord>>,
+    /// Parent event bus. Set after the session is spawned via `set_bus`.
+    /// Used to emit SubagentSpawned / SubagentCompleted on the parent's bus
+    /// so GUIs and TUIs can update their sub-agent panels in real time.
+    bus_slot: Mutex<Option<tokio::sync::broadcast::Sender<SessionEvent>>>,
+    /// Resolved model profile from the parent's probe. Set by `Runner::run`
+    /// immediately after the probe completes so child runners can inherit
+    /// the parent's observed emission strategy without re-probing.
+    profile_slot: Mutex<Option<ModelProfile>>,
 }
 
 impl RunnerSpawner {
@@ -84,6 +95,28 @@ impl RunnerSpawner {
             _type_registry: type_registry,
             in_flight: Mutex::new(HashMap::new()),
             completed: Mutex::new(Vec::new()),
+            bus_slot: Mutex::new(None),
+            profile_slot: Mutex::new(None),
+        }
+    }
+
+    /// Wire the parent session's broadcast sender so lifecycle events
+    /// (SubagentSpawned, SubagentCompleted, SubagentCancelled) are visible
+    /// on the parent's bus. Called by `Runner::run` immediately after the
+    /// session actor is spawned.
+    pub fn set_bus(&self, bus: tokio::sync::broadcast::Sender<SessionEvent>) {
+        *self.bus_slot.lock() = Some(bus);
+    }
+
+    /// Store the parent's resolved `ModelProfile` so child runners can
+    /// inherit it. Called by `Runner::run` right after the probe completes.
+    pub fn set_profile(&self, profile: ModelProfile) {
+        *self.profile_slot.lock() = Some(profile);
+    }
+
+    fn emit_on_parent(&self, ev: SessionEvent) {
+        if let Some(bus) = self.bus_slot.lock().as_ref() {
+            let _ = try_emit(bus, ev);
         }
     }
 }
@@ -112,27 +145,71 @@ impl SubagentSpawner for RunnerSpawner {
         let user_prompt = req.prompt.clone();
         let max_turns = req.effective_max_turns() as usize;
 
-        // Build the child runner. We use `with_adapter_for_test` here
-        // rather than going through the provider-choice path because the
-        // parent has already selected and initialised the adapter — the
-        // sub-agent should use the same (or a type-manifest-overridden)
-        // provider. For the v1 cut we always inherit the parent adapter.
+        // Build an EventSink for the child runner that forwards turn-progress
+        // events (SubagentTurnAdvanced, SubagentToolCall) to the parent bus
+        // so GUIs/TUIs can show what the sub-agent is doing in real time.
+        let child_sink = {
+            let id_str = subagent_id.0.to_string();
+            let mt = max_turns as u32;
+            match self.bus_slot.lock().clone() {
+                Some(parent_bus) => {
+                    let turn_ctr = Arc::new(std::sync::atomic::AtomicU32::new(0));
+                    EventSink::Callback(Arc::new(move |ev: &SessionEvent| match ev {
+                        SessionEvent::Transitioned { to, .. } if *to == ActorState::Streaming => {
+                            let t = turn_ctr.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                            let _ = try_emit(
+                                &parent_bus,
+                                SessionEvent::SubagentTurnAdvanced {
+                                    id: id_str.clone(),
+                                    turn: t,
+                                    max_turns: mt,
+                                },
+                            );
+                        }
+                        SessionEvent::Transitioned { to, .. }
+                            if *to == ActorState::ToolDispatching =>
+                        {
+                            let _ = try_emit(
+                                &parent_bus,
+                                SessionEvent::SubagentToolCall {
+                                    id: id_str.clone(),
+                                    tool: String::from("dispatching"),
+                                },
+                            );
+                        }
+                        _ => {}
+                    }))
+                }
+                None => EventSink::Null,
+            }
+        };
+
+        // Build the child runner. We use `with_adapter` (not the provider-
+        // choice path) because the parent has already selected and
+        // initialised the adapter — the sub-agent shares it. We also
+        // inherit the parent's resolved ModelProfile so the child starts
+        // with the correct emission strategy without an extra probe call.
+        let pinned_profile = self.profile_slot.lock().clone();
         let child_runner = {
-            // We can't use Runner::new (needs ProviderChoice + credentials).
-            // The `with_adapter_for_test` builder exists exactly for
-            // scenarios where the adapter is pre-built.
             let dummy = Runner::new(
                 self.workspace.clone(),
                 ProviderChoice::Mock { responses: vec![] },
-                EventSink::Null,
+                child_sink,
             )
             .map_err(|e| SpawnError::Internal(e.to_string()))?;
 
-            dummy
+            let r = dummy
                 .with_adapter(self.adapter.clone())
+                .with_probe_policy(crate::runner::ProbePolicy::Skip)
                 .with_max_turns(max_turns)
                 .with_external_cancel(child_cancel.clone())
-                .with_subagent_depth(depth)
+                .with_subagent_depth(depth);
+
+            if let Some(profile) = pinned_profile {
+                r.with_model_profile(profile)
+            } else {
+                r
+            }
         };
 
         // Prepend the system_prompt_addendum as a prefix to the user prompt
@@ -144,6 +221,15 @@ impl SubagentSpawner for RunnerSpawner {
         } else {
             format!("[System instruction]\n{addendum}\n\n{user_prompt}")
         };
+
+        // Emit on the parent bus so GUIs/TUIs update their sub-agent panel.
+        self.emit_on_parent(SessionEvent::SubagentSpawned {
+            id: subagent_id.0.to_string(),
+            parent_id: String::new(), // root runner has no persisted parent id
+            subagent_type: type_name.clone(),
+            description: description.clone(),
+            max_turns: max_turns as u32,
+        });
 
         let id = subagent_id.clone();
         let handle: JoinHandle<SubagentResult> = tokio::spawn(async move {
@@ -187,6 +273,11 @@ impl SubagentSpawner for RunnerSpawner {
         };
 
         let finished_at = now_rfc3339();
+        self.emit_on_parent(SessionEvent::SubagentCompleted {
+            id: result.id.0.to_string(),
+            status: result.status.clone(),
+            turns_used: result.turns_used,
+        });
         // Record for the parent runner to persist in session.json.
         self.completed.lock().push(CompletedSubagentRecord {
             description,
@@ -205,8 +296,11 @@ impl SubagentSpawner for RunnerSpawner {
         match entry {
             Some(entry) => {
                 entry.cancel.cancel();
-                // Abort the task so the JoinHandle is dropped and memory freed.
                 entry.handle.abort();
+                self.emit_on_parent(SessionEvent::SubagentCancelled {
+                    id: id.0.to_string(),
+                    reason: "cancelled by parent".to_string(),
+                });
                 Ok(())
             }
             None => Err(CancelError::NotFound(id.clone())),
@@ -214,7 +308,12 @@ impl SubagentSpawner for RunnerSpawner {
     }
 
     async fn wait_all(&self, _parent_id: &SubagentId) {
-        // Collect all in-flight handles, draining the map.
+        // Spec correctness: drain any in-flight sub-agents not yet
+        // awaited. In the current inline-await flow (spawn() awaits the
+        // child handle before returning to the caller), the map is
+        // already empty by the time the parent runner calls this before
+        // its §7 gate. The drain is a safety net for future
+        // fire-and-forget paths.
         let entries: Vec<InFlight> = self.in_flight.lock().drain().map(|(_, v)| v).collect();
         for entry in entries {
             let _ = entry.handle.await;

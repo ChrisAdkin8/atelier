@@ -117,6 +117,7 @@ dependencies = [
  "async-trait",
  "atelier-cli",
  "atelier-core",
+ "futures",
  "parking_lot",
  "predicates",
  "serde",

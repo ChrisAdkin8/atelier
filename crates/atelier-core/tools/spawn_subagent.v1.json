@@ -88,5 +88,6 @@
       }
     }
   },
+  "deadline_ms": 600000,
   "implementation": {"kind": "builtin"}
 }
