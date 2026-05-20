@@ -1,8 +1,21 @@
 # Atelier Spec — Changelog
 
-## v60.71 — 2026-05-20 (Phase B §7 — LSP live receiver end-to-end: U07–U11)
+## v60.71 — 2026-05-20 (Phase B §7 LSP live receiver + §15 TUI slash-completion: U03–U11)
 
-Closes the Tier-1 LSP hallucination-detection path. The data layer (`DiagnosticInput`, `map_diagnostic_to_discrepancy`) and pure-function TypeScript mapper (v60.25–v60.27) are now backed by a running `typescript-language-server` child process.
+Closes the Tier-1 LSP hallucination-detection path and wires the TUI §15 slash-completion run-loop.
+
+### U03–U06 — TUI §15 slash-completion run-loop wiring
+
+`crates/atelier-tui/src/lib.rs` only.
+
+- `InputMode::SlashInput { state: SlashState }` variant added alongside the existing `LspInstallConfirm` (added in U10).
+- `handle_key` intercepts `/` in Normal mode → `InputOutcome::EnterSlashInput`; routes Esc/Enter/Tab/Backspace/Up/Down/Char through `InputOutcome::SlashApply(SlashEvent)`.
+- `render_slash_popup` overlays a cyan-bordered block (up to 5 matches, selected row reversed) just above the footer whenever `SlashInput` is active and has matches.
+- `render_help` shows the current buffer + match-count + navigation hints (`↑/↓ navigate · Tab accept · Enter commit · Esc cancel`) as the footer line while `SlashInput` is active.
+- Run-loop: `EnterSlashInput` loads `SkillRegistry` from default paths; `SlashApply(SlashOutcome::Commit { raw })` pushes the expanded prompt as a User conversation line + event log entry.
+- 3 new tests: `slash_completion_tests::tui_slash_completion_tab_selects_skill`, `::tui_slash_completion_renders_popup_when_active`, `::tui_slash_completion_integration_smoke_tab_expands_r_skill`.
+
+ The data layer (`DiagnosticInput`, `map_diagnostic_to_discrepancy`) and pure-function TypeScript mapper (v60.25–v60.27) are now backed by a running `typescript-language-server` child process.
 
 ### U07 — `LspSession` (async-lsp 0.2 receiver)
 

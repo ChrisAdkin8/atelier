@@ -22,6 +22,16 @@ This file is volatile — entries are pruned when the underlying class of mistak
 
 ---
 
+## v60.71 — Parallel worktrees touching the same file
+
+### When two parallel agents modify the same file, a three-way merge is needed before committing
+
+**Failure**: spawned U03–U06 (TUI slash completion) and U07–U12 (LSP live receiver) as concurrent agents with `isolation: "worktree"`. Both modified `crates/atelier-tui/src/lib.rs` in different sections. Naively copying one worktree's file over the other would silently drop one set of changes.
+
+**Prevention**: when parallel worktrees touch the same file, resolve by running `git merge-file -p <ours> <base> <theirs> > merged`. Check for conflict markers (`grep -c '<<<<<<<' merged`); resolve any conflicts (in this case all three were "both sides added new enum variants at the same insertion point" — take both). Copy the merged result into the main repo. Verify with the full test suite before committing. The pattern: base = `git show HEAD:<path>`, ours = one worktree's copy, theirs = the other.
+
+---
+
 ## v60.36–v60.38 — Deep-scan response
 
 ### Subagent stream-watchdog stalls on large-scope rust-reviewer tasks
