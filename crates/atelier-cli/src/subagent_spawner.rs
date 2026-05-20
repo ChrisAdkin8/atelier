@@ -48,7 +48,11 @@ use crate::runner::{EventSink, ProviderChoice, RunReport, Runner};
 
 struct InFlight {
     cancel: CancellationToken,
-    handle: JoinHandle<SubagentResult>,
+    /// Abort handle for the spawned task. Kept separate from the JoinHandle
+    /// so the JoinHandle can live locally in `spawn()` and be awaited there
+    /// while this entry remains in the map — making `cancel()` functional
+    /// for the entire duration of the child's run.
+    abort: tokio::task::AbortHandle,
 }
 
 // ---------- RunnerSpawner ----------
@@ -249,31 +253,36 @@ impl SubagentSpawner for RunnerSpawner {
             }
         });
 
-        // Register in-flight before awaiting so cancel can find it.
+        // Register in-flight BEFORE awaiting the handle. The entry stays in
+        // the map for the entire duration of the child's run so `cancel()` can
+        // find and trip it at any point. (Previously the entry was removed
+        // immediately after insertion, making `cancel()` always return
+        // NotFound during the await.)
         self.in_flight.lock().insert(
             subagent_id.clone(),
             InFlight {
                 cancel: child_cancel,
-                handle,
+                abort: handle.abort_handle(),
             },
         );
 
         // Await completion inline (spec: tool returns only once sub-agent done).
-        let entry = self.in_flight.lock().remove(&subagent_id);
-        let result = if let Some(entry) = entry {
-            entry
-                .handle
-                .await
-                .map_err(|e| SpawnError::Internal(e.to_string()))?
-        } else {
-            // Was already removed by a concurrent cancel — return cancelled.
-            SubagentResult {
+        let join_result = handle.await;
+
+        // Remove entry now that the task is finished (or was already removed by
+        // a concurrent cancel(), in which case remove() is a no-op).
+        self.in_flight.lock().remove(&subagent_id);
+
+        let result = match join_result {
+            Ok(r) => r,
+            Err(e) if e.is_cancelled() => SubagentResult {
                 id: subagent_id,
                 result: String::new(),
                 status: SubagentStatus::Cancelled,
                 turns_used: 0,
                 cost: SubagentCost::default(),
-            }
+            },
+            Err(e) => return Err(SpawnError::Internal(e.to_string())),
         };
 
         let finished_at = now_rfc3339();
@@ -300,7 +309,7 @@ impl SubagentSpawner for RunnerSpawner {
         match entry {
             Some(entry) => {
                 entry.cancel.cancel();
-                entry.handle.abort();
+                entry.abort.abort();
                 self.emit_on_parent(SessionEvent::SubagentCancelled {
                     id: id.0.to_string(),
                     reason: "cancelled by parent".to_string(),
@@ -312,15 +321,16 @@ impl SubagentSpawner for RunnerSpawner {
     }
 
     async fn wait_all(&self, _parent_id: &SubagentId) {
-        // Spec correctness: drain any in-flight sub-agents not yet
-        // awaited. In the current inline-await flow (spawn() awaits the
-        // child handle before returning to the caller), the map is
-        // already empty by the time the parent runner calls this before
-        // its §7 gate. The drain is a safety net for future
-        // fire-and-forget paths.
+        // Spec correctness: drain any in-flight sub-agents not yet awaited.
+        // In the current inline-await flow (spawn() awaits the child handle
+        // before returning to the caller and then removes its entry), the map
+        // is already empty by the time the parent runner calls this before its
+        // §7 gate. Drain and abort any entries that remain — this is a safety
+        // net for future fire-and-forget paths; the JoinHandles are local to
+        // each spawn() call so we can only abort here.
         let entries: Vec<InFlight> = self.in_flight.lock().drain().map(|(_, v)| v).collect();
         for entry in entries {
-            let _ = entry.handle.await;
+            entry.abort.abort();
         }
     }
 }

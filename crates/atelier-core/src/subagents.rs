@@ -18,7 +18,7 @@
 //!
 //! ## Spec constants (PROVISIONAL — §10 line 521, line 556)
 //!
-//!   - [`DEFAULT_MAX_TURNS`] = 25
+//!   - [`DEFAULT_MAX_TURNS`] = 10  (lowered from spec's 25 to bound local-LLM wall-clock)
 //!   - [`RECURSION_DEPTH_CAP`] = 3
 //!   - [`BUS_FANOUT_FACTOR`] = 4  (1 + RECURSION_DEPTH_CAP)
 
@@ -38,7 +38,9 @@ use crate::dispatcher::SideEffectClass;
 
 /// PROVISIONAL — spec §10 line 521. Default turn cap when neither the
 /// sub-agent type manifest nor the `spawn_subagent` invocation specifies one.
-pub const DEFAULT_MAX_TURNS: u32 = 25;
+/// Kept low (10) so a two-child fan-out against a single-slot local LLM stays
+/// under ~5 min worst-case rather than the 20+ min a 25-turn cap would allow.
+pub const DEFAULT_MAX_TURNS: u32 = 10;
 
 /// PROVISIONAL — spec §10 line 556. Maximum recursion depth; attempts beyond
 /// this return `ToolError::SchemaViolation`.
@@ -555,7 +557,10 @@ mod tests {
 
     #[test]
     fn constants_match_spec() {
-        assert_eq!(DEFAULT_MAX_TURNS, 25);
+        // PROVISIONAL §10 — intentionally lowered from 25 to 10 to cap
+        // wall-clock on single-slot local LLMs (two child fan-out × 10 turns
+        // is ~5 min worst-case vs 20+ min at 25).
+        assert_eq!(DEFAULT_MAX_TURNS, 10);
         assert_eq!(RECURSION_DEPTH_CAP, 3);
         assert_eq!(BUS_FANOUT_FACTOR, 4);
     }

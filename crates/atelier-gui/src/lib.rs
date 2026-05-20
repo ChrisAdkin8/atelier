@@ -1960,6 +1960,46 @@ fn resolve_default_adapter(
     build_swap_adapter(wire)
 }
 
+/// Extract `host:port` from an HTTP/HTTPS base URL for TCP reachability checks.
+fn extract_host_port(base_url: &str) -> Option<String> {
+    let rest = base_url
+        .strip_prefix("https://")
+        .or_else(|| base_url.strip_prefix("http://"))?;
+    let host_port = rest.split('/').next()?;
+    if host_port.is_empty() {
+        return None;
+    }
+    if host_port.contains(':') {
+        Some(host_port.to_string())
+    } else {
+        let default_port = if base_url.starts_with("https://") {
+            "443"
+        } else {
+            "80"
+        };
+        Some(format!("{host_port}:{default_port}"))
+    }
+}
+
+/// Returns `true` when the host:port in `base_url` accepts a TCP connection
+/// within 1 second. Optimistically returns `true` if the URL can't be parsed.
+fn preflight_base_url(base_url: &str) -> bool {
+    use std::net::ToSocketAddrs;
+    let Some(addr_str) = extract_host_port(base_url) else {
+        return true;
+    };
+    let addrs: Vec<_> = match addr_str.to_socket_addrs() {
+        Ok(a) => a.collect(),
+        Err(_) => return true,
+    };
+    for sa in addrs {
+        if std::net::TcpStream::connect_timeout(&sa, std::time::Duration::from_secs(1)).is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
 /// §1 per-task routing — build the executor adapter from the profile
 /// named in `[routing].executor`. Returns `None` when routing is not
 /// configured; returns `Err` if the profile exists but is misconfigured.
@@ -2001,6 +2041,12 @@ fn resolve_executor_adapter(
                 std::env::var("OPENAI_BASE_URL")
                     .unwrap_or_else(|_| "https://api.openai.com/v1".to_string())
             });
+            if !preflight_base_url(&base) {
+                return Err(format!(
+                    "executor profile {name:?}: server at {base:?} is unreachable \
+                     (TCP connect timed out); skipping executor adapter"
+                ));
+            }
             let mut a = OpenAiCompatAdapter::new(api_key, model, base);
             if prof.cache_prompt.unwrap_or(false) {
                 a = a.with_cache_prompt(true);

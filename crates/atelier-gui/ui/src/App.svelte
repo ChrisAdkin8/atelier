@@ -387,7 +387,11 @@
     </div>
   </main>
 
-  <Composer busy={composerBusy} thinking={app.runInFlight} />
+  <Composer
+    busy={composerBusy}
+    thinking={app.runInFlight}
+    activeSubagents={app.subagents.filter((s) => s.status === 'running')}
+  />
 
   <footer class="help">
     <!-- Left column: context window usage + cost. -->

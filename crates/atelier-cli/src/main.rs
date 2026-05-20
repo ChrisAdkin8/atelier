@@ -1344,6 +1344,46 @@ fn resolve_probe_policy(cli: &CliArgs, config: &ProvidersConfig) -> Option<runne
         })
 }
 
+/// Extract `host:port` from an HTTP/HTTPS base URL for TCP reachability checks.
+fn extract_host_port(base_url: &str) -> Option<String> {
+    let rest = base_url
+        .strip_prefix("https://")
+        .or_else(|| base_url.strip_prefix("http://"))?;
+    let host_port = rest.split('/').next()?;
+    if host_port.is_empty() {
+        return None;
+    }
+    if host_port.contains(':') {
+        Some(host_port.to_string())
+    } else {
+        let default_port = if base_url.starts_with("https://") {
+            "443"
+        } else {
+            "80"
+        };
+        Some(format!("{host_port}:{default_port}"))
+    }
+}
+
+/// Returns `true` when the host:port in `base_url` accepts a TCP connection
+/// within 1 second. Optimistically returns `true` if the URL can't be parsed.
+fn preflight_base_url(base_url: &str) -> bool {
+    use std::net::ToSocketAddrs;
+    let Some(addr_str) = extract_host_port(base_url) else {
+        return true;
+    };
+    let addrs: Vec<_> = match addr_str.to_socket_addrs() {
+        Ok(a) => a.collect(),
+        Err(_) => return true,
+    };
+    for sa in addrs {
+        if std::net::TcpStream::connect_timeout(&sa, std::time::Duration::from_secs(1)).is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
 /// Build an executor adapter from a named profile in `config`. Used for
 /// §1 per-task routing. Errors are non-fatal — the caller logs a warning
 /// and falls back to the single-adapter path.
@@ -1365,6 +1405,12 @@ fn build_executor_adapter(
     match kind {
         ProviderKind::OpenaiCompat => {
             let base_url = profile.base_url.clone().unwrap_or_default();
+            if !preflight_base_url(&base_url) {
+                return Err(format!(
+                    "executor profile {profile_name:?}: server at {base_url:?} is unreachable \
+                     (TCP connect timed out); skipping executor adapter"
+                ));
+            }
             let api_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
             let mut adapter = atelier_core::adapter::openai_compat::OpenAiCompatAdapter::new(
                 api_key, model_id, base_url,

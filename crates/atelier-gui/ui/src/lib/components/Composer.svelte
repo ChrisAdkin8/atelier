@@ -12,12 +12,22 @@
   import { invoke } from '@tauri-apps/api/core'
   import { onMount } from 'svelte'
 
+  type SubagentEntry = {
+    id: string
+    subagentType: string
+    description: string
+    status: string
+    turn: number
+    maxTurns: number
+  }
+
   type Props = {
     busy: boolean
     thinking: boolean
+    activeSubagents?: SubagentEntry[]
   }
 
-  let { busy, thinking }: Props = $props()
+  let { busy, thinking, activeSubagents = [] }: Props = $props()
 
   type SkillEntry = {
     name: string
@@ -221,6 +231,15 @@
       {/if}
     </div>
   </div>
+  {#if activeSubagents.length > 0}
+    <div class="subagent-status">
+      {#each activeSubagents as sa}
+        <span class="sa-row">
+          sub-agent ({sa.subagentType}): turn {sa.turn}/{sa.maxTurns}
+        </span>
+      {/each}
+    </div>
+  {/if}
   {#if error}
     <p class="error">{error}</p>
   {/if}
@@ -354,5 +373,19 @@
     color: var(--accent-red);
     font-size: 0.75rem;
     font-family: var(--font-mono);
+  }
+  .subagent-status {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+  }
+  .sa-row {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    color: var(--accent-cyan);
+    background: var(--bg-pane-alt);
+    border: 1px solid var(--border-pane-strong);
+    border-radius: 3px;
+    padding: 0.1rem 0.4rem;
   }
 </style>
