@@ -184,6 +184,14 @@ def run_check(check, workdir, fixture_src):
             "exit_code": None,
             "reason": f"check command timed out after {DEFAULT_TEST_COMMAND_TIMEOUT_S}s",
         }
+    except OSError as e:
+        return {
+            "name": name,
+            "ok": False,
+            "kind": "command",
+            "exit_code": None,
+            "reason": f"check command not found or unrunnable: {e}",
+        }
     rc = result.returncode
     failures = []
     if "exit_code" in expect and rc != expect["exit_code"]:

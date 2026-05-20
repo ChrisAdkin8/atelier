@@ -698,6 +698,12 @@ impl Runner {
     /// `Role::Tool` use this adapter instead of the primary one. Lets
     /// a small local model handle follow-through tool calls while the
     /// primary (larger) model handles planning / user-facing turns.
+    ///
+    /// `#[allow(dead_code)]`: called from `main.rs` and `atelier-gui`
+    /// which are binary / cdylib crates; the integration test target
+    /// includes this file via `#[path]` without those entry points,
+    /// so clippy --all-targets sees it as unused from the test's POV.
+    #[allow(dead_code)]
     pub fn with_executor_adapter(mut self, adapter: Arc<dyn Adapter>) -> Self {
         self.executor_adapter = Some(adapter);
         self
