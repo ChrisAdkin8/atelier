@@ -33,6 +33,8 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
+use crate::error::ToolError;
+
 /// A single staged write within a batch.
 ///
 /// `path` is **relative to the workspace root** — staging never accepts
@@ -651,10 +653,7 @@ impl StagedBatch {
             let target = self.workspace_root.join(&outcome.path);
             ensure_target_inside_workspace(&self.workspace_root, &target, &outcome.path)?;
             if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| StagingError::Io {
-                    path: parent.to_path_buf(),
-                    source: e,
-                })?;
+                create_target_parent_inside_workspace(&self.workspace_root, parent, &outcome.path)?;
                 parents_to_sync.insert(parent.to_path_buf());
             }
             if let CommitMode::PartialHunks(accepted_hunk_indices) = mode {
@@ -680,6 +679,17 @@ impl StagedBatch {
         for (applied, (outcome, _mode)) in planned.iter().enumerate() {
             let staged_path = self.staging_dir.path().join(&outcome.path);
             let target = self.workspace_root.join(&outcome.path);
+            ensure_target_inside_workspace(&self.workspace_root, &target, &outcome.path).map_err(
+                |e| match e {
+                    StagingError::EscapesWorkspace(_) => StagingError::PartialCommit {
+                        applied,
+                        failed_path: outcome.path.clone(),
+                        remaining: total - applied,
+                        source: io::Error::new(io::ErrorKind::PermissionDenied, e.to_string()),
+                    },
+                    other => other,
+                },
+            )?;
             std::fs::rename(&staged_path, &target).map_err(|e| StagingError::PartialCommit {
                 applied,
                 failed_path: outcome.path.clone(),
@@ -880,6 +890,22 @@ fn ensure_target_inside_workspace(
         return Err(StagingError::EscapesWorkspace(rel.to_path_buf()));
     }
     Ok(())
+}
+
+fn create_target_parent_inside_workspace(
+    workspace_root: &Path,
+    parent: &Path,
+    rel: &Path,
+) -> Result<(), StagingError> {
+    crate::path_safety::create_dir_all_inside_workspace(workspace_root, "staging", parent).map_err(
+        |e| match e {
+            ToolError::PermissionDenied { .. } => StagingError::EscapesWorkspace(rel.to_path_buf()),
+            other => StagingError::Io {
+                path: parent.to_path_buf(),
+                source: io::Error::other(other.to_string()),
+            },
+        },
+    )
 }
 
 /// SHA-256 of a buffer, returned as a fixed-size array so `expected_pre_hash`

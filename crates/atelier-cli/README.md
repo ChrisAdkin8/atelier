@@ -9,7 +9,7 @@ Spec references: §11 (project bootstrap, credential storage), §1 (BYOM Runner)
 Two subcommands implemented:
 
 - `atelier init [PATH]` — bootstrap a repo at `PATH` (defaults to `cwd`). Idempotent; never overwrites an existing `ATELIER.md`. Backed by `atelier_core::init`.
-- `atelier run [OPTIONS] [PROMPT]` — drive the agent loop. Wires the §2.5 actor + §15 dispatcher + 7 built-in tools + §15 hooks + §7 DoD + §11 sandbox + §1 typed ledger + §1 probe-on-first-use against the chosen adapter; loops turns until `claimed_done: true`; transitions to `Verifying` for DoD checks; persists the session to `<repo>/.atelier/sessions/<uuid>/`. Flags:
+- `atelier run [OPTIONS] [PROMPT]` — drive the agent loop. Wires the §2.5 actor + §15 dispatcher + eight built-in tools + registered MCP tools + §15 hooks + §7 DoD + §11 sandbox + §1 typed ledger + §1 probe-on-first-use against the chosen adapter; loops turns until `claimed_done: true`; transitions to `Verifying` for DoD checks; persists the session to `<repo>/.atelier/sessions/<uuid>/`. Flags:
   - `--provider {mock,anthropic,openai-compat}` — chosen BYOM adapter.
   - `--model <ID>` — `<provider>:<model>` form. Required for the network providers; ignored for `mock`.
   - `--base-url <URL>` — `openai-compat` only. Full URL ending in `/v1`. Omit to use OpenAI itself.

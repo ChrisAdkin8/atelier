@@ -26,7 +26,8 @@
 //! containment has to live here.
 
 pub use crate::path_safety::{
-    ensure_inside_workspace_creatable, ensure_inside_workspace_existing, resolve_repo_path,
+    create_dir_all_inside_workspace, ensure_inside_workspace_creatable,
+    ensure_inside_workspace_existing, resolve_repo_path,
 };
 
 /// Map a [`tokio::task::JoinError`] from a tool's `spawn_blocking` wrapper

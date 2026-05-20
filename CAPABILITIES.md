@@ -37,7 +37,7 @@ Atelier is one engine with three faces:
 - **TUI** — terminal app built on ratatui. Three panes (conversation, context/memory/plan, diff), scrubber-style history, full keyboard discipline. Good fit when you live in tmux.
 - **GUI** — Tauri 2 + Svelte 5 desktop app. Chat-REPL mode: Composer talks directly to the adapter, with the same three side-panels (Context, Memory, Plan), inline Mermaid / image rendering, and drag-and-drop plan reorder.
 
-The CLI, TUI, and GUI all consume the same `atelier-core` engine through a broadcast event channel. Whatever surface you prefer, the underlying behaviour is the same.
+The CLI, TUI, and GUI all consume the same `atelier-core` engine through a broadcast event channel, while each surface exposes the controls that are currently implemented for that UI.
 
 ---
 
@@ -46,11 +46,11 @@ The CLI, TUI, and GUI all consume the same `atelier-core` engine through a broad
 1. **You write a prompt.** Plain English; the model picks up context from any pinned files and from your memory cards.
 2. **The agent loop runs.** Each turn, the model can:
    - Emit a structured envelope alongside its prose (claimed changes, plan updates, uncertainty markers).
-   - Call one or more built-in tools (`read_file`, `list_dir`, `grep`, `ast_grep`, `write_file`, `edit_file`, `shell`).
+   - Call one or more built-in tools (`read_file`, `list_dir`, `grep`, `ast_grep`, `write_file`, `edit_file`, `shell`, `spawn_subagent`).
    - Call any MCP-registered external tool.
 3. **The dispatcher runs tool calls in a sandbox.** Filesystem reads are confined to the repo (symlink escapes are rejected); writes stage into a per-session staging area first. Network egress from the `shell` tool is denied by default; every blocked attempt is audited.
 4. **Edits land in the staging area.** Before anything hits your real working tree, you see the proposed change in the diff pane (TUI). The model's own rationale ("Why this change?") is drawn from its `claimed_changes` envelope.
-5. **You accept or reject — per file in the TUI.** Accepted hunks atomically apply to disk; rejected hunks vanish. The accept path runs symlink-containment + per-file size checks again at commit time so a race between staging and apply can't escape the workspace.
+5. **You accept or reject — per file in the TUI.** Accepted files atomically apply to disk; rejected files are discarded. The accept path runs symlink-containment + per-file size checks again at commit time so a race between staging and apply can't escape the workspace.
 6. **Verification fires.** Atelier checks that the changes actually match what the model claimed (did-it-do-what-it-said). Mismatches surface as `VerificationFailed` events.
 7. **The turn ledger updates.** Token counts, latency, and (for local providers) latency-weighted cost land in the cost meter.
 

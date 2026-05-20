@@ -32,7 +32,13 @@
           "description": {"type": "string"},
           "required": {"type": "boolean", "default": false},
           "default": {"type": "string", "description": "String default used when the arg is omitted. Only valid if `required` is false."}
-        }
+        },
+        "allOf": [
+          {
+            "if": {"required": ["required"], "properties": {"required": {"const": true}}},
+            "then": {"not": {"required": ["default"]}}
+          }
+        ]
       }
     },
     "pinned_context": {

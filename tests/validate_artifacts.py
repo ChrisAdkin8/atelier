@@ -121,9 +121,6 @@ def validate_envelopes_in_markdown(path, validator):
         except json.JSONDecodeError as e:
             results.append((False, f"block {i}: invalid JSON: {e}"))
             continue
-        if not isinstance(data, dict):
-            results.append((True, f"block {i}: non-object (skipped)"))
-            continue
         errors = sorted(validator.iter_errors(data), key=lambda e: list(e.path))
         if errors:
             results.append((False, f"block {i}: " + "; ".join(f"{list(e.path)}: {e.message}" for e in errors)))

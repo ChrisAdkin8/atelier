@@ -115,7 +115,7 @@ impl FileWatcherHandle {
         // `RecursiveMode::NonRecursive` is enough: read_file targets a
         // single file; list_dir targets a directory the user already
         // chose. Following symlinks is the OS watcher's call.
-        {
+        if !skip_notify_watch_for_test() {
             let mut watcher = inner._watcher.lock();
             let _ = watcher.watch(&watch_target, RecursiveMode::NonRecursive);
         }
@@ -162,6 +162,16 @@ fn canonicalize_for_track(path: &Path) -> PathBuf {
     #[cfg(test)]
     contention_tests::maybe_inject_slow_canonicalize();
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+#[cfg(test)]
+fn skip_notify_watch_for_test() -> bool {
+    contention_tests::should_skip_notify_watch()
+}
+
+#[cfg(not(test))]
+fn skip_notify_watch_for_test() -> bool {
+    false
 }
 
 /// Spawn a per-session file watcher. Returns a [`FileWatcherHandle`]
@@ -409,11 +419,12 @@ mod contention_tests {
 
     use super::*;
     use std::cell::Cell;
-    use std::sync::Arc;
+    use std::sync::{Arc, Barrier};
     use std::time::Instant;
 
     thread_local! {
         static SLOW_CANONICALIZE: Cell<bool> = const { Cell::new(false) };
+        static SKIP_NOTIFY_WATCH: Cell<bool> = const { Cell::new(false) };
     }
 
     pub(super) fn maybe_inject_slow_canonicalize() {
@@ -426,7 +437,15 @@ mod contention_tests {
         SLOW_CANONICALIZE.with(|c| c.set(true));
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    pub(super) fn should_skip_notify_watch() -> bool {
+        SKIP_NOTIFY_WATCH.with(|c| c.get())
+    }
+
+    fn skip_notify_watch() {
+        SKIP_NOTIFY_WATCH.with(|c| c.set(true));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn track_canonicalize_runs_outside_lock() {
         let (tx, _rx) = broadcast::channel::<Event>(8);
         let td = tempfile::TempDir::new().unwrap();
@@ -434,18 +453,20 @@ mod contention_tests {
         std::fs::write(&f, b"x").unwrap();
         let h = spawn(tx, FILE_WATCH_DEBOUNCE).expect("spawn");
         let h = Arc::new(h);
+        let barrier = Arc::new(Barrier::new(33));
 
-        // Arm the slow-canonicalize hook from every worker thread by
-        // spawning a setter as the first thing each task does.
         let mut handles = Vec::new();
         let mut waits_ms: Vec<u128> = Vec::new();
-        let (latency_tx, mut latency_rx) = tokio::sync::mpsc::unbounded_channel::<u128>();
+        let (latency_tx, latency_rx) = std::sync::mpsc::channel::<u128>();
         for _ in 0..32 {
             let hh = h.clone();
             let fp = f.clone();
             let lt = latency_tx.clone();
-            handles.push(tokio::task::spawn_blocking(move || {
+            let b = barrier.clone();
+            handles.push(std::thread::spawn(move || {
                 arm_slow_canonicalize();
+                skip_notify_watch();
+                b.wait();
                 let started = Instant::now();
                 hh.track(&fp);
                 let elapsed = started.elapsed().as_millis();
@@ -455,12 +476,13 @@ mod contention_tests {
         drop(latency_tx);
 
         let overall_start = Instant::now();
+        barrier.wait();
         for h in handles {
-            h.await.unwrap();
+            h.join().unwrap();
         }
         let overall_elapsed = overall_start.elapsed();
 
-        while let Some(ms) = latency_rx.recv().await {
+        while let Ok(ms) = latency_rx.recv() {
             waits_ms.push(ms);
         }
         waits_ms.sort_unstable();

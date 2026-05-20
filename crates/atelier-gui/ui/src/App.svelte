@@ -381,7 +381,7 @@
     </div>
     <div class="pane-slot context-slot">
       <div class="context-stack">
-        <ContextPane items={app.contextItems} />
+        <ContextPane items={app.contextItems} currentModelId={app.currentModel?.modelId ?? null} />
         <EventLogPane events={app.events} />
       </div>
     </div>

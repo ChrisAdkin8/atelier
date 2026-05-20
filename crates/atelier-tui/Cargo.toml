@@ -32,8 +32,4 @@ uuid = { workspace = true }
 # including the harness_meta envelope. Same workspace dep the GUI uses
 # for `bridge_event` payload construction.
 serde_json = { workspace = true }
-
-[dev-dependencies]
-# v60.53 §15 — skills_completion tests use TempDir to mount a bundled
-# SkillRegistry without touching the user's home.
 tempfile = { workspace = true }

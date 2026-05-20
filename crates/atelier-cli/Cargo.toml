@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+publish = false
 description = "Atelier command-line interface. Headless entry point — provides `atelier init` (spec §11) and will host `atelier login/logout/rotate/whoami` once §11 credentials land. No UI dependencies."
 
 [features]

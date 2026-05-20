@@ -227,13 +227,12 @@ impl McpServerManifest {
 
 // ---------- env / header interpolation ----------
 
-/// Resolve `${env:NAME}` and `${keychain:NAME}` tokens against the current
-/// environment. Plaintext values pass through unchanged.
+/// Resolve `${env:NAME}` tokens against the current environment. Plaintext
+/// values pass through unchanged.
 ///
-/// **Keychain interpolation is out of scope in this bundle** — it returns
-/// `McpConfigError::KeychainNotYet` so callers see a typed error instead of
-/// a silent empty string. The rmcp client bundle will replace this stub
-/// with a real call into the §11 credential layer.
+/// `${keychain:NAME}` is reserved for future OS keychain integration and
+/// fails closed with `McpConfigError::KeychainNotYet` so callers see a typed
+/// error instead of a silent empty string.
 pub fn interpolate(value: &str) -> Result<String, McpConfigError> {
     // We scan the string left-to-right looking for `${env:NAME}` /
     // `${keychain:NAME}`. Anything else (including stray `$`, `${`, or
@@ -614,6 +613,7 @@ mod tests {
                     "name": "websearch",
                     "transport": "http",
                     "url": "https://search.example/mcp",
+                    "allow_net": true,
                     "headers": {"Authorization": "Bearer ${env:WEBSEARCH_TOKEN}"},
                     "side_effect_class": "shared-state"
                 }

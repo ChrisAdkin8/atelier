@@ -83,6 +83,33 @@ def test_envelope_version_const_pinned():
         jsonschema.validate({"version": 2, "claimed_done": True}, schema)
 
 
+def test_schema_format_checker_rejects_invalid_uuid_datetime_and_uri():
+    """Shared validators must enforce JSON Schema `format` annotations."""
+    telemetry = load("telemetry/payload.v1.json")
+    bad_telemetry = {
+        "version": 1,
+        "channel": "usage",
+        "atelier_version": "0.0.0",
+        "session_uuid": "not-a-uuid",
+        "sent_at": "not-a-date-time",
+        "body": {"feature": "x", "count": 1},
+    }
+    with pytest.raises(jsonschema.ValidationError):
+        validate_with_registry(telemetry, bad_telemetry)
+
+    phase_a = load("ci/phase_a_gate.v1.json")
+    bad_phase_a = {
+        "version": 1,
+        "run_id": "not-a-date-time",
+        "git_sha": "abcdef0",
+        "workflow_run_url": "http://[::1",
+        "all_passed": True,
+        "gates": [{"name": "fmt", "status": "passed"}],
+    }
+    with pytest.raises(jsonschema.ValidationError):
+        validate_with_registry(phase_a, bad_phase_a)
+
+
 def test_audit_schemas_cap_free_form_strings():
     """v60.36 H5 — audit schemas must cap every free-form string field so a
     misbehaving producer can't bloat the audit log. Probes a representative
@@ -299,7 +326,7 @@ def test_mcp_servers_stdio_with_command_valid():
 
 def test_mcp_servers_http_with_url_valid():
     schema = load("config/mcp_servers.v1.json")
-    jsonschema.validate({"version": 1, "servers": [{"name": "ws", "transport": "http", "url": "https://x.example/mcp"}]}, schema)
+    jsonschema.validate({"version": 1, "servers": [{"name": "ws", "transport": "http", "url": "https://x.example/mcp", "allow_net": True}]}, schema)
 
 
 def test_mcp_servers_stdio_without_command_rejected():
@@ -312,6 +339,14 @@ def test_mcp_servers_http_without_url_rejected():
     schema = load("config/mcp_servers.v1.json")
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate({"version": 1, "servers": [{"name": "ws", "transport": "http"}]}, schema)
+
+
+def test_mcp_servers_http_requires_allow_net_true():
+    schema = load("config/mcp_servers.v1.json")
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate({"version": 1, "servers": [{"name": "ws", "transport": "http", "url": "https://x.example/mcp"}]}, schema)
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate({"version": 1, "servers": [{"name": "ws", "transport": "sse", "url": "https://x.example/mcp", "allow_net": False}]}, schema)
 
 
 def test_mcp_servers_bad_name_pattern_rejected():
@@ -327,7 +362,7 @@ def test_mcp_servers_allowed_hosts_round_trips():
     jsonschema.validate({
         "version": 1,
         "servers": [{
-            "name": "ws", "transport": "http", "url": "https://x.example/mcp",
+            "name": "ws", "transport": "http", "url": "https://x.example/mcp", "allow_net": True,
             "allowed_hosts": ["x.example", "y.example"],
         }],
     }, schema)
@@ -339,7 +374,7 @@ def test_mcp_servers_allowed_hosts_wrong_type_rejected():
         jsonschema.validate({
             "version": 1,
             "servers": [{
-                "name": "ws", "transport": "http", "url": "https://x.example/mcp",
+                "name": "ws", "transport": "http", "url": "https://x.example/mcp", "allow_net": True,
                 "allowed_hosts": "not-an-array",
             }],
         }, schema)
@@ -765,6 +800,18 @@ def test_hook_manifest_rejects_impl_timeout_ms():
         })
 
 
+def test_hook_manifest_rejects_http_implementation_until_executor_exists():
+    schema = load("config/hook_manifest.v1.json")
+    with pytest.raises(jsonschema.ValidationError):
+        validate_with_registry(schema, {
+            "version": 1,
+            "name": "x",
+            "event": "pre-tool",
+            "implementation": {"kind": "http", "url": "https://hooks.example/atelier"},
+            "time_budget_ms": 50,
+        })
+
+
 # ---- routing config ----
 
 def test_routing_minimal_valid():
@@ -1050,6 +1097,56 @@ def test_skill_manifest_arg_with_bad_name_rejected():
         }, schema)
 
 
+def test_skill_manifest_required_arg_default_rejected():
+    schema = load("config/skill_manifest.v1.json")
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate({
+            "version": 1,
+            "name": "x",
+            "description": "x",
+            "prompt_template": "x",
+            "args": [{"name": "target", "required": True, "default": "src"}],
+        }, schema)
+
+
+def test_skill_manifest_optional_arg_default_valid():
+    schema = load("config/skill_manifest.v1.json")
+    jsonschema.validate({
+        "version": 1,
+        "name": "x",
+        "description": "x",
+        "prompt_template": "x",
+        "args": [{"name": "target", "required": False, "default": "src"}],
+    }, schema)
+
+
+# ---- telemetry ----
+
+
+def _telemetry(channel, body):
+    return {
+        "version": 1,
+        "channel": channel,
+        "atelier_version": "0.0.0",
+        "session_uuid": "33333333-3333-4333-8333-333333333333",
+        "sent_at": "2026-05-20T00:00:00Z",
+        "body": body,
+    }
+
+
+def test_telemetry_channel_body_pairs_valid():
+    schema = load("telemetry/payload.v1.json")
+    validate_with_registry(schema, _telemetry("crash", {"stack": "trace", "exit_code": 1}))
+    validate_with_registry(schema, _telemetry("perf", {"ledger_summary": {"total_prompt_tokens": 1}}))
+    validate_with_registry(schema, _telemetry("usage", {"feature": "skill", "count": 1}))
+
+
+def test_telemetry_cross_channel_body_rejected():
+    schema = load("telemetry/payload.v1.json")
+    with pytest.raises(jsonschema.ValidationError):
+        validate_with_registry(schema, _telemetry("crash", {"feature": "skill", "count": 1}))
+
+
 # ---- mcp_catalog ----
 
 def test_mcp_catalog_minimal_valid():
@@ -1063,10 +1160,10 @@ def test_mcp_catalog_minimal_valid():
             "transport": "stdio",
             "install": {
                 "kind": "npm",
-                "npm_package": "@modelcontextprotocol/server-filesystem",
+                "npm_package": "@modelcontextprotocol/server-filesystem@0.6.2",
                 "command_template": {
                     "command": "npx",
-                    "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path"],
+                    "args": ["-y", "@modelcontextprotocol/server-filesystem@0.6.2", "/path"],
                 },
             },
         }],
@@ -1106,6 +1203,24 @@ def test_mcp_catalog_npm_install_without_package_rejected():
         }, schema)
 
 
+def test_mcp_catalog_npm_package_must_be_version_pinned():
+    schema = load("config/mcp_catalog.v1.json")
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate({
+            "version": 1,
+            "servers": [{
+                "name": "filesystem",
+                "display_name": "Filesystem",
+                "description": "Read and write local files.",
+                "transport": "stdio",
+                "install": {
+                    "kind": "npm",
+                    "npm_package": "@modelcontextprotocol/server-filesystem",
+                },
+            }],
+        }, schema)
+
+
 def test_mcp_catalog_install_kind_mismatch_rejected():
     schema = load("config/mcp_catalog.v1.json")
     # binary install requires command_template, not npm_package
@@ -1133,10 +1248,28 @@ def test_mcp_catalog_requires_secrets_shape():
             "transport": "http",
             "install": {"kind": "http", "url": "https://x.example"},
             "requires_secrets": [
-                {"name": "api_key", "description": "API key", "where": "header"}
+                {"name": "api_key", "description": "API key", "where": "header", "header_name": "Authorization"}
             ],
         }],
     }, schema)
+
+
+def test_mcp_catalog_env_secret_requires_env_name():
+    schema = load("config/mcp_catalog.v1.json")
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate({
+            "version": 1,
+            "servers": [{
+                "name": "x",
+                "display_name": "X",
+                "description": "x",
+                "transport": "http",
+                "install": {"kind": "http", "url": "https://x.example"},
+                "requires_secrets": [
+                    {"name": "api_key", "description": "API key", "where": "env"}
+                ],
+            }],
+        }, schema)
 
 
 # ---- subagent_type ----

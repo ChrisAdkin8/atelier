@@ -37,6 +37,8 @@ def main():
     ap.add_argument("--atelier", required=True, help="path to Atelier prompt-count JSON")
     ap.add_argument("--target-ratio", type=float, default=DEFAULT_TARGET_RATIO,
                     help=f"max acceptable Atelier/baseline ratio (default {DEFAULT_TARGET_RATIO})")
+    ap.add_argument("--allow-task-set-drift", action="store_true",
+                    help="allow missing/extra task IDs; by default task-set drift fails the comparison")
     args = ap.parse_args()
 
     bl = load(args.baseline)
@@ -82,8 +84,11 @@ def main():
     if missing_in_baseline:
         print(f"\nMissing in baseline file: {missing_in_baseline}")
 
-    passed = agg_ratio <= args.target_ratio
+    task_sets_match = not missing_in_atelier and not missing_in_baseline
+    passed = agg_ratio <= args.target_ratio and (task_sets_match or args.allow_task_set_drift)
     print(f"\nTarget ratio: ≤{args.target_ratio:.2f}")
+    if not task_sets_match and not args.allow_task_set_drift:
+        print("Task set drift: FAIL (use --allow-task-set-drift to override intentionally)")
     print(f"Result: {'PASS' if passed else 'FAIL'} (aggregate {agg_ratio:.2f})")
     return 0 if passed else 1
 

@@ -6,7 +6,7 @@ Spec references: §1, §2, §2.5, §3, §4, §7, §11, §14, §15.
 
 ## Current state
 
-The crate is **end-to-end runnable** for Phase A/B/C scope: three BYOM adapters live (Mock, Anthropic, OpenAI-compatible — the third covers LM Studio, llama-server, vLLM, sglang, Ollama, OpenAI itself), seven built-in tools route through the §15 dispatcher with §11 sandbox enforcement, hunk accept/reject lives end-to-end via `SessionDispatcher::submit_approval`, v51 adds probe-on-first-use model adaptation, v53 reshapes the TOML config into multi-profile `.atelier/providers.toml` + adds the §5 Context panel data layer, and v54 adds the §5 Memory panel data layer (`MemoryCardSummary` + `MemoryStore::summarise()` + `Event::MemoryCards`). **506 unit tests, all green** (v54: +8 from `memory`). The only big Phase A item still outstanding is the §15 MCP client (gated on the `rmcp` spike outcome) — the built-in tool dispatcher is the same surface a future MCP client will share, so all hook / ledger / verification wiring is in place.
+The crate is **end-to-end runnable** for Phase A/B/C scope: three BYOM adapters live (Mock, Anthropic, OpenAI-compatible — the third covers LM Studio, llama-server, vLLM, sglang, Ollama, OpenAI itself), eight built-in tools route through the §15 dispatcher with §11 sandbox enforcement, registered MCP stdio/HTTP/SSE tools share the same dispatcher surface, and file-level accept/reject lives end-to-end via `SessionDispatcher::submit_approval`. The current runtime also includes probe-on-first-use model adaptation, multi-profile `.atelier/providers.toml`, §5 Context/Memory/Plan data layers, reversible context compaction, sub-agent delegation, LSP-backed Tier-1 verification, and §14 concurrent-edit/recovery plumbing.
 
 | Module | Spec | What it gives you |
 |---|---|---|
@@ -26,7 +26,7 @@ The crate is **end-to-end runnable** for Phase A/B/C scope: three BYOM adapters 
 | `src/ledger.rs` | §1 (Phase C unblocker) | Typed `LedgerEntry::{ModelCall, ToolCall, CacheBust}` enforcing the schema's per-kind required fields at compile time. `Ledger` append-only (`parking_lot::RwLock<Vec>` — no poisoning, so a panicking writer can't brick later reads) with `total_cost_usd / entries_without_cost / total_tokens` for the §3 cost meter. `local_cost_usd` + `DEFAULT_LOCAL_RATE_USD_PER_SEC` for latency-weighted local cost. `OnDiskSession.cost_ledger` retyped. Share via `Arc<Ledger>`, never `clone`. |
 | `src/dispatcher.rs` | §15 (Phase C unblocker) | Async `Tool` trait + `ToolRegistry` + `Dispatcher::dispatch` walking the per-tool-call lifecycle (lookup → identify hooks via `HookSet::for_tool_event` → execute → translate `CommitReport` → per-file `Event::EditStaged` → build `LedgerEntry::ToolCall`). Returns a pure `DispatchOutcome` — caller side-effects. `SessionDispatcher` wraps it with `Arc<Ledger>` + `broadcast::Sender<Event>` for the runtime path. `HookExecutor` trait + `ShellHookExecutor` (concrete, via the subprocess helper) + `NoopHookExecutor` (test default). |
 | `src/subprocess.rs` | §11 / §15 (Phase C unblocker) | Shared `run(program, args, &SubprocessSpec)` over `tokio::process` with concurrent stdout/stderr drain + timeout + reap. `sandboxed_argv(argv, &SandboxPolicy)` produces the macOS sandbox-exec / Linux bwrap-wrapped argv. Powers both the `shell` built-in tool and `ShellHookExecutor` so the §11 plumbing isn't duplicated. |
-| `src/tools/` | §15 (Phase C unblocker) | Seven `Tool` impls: `read_file`, `list_dir`, `grep` (regex + walkdir; skips binary + hidden dirs + symlinks), `write_file` (via `Staging`), `edit_file` (anchor-based; rejects ambiguous matches; via `Staging` with `expected_pre_hash`), `ast_grep` (`kind:<node-kind>` over tree-sitter-json), `shell` (via subprocess helper + sandbox profile). Path safety enforced uniformly via `crate::path_safety` (syntax + symlink-containment). Every file-touching tool wraps its blocking I/O in `tokio::task::spawn_blocking` so the async runtime stays responsive. |
+| `src/tools/` | §15 (Phase C unblocker) | Eight `Tool` impls: `read_file`, `list_dir`, `grep` (regex + walkdir; skips binary + hidden dirs + symlinks), `write_file` (via `Staging`), `edit_file` (anchor-based; rejects ambiguous matches; via `Staging` with `expected_pre_hash`), `ast_grep` (`kind:<node-kind>` over tree-sitter-json), `shell` (via subprocess helper + sandbox profile), and `spawn_subagent`. Path safety enforced uniformly via `crate::path_safety` (syntax + symlink-containment). Every file-touching tool wraps its blocking I/O in `tokio::task::spawn_blocking` so the async runtime stays responsive. |
 | `src/path_safety.rs` | §11 (security) | Repo-relative path validation + canonicalize-and-prefix-check for symlink containment. Every file-touching tool calls it after `resolve_repo_path`; `Staging::commit` does the equivalent inline. Catches the symlink-escape attack (repo-internal `link.txt` → `/etc/passwd`) that the §11 sandbox profile generator doesn't cover (the profile only wraps shelled-out subprocesses, not the harness's own I/O). |
 | `src/verify.rs` | §7 | Pure `compare(envelope, &[ObservedChange]) -> Vec<Discrepancy>` for the did-it-do-what-it-said gate. Detects claimed-but-missing, silent-edit, kind-mismatch (e.g. claimed delete + observed modify), duplicate claims. |
 | `src/dod.rs` | §7 | `DodConfig` loader for `schemas/config/dod.v1.json`. Discovery: per-repo `<repo>/.atelier/dod.json` overrides global `~/.atelier/dod.json`; missing both is soft no-config. Validates name regex, absolute / `..`-escaping `working_dir`, zero timeouts. `by_tier` helper for UI grouping. |
@@ -39,7 +39,7 @@ The crate is **end-to-end runnable** for Phase A/B/C scope: three BYOM adapters 
 
 ```
 cargo build -p atelier-core
-cargo test  -p atelier-core   # 506 tests (v54)
+cargo test  -p atelier-core
 ```
 
 ## `rmcp` dependency wiring
@@ -88,19 +88,16 @@ Finished `dev` profile [unoptimized + debuginfo] target(s) in 13.85s
 
 ### The maturity spike
 
-For the standalone `rmcp` maturity-assessment spike — a separate experiment, not part of the Cargo workspace — see `../../experiments/rmcp_spike/README.md`. Its outcome (GO / GO-WITH-CAVEATS / NO-GO) is a Phase A prerequisite per `../../tasks/todo.md`.
+For the standalone `rmcp` maturity-assessment spike — a separate experiment, not part of the Cargo workspace — see `../../experiments/rmcp_spike/README.md`. Its outcome was GO-WITH-CAVEATS; the production client now lives under `src/mcp/`.
 
 ## What's still planned
 
 The table above lists what exists today. Outstanding (in roughly the order they unblock each other):
 
-- `mcp` — MCP client wrapping `rmcp`; stdio + HTTP/SSE transports; server registration from `mcp_servers.json`. Gated on the `rmcp` maturity spike at `../../experiments/rmcp_spike/`. The dispatcher is already structured around the `Tool` trait; the MCP client lands as a new `Tool` impl shape that wraps `rmcp::Client`.
 - LiteLLM-shaped adapter — likely subsumed by `openai_compat` if the LiteLLM gateway speaks the OpenAI chat-completions surface, which it does. Re-evaluate once a concrete LiteLLM regression is in the canonical workload.
 - Bedrock + Vertex adapters (Phase E/F).
 - DoD-check executor — the loader is in but the runtime that actually shells out to `dod.checks[].command` and folds results into the `Verifying` transition is stubbed. The Runner emits a one-shot warning when a DoD config is present so callers see that checks aren't being honoured.
-- `secrets` — OS keychain (`keyring`) + env-var fallback; `${env:…}` / `${keychain:…}` interpolation per spec §11. Today `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` are read directly from the environment.
+- `secrets` — OS keychain (`keyring`) integration for `${keychain:…}` interpolation. Today `${env:…}` interpolation is supported in MCP/hook config, `${keychain:…}` fails closed, and provider API keys are read directly from the environment.
 - `checkpoint` — §4 diff-blob storage under `.atelier/sessions/<uuid>/diffs/`; integrates with `persistence::OnDiskSession::checkpoints`.
-- `watcher` — `notify` integration for §14 concurrent-edit detection; queues at tool-call boundary, never cancels mid-stream. The crate already declares the `notify` dep in the workspace; the integration is gated on the dispatcher exposing its read-set.
-- Probe-driven initial-strategy hint — v51 lands the observation layer; threading `ModelProfile.strategy` into the adapter's first-turn strategy (so the warm-up doesn't waste a downshift cycle) is a v52 one-line wiring change.
 
 The 8 built-in tool manifests live under `tools/`; subagent type manifests under `subagents/`; skill manifests under `skills/`; the MCP catalog at `catalog/mcp_servers.json`. The dispatcher reads the tool manifests at session start.

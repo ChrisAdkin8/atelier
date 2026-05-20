@@ -8,6 +8,9 @@ Covers:
   need write access opt in per-job.
 """
 import re
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -20,11 +23,11 @@ except ImportError:
 ROOT = Path(__file__).resolve().parent.parent
 WORKFLOWS_DIR = ROOT / ".github" / "workflows"
 
-SHA_PIN_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[a-f0-9]{40}( |$)")
+SHA_PIN_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:/[^@\s]+)?@[a-f0-9]{40}( |$)")
 
 
 def _workflow_files():
-    return sorted(WORKFLOWS_DIR.glob("*.yml"))
+    return sorted({*WORKFLOWS_DIR.glob("*.yml"), *WORKFLOWS_DIR.glob("*.yaml")})
 
 
 def _parse(path: Path) -> dict:
@@ -32,8 +35,12 @@ def _parse(path: Path) -> dict:
 
 
 def _flatten_uses(doc):
-    """Yield every `uses:` string in a workflow doc."""
+    """Yield every step- and job-level `uses:` string in a workflow doc."""
     for job in (doc.get("jobs") or {}).values():
+        if not isinstance(job, dict):
+            continue
+        if isinstance(job.get("uses"), str):
+            yield job["uses"]
         for step in job.get("steps", []) or []:
             if isinstance(step, dict) and "uses" in step:
                 yield step["uses"]
@@ -55,6 +62,66 @@ def test_actions_are_sha_pinned():
         "workflow `uses:` entries must be SHA-pinned; offenders: "
         + "; ".join(offenders)
     )
+
+
+def test_flatten_uses_includes_job_level_reusable_workflows():
+    doc = {"jobs": {"call": {"uses": "owner/repo/.github/workflows/reuse.yml@v1"}}}
+    assert list(_flatten_uses(doc)) == ["owner/repo/.github/workflows/reuse.yml@v1"]
+    assert not SHA_PIN_RE.match(next(_flatten_uses(doc)))
+
+
+def test_workflow_files_include_yaml_extension(tmp_path, monkeypatch):
+    workflow = tmp_path / "bad.yaml"
+    workflow.write_text("name: bad\n", encoding="utf-8")
+    monkeypatch.setattr(sys.modules[__name__], "WORKFLOWS_DIR", tmp_path)
+    assert _workflow_files() == [workflow]
+
+
+def _phase_b_compose_python() -> str:
+    workflow = _parse(WORKFLOWS_DIR / "nightly_phase_b_gate.yml")
+    for step in workflow["jobs"]["measure"]["steps"]:
+        if step.get("id") == "compose":
+            run = step["run"]
+            start = run.index("python3 - <<'PY'") + len("python3 - <<'PY'")
+            end = run.index("\nPY", start)
+            return run[start:end].strip()
+    raise AssertionError("compose step not found")
+
+
+def test_phase_b_compose_honours_nonzero_live_exit_with_summary(tmp_path):
+    summary = tmp_path / "phase_b_summary.json"
+    summary.write_text("[]", encoding="utf-8")
+    output = tmp_path / "github_output"
+    (tmp_path / "tests" / "phase_b_gate").mkdir(parents=True)
+
+    subprocess.run(["git", "init", "--quiet"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, check=True)
+    (tmp_path / "README").write_text("x", encoding="utf-8")
+    subprocess.run(["git", "add", "README"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "--quiet", "-m", "init"], cwd=tmp_path, check=True)
+
+    env = os.environ | {
+        "PHASE_B_SKIPPED": "false",
+        "PHASE_B_SUMMARY_PATH": str(summary),
+        "PHASE_B_EXIT_CODE": "7",
+        "CALIBRATION_PHASE": "true",
+        "PHASE_B_FLOOR": "0.95",
+        "RUN_URL": "https://github.com/example/repo/actions/runs/1",
+        "GITHUB_OUTPUT": str(output),
+    }
+    r = subprocess.run(
+        [sys.executable, "-c", _phase_b_compose_python()],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert r.returncode == 0, f"stderr: {r.stderr}\nstdout: {r.stdout}"
+    payload = yaml.safe_load((tmp_path / "tests" / "phase_b_gate" / "last_run.json").read_text())
+    assert payload["all_passed"] is False
+    assert payload["status"] == "red"
+    assert "all_passed=false" in output.read_text()
 
 
 def test_every_workflow_has_top_level_permissions():

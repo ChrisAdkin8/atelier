@@ -13,6 +13,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 RUNNER = ROOT / "tests" / "workload" / "runner" / "runner.py"
+COMPARE_BASELINES = ROOT / "tests" / "workload" / "runner" / "compare_baselines.py"
 
 
 def _import_runner():
@@ -211,6 +212,55 @@ def test_runner_catches_no_op_harness_on_t07():
     )
     assert r.returncode != 0
     assert "FAIL" in r.stdout
+
+
+def _write_prompt_counts(path: Path, task_ids: list[str]) -> None:
+    path.write_text(json.dumps({
+        "version": 1,
+        "captured_at": "2026-05-20T00:00:00Z",
+        "baseline_harness_name": "synthetic",
+        "baseline_harness_version": "0.0.0",
+        "model_id": "test:model",
+        "reference_machine": "test",
+        "tasks": [
+            {"task_id": tid, "median_prompt_count": 10, "runs": [10, 10, 10]}
+            for tid in task_ids
+        ],
+    }), encoding="utf-8")
+
+
+def test_compare_baselines_fails_on_missing_tasks(tmp_path):
+    baseline = tmp_path / "baseline.json"
+    atelier = tmp_path / "atelier.json"
+    _write_prompt_counts(baseline, ["t01", "t02"])
+    _write_prompt_counts(atelier, ["t01"])
+
+    r = subprocess.run(
+        [sys.executable, str(COMPARE_BASELINES), "--baseline", str(baseline), "--atelier", str(atelier), "--target-ratio", "1.0"],
+        cwd=ROOT, capture_output=True, text=True,
+    )
+    assert r.returncode != 0
+    assert "Missing in atelier file" in r.stdout
+    assert "Task set drift: FAIL" in r.stdout
+
+
+def test_compare_baselines_can_allow_task_set_drift(tmp_path):
+    baseline = tmp_path / "baseline.json"
+    atelier = tmp_path / "atelier.json"
+    _write_prompt_counts(baseline, ["t01", "t02"])
+    _write_prompt_counts(atelier, ["t01"])
+
+    r = subprocess.run(
+        [
+            sys.executable, str(COMPARE_BASELINES),
+            "--baseline", str(baseline),
+            "--atelier", str(atelier),
+            "--target-ratio", "1.0",
+            "--allow-task-set-drift",
+        ],
+        cwd=ROOT, capture_output=True, text=True,
+    )
+    assert r.returncode == 0, f"stderr: {r.stderr}\nstdout: {r.stdout}"
 
 
 # ---- checks.json hygiene (regression guard for B1) ----

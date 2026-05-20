@@ -6,8 +6,9 @@ Atelier touches several security-sensitive surfaces: it stores credentials (via 
 
 **Do not file a public GitHub issue for security reports.** Use one of these channels instead:
 
-- **GitHub Security Advisories** (preferred) — open a private advisory via `Security → Report a vulnerability` on this repo.
-- **Email** — `security@atelier.example` (rotate to the actual address before public release).
+- **GitHub private vulnerability reporting** (preferred) — use `Security` → `Report a vulnerability` on this repository to open a private report with the maintainers.
+
+No security email is published until a monitored project address is available.
 
 Include, where possible:
 
@@ -28,7 +29,7 @@ Critical issues (RCE, credential exfiltration, sandbox escape) are prioritized o
 
 ## Supported versions
 
-Until v0.1 ships, **no version is "supported"** in the security-fix sense — this repo is pre-implementation. Security reports against the spec, schemas, or rig itself are welcomed and will be triaged on the same SLOs.
+Until v0.1 ships, **no version is "supported"** in the security-fix sense. The harness is runnable but pre-release; security reports against the spec, schemas, rig, or implementation are welcomed and will be triaged on the same SLOs.
 
 Once v0.1 ships, the supported-version policy is:
 
@@ -55,7 +56,7 @@ Out of scope:
 
 - Run Atelier inside the §11 sandbox defaults; do not set `allow_net: true` on tools unless required.
 - Keep `mcp_servers.json` under version control if you want auditability; review additions before invoking.
-- Use `${keychain:…}` or `${env:…}` interpolation for any secret; plaintext literals are rejected at load.
+- Use `${env:…}` interpolation for secrets today; `${keychain:…}` is reserved and fails closed until OS keychain support lands. Avoid plaintext literals in committed manifests.
 - Enable `--local-only` mode for sensitive sessions (§12).
 - Review the egress audit log (`schemas/audit/egress.v1.json`) periodically.
 

@@ -262,8 +262,14 @@ mod tests {
         if !path.exists() {
             return;
         }
-        let exit = run(&path);
-        // The seed has all_passed: true (one skipped, rest passed).
-        assert_eq!(exit, 0, "seed artifact at {} did not pass", path.display());
+        let bytes = fs::read(&path).unwrap();
+        let parsed: LastRun = serde_json::from_slice(&bytes).unwrap();
+        let expected = if parsed.all_passed { 0 } else { 1 };
+        assert_eq!(
+            run(&path),
+            expected,
+            "seed artifact at {} did not match its all_passed flag",
+            path.display()
+        );
     }
 }

@@ -10,10 +10,10 @@
       "tags": ["filesystem", "core", "first-party"],
       "install": {
         "kind": "npm",
-        "npm_package": "@modelcontextprotocol/server-filesystem",
+        "npm_package": "@modelcontextprotocol/server-filesystem@0.6.2",
         "command_template": {
           "command": "npx",
-          "args": ["-y", "@modelcontextprotocol/server-filesystem", "${repo_root}"]
+          "args": ["-y", "@modelcontextprotocol/server-filesystem@0.6.2", "${repo_root}"]
         }
       },
       "homepage": "https://github.com/modelcontextprotocol/servers/tree/main/src/filesystem",
@@ -27,10 +27,10 @@
       "tags": ["vcs", "core", "first-party"],
       "install": {
         "kind": "npm",
-        "npm_package": "@modelcontextprotocol/server-git",
+        "npm_package": "@modelcontextprotocol/server-git@0.6.2",
         "command_template": {
           "command": "npx",
-          "args": ["-y", "@modelcontextprotocol/server-git", "--repository", "${repo_root}"]
+          "args": ["-y", "@modelcontextprotocol/server-git@0.6.2", "--repository", "${repo_root}"]
         }
       },
       "homepage": "https://github.com/modelcontextprotocol/servers/tree/main/src/git",
@@ -44,10 +44,10 @@
       "tags": ["database", "first-party"],
       "install": {
         "kind": "npm",
-        "npm_package": "@modelcontextprotocol/server-sqlite",
+        "npm_package": "@modelcontextprotocol/server-sqlite@0.6.2",
         "command_template": {
           "command": "npx",
-          "args": ["-y", "@modelcontextprotocol/server-sqlite", "--db-path", "${db_path}"]
+          "args": ["-y", "@modelcontextprotocol/server-sqlite@0.6.2", "--db-path", "${db_path}"]
         }
       },
       "homepage": "https://github.com/modelcontextprotocol/servers/tree/main/src/sqlite",
@@ -61,10 +61,10 @@
       "tags": ["web", "shared-state", "first-party"],
       "install": {
         "kind": "npm",
-        "npm_package": "@modelcontextprotocol/server-fetch",
+        "npm_package": "@modelcontextprotocol/server-fetch@0.6.2",
         "command_template": {
           "command": "npx",
-          "args": ["-y", "@modelcontextprotocol/server-fetch"]
+          "args": ["-y", "@modelcontextprotocol/server-fetch@0.6.2"]
         }
       },
       "homepage": "https://github.com/modelcontextprotocol/servers/tree/main/src/fetch",
@@ -78,10 +78,10 @@
       "tags": ["memory", "persistence", "first-party"],
       "install": {
         "kind": "npm",
-        "npm_package": "@modelcontextprotocol/server-memory",
+        "npm_package": "@modelcontextprotocol/server-memory@0.6.2",
         "command_template": {
           "command": "npx",
-          "args": ["-y", "@modelcontextprotocol/server-memory"]
+          "args": ["-y", "@modelcontextprotocol/server-memory@0.6.2"]
         }
       },
       "homepage": "https://github.com/modelcontextprotocol/servers/tree/main/src/memory",
@@ -95,17 +95,18 @@
       "tags": ["vcs", "remote", "shared-state", "first-party"],
       "install": {
         "kind": "npm",
-        "npm_package": "@modelcontextprotocol/server-github",
+        "npm_package": "@modelcontextprotocol/server-github@0.6.2",
         "command_template": {
           "command": "npx",
-          "args": ["-y", "@modelcontextprotocol/server-github"]
+          "args": ["-y", "@modelcontextprotocol/server-github@0.6.2"]
         }
       },
       "requires_secrets": [
         {
           "name": "github_personal_access_token",
-          "description": "Personal access token with the repo scopes you intend the agent to operate against. Stored via §11 keychain.",
-          "where": "env"
+          "description": "Personal access token with the repo scopes you intend the agent to operate against. Until OS keychain support lands, provide it through the generated environment variable only for trusted sessions.",
+          "where": "env",
+          "env_name": "GITHUB_PERSONAL_ACCESS_TOKEN"
         }
       ],
       "homepage": "https://github.com/modelcontextprotocol/servers/tree/main/src/github",
@@ -119,17 +120,18 @@
       "tags": ["database", "shared-state", "first-party"],
       "install": {
         "kind": "npm",
-        "npm_package": "@modelcontextprotocol/server-postgres",
+        "npm_package": "@modelcontextprotocol/server-postgres@0.6.2",
         "command_template": {
           "command": "npx",
-          "args": ["-y", "@modelcontextprotocol/server-postgres"]
+          "args": ["-y", "@modelcontextprotocol/server-postgres@0.6.2"]
         }
       },
       "requires_secrets": [
         {
           "name": "postgres_connection_string",
-          "description": "Standard libpq connection string. Use a role with the minimum privilege the agent needs.",
-          "where": "env"
+          "description": "Standard libpq connection string. Use a role with the minimum privilege the agent needs; until OS keychain support lands, provide it through the generated environment variable only for trusted sessions.",
+          "where": "env",
+          "env_name": "POSTGRES_CONNECTION_STRING"
         }
       ],
       "homepage": "https://github.com/modelcontextprotocol/servers/tree/main/src/postgres",
@@ -143,10 +145,10 @@
       "tags": ["browser", "automation", "shared-state", "first-party"],
       "install": {
         "kind": "npm",
-        "npm_package": "@modelcontextprotocol/server-puppeteer",
+        "npm_package": "@modelcontextprotocol/server-puppeteer@0.6.2",
         "command_template": {
           "command": "npx",
-          "args": ["-y", "@modelcontextprotocol/server-puppeteer"]
+          "args": ["-y", "@modelcontextprotocol/server-puppeteer@0.6.2"]
         }
       },
       "homepage": "https://github.com/modelcontextprotocol/servers/tree/main/src/puppeteer",

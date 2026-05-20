@@ -113,6 +113,69 @@ pub fn ensure_inside_workspace_creatable(
     Ok(canonical_parent.join(basename))
 }
 
+/// Create `dir` one component at a time, rejecting any existing component
+/// that resolves outside `workspace_root`. Unlike `std::fs::create_dir_all`,
+/// this validates before descending through symlinked path components, so a
+/// repo-controlled symlink cannot redirect directory creation outside the
+/// workspace.
+pub fn create_dir_all_inside_workspace(
+    workspace_root: &Path,
+    tool: &str,
+    dir: &Path,
+) -> Result<(), ToolError> {
+    let canonical_root = canonicalize_root(workspace_root, tool)?;
+    let rel = dir
+        .strip_prefix(workspace_root)
+        .map_err(|_| ToolError::PermissionDenied {
+            tool: tool.to_string(),
+            reason: format!("{dir:?} is not under workspace root {workspace_root:?}"),
+        })?;
+
+    let mut current = workspace_root.to_path_buf();
+    assert_existing_dir_inside_workspace(tool, &current, &canonical_root)?;
+
+    for component in rel.components() {
+        let Component::Normal(part) = component else {
+            return Err(ToolError::PermissionDenied {
+                tool: tool.to_string(),
+                reason: format!("{dir:?} contains unsupported path component {component:?}"),
+            });
+        };
+        current.push(part);
+        match std::fs::symlink_metadata(&current) {
+            Ok(_) => {
+                assert_existing_dir_inside_workspace(tool, &current, &canonical_root)?;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                match std::fs::create_dir(&current) {
+                    Ok(()) => {
+                        assert_existing_dir_inside_workspace(tool, &current, &canonical_root)?;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                        assert_existing_dir_inside_workspace(tool, &current, &canonical_root)?;
+                    }
+                    Err(e) => {
+                        return Err(ToolError::ExecutionFailed {
+                            tool: tool.to_string(),
+                            exit_code: -1,
+                            stderr: format!("create_dir {current:?} failed: {e}"),
+                        });
+                    }
+                }
+            }
+            Err(e) => {
+                return Err(ToolError::ExecutionFailed {
+                    tool: tool.to_string(),
+                    exit_code: -1,
+                    stderr: format!("stat {current:?} failed: {e}"),
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// v60.37 A1 — promote the atomic-write helper to a shared location so
 /// every `NamedTempFile::persist` site can call it without re-implementing
 /// the cfg(unix)/cfg(windows) split. POSIX rename is atomic for content
@@ -142,6 +205,34 @@ fn canonicalize_root(workspace_root: &Path, tool: &str) -> Result<PathBuf, ToolE
         exit_code: -1,
         stderr: format!("canonicalize workspace root {workspace_root:?} failed: {e}"),
     })
+}
+
+fn assert_existing_dir_inside_workspace(
+    tool: &str,
+    path: &Path,
+    canonical_root: &Path,
+) -> Result<(), ToolError> {
+    let canonical = std::fs::canonicalize(path).map_err(|e| ToolError::ExecutionFailed {
+        tool: tool.to_string(),
+        exit_code: -1,
+        stderr: format!("canonicalize {path:?} failed: {e}"),
+    })?;
+    if !canonical.starts_with(canonical_root) {
+        return Err(ToolError::PermissionDenied {
+            tool: tool.to_string(),
+            reason: format!(
+                "{path:?} resolves to {canonical:?} which is outside the workspace {canonical_root:?} (symlink escape?)"
+            ),
+        });
+    }
+    if !canonical.is_dir() {
+        return Err(ToolError::ExecutionFailed {
+            tool: tool.to_string(),
+            exit_code: -1,
+            stderr: format!("{path:?} is not a directory"),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -263,5 +354,29 @@ mod tests {
         let path = ws.path().join("ghost-dir").join("file.txt");
         let err = ensure_inside_workspace_creatable(ws.path(), "t", &path).unwrap_err();
         assert!(matches!(err, ToolError::ExecutionFailed { .. }));
+    }
+
+    #[test]
+    fn create_dir_all_inside_workspace_creates_nested_dirs() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let dir = ws.path().join("a/b/c");
+        create_dir_all_inside_workspace(ws.path(), "t", &dir).unwrap();
+        assert!(dir.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_dir_all_inside_workspace_rejects_symlink_escape() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let link = ws.path().join("link");
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+
+        let err = create_dir_all_inside_workspace(ws.path(), "t", &link.join("child")).unwrap_err();
+        assert!(matches!(err, ToolError::PermissionDenied { .. }));
+        assert!(
+            !outside.path().join("child").exists(),
+            "helper followed symlink and created outside workspace"
+        );
     }
 }

@@ -128,3 +128,22 @@ def test_validate_artifacts_honours_unvalidated_annotation():
     r = run(ARTIFACT_VALIDATOR)
     assert r.returncode == 0, f"stderr: {r.stderr}\nstdout: {r.stdout}"
     assert "SKIP tests/audit/ambiguous_row.json" in r.stdout
+
+
+def test_validate_artifacts_rejects_non_object_fenced_json(tmp_path):
+    """Fenced JSON arrays/strings must not be silently skipped for envelope validation."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("validate_artifacts", ARTIFACT_VALIDATOR)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    fixture = tmp_path / "fewshot.md"
+    fixture.write_text("```json\n[]\n```\n", encoding="utf-8")
+    schema = json.loads((ROOT / "schemas" / "model_protocol" / "envelope.v1.json").read_text())
+    validator = mod.validator_for(schema, registry=mod.build_schema_registry())
+
+    results = mod.validate_envelopes_in_markdown(fixture, validator)
+    assert results
+    assert results[0][0] is False
+    assert "is not of type 'object'" in results[0][1]

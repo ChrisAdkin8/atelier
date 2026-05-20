@@ -11,7 +11,8 @@ use async_trait::async_trait;
 use serde::Deserialize;
 
 use super::{
-    ensure_inside_workspace_creatable, ensure_inside_workspace_existing, resolve_repo_path,
+    create_dir_all_inside_workspace, ensure_inside_workspace_creatable,
+    ensure_inside_workspace_existing, resolve_repo_path,
 };
 use crate::dispatcher::{SideEffectClass, Tool, ToolContext, ToolResult};
 use crate::error::ToolError;
@@ -91,11 +92,7 @@ impl Tool for WriteFile {
             // parent must exist. `create_dirs: true` ensures it does.
             if parsed.create_dirs {
                 if let Some(parent) = abs.parent() {
-                    std::fs::create_dir_all(parent).map_err(|e| ToolError::ExecutionFailed {
-                        tool: NAME.into(),
-                        exit_code: -1,
-                        stderr: format!("create_dir_all {parent:?} failed: {e}"),
-                    })?;
+                    create_dir_all_inside_workspace(&workspace_root, NAME, parent)?;
                 }
             }
 
@@ -285,5 +282,32 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::PermissionDenied { .. }));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn create_dirs_rejects_symlinked_parent_before_mutating_outside() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("link")).unwrap();
+        let s = SandboxPolicy::restrictive(dir.path()).unwrap();
+
+        let err = WriteFile
+            .execute(
+                serde_json::json!({
+                    "path": "link/nested/file.txt",
+                    "content": "x",
+                    "create_dirs": true
+                }),
+                &ctx(dir.path(), &s),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, ToolError::PermissionDenied { .. }));
+        assert!(
+            !outside.path().join("nested").exists(),
+            "write_file followed symlink and created directories outside workspace"
+        );
     }
 }

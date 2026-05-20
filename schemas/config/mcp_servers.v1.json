@@ -36,7 +36,7 @@
           "env": {
             "type": "object",
             "additionalProperties": {"type": "string", "maxLength": 4096},
-            "description": "Environment variables for the subprocess (stdio only). Values support interpolation tokens `${env:NAME}` and `${keychain:NAME}` per §11 credential storage. Subject to §12 redaction policy on values. v60.37 SCH-M4 — values capped at 4 KiB to bound launcher memory + audit-log bloat."
+            "description": "Environment variables for the subprocess (stdio only). Values support interpolation tokens `${env:NAME}`. `${keychain:NAME}` tokens are reserved and fail closed until OS keychain support lands. Subject to §12 redaction policy on values. v60.37 SCH-M4 — values capped at 4 KiB to bound launcher memory + audit-log bloat."
           },
           "url": {
             "type": "string",
@@ -48,7 +48,7 @@
           "headers": {
             "type": "object",
             "additionalProperties": {"type": "string", "maxLength": 4096},
-            "description": "HTTP headers for http/sse transport. Values support interpolation tokens `${env:NAME}` (read from environment) and `${keychain:NAME}` (read from OS keychain via §11 credential storage). Plaintext literals are accepted but discouraged for anything resembling a secret. `Authorization` headers are redacted in the §12 egress audit log; interpolation is resolved at request time and never persisted. v60.37 SCH-M4 — values capped at 4 KiB."
+            "description": "HTTP headers for http/sse transport. Values support interpolation tokens `${env:NAME}`. `${keychain:NAME}` tokens are reserved and fail closed until OS keychain support lands. Plaintext literals are accepted but discouraged for anything resembling a secret. `Authorization` headers are redacted in the §12 egress audit log; interpolation is resolved at request time and never persisted. v60.37 SCH-M4 — values capped at 4 KiB."
           },
           "side_effect_class": {
             "enum": ["local-safe", "local-risky", "shared-state", "irreversible"],
@@ -57,7 +57,7 @@
           "allow_net": {
             "type": "boolean",
             "default": false,
-            "description": "stdio transport only: if true, the subprocess sandbox permits outbound network. http/sse transports imply network; this flag is ignored."
+            "description": "For stdio, permits outbound network from the subprocess sandbox. For http/sse, must be true because the transport definitionally performs network egress."
           },
           "allowed_hosts": {
             "type": "array",
@@ -77,7 +77,10 @@
           },
           {
             "if": {"properties": {"transport": {"enum": ["http", "sse"]}}},
-            "then": {"required": ["url"]}
+            "then": {
+              "required": ["url", "allow_net"],
+              "properties": {"allow_net": {"const": true}}
+            }
           }
         ]
       }
@@ -98,6 +101,7 @@
           "name": "websearch",
           "transport": "http",
           "url": "https://search.example/mcp",
+          "allow_net": true,
           "headers": {"Authorization": "Bearer ${WEBSEARCH_TOKEN}"},
           "side_effect_class": "shared-state"
         }

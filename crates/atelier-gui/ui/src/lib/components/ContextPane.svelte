@@ -25,8 +25,9 @@
 
   interface Props {
     items: ContextItemSummary[]
+    currentModelId?: string | null
   }
-  let { items }: Props = $props()
+  let { items, currentModelId = null }: Props = $props()
 
   // v55 — per-row mutator round-trip. The dispatcher mutator
   // re-emits `ContextItems` on success, so we don't update state
@@ -94,7 +95,7 @@
         summary_card_id: string
         summary_tokens_in: number
         summary_tokens_out: number
-      }>('compact_context_items', { ids })
+      }>('compact_context_items', { ids, expectedModelId: currentModelId })
       showToast(
         `compacted ${ids.length} items — freed ${r.tokens_freed} tokens; summary ${r.summary_card_id} (${r.summary_tokens_in}→${r.summary_tokens_out} tokens)`,
         false,

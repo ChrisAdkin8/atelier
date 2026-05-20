@@ -105,8 +105,12 @@ pub fn write(
         .join("sessions")
         .join(session_id)
         .join("compactions");
-    std::fs::create_dir_all(&compactions_dir)
-        .map_err(|e| format!("compaction_blob::write: mkdir {compactions_dir:?}: {e}"))?;
+    atelier_core::path_safety::create_dir_all_inside_workspace(
+        &canonical_workspace,
+        "compaction_blob",
+        &compactions_dir,
+    )
+    .map_err(|e| format!("compaction_blob::write: mkdir {compactions_dir:?}: {e}"))?;
     let canonical_dir = std::fs::canonicalize(&compactions_dir)
         .map_err(|e| format!("compaction_blob::write: canonicalize {compactions_dir:?}: {e}"))?;
 
@@ -358,6 +362,24 @@ mod tests {
             .parent()
             .unwrap()
             .ends_with(format!("sessions/{sid}/compactions")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_rejects_symlinked_atelier_dir_before_mutating_outside() {
+        let ws = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        std::os::unix::fs::symlink(outside.path(), ws.path().join(".atelier")).unwrap();
+        let sid = fresh_session_id();
+        let items = vec![fixture_item("a.rs", 5)];
+
+        let err = write(ws.path(), &sid, "t", &items).unwrap_err();
+
+        assert!(err.contains("symlink escape") || err.contains("outside the workspace"));
+        assert!(
+            !outside.path().join("sessions").exists(),
+            "compaction blob write followed symlinked .atelier"
+        );
     }
 
     #[test]

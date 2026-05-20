@@ -77,13 +77,36 @@ def _shown(lockfile: Path) -> str:
         return str(lockfile)
 
 
+def _iter_lockfile_packages(doc: dict):
+    """Yield ``(label, package)`` pairs from npm lockfile v1 and v2/v3 shapes."""
+    packages = doc.get("packages") or {}
+    if isinstance(packages, dict):
+        for pkg_key, pkg in packages.items():
+            if isinstance(pkg, dict):
+                yield (pkg_key if pkg_key else "<workspace-root>"), pkg
+
+    def walk_v1(deps: dict, chain: tuple[str, ...] = ()):
+        for name, dep in deps.items():
+            if not isinstance(dep, dict):
+                continue
+            current = (*chain, name)
+            yield_label = " > ".join(current)
+            yield yield_label, dep
+            nested = dep.get("dependencies") or {}
+            if isinstance(nested, dict):
+                yield from walk_v1(nested, current)
+
+    deps = doc.get("dependencies") or {}
+    if isinstance(deps, dict):
+        yield from walk_v1(deps)
+
+
 def check_no_lifecycle_scripts(lockfile: Path) -> list[str]:
     """Check 2: no dependency declares a `preinstall` / `postinstall` script.
 
-    npm v3+ lockfiles encode per-package scripts under
-    `packages.<key>.scripts.{preinstall,postinstall}`. We walk the whole
-    `packages` map (npm lockfile v3 schema) so transitive deps are
-    covered too.
+    npm v2/v3 lockfiles encode per-package scripts under ``packages``;
+    npm v1 stores packages under recursive top-level ``dependencies``.
+    Walk both shapes so transitive deps are covered.
     """
     if not lockfile.is_file():
         return []  # No lockfile → nothing to check; the workspace just doesn't use npm here.
@@ -93,19 +116,12 @@ def check_no_lifecycle_scripts(lockfile: Path) -> list[str]:
         return [f"{_shown(lockfile)}: lockfile is not valid JSON: {e}"]
 
     offenders: list[str] = []
-    packages = doc.get("packages") or {}
-    for pkg_key, pkg in packages.items():
-        if not isinstance(pkg, dict):
-            continue
+    for pkg_key, pkg in _iter_lockfile_packages(doc):
         scripts = pkg.get("scripts") or {}
         for banned in BANNED_LIFECYCLE_SCRIPTS:
             if banned in scripts:
-                # Top-level package (key == "") is the workspace itself;
-                # surface the path differently to make the message
-                # readable.
-                shown_key = pkg_key if pkg_key else "<workspace-root>"
                 offenders.append(
-                    f"{_shown(lockfile)}: `{shown_key}` declares "
+                    f"{_shown(lockfile)}: `{pkg_key}` declares "
                     f"`scripts.{banned}` = {scripts[banned]!r}"
                 )
     return offenders
@@ -121,10 +137,7 @@ def check_lockfile_hosts(lockfile: Path) -> list[str]:
         return [f"{_shown(lockfile)}: lockfile is not valid JSON: {e}"]
 
     offenders: list[str] = []
-    packages = doc.get("packages") or {}
-    for pkg_key, pkg in packages.items():
-        if not isinstance(pkg, dict):
-            continue
+    for pkg_key, pkg in _iter_lockfile_packages(doc):
         resolved = pkg.get("resolved")
         if not resolved:
             # Workspace-root entry and some peer-only entries legitimately

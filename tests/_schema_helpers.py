@@ -7,7 +7,9 @@ resolve without network access.
 Used by both `tests/validate_artifacts.py` and `tests/test_schemas.py`.
 """
 import json
+from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
 import jsonschema
 from referencing import Registry, Resource
@@ -39,4 +41,31 @@ def validator_for(schema: dict, registry: Registry | None = None):
     if registry is None:
         registry = build_schema_registry()
     ValidatorCls = jsonschema.validators.validator_for(schema)
-    return ValidatorCls(schema, registry=registry)
+    return ValidatorCls(schema, registry=registry, format_checker=format_checker())
+
+
+def format_checker() -> jsonschema.FormatChecker:
+    checker = jsonschema.FormatChecker()
+
+    @checker.checks("date-time")
+    def is_date_time(value: object) -> bool:
+        if not isinstance(value, str):
+            return True
+        text = value[:-1] + "+00:00" if value.endswith("Z") else value
+        try:
+            datetime.fromisoformat(text)
+        except ValueError:
+            return False
+        return True
+
+    @checker.checks("uri")
+    def is_uri(value: object) -> bool:
+        if not isinstance(value, str):
+            return True
+        try:
+            parsed = urlparse(value)
+        except ValueError:
+            return False
+        return bool(parsed.scheme and (parsed.netloc or parsed.scheme not in {"http", "https"}))
+
+    return checker

@@ -314,11 +314,27 @@ pub async fn launch_http_server(
     // running-service state we don't want to keep alive elsewhere.
     let server_info: rmcp::model::ServerInfo = handshake.peer().peer_info().clone();
 
-    // Protocol-version check — same string-contains check the stdio
-    // launcher uses. Failure path mirrors stdio's: cancel cleanly +
-    // surface a typed error.
-    let version = format!("{:?}", server_info.protocol_version);
-    if !version.contains(SUPPORTED_PROTOCOL_VERSION) {
+    // Protocol-version check: extract the serde string value and compare
+    // exactly. Debug-string substring matching can falsely accept versions
+    // that merely contain the supported version as text.
+    let version = match protocol_version_string(&server_info.protocol_version) {
+        Ok(version) => version,
+        Err(version) => {
+            let _ = handshake.cancel().await;
+            audit_failure(
+                audit_dir,
+                &manifest.name,
+                url,
+                handshake_phase,
+                "protocol-mismatch",
+            );
+            return Err(McpLaunchError::ProtocolMismatch {
+                name: manifest.name.clone(),
+                version,
+            });
+        }
+    };
+    if version != SUPPORTED_PROTOCOL_VERSION {
         let _ = handshake.cancel().await;
         audit_failure(
             audit_dir,
@@ -384,6 +400,13 @@ pub async fn launch_http_server(
         handshake,
         server_info,
     ))
+}
+
+fn protocol_version_string(version: &rmcp::model::ProtocolVersion) -> Result<String, String> {
+    match serde_json::to_value(version) {
+        Ok(serde_json::Value::String(s)) => Ok(s),
+        _ => Err(format!("{version:?}")),
+    }
 }
 
 /// Best-effort HTTP status extractor for rmcp's `SseTransportError`. The
@@ -776,5 +799,26 @@ mod tests {
         assert_eq!(body.lines().count(), 1);
         let row: McpEgressEvent = serde_json::from_str(body.lines().next().unwrap()).unwrap();
         assert_eq!(row.provider, "x");
+    }
+
+    #[test]
+    fn protocol_version_string_uses_exact_serde_value() {
+        let supported = rmcp::model::ProtocolVersion::V_2024_11_05;
+        assert_eq!(
+            protocol_version_string(&supported).unwrap(),
+            SUPPORTED_PROTOCOL_VERSION
+        );
+
+        let unsupported: rmcp::model::ProtocolVersion =
+            serde_json::from_value(serde_json::Value::String("prefix-2024-11-05-suffix".into()))
+                .expect("rmcp accepts unknown protocol versions");
+        assert_eq!(
+            protocol_version_string(&unsupported).unwrap(),
+            "prefix-2024-11-05-suffix"
+        );
+        assert_ne!(
+            protocol_version_string(&unsupported).unwrap(),
+            SUPPORTED_PROTOCOL_VERSION
+        );
     }
 }

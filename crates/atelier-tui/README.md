@@ -12,24 +12,24 @@ Terminal UI using `ratatui` + `crossterm`. Consumes the same `atelier-core` even
 - Context-window meter
 - Timeline scrubber — keys: `[` `]` step, `g <n>` jump
 
-Not in TUI (GUI-only): drag-and-drop, Mermaid/D2 inline rendering, browser previews, visual hunk-rewrite.
+Not in TUI (GUI-only): drag-and-drop, Mermaid/D2 inline rendering, browser previews, visual hunk-rewrite, and native folder picking.
 
 ## Current state
 
-**Driver mode (v48).** Same `Runner` library the GUI uses, but pumped into ratatui widgets. Two run modes:
+**Driver mode.** Same `Runner` library the CLI uses, pumped into ratatui widgets. Two run modes:
 
-- **Driver mode** — `cargo run -p atelier-tui -- "<prompt>"`. Builds a `Runner` with `ApprovalPolicy::AwaitApproval` and a scripted `MockAdapter`, pops a yellow `(PENDING)` diff banner when staging hits the approval gate, and routes `y` / `n` keys through `SessionDispatcher::submit_approval`. Footer pivots to `APPROVAL REQUIRED · y accept all · n reject all · q quit` while a decision is pending.
+- **Driver mode** — `cargo run -p atelier-tui -- "<prompt>"`. Builds a `Runner` with `ApprovalPolicy::AwaitApproval`, pops a yellow `(PENDING)` diff banner when staging hits the approval gate, and routes `y` / `n` keys through `SessionDispatcher::submit_approval`. Footer pivots to `APPROVAL REQUIRED · y accept all · n reject all · q quit` while a decision is pending.
 - **Viewer mode** — `cargo run -p atelier-tui` (no prompt). Spawns a NoopHook session, subscribes to its bus, renders the panes — useful for testing the terminal lifecycle in isolation.
 
-Panes wired: conversation, textual live diff (Hunks::Lines `@@` headers + `+`/`-`/`Created`/`Deleted`/`Binary`/`Same` badges), plan canvas tree, cost meter, context meter (Gauge with `+N unknown` for `TokenSource::Unavailable` items), scrubber keys `[` / `]` / `g`. `Event::ModelProfileLoaded` (v51) prints a one-line "ModelProfile · strategy=… · …" event in the log so the active §2 strategy is visible at-a-glance.
+Panes wired: conversation, textual live diff (Hunks::Lines `@@` headers + `+`/`-`/`Created`/`Deleted`/`Binary`/`Same` badges), plan canvas tree, memory, sub-agents, cost meter, context meter (Gauge with `+N unknown` for `TokenSource::Unavailable` items), scrubber keys `[` / `]` / `g`, LSP install prompt, and slash-skill completion. `Event::ModelProfileLoaded` prints a one-line "ModelProfile · strategy=… · …" event in the log so the active §2 strategy is visible at-a-glance.
 
 **v52 — model badge in the footer.** The right side of the help line renders `model_id · strategy · outcome` (cyan bold id, green strategy, dim outcome) for the lifetime of the run. Pre-event the footer is just the scrub-key help line; during an outstanding hunk approval the badge is suppressed so the yellow `APPROVAL REQUIRED` banner is the unambiguous focus. The split is one ratatui `Layout::default().direction(Horizontal).constraints([Min(0), Length(badge_width)])`; `model_badge_width()` computes the column count from the underlying strings so the layout matches what gets rendered.
 
 **v53 — §5 Context panel in the right column.** Between the aggregate context gauge and the bounded event-log tail, `render_context_pane` renders one row per `ContextItemSummary` from `Event::ContextItems`: right-aligned token count (cyan exact / yellow approx / dim unavailable), short provenance badge (`init`/`usr`/`tool`/`mem`/`pin`/`asst`), pin glyph, label. Empty-state placeholder before the first event. Constraint shape `[Length(2), Length(2), Min(2), Length(4)]` keeps the gauges' 2-row allocation intact even when the terminal is tight; the §5 panel takes whatever remains.
 
-**v54 — §5 Memory panel in the top-right column.** Top-right column split vertically 50/50 between Plan (top) and Memory (bottom) — mirrors the GUI's stack. `render_memory_pane` shows one row per `MemoryCardSummary`: pin glyph + bold title (white when pinned) + compact `YYYY-MM-DD HH:MM` last-used timestamp. Body preview deliberately omitted (the GUI has more row budget; the TUI prioritises title + last-used). Empty-state placeholder until a card source populates the store.
+**§5 Memory + §10.1 Sub-agents in the top-right column.** Top-right column is split between Plan, Memory, and Sub-agents. `render_memory_pane` shows one row per `MemoryCardSummary`; `render_subagents_pane` mirrors child-agent status and turn counters so delegated work is visible while the parent is waiting.
 
-`cargo test -p atelier-tui` → 65 unit tests (v54: +3) against the pure `render` + `apply` + `handle_key` + `project_event` + model-badge + §5 Context + §5 Memory surface, plus the v48 approval-key tests.
+`cargo test -p atelier-tui` exercises the pure `render` + `apply` + `handle_key` + `project_event` + model-badge + §5 Context/Memory + §10.1 Sub-agent + slash-completion surfaces, plus the approval-key tests.
 
 What's not here yet: file tree (needs `OnDiskSession.files` snapshot the actor doesn't surface), `g <n>` step-index prefix (needs §4 time-travel step count to clamp against).
 
@@ -38,7 +38,7 @@ What's not here yet: file tree (needs `OnDiskSession.files` snapshot the actor d
 ```sh
 cargo run -p atelier-tui -- "rename my-script"   # driver mode
 cargo run -p atelier-tui                          # viewer mode
-cargo test -p atelier-tui                         # 65 unit tests (v54)
+cargo test -p atelier-tui
 ```
 
 ## Architecture

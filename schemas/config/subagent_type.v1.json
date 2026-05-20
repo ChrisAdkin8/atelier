@@ -29,7 +29,7 @@
     "default_max_turns": {
       "type": "integer",
       "minimum": 1,
-      "description": "Cap on the sub-agent's §2.5 state-machine turn count. The parent can override on a per-invocation basis via the `spawn_subagent` tool's `max_turns` argument. PROVISIONAL default 25 if not set here and not overridden by the caller."
+      "description": "Cap on the sub-agent's §2.5 state-machine turn count. The parent can override on a per-invocation basis via the `spawn_subagent` tool's `max_turns` argument. PROVISIONAL default 10 if not set here and not overridden by the caller."
     },
     "model_routing": {
       "description": "Optional per-subagent routing override. When absent, the sub-agent inherits the session's routing (`schemas/config/routing.v1.json`). When present, fully replaces the routing for this sub-agent only.",

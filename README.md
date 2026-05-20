@@ -179,7 +179,7 @@ First use against a given `(model, base_url)` fires a short calibration probe (o
 
 ### Multi-pane workspace
 
-The Tauri GUI (`cargo tauri dev` from `crates/atelier-gui/`) and the ratatui TUI (`cargo run -p atelier-tui -- "<prompt>"`) drive the same loop with a live multi-pane workspace (conversation, diff with hunk accept/reject, plan canvas, cost + context meters, §5 Context panel, footer with active model badge).
+The Tauri GUI (`cargo tauri dev` from `crates/atelier-gui/`) and the ratatui TUI (`cargo run -p atelier-tui -- "<prompt>"`) expose the same engine through different surfaces: the GUI is currently a chat-REPL workspace with Context, Memory, and Plan side panels, while the TUI provides the live agent workspace with conversation, context/memory/plan, diff, meters, and file-level accept/reject.
 
 For first-time build prerequisites (rustup, pinned toolchain), see [Build](#build) below. For what each run actually does inside the agent loop, see [How a run works](#how-a-run-works). Piece-by-piece state of the build is in [`STATUS.md`](STATUS.md#phase-a--piece-by-piece-tracker).
 
@@ -191,10 +191,10 @@ Atelier is a **Rust workspace**. Four crates under [`crates/`](crates/):
 
 | Crate | Role |
 |---|---|
-| [`atelier-core`](crates/atelier-core/) | Agent loop, BYOM adapters (Mock + Anthropic + OpenAI-compatible as of v50), session state, dispatcher, seven built-in tools, cost ledger, §1 probe-on-first-use cache (v51). **No UI dependencies.** The §2.5 state machine lives here. |
+| [`atelier-core`](crates/atelier-core/) | Agent loop, BYOM adapters (Mock + Anthropic + OpenAI-compatible as of v50), session state, dispatcher, eight built-in tools, cost ledger, §1 probe-on-first-use cache (v51). **No UI dependencies.** The §2.5 state machine lives here. |
 | [`atelier-cli`](crates/atelier-cli/) | Hybrid lib + binary. The `atelier` binary provides `atelier init` and `atelier run` (the end-to-end agent-loop driver); the library exports a `Runner` the GUI and TUI link against for their own driver modes. |
-| [`atelier-gui`](crates/atelier-gui/) | Tauri 2.x + Svelte 5 driver. Multi-pane workspace (conversation / diff / plan / meters / composer); hunk accept-reject wired through the live `SessionDispatcher`; concurrent-run guard + per-run UUID workspaces. |
-| [`atelier-tui`](crates/atelier-tui/) | `ratatui` + `crossterm` driver. Same panes as the GUI plus scrubber keys `[` `]` `g`; `y` / `n` route through `SessionDispatcher::submit_approval`. Run with `cargo run -p atelier-tui -- "<prompt>"` for driver mode, no argument for viewer mode. |
+| [`atelier-gui`](crates/atelier-gui/) | Tauri 2.x + Svelte 5 shell. Chat-REPL composer that talks to the adapter with Context, Memory, and Plan side panels, inline Mermaid / image rendering, drag-and-drop plan reorder, concurrent-run guard, and per-run UUID workspaces. |
+| [`atelier-tui`](crates/atelier-tui/) | `ratatui` + `crossterm` driver. Live agent workspace with conversation, context/memory/plan, diff, meters, scrubber keys `[` `]` `g`, and file-level accept/reject from the diff pane. Run with `cargo run -p atelier-tui -- "<prompt>"` for driver mode, no argument for viewer mode. |
 
 Top-level tree:
 
@@ -258,7 +258,7 @@ briefing a colleague who just walked into the room.
 
 ## Skills
 
-Skills are named, slash-invoked prompt expansions — `/review`, `/fix`, `/audit`, etc. The harness ships 14 bundled skills out of the box; you can override any of them in `~/.atelier/skills/` (your scope) or `<workspace>/.atelier/skills/` (per-repo, checked into git so the team shares the same shortcut).
+Skills are named, slash-invoked prompt expansions — `/review`, `/fix`, `/audit`, etc. The harness ships 19 bundled skills out of the box; you can override any of them in `~/.atelier/skills/` (your scope) or `<workspace>/.atelier/skills/` (per-repo, checked into git so the team shares the same shortcut).
 
 When you type `/review` in the GUI Composer (or `atelier run /review` on the CLI), the harness looks up the skill's manifest, expands `${arg}` substitutions against any args you passed, and sends the expanded body as your next user turn. The §2.5 agent loop runs unchanged — skills don't introduce a new state, they just save you typing the same prompt repeatedly.
 
@@ -269,7 +269,7 @@ When you type `/review` in the GUI Composer (or `atelier run /review` on the CLI
 | **`atelier skills validate`** | Lints every registered manifest (or one path) | Pre-commit hook–friendly. Catches typos in `${arg}` references and bad slugs. |
 | **`atelier skills show <name>`** | Prints the resolved manifest + its source path | "Is *this* the one I edited?" |
 
-The full bundled set: `/review`, `/security-review`, `/test`, `/explain`, `/fix`, `/document`, `/refactor`, `/optimize`, `/commit`, `/changelog`, `/audit`, `/spec`, `/sweep`, `/scan`. Run `atelier skills` for the live list with descriptions + override sources.
+The full bundled set: `/review`, `/security-review`, `/test`, `/explain`, `/fix`, `/document`, `/refactor`, `/optimize`, `/commit`, `/changelog`, `/audit`, `/spec`, `/sweep`, `/scan`, `/plan`, `/diagram`, `/triage`, `/release`, `/document-sweep`. Run `atelier skills` for the live list with descriptions + override sources.
 
 **Substitution variables** available in `prompt_template`:
 
@@ -336,7 +336,7 @@ For `rmcp` dependency wiring and troubleshooting (`edition2024` error, proxy/net
 
 `atelier run` is the end-to-end agent-loop driver. Three providers live today (v51): Mock, Anthropic Messages API, and any OpenAI-compatible `POST /v1/chat/completions` server. Invocations + configuration are in [Quick start](#quick-start).
 
-Under the hood, each run: loads `ATELIER.md` into the system prompt, opens a session under `.atelier/sessions/<uuid>/`, calls the configured BYOM adapter, streams tool calls through the §15 dispatcher (seven built-in tools — MCP-hosted external tools land when the `rmcp` spike clears), applies edits atomically (`tempfile` + tree-sitter pre-commit check, spec §3), and either transitions to `Verifying` on `claimed_done: true` or bails after `--max-turns`. Cost-ledger entries land per call; session JSON conforms to `schemas/session/v1.json`.
+Under the hood, each run: loads `ATELIER.md` into the system prompt, opens a session under `.atelier/sessions/<uuid>/`, calls the configured BYOM adapter, streams tool calls through the §15 dispatcher (eight built-in tools plus registered MCP tools), applies edits atomically (`tempfile` + tree-sitter pre-commit check, spec §3), and either transitions to `Verifying` on `claimed_done: true` or bails after `--max-turns`. Cost-ledger entries land per call; session JSON conforms to `schemas/session/v1.json`.
 
 ---
 

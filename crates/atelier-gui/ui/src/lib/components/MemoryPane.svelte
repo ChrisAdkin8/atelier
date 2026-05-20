@@ -45,6 +45,8 @@
   let draft: string = $state('')
   let toast: string | null = $state(null)
   let toastError: boolean = $state(false)
+  let deleteConfirmFor: string | null = $state(null)
+  let deleteInFlight: boolean = $state(false)
 
   // v60.6 — Expand confirm state. Open at most one row at a time;
   // confirm triggers `expand_memory_card`, which on success removes
@@ -63,11 +65,25 @@
     }
   }
 
-  async function deleteCard(id: string) {
+  function askDelete(id: string) {
+    deleteConfirmFor = id
+  }
+
+  function cancelDelete() {
+    deleteConfirmFor = null
+  }
+
+  async function confirmDelete(id: string) {
+    if (deleteInFlight) return
+    deleteInFlight = true
     try {
       await invoke<null>('delete_memory_card', { id })
+      showToast('memory card deleted', false)
     } catch (e) {
       showToast(String(e), true)
+    } finally {
+      deleteInFlight = false
+      deleteConfirmFor = null
     }
   }
 
@@ -201,7 +217,7 @@
               </button>
               <button
                 class="action danger"
-                onclick={() => void deleteCard(card.id)}
+                onclick={() => askDelete(card.id)}
                 title="delete"
                 aria-label="delete {card.id}"
               >
@@ -237,6 +253,23 @@
                   disabled={expandInFlight}
                   onclick={cancelExpand}
                 >
+                  cancel
+                </button>
+              </span>
+            </div>
+          {/if}
+          {#if deleteConfirmFor === card.id}
+            <div class="expand-confirm" role="dialog" aria-label="confirm delete memory card">
+              <span class="expand-msg">Delete this memory card? This cannot be undone.</span>
+              <span class="expand-buttons">
+                <button
+                  class="action danger"
+                  disabled={deleteInFlight}
+                  onclick={() => void confirmDelete(card.id)}
+                >
+                  {deleteInFlight ? 'deleting…' : 'delete'}
+                </button>
+                <button class="action" disabled={deleteInFlight} onclick={cancelDelete}>
                   cancel
                 </button>
               </span>

@@ -24,40 +24,19 @@
       "description": "If present, hook fires only for tool calls whose tool name matches one of these glob patterns. Default: fires for all tools. Ignored for on-verify-* events."
     },
     "implementation": {
-      "description": "Hook impls deliberately do NOT support implementation-level `timeout_ms` — hooks have manifest-level `time_budget_ms` with warn-but-never-block semantics (§15). Kept inline (rather than $ref'ing config/_implementation.v1.json) so tool-level `timeout_ms` cannot leak in via the shared schema.",
-      "oneOf": [
-        {
-          "title": "shell",
+      "description": "Hook impls deliberately do NOT support implementation-level `timeout_ms` — hooks have manifest-level `time_budget_ms` with warn-but-never-block semantics (§15). Kept inline (rather than $ref'ing config/_implementation.v1.json) so tool-level `timeout_ms` cannot leak in via the shared schema. v1 supports shell hooks only; HTTP hook manifests are reserved until a production HTTP executor exists.",
+      "type": "object",
+      "required": ["kind", "command"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {"const": "shell"},
+        "command": {"type": "string"},
+        "env": {
           "type": "object",
-          "description": "Spawn a subprocess. Event payload (tool name + args + result + envelope) arrives as JSON on stdin. Hook may write nothing, or write JSON describing follow-up actions (out of scope for v1; reserved).",
-          "required": ["kind", "command"],
-          "additionalProperties": false,
-          "properties": {
-            "kind": {"const": "shell"},
-            "command": {"type": "string"},
-            "env": {
-              "type": "object",
-              "additionalProperties": {"type": "string", "maxLength": 4096},
-              "description": "Environment overrides. Values support ${env:NAME} / ${keychain:NAME} interpolation per §11 credential storage. v60.37 SCH-M4 — values capped at 4 KiB."
-            }
-          }
-        },
-        {
-          "title": "http",
-          "type": "object",
-          "description": "POST event payload as JSON. Counts as §12 egress.",
-          "required": ["kind", "url"],
-          "additionalProperties": false,
-          "properties": {
-            "kind": {"const": "http"},
-            "url": {"type": "string", "format": "uri"},
-            "headers": {
-              "type": "object",
-              "additionalProperties": {"type": "string"}
-            }
-          }
+          "additionalProperties": {"type": "string", "maxLength": 4096},
+          "description": "Environment overrides. Values support ${env:NAME}; ${keychain:NAME} is reserved and fails closed until OS keychain support lands. v60.37 SCH-M4 — values capped at 4 KiB."
         }
-      ]
+      }
     },
     "time_budget_ms": {
       "type": "integer",

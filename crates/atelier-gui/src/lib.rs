@@ -503,6 +503,7 @@ pub struct CompactionResult {
 /// a hostile or buggy webview shouldn't be able to push a 1M-id list
 /// through the IPC boundary.
 const MAX_COMPACTION_IDS: usize = 256;
+const MAX_GUI_SETTINGS_BYTES: u64 = 64 * 1024;
 
 fn require_adapter(
     state: &tauri::State<'_, SessionState>,
@@ -1048,16 +1049,31 @@ fn build_swap_adapter(
             cache_prompt,
         } => {
             let api_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
-            let base = base_url.unwrap_or_else(|| {
-                std::env::var("OPENAI_BASE_URL")
-                    .unwrap_or_else(|_| "https://api.openai.com/v1".to_string())
-            });
+            let base = effective_openai_base_url(base_url);
+            ensure_base_url_allowed(Some(&base))?;
             let mut adapter = OpenAiCompatAdapter::new(api_key, model_id, base);
             if cache_prompt {
                 adapter = adapter.with_cache_prompt(true);
             }
             Ok(std::sync::Arc::new(adapter))
         }
+    }
+}
+
+fn effective_openai_base_url(base_url: Option<String>) -> String {
+    base_url.unwrap_or_else(|| {
+        std::env::var("OPENAI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".to_string())
+    })
+}
+
+fn ensure_base_url_allowed(base_url: Option<&str>) -> Result<(), String> {
+    if is_base_url_allowed(base_url) {
+        Ok(())
+    } else {
+        Err(format!(
+            "base_url {:?} not in swap_adapter allowlist",
+            base_url.unwrap_or("<none>")
+        ))
     }
 }
 
@@ -1721,32 +1737,48 @@ fn gui_settings_path() -> Option<std::path::PathBuf> {
     Some(std::path::PathBuf::from(home).join(".atelier/gui.toml"))
 }
 
+#[derive(serde::Deserialize, serde::Serialize)]
+struct GuiSettings {
+    workspace: GuiWorkspaceSettings,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct GuiWorkspaceSettings {
+    path: std::path::PathBuf,
+}
+
+fn parse_persisted_workspace(body: &str) -> Result<std::path::PathBuf, String> {
+    let settings: GuiSettings =
+        toml::from_str(body).map_err(|e| format!("invalid gui.toml: {e}"))?;
+    Ok(settings.workspace.path)
+}
+
+fn serialize_persisted_workspace(path: &std::path::Path) -> std::io::Result<String> {
+    let settings = GuiSettings {
+        workspace: GuiWorkspaceSettings {
+            path: path.to_path_buf(),
+        },
+    };
+    toml::to_string_pretty(&settings).map_err(std::io::Error::other)
+}
+
 fn load_persisted_workspace() -> Option<std::path::PathBuf> {
     let path = gui_settings_path()?;
-    let body = std::fs::read_to_string(&path).ok()?;
-    // Minimal hand-roll instead of pulling in serde_toml derive plumbing
-    // for a 2-field file — find `[workspace]` then `path = "..."`.
-    let mut in_workspace = false;
-    for line in body.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        if trimmed.starts_with('[') {
-            in_workspace = trimmed == "[workspace]";
-            continue;
-        }
-        if in_workspace {
-            if let Some(rest) = trimmed.strip_prefix("path") {
-                let rest = rest.trim().strip_prefix('=')?.trim();
-                let unquoted = rest.trim_matches('"');
-                if !unquoted.is_empty() {
-                    return Some(std::path::PathBuf::from(unquoted));
-                }
-            }
-        }
+    if std::fs::metadata(&path).ok()?.len() > MAX_GUI_SETTINGS_BYTES {
+        tracing::warn!(
+            path = %path.display(),
+            max_bytes = MAX_GUI_SETTINGS_BYTES,
+            "gui settings file too large; ignoring"
+        );
+        return None;
     }
-    None
+    let body = std::fs::read_to_string(&path).ok()?;
+    parse_persisted_workspace(&body)
+        .map_err(|e| {
+            tracing::warn!(path = %path.display(), error = %e, "failed to parse gui settings");
+            e
+        })
+        .ok()
 }
 
 fn persist_workspace(path: &std::path::Path) -> std::io::Result<()> {
@@ -1755,14 +1787,11 @@ fn persist_workspace(path: &std::path::Path) -> std::io::Result<()> {
     if let Some(parent) = settings.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let body = format!(
-        "# atelier-gui settings — managed by the workspace selector.\n\
-         # Edit by hand only if the GUI is closed; otherwise use the\n\
-         # in-app picker so changes round-trip cleanly.\n\
-         [workspace]\n\
-         path = \"{}\"\n",
-        path.to_string_lossy()
-    );
+    let mut body = "# atelier-gui settings — managed by the workspace selector.\n\
+                    # Edit by hand only if the GUI is closed; otherwise use the\n\
+                    # in-app picker so changes round-trip cleanly.\n"
+        .to_string();
+    body.push_str(&serialize_persisted_workspace(path)?);
     std::fs::write(&settings, body)
 }
 
@@ -2006,7 +2035,6 @@ fn preflight_base_url(base_url: &str) -> bool {
 fn resolve_executor_adapter(
     repo_root: &std::path::Path,
 ) -> Result<Option<std::sync::Arc<dyn atelier_core::adapter::Adapter>>, String> {
-    use atelier_core::adapter::openai_compat::OpenAiCompatAdapter;
     use atelier_core::config::{ProviderKind, ProvidersConfig};
     let loaded = match ProvidersConfig::load(repo_root)
         .map_err(|e| format!("providers.toml load failed: {e}"))?
@@ -2036,22 +2064,20 @@ fn resolve_executor_adapter(
         .ok_or_else(|| format!("executor profile {name:?} missing `model`"))?;
     let adapter: std::sync::Arc<dyn atelier_core::adapter::Adapter> = match kind {
         ProviderKind::OpenaiCompat => {
-            let api_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
-            let base = prof.base_url.clone().unwrap_or_else(|| {
-                std::env::var("OPENAI_BASE_URL")
-                    .unwrap_or_else(|_| "https://api.openai.com/v1".to_string())
-            });
+            let base = effective_openai_base_url(prof.base_url.clone());
+            ensure_base_url_allowed(Some(&base))
+                .map_err(|e| format!("executor profile {name:?}: {e}"))?;
             if !preflight_base_url(&base) {
                 return Err(format!(
                     "executor profile {name:?}: server at {base:?} is unreachable \
                      (TCP connect timed out); skipping executor adapter"
                 ));
             }
-            let mut a = OpenAiCompatAdapter::new(api_key, model, base);
-            if prof.cache_prompt.unwrap_or(false) {
-                a = a.with_cache_prompt(true);
-            }
-            std::sync::Arc::new(a)
+            build_swap_adapter(SwapProviderWire::OpenAiCompat {
+                model_id: model,
+                base_url: Some(base),
+                cache_prompt: prof.cache_prompt.unwrap_or(false),
+            })?
         }
         ProviderKind::Anthropic => {
             use atelier_core::adapter::anthropic::AnthropicAdapter;
@@ -3451,6 +3477,76 @@ mod tests {
         assert!(is_base_url_allowed(Some("http://localhost:11434/v1")));
         assert!(is_base_url_allowed(Some("http://127.0.0.1:8080/v1")));
         assert!(is_base_url_allowed(None));
+    }
+
+    #[test]
+    fn default_openai_profile_uses_swap_allowlist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dot_atelier = tmp.path().join(".atelier");
+        std::fs::create_dir_all(&dot_atelier).unwrap();
+        std::fs::write(
+            dot_atelier.join("providers.toml"),
+            r#"
+default = "leak"
+
+[providers.leak]
+provider = "openai-compat"
+base_url = "https://evil.example/v1"
+model = "local:evil"
+"#,
+        )
+        .unwrap();
+
+        let err = match resolve_default_adapter(tmp.path()) {
+            Ok(_) => panic!("malicious base_url must reject"),
+            Err(e) => e,
+        };
+        assert!(err.contains("allowlist"), "got: {err}");
+        assert!(err.contains("evil.example"), "got: {err}");
+    }
+
+    #[test]
+    fn executor_openai_profile_uses_swap_allowlist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dot_atelier = tmp.path().join(".atelier");
+        std::fs::create_dir_all(&dot_atelier).unwrap();
+        std::fs::write(
+            dot_atelier.join("providers.toml"),
+            r#"
+[routing]
+executor = "leak"
+
+[providers.leak]
+provider = "openai-compat"
+base_url = "https://evil.example/v1"
+model = "local:evil"
+"#,
+        )
+        .unwrap();
+
+        let err = match resolve_executor_adapter(tmp.path()) {
+            Ok(_) => panic!("malicious executor base_url must reject"),
+            Err(e) => e,
+        };
+        assert!(err.contains("executor profile"), "got: {err}");
+        assert!(err.contains("allowlist"), "got: {err}");
+        assert!(err.contains("evil.example"), "got: {err}");
+    }
+
+    #[test]
+    fn gui_settings_toml_round_trips_escaped_paths() {
+        let path = std::path::PathBuf::from(r#"/Users/example/quote"slash\repo"#);
+        let body = serialize_persisted_workspace(&path).unwrap();
+        let parsed = parse_persisted_workspace(&body).unwrap();
+        assert_eq!(parsed, path);
+        assert!(body.contains("[workspace]"));
+    }
+
+    #[test]
+    fn gui_settings_rejects_invalid_toml_clearly() {
+        let err = parse_persisted_workspace("[workspace]\npath = \"unterminated\n")
+            .expect_err("invalid TOML must not be hand-parsed");
+        assert!(err.contains("invalid gui.toml"), "got: {err}");
     }
 
     // ---------- v60.37 B5 list_provider_profiles ----------

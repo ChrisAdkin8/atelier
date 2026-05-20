@@ -6,6 +6,20 @@
   "type": "object",
   "required": ["version", "channel", "atelier_version", "session_uuid", "sent_at", "body"],
   "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {"properties": {"channel": {"const": "crash"}}, "required": ["channel"]},
+      "then": {"properties": {"body": {"$ref": "#/$defs/crashBody"}}}
+    },
+    {
+      "if": {"properties": {"channel": {"const": "perf"}}, "required": ["channel"]},
+      "then": {"properties": {"body": {"$ref": "#/$defs/perfBody"}}}
+    },
+    {
+      "if": {"properties": {"channel": {"const": "usage"}}, "required": ["channel"]},
+      "then": {"properties": {"body": {"$ref": "#/$defs/usageBody"}}}
+    }
+  ],
   "properties": {
     "version": {"const": 1, "description": "Schema version."},
     "channel": {"enum": ["crash", "perf", "usage"]},
@@ -15,49 +29,54 @@
     "os": {"type": "string"},
     "body": {
       "oneOf": [
-        {
-          "title": "crash",
-          "type": "object",
-          "required": ["stack", "exit_code"],
-          "additionalProperties": false,
-          "properties": {
-            "stack": {"type": "string"},
-            "exit_code": {"type": "integer"},
-            "last_tool": {"type": "string"}
-          }
-        },
-        {
-          "title": "perf",
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "tool_latency_histogram": {
-              "type": "object",
-              "additionalProperties": {"type": "array", "items": {"type": "number"}}
-            },
-            "ledger_summary": {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "total_prompt_tokens": {"type": "integer", "minimum": 0},
-                "total_completion_tokens": {"type": "integer", "minimum": 0},
-                "cached_tokens": {"type": "integer", "minimum": 0},
-                "total_cost_usd": {"type": "number", "minimum": 0}
-              }
-            }
-          }
-        },
-        {
-          "title": "usage",
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "feature": {"type": "string"},
-            "count": {"type": "integer", "minimum": 1}
-          },
-          "required": ["feature", "count"]
-        }
+        {"$ref": "#/$defs/crashBody"},
+        {"$ref": "#/$defs/perfBody"},
+        {"$ref": "#/$defs/usageBody"}
       ]
+    }
+  },
+  "$defs": {
+    "crashBody": {
+      "title": "crash",
+      "type": "object",
+      "required": ["stack", "exit_code"],
+      "additionalProperties": false,
+      "properties": {
+        "stack": {"type": "string"},
+        "exit_code": {"type": "integer"},
+        "last_tool": {"type": "string"}
+      }
+    },
+    "perfBody": {
+      "title": "perf",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "tool_latency_histogram": {
+          "type": "object",
+          "additionalProperties": {"type": "array", "items": {"type": "number"}}
+        },
+        "ledger_summary": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "total_prompt_tokens": {"type": "integer", "minimum": 0},
+            "total_completion_tokens": {"type": "integer", "minimum": 0},
+            "cached_tokens": {"type": "integer", "minimum": 0},
+            "total_cost_usd": {"type": "number", "minimum": 0}
+          }
+        }
+      }
+    },
+    "usageBody": {
+      "title": "usage",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "feature": {"type": "string"},
+        "count": {"type": "integer", "minimum": 1}
+      },
+      "required": ["feature", "count"]
     }
   }
 }

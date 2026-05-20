@@ -22,9 +22,7 @@ atelier-core = { workspace = true }
 # v47: GUI drives a turn loop via the atelier-cli library. Pulls in
 # Runner, ProviderChoice, MockResponse, EventSink, DispatcherHandle.
 atelier-cli = { workspace = true }
-# `devtools` keeps Inspect Element + WKWebView `isInspectable` on macOS
-# available while we still need to diagnose.
-tauri = { workspace = true, features = ["devtools"] }
+tauri = { workspace = true }
 # v60.46 — native OS folder picker for the workspace selector.
 # Frontend pairs with `@tauri-apps/plugin-dialog`.
 tauri-plugin-dialog = "2"
@@ -36,6 +34,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+toml = { workspace = true }
 # Bridge for `Event::StagingPendingApproval { commit_id: Uuid }` /
 # `CommitDecision { commit_id: Uuid }` — projected onto JSON strings
 # for the webview.
@@ -53,6 +52,8 @@ tempfile = { workspace = true }
 # server and makes hot-reload impossible.
 [features]
 custom-protocol = ["tauri/custom-protocol"]
+# Opt-in only for local diagnostics; release builds do not enable WebView devtools.
+devtools = ["tauri/devtools"]
 
 [build-dependencies]
 tauri-build = { workspace = true }

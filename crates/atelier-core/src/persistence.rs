@@ -243,10 +243,7 @@ impl OnDiskSession {
     /// because session.json contains conversation snapshots and (eventually)
     /// resumable tool fixtures that may include secrets the model saw.
     pub fn save_to(&self, dir: &Path) -> Result<PathBuf, PersistenceError> {
-        std::fs::create_dir_all(dir).map_err(|e| PersistenceError::Io {
-            path: dir.to_path_buf(),
-            source: e,
-        })?;
+        Self::create_session_dir_safely(dir)?;
         // Best-effort tighten mode to 0700 on Unix; harmless elsewhere.
         // Atomically retighten on every save so a directory created by a
         // pre-fix build gets fixed on the next write.
@@ -279,6 +276,35 @@ impl OnDiskSession {
         // Windows isn't a v1 target.
         fsync_dir(dir)?;
         Ok(target)
+    }
+
+    fn create_session_dir_safely(dir: &Path) -> Result<(), PersistenceError> {
+        if let Some(repo_root) = Self::repo_root_for_atelier_path(dir) {
+            return crate::path_safety::create_dir_all_inside_workspace(
+                repo_root,
+                "persistence",
+                dir,
+            )
+            .map_err(|e| PersistenceError::Io {
+                path: dir.to_path_buf(),
+                source: io::Error::new(io::ErrorKind::PermissionDenied, e.to_string()),
+            });
+        }
+
+        std::fs::create_dir_all(dir).map_err(|e| PersistenceError::Io {
+            path: dir.to_path_buf(),
+            source: e,
+        })
+    }
+
+    fn repo_root_for_atelier_path(path: &Path) -> Option<&Path> {
+        let mut cur = path;
+        loop {
+            if cur.file_name().and_then(|name| name.to_str()) == Some(".atelier") {
+                return cur.parent();
+            }
+            cur = cur.parent()?;
+        }
     }
 
     /// v61 — reconstruct the resume-ready conversation prefix. Walks
@@ -660,6 +686,24 @@ mod tests {
         assert_eq!(
             p.file_name().unwrap().to_str().unwrap(),
             uuid_for(7).to_string()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_to_rejects_symlinked_atelier_dir_before_mutating_outside() {
+        let ws = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        std::os::unix::fs::symlink(outside.path(), ws.path().join(".atelier")).unwrap();
+        let dir = OnDiskSession::session_dir(ws.path(), uuid_for(8));
+        let s = OnDiskSession::fresh(uuid_for(8), "0.0.0", "2026-05-16T10:00:00Z");
+
+        let err = s.save_to(&dir).unwrap_err();
+
+        assert!(matches!(err, PersistenceError::Io { .. }));
+        assert!(
+            !outside.path().join("sessions").exists(),
+            "save_to followed symlinked .atelier and created outside state"
         );
     }
 

@@ -2880,6 +2880,7 @@ async fn run_async(prompt: Option<String>) -> io::Result<()> {
     // `None` in viewer mode (no adapter to call); otherwise mirrors
     // `dispatcher_handle`'s lifetime via the same `AdapterHandleGuard`.
     let adapter_handle: Option<atelier_cli::runner::AdapterHandle>;
+    let driver_workspace: Option<tempfile::TempDir>;
     let _run_task: Option<tokio::task::JoinHandle<()>>;
     let _viewer_session: Option<atelier_core::SessionHandle>;
 
@@ -2887,9 +2888,10 @@ async fn run_async(prompt: Option<String>) -> io::Result<()> {
         Some(p) => {
             // Driver mode: build the Runner, wire EventSink::Callback
             // to the mpsc, spawn the run.
-            let (handle, adapter_h, task) = spawn_driver_run(p, event_tx.clone())?;
+            let (handle, adapter_h, workspace, task) = spawn_driver_run(p, event_tx.clone())?;
             dispatcher_handle = Some(handle);
             adapter_handle = Some(adapter_h);
+            driver_workspace = Some(workspace);
             _run_task = Some(task);
             _viewer_session = None;
         }
@@ -2921,6 +2923,7 @@ async fn run_async(prompt: Option<String>) -> io::Result<()> {
             });
             dispatcher_handle = None;
             adapter_handle = None;
+            driver_workspace = None;
             _run_task = None;
             _viewer_session = Some(session_handle);
         }
@@ -3028,7 +3031,16 @@ async fn run_async(prompt: Option<String>) -> io::Result<()> {
                             }
                             InputOutcome::CompactConfirmYes { ids, tokens_freed: _ } => {
                                 state.input_mode = InputMode::Normal;
-                                submit_compact(&dispatcher_handle, &adapter_handle, ids);
+                                if let Some(workspace) = driver_workspace.as_ref() {
+                                    submit_compact(
+                                        &dispatcher_handle,
+                                        &adapter_handle,
+                                        workspace.path(),
+                                        ids,
+                                    );
+                                } else {
+                                    tracing::warn!("submit_compact: no private workspace");
+                                }
                             }
                             InputOutcome::ExpandAsk {
                                 card_id,
@@ -3043,7 +3055,11 @@ async fn run_async(prompt: Option<String>) -> io::Result<()> {
                             }
                             InputOutcome::ExpandConfirmYes { card_id } => {
                                 state.input_mode = InputMode::Normal;
-                                submit_expand(&dispatcher_handle, card_id);
+                                if let Some(workspace) = driver_workspace.as_ref() {
+                                    submit_expand(&dispatcher_handle, workspace.path(), card_id);
+                                } else {
+                                    tracing::warn!("submit_expand: no private workspace");
+                                }
                             }
                             InputOutcome::ConcurrentEditResolve { outcome } => {
                                 // v61 — clear the modal locally and
@@ -3239,6 +3255,7 @@ fn spawn_driver_run(
 ) -> io::Result<(
     atelier_cli::runner::DispatcherHandle,
     atelier_cli::runner::AdapterHandle,
+    tempfile::TempDir,
     tokio::task::JoinHandle<()>,
 )> {
     use atelier_cli::runner::{
@@ -3261,15 +3278,8 @@ fn spawn_driver_run(
         ));
     }
 
-    let workspace = std::env::temp_dir().join(format!(
-        "atelier-tui-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
-    std::fs::create_dir_all(&workspace)?;
+    let workspace_tempdir = private_tui_tempdir()?;
+    let workspace = workspace_tempdir.path().to_path_buf();
 
     let file_name = first_word_or_default(&prompt, "demo.txt");
     let content = format!("written by the TUI demo driver:\n{prompt}\n");
@@ -3317,7 +3327,13 @@ fn spawn_driver_run(
             tracing::warn!(error = %e, "TUI demo run failed");
         }
     });
-    Ok((handle, adapter_handle, task))
+    Ok((handle, adapter_handle, workspace_tempdir, task))
+}
+
+fn private_tui_tempdir() -> io::Result<tempfile::TempDir> {
+    tempfile::Builder::new()
+        .prefix(&format!("atelier-tui-{}-", std::process::id()))
+        .tempdir()
 }
 
 /// Pick the first whitespace-delimited word from `s`, sanitised to
@@ -3457,6 +3473,7 @@ fn submit_mutation(handle: &Option<atelier_cli::runner::DispatcherHandle>, m: Mu
 fn submit_compact(
     dispatcher_handle: &Option<atelier_cli::runner::DispatcherHandle>,
     adapter_handle: &Option<atelier_cli::runner::AdapterHandle>,
+    workspace_root: &std::path::Path,
     ids: Vec<String>,
 ) {
     let (Some(dh), Some(ah)) = (dispatcher_handle, adapter_handle) else {
@@ -3472,13 +3489,7 @@ fn submit_compact(
         return;
     };
     let now = atelier_core::time::now_rfc3339();
-    // The TUI driver run doesn't currently surface its per-run
-    // workspace_root or session_id externally, so we mint a fresh
-    // session UUID per compaction call and write the blob under
-    // `std::env::temp_dir()`. Once the TUI grows a real session
-    // picker (Phase D §4 time-travel) these will come from the
-    // active session.
-    let workspace = std::env::temp_dir();
+    let workspace = workspace_root.to_path_buf();
     let session_id = uuid::Uuid::new_v4().to_string();
     tokio::spawn(async move {
         let result = atelier_cli::compaction::compact(
@@ -3507,13 +3518,12 @@ fn submit_compact(
 /// call in the loop), so the function signature is one parameter
 /// shorter.
 ///
-/// The blob is resolved against `std::env::temp_dir()` — same
-/// shortcut [`submit_compact`] takes, since the TUI driver run
-/// doesn't externally expose its `workspace_root`. The compaction
-/// path also wrote under this same root, so reads and writes
-/// pair correctly for the demo run.
+/// The blob is resolved against the private driver workspace also used
+/// by [`submit_compact`], so reads and writes pair correctly without
+/// falling back to the process-global temp directory.
 fn submit_expand(
     dispatcher_handle: &Option<atelier_cli::runner::DispatcherHandle>,
+    workspace_root: &std::path::Path,
     card_id: String,
 ) {
     let Some(dh) = dispatcher_handle else {
@@ -3525,7 +3535,7 @@ fn submit_expand(
         return;
     };
     let now = atelier_core::time::now_rfc3339();
-    let workspace = std::env::temp_dir();
+    let workspace = workspace_root.to_path_buf();
     tokio::spawn(async move {
         let result = atelier_cli::expansion::expand(sd.as_ref(), &workspace, card_id, &now).await;
         if let Err(e) = result {
@@ -3671,6 +3681,22 @@ mod tests {
             s.apply(&SessionEvent::Cancelled);
         }
         assert_eq!(s.events.len(), MAX_EVENT_LOG);
+    }
+
+    #[test]
+    fn private_tui_tempdir_is_unique_and_removed_on_drop() {
+        let first = private_tui_tempdir().unwrap();
+        let second = private_tui_tempdir().unwrap();
+        assert_ne!(first.path(), second.path());
+        assert!(first.path().exists());
+        assert!(second.path().exists());
+        assert_ne!(first.path(), std::env::temp_dir());
+        let first_path = first.path().to_path_buf();
+        drop(first);
+        assert!(
+            !first_path.exists(),
+            "TempDir should remove workspace on drop"
+        );
     }
 
     #[test]

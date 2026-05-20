@@ -169,6 +169,7 @@ jobs:
         env:
           PHASE_B_SKIPPED: ${{ steps.phase_b_anthropic.outputs.is_skipped }}
           PHASE_B_SUMMARY_PATH: ${{ steps.phase_b_anthropic.outputs.summary_path }}
+          PHASE_B_EXIT_CODE: ${{ steps.phase_b_anthropic.outputs.exit_code }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -e
@@ -179,6 +180,11 @@ jobs:
           summary_path = os.environ.get("PHASE_B_SUMMARY_PATH", "")
           calibration_env = os.environ.get("CALIBRATION_PHASE", "true")
           phase_b_floor = float(os.environ.get("PHASE_B_FLOOR", "0.95"))
+          try:
+              live_exit_code = int(os.environ.get("PHASE_B_EXIT_CODE") or "0")
+          except ValueError:
+              print(f"::error::invalid PHASE_B_EXIT_CODE={os.environ.get('PHASE_B_EXIT_CODE')!r}", file=sys.stderr)
+              sys.exit(1)
 
           if skipped:
               # Skipped: empty summaries, status=yellow (no evidence),
@@ -209,12 +215,11 @@ jobs:
               if not isinstance(summaries, list):
                   print(f"::error::summary must be a JSON array; got {type(summaries).__name__}", file=sys.stderr)
                   sys.exit(1)
-              # During calibration, every run is yellow + all_passed=true.
-              # Post-calibration the workflow computes status via the
-              # Rust ConformanceStatus::for_run lattice (binary call
-              # below) — for now we keep the records-only posture.
-              status = "yellow"
-              all_passed = True
+              # During calibration, successful live runs are records-only
+              # yellow. A nonzero live exit is still a failed gate even if
+              # the test managed to leave a summary file behind.
+              status = "red" if live_exit_code != 0 else "yellow"
+              all_passed = live_exit_code == 0
               calibration = calibration_env == "true"
 
           payload = {

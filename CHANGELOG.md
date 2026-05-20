@@ -1,5 +1,24 @@
 # Atelier Spec — Changelog
 
+## v60.73 — 2026-05-20 (hardening + documentation sweep)
+
+Security and schema hardening pass, followed by a documentation sweep to align the public docs with the current GUI/TUI split and the eight-tool dispatcher surface.
+
+### Hardening highlights
+
+- **Path containment**: `path_safety::create_dir_all_inside_workspace` creates directory trees component-by-component and rejects symlinked path components that resolve outside the workspace before descending.
+- **MCP protocol checks**: HTTP/SSE launch now compares the serialized MCP protocol version exactly instead of accepting debug-string substring matches.
+- **Provider egress allowlist**: GUI default-provider and executor-provider resolution now reuse the provider-swap base-URL allowlist, including `OPENAI_BASE_URL` fallback paths.
+- **GUI settings parsing**: `~/.atelier/gui.toml` now round-trips through TOML serialization/deserialization with a 64 KiB read cap and explicit parse warnings.
+- **Schema tightening**: hook manifests are shell-only until an HTTP executor exists; MCP HTTP/SSE server entries must opt into `allow_net: true`; MCP catalog npm packages must be exact pinned versions; skill args cannot be both `required` and defaulted; telemetry bodies are discriminated by channel.
+- **CI / supply-chain gates**: the Phase B nightly marks nonzero live exits red even when a summary file exists, workflow SHA-pin checks include `.yaml` and reusable workflows, and the npm IoC sweep now covers npm lockfile v1 dependency trees.
+
+### Documentation sweep
+
+- README / CAPABILITIES / crate READMEs now consistently describe eight built-ins (`spawn_subagent` included), registered MCP tools, the GUI chat-REPL workspace, and TUI file-level approval.
+- SECURITY now reflects the pre-release runnable state and the current secret-interpolation contract (`${env:...}` supported, `${keychain:...}` reserved/fail-closed).
+- STATUS was refreshed for the current Phase A closure, MCP client, file watcher, GUI pivot, TUI sub-agent/slash/LSP surfaces, and latest version pointer.
+
 ## v60.72 — 2026-05-20 (§10.1 sub-agent hang mitigations)
 
 Four reliability fixes for the sub-agent delegation path, targeting hangs observed when running a two-child fan-out against a single-slot local LLM.

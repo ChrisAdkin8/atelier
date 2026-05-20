@@ -44,7 +44,11 @@
                 "additionalProperties": false,
                 "properties": {
                   "kind": {"const": "npm"},
-                  "npm_package": {"type": "string"},
+                  "npm_package": {
+                    "type": "string",
+                    "pattern": "^(@[A-Za-z0-9._-]+/[A-Za-z0-9._-]+|[A-Za-z0-9._-]+)@[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$",
+                    "description": "Exact npm package spec including a pinned version, e.g. @scope/name@1.2.3. Tags such as latest are not allowed in the curated catalog."
+                  },
                   "command_template": {
                     "type": "object",
                     "description": "Pre-fill for the user's mcp_servers.json entry. Variables like ${repo_root} are documented but not part of the schema.",
@@ -93,7 +97,7 @@
             "type": "array",
             "items": {
               "type": "object",
-              "required": ["name", "description"],
+              "required": ["name", "description", "where"],
               "additionalProperties": false,
               "properties": {
                 "name": {"type": "string", "description": "Keychain entry name; the GUI prompts for this via the §11 credential UI."},
@@ -101,8 +105,27 @@
                 "where": {
                   "enum": ["header", "env"],
                   "description": "Where the secret is injected when the server is run."
+                },
+                "env_name": {
+                  "type": "string",
+                  "pattern": "^[A-Z_][A-Z0-9_]*$",
+                  "description": "Required when where=env; environment variable name the generated server manifest will populate."
+                },
+                "header_name": {
+                  "type": "string",
+                  "description": "Required when where=header; HTTP header name the generated server manifest will populate."
                 }
-              }
+              },
+              "allOf": [
+                {
+                  "if": {"properties": {"where": {"const": "env"}}},
+                  "then": {"required": ["env_name"], "not": {"required": ["header_name"]}}
+                },
+                {
+                  "if": {"properties": {"where": {"const": "header"}}},
+                  "then": {"required": ["header_name"], "not": {"required": ["env_name"]}}
+                }
+              ]
             }
           },
           "homepage": {"type": "string", "format": "uri"},
