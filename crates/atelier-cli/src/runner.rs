@@ -1510,11 +1510,17 @@ impl Runner {
 
         if let Some(resume_uuid) = self.resume_from {
             let session_dir = OnDiskSession::session_dir(&workspace, resume_uuid);
-            let on_disk = OnDiskSession::load_from(&session_dir).map_err(|e| {
+            let on_disk = OnDiskSession::load_manifest_from(&session_dir).map_err(|e| {
                 RunError::Config(format!("resume: cannot load session {resume_uuid}: {e}"))
             })?;
             // Re-hydrate the in-memory message list from the prefix.
-            for entry in on_disk.resume_conversation_prefix() {
+            let resume_prefix = OnDiskSession::resume_conversation_prefix_from_dir(&session_dir)
+                .map_err(|e| {
+                    RunError::Config(format!(
+                        "resume: cannot load conversation prefix for session {resume_uuid}: {e}"
+                    ))
+                })?;
+            for entry in resume_prefix {
                 let role = match entry.role.as_str() {
                     "user" => Role::User,
                     "assistant" => Role::Assistant,
@@ -2672,7 +2678,7 @@ impl Runner {
             }
         }
 
-        if let Err(e) = snapshot.save_to(&session_dir) {
+        if let Err(e) = snapshot.save_split_to(&session_dir) {
             tracing::warn!(error = %e, "atelier run: session snapshot save failed");
         }
 

@@ -90,7 +90,7 @@ If the model returns a context-overflow error mid-turn, the harness can auto-com
 - **§11 sandbox.** Built-in tools and shelled-out subprocesses run with a default-deny network policy; reads are repo-scoped; writes to `/etc`, `/usr/local`, etc. are refused.
 - **§12 audit log.** Every blocked network attempt, every MCP HTTP request, every LSP install prompt writes a structured row to `<workspace>/.atelier/sessions/<uuid>/audit.log`. Exportable for privacy review.
 - **§14 concurrent-edit modal.** A file watcher tracks the dispatcher's read-set. If you (or another process) modify a file the agent has read, the next tool call pauses and the harness asks you whether to Reload (drop the queued call and re-read), Wait (keep the call queued), or Pause (5-minute auto-Reload fallback). The `--non-interactive` flag auto-resolves to Reload.
-- **§14 crash recovery.** Sessions persist to `<workspace>/.atelier/sessions/<uuid>/session.json` with full atomic-write discipline (tempfile → fsync → rename → fsync of parent dir). After a `kill -9` mid-turn, `atelier run --resume <uuid>` picks up at the last fully-completed tool call; partial output lives in `recovery_log` and never gets confused for finished conversation.
+- **§14 crash recovery.** Sessions persist under `<workspace>/.atelier/sessions/<uuid>/` with a schema-valid `session.json` manifest plus `conversation.jsonl` / `ledger.jsonl` sidecars and a `resume_index.json` cursor. Writes use full atomic discipline (tempfile → fsync → rename → fsync of parent dir). After a `kill -9` mid-turn, `atelier run --resume <uuid>` picks up at the last fully-completed tool call; partial output lives in `recovery_log` and never gets confused for finished conversation.
 - **Supply-chain gates.** `make audit` runs `cargo audit --deny warnings` against the Rust workspace, `npm audit --audit-level=high` against the GUI's frontend deps, and a Shai-Hulud / npm supply-chain IoC sweep (no malicious workflow file, no `preinstall`/`postinstall` hooks, every tarball resolved from `registry.npmjs.org`).
 
 ---
@@ -114,7 +114,7 @@ The cost ledger records every adapter call:
 - **Latency** — measured at the adapter boundary.
 - **Cost in USD** — local providers (Mock, OpenAI-compat against a self-hosted server) get a latency-weighted `$0.00028/sec` attribution; cloud providers (Anthropic, hosted OpenAI) leave the field empty until per-provider pricing tables ship.
 
-The §3 cost meter in the GUI/TUI footer shows the running total. The ledger is JSON, lives in `session.json`, and is yours — export it however you like.
+The §3 cost meter in the GUI/TUI footer shows the running total. The ledger is JSON; long sessions store it in `ledger.jsonl` next to the schema-valid `session.json` manifest, and older snapshot-only sessions still load from `session.json`.
 
 ---
 
@@ -179,7 +179,10 @@ Deferred: GUI sub-agent card, TUI sub-agent line, §4 time-travel checkpointing 
   hooks/                  # per-repo hook manifests
   hook_approvals.json     # auto-managed
   sessions/<uuid>/
-    session.json          # durable session state
+    session.json          # schema-valid session manifest
+    conversation.jsonl    # completed conversation rows
+    ledger.jsonl          # cost-ledger rows
+    resume_index.json     # last safe resume cursor
     audit.log             # §12 audit rows (JSONL)
     compactions/          # reversible compaction blobs
     recovery_log          # partial output preserved across crashes

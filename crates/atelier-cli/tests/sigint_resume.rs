@@ -157,11 +157,11 @@ async fn external_cancel_writes_partial_session_to_disk() {
         parsed["session_uuid"].as_str(),
         Some(session_uuid.to_string().as_str())
     );
-    // `conversation` is an array; even on cancel the user turn is
-    // always written before the loop hits its first adapter call.
-    let conv = parsed["conversation"]
-        .as_array()
-        .expect("conversation must be an array");
+    // Split-session persistence keeps the schema-valid manifest small and
+    // hydrates conversation rows from sidecars through `load_from`.
+    let hydrated =
+        atelier_core::OnDiskSession::load_from(&session_dir).expect("session must hydrate");
+    let conv = &hydrated.conversation;
     assert!(
         !conv.is_empty(),
         "conversation must contain at least the user turn"
@@ -197,10 +197,9 @@ async fn external_cancel_writes_partial_session_to_disk() {
         !after.is_empty(),
         "session.json must remain non-empty after resume"
     );
-    let after_parsed: serde_json::Value = serde_json::from_slice(&after).unwrap();
-    let after_conv = after_parsed["conversation"]
-        .as_array()
-        .expect("conversation must be an array post-resume");
+    let after_hydrated =
+        atelier_core::OnDiskSession::load_from(&session_dir).expect("session must rehydrate");
+    let after_conv = &after_hydrated.conversation;
     assert!(
         after_conv.len() >= conv.len(),
         "resume must preserve or extend the prior conversation (was {}, now {})",

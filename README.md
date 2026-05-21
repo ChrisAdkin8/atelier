@@ -357,7 +357,7 @@ For `rmcp` dependency wiring and troubleshooting (`edition2024` error, proxy/net
 
 `atelier run` is the end-to-end agent-loop driver. Three providers live today (v51): Mock, Anthropic Messages API, and any OpenAI-compatible `POST /v1/chat/completions` server. Invocations + configuration are in [Quick start](#quick-start).
 
-Under the hood, each run: loads `ATELIER.md` into the system prompt, opens a session under `.atelier/sessions/<uuid>/`, calls the configured BYOM adapter, streams tool calls through the §15 dispatcher (eight built-in tools plus registered MCP tools), applies edits atomically (`tempfile` + tree-sitter pre-commit check, spec §3), and either transitions to `Verifying` on `claimed_done: true` or bails after `--max-turns`. Cost-ledger entries land per call; session JSON conforms to `schemas/session/v1.json`.
+Under the hood, each run: loads `ATELIER.md` into the system prompt, opens a session under `.atelier/sessions/<uuid>/`, calls the configured BYOM adapter, streams tool calls through the §15 dispatcher (eight built-in tools plus registered MCP tools), applies edits atomically (`tempfile` + tree-sitter pre-commit check, spec §3), and either transitions to `Verifying` on `claimed_done: true` or bails after `--max-turns`. The session manifest (`session.json`) conforms to `schemas/session/v1.json`; long append-like arrays are split into `conversation.jsonl` and `ledger.jsonl` sidecars with a `resume_index.json` cursor so `--resume` can reconstruct the last safe prefix without hydrating unrelated session sections.
 
 ---
 

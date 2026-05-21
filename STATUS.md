@@ -2,7 +2,7 @@
 
 [← back to README](README.md)
 
-The harness is **end-to-end runnable** for the Phase A/B/C scope, against Mock, Anthropic, and any OpenAI-compatible server (LM Studio, llama-server, vLLM, sglang, Ollama, OpenAI itself). The Tauri GUI is currently a chat-REPL workspace with context/memory/plan/sub-agent surfaces; the `ratatui` TUI remains the live agent workspace with diff and file-level approval controls. The spec, schemas, canonical workload, and self-testing rig are fully wired and verify the harness as it grows. This file tracks **what has landed**, **what is in flight**, and **what gates each phase**. Ordered build plan: [`tasks/todo.md`](tasks/todo.md); version-by-version trail: [`CHANGELOG.md`](CHANGELOG.md) (latest **v60.73**).
+The harness is **end-to-end runnable** for the Phase A/B/C scope, against Mock, Anthropic, and any OpenAI-compatible server (LM Studio, llama-server, vLLM, sglang, Ollama, OpenAI itself). The Tauri GUI is currently a chat-REPL workspace with context/memory/plan/sub-agent surfaces; the `ratatui` TUI remains the live agent workspace with diff and file-level approval controls. The spec, schemas, canonical workload, and self-testing rig are fully wired and verify the harness as it grows. This file tracks **what has landed**, **what is in flight**, and **what gates each phase**. Ordered build plan: [`tasks/todo.md`](tasks/todo.md); version-by-version trail: [`CHANGELOG.md`](CHANGELOG.md) (latest **v60.75**).
 
 ---
 
@@ -16,7 +16,7 @@ The Phase A foundation, Phase B protocol/verification subset, and Phase C worksp
 - §3 atomic diff staging — tempfile + tree-sitter JSON pre-commit + SHA-256 conflict check + incremental `Hunks` stream over the bus.
 - §3 file-level accept/reject (v46 contract) — `ApprovalPolicy::{AutoApproveAll, AwaitApproval}`, `StagedBatch::commit_selected`, `StagingPendingApproval` / `CommitDecision` events.
 - §11 sandbox profile generators — macOS `sandbox-exec` `.sb` + Linux `bwrap` argv; default-deny; `/etc` and `/usr/local` writes rejected at policy-build time.
-- §14 on-disk session + global registry + recovery-log scaffold; atomic save with `fsync_dir_best_effort`; 0700 session dirs on Unix.
+- §14 on-disk session + global registry + recovery-log scaffold; schema-valid `session.json` manifest plus `conversation.jsonl` / `ledger.jsonl` sidecars and `resume_index.json` cursor; atomic save with directory fsync; 0700 session dirs on Unix.
 - §15 hook manifest loader + first-use approval; `ShellHookExecutor` runs hooks via `sandboxed_argv` + `subprocess::run`; `time_budget_ms` warns past but never blocks.
 - §15 dispatcher + `ToolRegistry` + eight built-in tools: `read_file`, `list_dir`, `grep`, `write_file`, `edit_file`, `ast_grep`, `shell`, `spawn_subagent` — all routed through the same dispatcher with hook + ledger + event-bus uniformity.
 - §2 typed envelope + three emission strategies (`native_tool` / `json_sentinel` / `regex_prose`) + downshifting conformance tracker (100-call ring buffer).
@@ -66,7 +66,7 @@ For the invariants the rig *enforces* (no-op-harness exploits, cross-schema `$re
 | §3 atomic diff staging | [`crates/atelier-core/src/staging.rs`](crates/atelier-core/src/staging.rs) | **done** (tempfile + tree-sitter JSON pre-commit + SHA-256 conflict check; parent-dir fsync; all-or-nothing per turn) |
 | §3 file-level accept/reject | `staging.rs` + `dispatcher.rs` + `session.rs` | **done** (v46 contract; `commit_selected`; bus events; round-trips via `submit_approval`) |
 | §11 sandbox profile generators (macOS `.sb` + Linux `bwrap`) | [`crates/atelier-core/src/sandbox.rs`](crates/atelier-core/src/sandbox.rs) | **done** (default deny; `/etc` and `/usr/local` writes rejected at policy-build time) |
-| §14 on-disk session + recovery log + global registry | [`crates/atelier-core/src/persistence.rs`](crates/atelier-core/src/persistence.rs) | **done** (typed `OnDiskSession`; atomic save; version-skew rejected on load; 0700 dirs on Unix) |
+| §14 on-disk session + recovery log + global registry | [`crates/atelier-core/src/persistence.rs`](crates/atelier-core/src/persistence.rs) | **done** (typed `OnDiskSession`; schema-valid manifest + JSONL sidecars; resume cursor; compaction; atomic save; version-skew rejected on load; 0700 dirs on Unix) |
 | §15 hook manifest loader + first-use approval | [`crates/atelier-core/src/hooks.rs`](crates/atelier-core/src/hooks.rs) | **done** (per-repo-overrides-global; `_approvals.json` store) |
 | §15 dispatcher + 8 built-in tools + `ShellHookExecutor` | [`crates/atelier-core/src/dispatcher.rs`](crates/atelier-core/src/dispatcher.rs) + [`crates/atelier-core/src/tools/`](crates/atelier-core/src/tools/) | **done** (`read_file`, `list_dir`, `grep`, `write_file`, `edit_file`, `ast_grep`, `shell`, `spawn_subagent`; writes route through staging; sandboxed subprocess) |
 | §2 envelope types | [`crates/atelier-core/src/protocol.rs`](crates/atelier-core/src/protocol.rs) | **done** |

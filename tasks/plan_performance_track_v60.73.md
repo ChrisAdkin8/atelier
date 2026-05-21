@@ -4,6 +4,8 @@ Date: 2026-05-20. Source: repo performance scope review. This plan prioritises t
 
 The work is ordered to land low-risk, user-visible latency wins before changing the persistence model. Items are labelled **PERF01–PERF12** for commit-message traceability.
 
+Implementation note: Track C uses **Option B** — schema-valid `session.json` manifest plus `conversation.jsonl` / `ledger.jsonl` sidecars, with snapshot-only session fallback on load. v60.75 completes the focused Track C hardening pass with `resume_index.json` cursoring, indexed resume-prefix loading, sidecar compaction, and compatibility tests.
+
 ---
 
 ## Standing gates
@@ -211,6 +213,8 @@ Performance work must preserve existing safety semantics: event ordering, approv
 
 ### PERF10 — Add append-only conversation / ledger writer
 
+**Status:** Partially landed in v60.73/v60.75 as split sidecar persistence. Completed turn and ledger rows are stored outside the hot manifest, but true per-turn append during an active run remains a future optimisation; end-of-run writes still materialise the current in-memory session snapshot before splitting it into sidecars.
+
 **Files:**
 - `crates/atelier-core/src/persistence.rs`
 - `crates/atelier-cli/src/runner.rs`
@@ -228,6 +232,8 @@ Performance work must preserve existing safety semantics: event ordering, approv
 
 ### PERF11 — Resume cursor / index
 
+**Status:** Done in v60.75 via `resume_index.json`. New split sessions record the last quiescent conversation row count and ledger row count; `OnDiskSession::resume_conversation_prefix_from_dir` reads only the indexed conversation prefix from `conversation.jsonl`, while snapshot-only sessions still resume from the manifest array.
+
 **Files:**
 - `crates/atelier-core/src/persistence.rs`
 - `crates/atelier-cli/src/runner.rs`
@@ -243,6 +249,8 @@ Performance work must preserve existing safety semantics: event ordering, approv
 3. Version mismatch / migration errors remain explicit, not silent.
 
 ### PERF12 — Snapshot compaction and compatibility tests
+
+**Status:** Done for the sidecar-backed shape in v60.75. `OnDiskSession::compact_split_sidecars` rewrites complete JSONL rows, drops an incomplete trailing row, and refreshes the resume cursor; tests cover sidecar hydration, partial trailing rows, indexed resume, and compaction cursor refresh. The session schema did not change.
 
 **Files:**
 - `crates/atelier-core/src/persistence.rs`

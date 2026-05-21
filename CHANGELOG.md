@@ -1,5 +1,21 @@
 # Atelier Spec — Changelog
 
+## v60.75 — 2026-05-20 (split-session resume cursor + compaction)
+
+Completes the focused performance bundle that followed the v60.73/v60.74 UI and runner churn reductions.
+
+### Persistence performance
+
+- Split session persistence now writes a `resume_index.json` cursor alongside `conversation.jsonl` and `ledger.jsonl`, recording the last quiescent conversation row and ledger row count without changing the schema-valid `session.json` manifest.
+- Resume now loads the small manifest first and reconstructs the adapter message prefix through `OnDiskSession::resume_conversation_prefix_from_dir`, reading only the indexed safe conversation prefix from `conversation.jsonl`; snapshot-only sessions still fall back to the manifest conversation array.
+- Added `OnDiskSession::compact_split_sidecars` and threshold-triggered sidecar rewrite support so complete JSONL rows are preserved, partial tails are dropped, and the resume cursor is refreshed under the same atomic write + directory fsync discipline.
+- GUI chat streaming now coalesces assistant text deltas into frame-sized chunks, reducing IPC/reducer pressure without batching across semantic boundary events.
+
+### Documentation and tests
+
+- README, CAPABILITIES, STATUS, the core crate README, and `tasks/plan_performance_track_v60.73.md` now describe the sidecar-backed session layout and v60.75 completion state.
+- Added persistence tests for sidecar hydration, partial JSONL tails, indexed resume prefix loading, and compaction cursor refresh.
+
 ## v60.74 — 2026-05-20 (performance-track polish + README architecture)
 
 Follow-on documentation and low-risk runtime polish for the v60.73 performance track.

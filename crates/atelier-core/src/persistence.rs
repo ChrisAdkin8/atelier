@@ -40,6 +40,7 @@ use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -54,6 +55,10 @@ pub const HARNESS_SESSION_VERSION: u32 = 1;
 
 /// Filename within a session directory.
 pub const SESSION_FILE: &str = "session.json";
+pub const CONVERSATION_LOG_FILE: &str = "conversation.jsonl";
+pub const LEDGER_LOG_FILE: &str = "ledger.jsonl";
+pub const RESUME_INDEX_FILE: &str = "resume_index.json";
+const SPLIT_SIDECAR_COMPACT_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Sub-directory under a session for diff blobs (§14 diff format). Created
 /// lazily by the §4 checkpoint store; present here so the path layout is
@@ -135,6 +140,13 @@ pub struct PersistedSubagent {
     pub turns_used: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cost_summary: Option<PersistedSubagentCost>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ResumeIndex {
+    pub conversation_rows: usize,
+    pub ledger_rows: usize,
 }
 
 /// Diff-based checkpoint tree (spec §4). Root id + map of nodes. Concrete
@@ -278,6 +290,42 @@ impl OnDiskSession {
         Ok(target)
     }
 
+    /// v60.73 PERF10 — split large append-like session arrays into JSONL
+    /// sidecars. `session.json` remains schema-valid but carries empty
+    /// `conversation` / `cost_ledger` arrays; `load_from` hydrates those
+    /// fields from the sidecars when present. This keeps the hot manifest
+    /// small while preserving backwards compatibility with snapshot-only
+    /// sessions written by older builds.
+    pub fn save_split_to(&self, dir: &Path) -> Result<PathBuf, PersistenceError> {
+        Self::create_session_dir_safely(dir)?;
+        restrict_dir_mode(dir);
+        write_jsonl_sidecar(dir, CONVERSATION_LOG_FILE, &self.conversation)?;
+        write_jsonl_sidecar(dir, LEDGER_LOG_FILE, &self.cost_ledger)?;
+        write_json_file_atomic(
+            dir,
+            RESUME_INDEX_FILE,
+            &ResumeIndex {
+                conversation_rows: safe_conversation_prefix_len(&self.conversation),
+                ledger_rows: self.cost_ledger.len(),
+            },
+        )?;
+
+        let mut manifest = self.clone();
+        manifest.conversation.clear();
+        manifest.cost_ledger.clear();
+        let saved = manifest.save_to(dir)?;
+        compact_split_sidecars_if_needed(dir)?;
+        Ok(saved)
+    }
+
+    /// v60.75 — rewrite split-session sidecars from complete rows only and
+    /// refresh the resume cursor. Useful after append-style writes leave a
+    /// partial tail, and called automatically by `save_split_to` once sidecar
+    /// volume crosses the compaction threshold.
+    pub fn compact_split_sidecars(dir: &Path) -> Result<(), PersistenceError> {
+        compact_split_sidecars(dir)
+    }
+
     fn create_session_dir_safely(dir: &Path) -> Result<(), PersistenceError> {
         if let Some(repo_root) = Self::repo_root_for_atelier_path(dir) {
             return crate::path_safety::create_dir_all_inside_workspace(
@@ -320,76 +368,150 @@ impl OnDiskSession {
     /// tuple-form the runner translates into adapter `Message`s. Keeps
     /// the persistence layer free of the adapter type.
     pub fn resume_conversation_prefix(&self) -> Vec<ConversationEntry> {
-        let mut out: Vec<ConversationEntry> = Vec::new();
-        let mut pending_tool_ids: std::collections::BTreeSet<String> =
-            std::collections::BTreeSet::new();
-        // First pass: find the last index that closes any open
-        // tool-call set. We walk forward, tracking unmet tool-call ids
-        // emitted by assistant turns and ticking them off as `tool`
-        // turns arrive. A turn is "safe to keep" iff it doesn't leave
-        // pending ids behind at the end of the walk.
-        //
-        // Concretely: we accumulate a candidate prefix as we go, and
-        // commit it to `out` only at points where `pending_tool_ids`
-        // is empty (a quiescent boundary).
-        let mut tentative: Vec<ConversationEntry> = Vec::new();
-        let mut commit_to = 0usize;
-        for entry in &self.conversation {
-            let role = entry
-                .get("role")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let content = entry
-                .get("content")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let tool_call_id = entry
-                .get("tool_call_id")
-                .and_then(|v| v.as_str())
-                .map(str::to_string);
-            let tool_calls = entry
-                .get("tool_calls")
-                .and_then(|v| v.as_array())
-                .cloned()
-                .unwrap_or_default();
-
-            match role.as_str() {
-                "assistant" => {
-                    for tc in &tool_calls {
-                        if let Some(id) = tc
-                            .get("tool_call_id")
-                            .or_else(|| tc.get("id"))
-                            .and_then(|v| v.as_str())
-                        {
-                            pending_tool_ids.insert(id.to_string());
-                        }
-                    }
-                }
-                "tool" => {
-                    if let Some(id) = &tool_call_id {
-                        pending_tool_ids.remove(id);
-                    }
-                }
-                _ => {}
-            }
-
-            tentative.push(ConversationEntry {
-                role,
-                content,
-                tool_call_id,
-                tool_calls,
-            });
-
-            if pending_tool_ids.is_empty() {
-                commit_to = tentative.len();
-            }
-        }
-        out.extend(tentative.into_iter().take(commit_to));
-        out
+        resume_conversation_prefix_from_entries(&self.conversation)
     }
 
+    /// v60.75 — resume without hydrating the whole sidecar-backed
+    /// conversation. Split-session saves write `resume_index.json` with the
+    /// last safe quiescent row count. This loader reads only that prefix from
+    /// `conversation.jsonl`; snapshot-only sessions fall back to the manifest
+    /// field.
+    pub fn resume_conversation_prefix_from_dir(
+        dir: &Path,
+    ) -> Result<Vec<ConversationEntry>, PersistenceError> {
+        let manifest = Self::load_manifest_from(dir)?;
+        let sidecar = dir.join(CONVERSATION_LOG_FILE);
+        let conversation = if manifest.conversation.is_empty() && sidecar.exists() {
+            let rows = read_resume_index(dir)?
+                .map(|idx| idx.conversation_rows)
+                .unwrap_or(usize::MAX);
+            read_jsonl_sidecar_limited::<serde_json::Value>(&sidecar, Some(rows))?
+                .unwrap_or_default()
+        } else {
+            manifest.conversation
+        };
+        Ok(resume_conversation_prefix_from_entries(&conversation))
+    }
+
+    pub fn load_manifest_from(dir: &Path) -> Result<Self, PersistenceError> {
+        let path = dir.join(SESSION_FILE);
+        let bytes =
+            crate::io_caps::read_capped(&path, crate::io_caps::CAP_SESSION).map_err(|e| {
+                PersistenceError::Io {
+                    path: path.clone(),
+                    source: e,
+                }
+            })?;
+        let session: Self =
+            serde_json::from_slice(&bytes).map_err(|e| PersistenceError::Deserialize {
+                path: path.clone(),
+                error: e.to_string(),
+            })?;
+        if session.harness_session_version != HARNESS_SESSION_VERSION {
+            return Err(PersistenceError::IncompatibleVersion {
+                path,
+                got: session.harness_session_version,
+                expected: HARNESS_SESSION_VERSION,
+            });
+        }
+        Ok(session)
+    }
+
+    fn hydrate_split_sidecars(&mut self, dir: &Path) -> Result<(), PersistenceError> {
+        if self.conversation.is_empty() {
+            if let Some(rows) =
+                read_jsonl_sidecar::<serde_json::Value>(&dir.join(CONVERSATION_LOG_FILE))?
+            {
+                self.conversation = rows;
+            }
+        }
+        if self.cost_ledger.is_empty() {
+            if let Some(rows) = read_jsonl_sidecar::<LedgerEntry>(&dir.join(LEDGER_LOG_FILE))? {
+                self.cost_ledger = rows;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn resume_conversation_prefix_from_entries(
+    conversation: &[serde_json::Value],
+) -> Vec<ConversationEntry> {
+    let mut out: Vec<ConversationEntry> = Vec::new();
+    let mut pending_tool_ids: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+    // First pass: find the last index that closes any open
+    // tool-call set. We walk forward, tracking unmet tool-call ids
+    // emitted by assistant turns and ticking them off as `tool`
+    // turns arrive. A turn is "safe to keep" iff it doesn't leave
+    // pending ids behind at the end of the walk.
+    //
+    // Concretely: we accumulate a candidate prefix as we go, and
+    // commit it to `out` only at points where `pending_tool_ids`
+    // is empty (a quiescent boundary).
+    let mut tentative: Vec<ConversationEntry> = Vec::new();
+    let mut commit_to = 0usize;
+    for entry in conversation {
+        let role = entry
+            .get("role")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let content = entry
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let tool_call_id = entry
+            .get("tool_call_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let tool_calls = entry
+            .get("tool_calls")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        match role.as_str() {
+            "assistant" => {
+                for tc in &tool_calls {
+                    if let Some(id) = tc
+                        .get("tool_call_id")
+                        .or_else(|| tc.get("id"))
+                        .and_then(|v| v.as_str())
+                    {
+                        pending_tool_ids.insert(id.to_string());
+                    }
+                }
+            }
+            "tool" => {
+                if let Some(id) = &tool_call_id {
+                    pending_tool_ids.remove(id);
+                }
+            }
+            _ => {}
+        }
+
+        tentative.push(ConversationEntry {
+            role,
+            content,
+            tool_call_id,
+            tool_calls,
+        });
+
+        if pending_tool_ids.is_empty() {
+            commit_to = tentative.len();
+        }
+    }
+    out.extend(tentative.into_iter().take(commit_to));
+    out
+}
+
+fn safe_conversation_prefix_len(conversation: &[serde_json::Value]) -> usize {
+    resume_conversation_prefix_from_entries(conversation).len()
+}
+
+impl OnDiskSession {
     /// v61 — record one round-tripped conversation turn. The session
     /// keeps its conversation as `serde_json::Value` (the schema's
     /// shape is the source of truth) so this helper centralises the
@@ -431,28 +553,8 @@ impl OnDiskSession {
     /// `harness_session_version` differs from [`HARNESS_SESSION_VERSION`] —
     /// per spec §14 those need a one-way migration.
     pub fn load_from(dir: &Path) -> Result<Self, PersistenceError> {
-        let path = dir.join(SESSION_FILE);
-        // v60.37 A2 — cap at 16 MiB. Sessions accumulate conversation +
-        // tool fixtures, so the cap is higher than other configs.
-        let bytes =
-            crate::io_caps::read_capped(&path, crate::io_caps::CAP_SESSION).map_err(|e| {
-                PersistenceError::Io {
-                    path: path.clone(),
-                    source: e,
-                }
-            })?;
-        let session: Self =
-            serde_json::from_slice(&bytes).map_err(|e| PersistenceError::Deserialize {
-                path: path.clone(),
-                error: e.to_string(),
-            })?;
-        if session.harness_session_version != HARNESS_SESSION_VERSION {
-            return Err(PersistenceError::IncompatibleVersion {
-                path,
-                got: session.harness_session_version,
-                expected: HARNESS_SESSION_VERSION,
-            });
-        }
+        let mut session = Self::load_manifest_from(dir)?;
+        session.hydrate_split_sidecars(dir)?;
         Ok(session)
     }
 }
@@ -601,6 +703,164 @@ fn fsync_dir(_dir: &Path) -> Result<(), PersistenceError> {
     // a thing. v1 doesn't target them. Returning Ok here is honest —
     // we made no durability promise on these platforms.
     Ok(())
+}
+
+fn write_jsonl_sidecar<T: Serialize>(
+    dir: &Path,
+    filename: &str,
+    rows: &[T],
+) -> Result<(), PersistenceError> {
+    let mut bytes = Vec::new();
+    for row in rows {
+        let row_bytes =
+            serde_json::to_vec(row).map_err(|e| PersistenceError::Serialize(e.to_string()))?;
+        bytes.extend_from_slice(&row_bytes);
+        bytes.push(b'\n');
+    }
+    let target = dir.join(filename);
+    let mut tmp = tempfile::NamedTempFile::new_in(dir).map_err(|e| PersistenceError::Io {
+        path: dir.to_path_buf(),
+        source: e,
+    })?;
+    io::Write::write_all(tmp.as_file_mut(), &bytes).map_err(|e| PersistenceError::Io {
+        path: tmp.path().to_path_buf(),
+        source: e,
+    })?;
+    tmp.as_file().sync_all().map_err(|e| PersistenceError::Io {
+        path: tmp.path().to_path_buf(),
+        source: e,
+    })?;
+    tmp.persist(&target).map_err(|e| PersistenceError::Io {
+        path: target,
+        source: e.error,
+    })?;
+    fsync_dir(dir)?;
+    Ok(())
+}
+
+fn read_jsonl_sidecar<T: DeserializeOwned>(
+    path: &Path,
+) -> Result<Option<Vec<T>>, PersistenceError> {
+    read_jsonl_sidecar_limited(path, None)
+}
+
+fn read_jsonl_sidecar_limited<T: DeserializeOwned>(
+    path: &Path,
+    max_rows: Option<usize>,
+) -> Result<Option<Vec<T>>, PersistenceError> {
+    let bytes = match crate::io_caps::read_capped(path, crate::io_caps::CAP_SESSION) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(PersistenceError::Io {
+                path: path.to_path_buf(),
+                source: e,
+            })
+        }
+    };
+    if bytes.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+    let complete = if bytes.ends_with(b"\n") {
+        bytes.as_slice()
+    } else {
+        match bytes.iter().rposition(|b| *b == b'\n') {
+            Some(idx) => &bytes[..=idx],
+            None => return Ok(Some(Vec::new())),
+        }
+    };
+    let mut rows = Vec::new();
+    let row_limit = max_rows.unwrap_or(usize::MAX);
+    for line in complete.split(|b| *b == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        if rows.len() >= row_limit {
+            break;
+        }
+        rows.push(
+            serde_json::from_slice(line).map_err(|e| PersistenceError::Deserialize {
+                path: path.to_path_buf(),
+                error: e.to_string(),
+            })?,
+        );
+    }
+    Ok(Some(rows))
+}
+
+fn write_json_file_atomic<T: Serialize>(
+    dir: &Path,
+    filename: &str,
+    value: &T,
+) -> Result<(), PersistenceError> {
+    let target = dir.join(filename);
+    let json =
+        serde_json::to_vec_pretty(value).map_err(|e| PersistenceError::Serialize(e.to_string()))?;
+    let mut tmp = tempfile::NamedTempFile::new_in(dir).map_err(|e| PersistenceError::Io {
+        path: dir.to_path_buf(),
+        source: e,
+    })?;
+    io::Write::write_all(tmp.as_file_mut(), &json).map_err(|e| PersistenceError::Io {
+        path: tmp.path().to_path_buf(),
+        source: e,
+    })?;
+    tmp.as_file().sync_all().map_err(|e| PersistenceError::Io {
+        path: tmp.path().to_path_buf(),
+        source: e,
+    })?;
+    tmp.persist(&target).map_err(|e| PersistenceError::Io {
+        path: target,
+        source: e.error,
+    })?;
+    fsync_dir(dir)?;
+    Ok(())
+}
+
+fn read_resume_index(dir: &Path) -> Result<Option<ResumeIndex>, PersistenceError> {
+    let path = dir.join(RESUME_INDEX_FILE);
+    let bytes = match crate::io_caps::read_capped(&path, crate::io_caps::CAP_SESSION) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(PersistenceError::Io { path, source: e }),
+    };
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|e| PersistenceError::Deserialize {
+            path,
+            error: e.to_string(),
+        })
+}
+
+fn compact_split_sidecars_if_needed(dir: &Path) -> Result<(), PersistenceError> {
+    let conversation_path = dir.join(CONVERSATION_LOG_FILE);
+    let ledger_path = dir.join(LEDGER_LOG_FILE);
+    let conversation_bytes = std::fs::metadata(&conversation_path)
+        .map(|meta| meta.len())
+        .unwrap_or(0);
+    let ledger_bytes = std::fs::metadata(&ledger_path)
+        .map(|meta| meta.len())
+        .unwrap_or(0);
+    if conversation_bytes + ledger_bytes <= SPLIT_SIDECAR_COMPACT_THRESHOLD_BYTES {
+        return Ok(());
+    }
+    compact_split_sidecars(dir)
+}
+
+fn compact_split_sidecars(dir: &Path) -> Result<(), PersistenceError> {
+    let conversation = read_jsonl_sidecar::<serde_json::Value>(&dir.join(CONVERSATION_LOG_FILE))?
+        .unwrap_or_default();
+    let cost_ledger =
+        read_jsonl_sidecar::<LedgerEntry>(&dir.join(LEDGER_LOG_FILE))?.unwrap_or_default();
+    write_jsonl_sidecar(dir, CONVERSATION_LOG_FILE, &conversation)?;
+    write_jsonl_sidecar(dir, LEDGER_LOG_FILE, &cost_ledger)?;
+    write_json_file_atomic(
+        dir,
+        RESUME_INDEX_FILE,
+        &ResumeIndex {
+            conversation_rows: safe_conversation_prefix_len(&conversation),
+            ledger_rows: cost_ledger.len(),
+        },
+    )
 }
 
 /// Tighten a directory's permissions to 0700 on Unix. Best-effort: we'd
@@ -906,6 +1166,101 @@ mod tests {
             .filter(|e| e.file_name() != SESSION_FILE)
             .collect();
         assert!(leftovers.is_empty(), "stray files: {leftovers:?}");
+    }
+
+    #[test]
+    fn split_save_hydrates_conversation_and_ledger_from_sidecars() {
+        let dir = TempDir::new().unwrap();
+        let mut s = OnDiskSession::fresh(uuid_for(30), "0.0.0", "2026-05-16T10:00:00Z");
+        s.append_conversation_turn("turn-1", "user", "hello", None, Vec::new());
+        s.cost_ledger.push(LedgerEntry::ToolCall {
+            timestamp: "2026-05-16T10:00:01Z".into(),
+            tool_name: "read_file".into(),
+            latency_ms: 10.0,
+            cost_usd: Some(0.0),
+            note: None,
+        });
+
+        s.save_split_to(dir.path()).unwrap();
+
+        let manifest_bytes = std::fs::read(dir.path().join(SESSION_FILE)).unwrap();
+        let manifest: OnDiskSession = serde_json::from_slice(&manifest_bytes).unwrap();
+        assert!(manifest.conversation.is_empty());
+        assert!(manifest.cost_ledger.is_empty());
+        assert!(dir.path().join(CONVERSATION_LOG_FILE).exists());
+        assert!(dir.path().join(LEDGER_LOG_FILE).exists());
+
+        let loaded = OnDiskSession::load_from(dir.path()).unwrap();
+        assert_eq!(loaded.conversation.len(), 1);
+        assert_eq!(loaded.cost_ledger.len(), 1);
+
+        let index_bytes = std::fs::read(dir.path().join(RESUME_INDEX_FILE)).unwrap();
+        let index: ResumeIndex = serde_json::from_slice(&index_bytes).unwrap();
+        assert_eq!(index.conversation_rows, 1);
+        assert_eq!(index.ledger_rows, 1);
+    }
+
+    #[test]
+    fn split_load_ignores_partial_trailing_jsonl_row() {
+        let dir = TempDir::new().unwrap();
+        let s = OnDiskSession::fresh(uuid_for(31), "0.0.0", "2026-05-16T10:00:00Z");
+        s.save_split_to(dir.path()).unwrap();
+        std::fs::write(
+            dir.path().join(CONVERSATION_LOG_FILE),
+            b"{\"turn_id\":\"turn-1\",\"role\":\"user\",\"content\":\"ok\"}\n{\"turn_id\"",
+        )
+        .unwrap();
+
+        let loaded = OnDiskSession::load_from(dir.path()).unwrap();
+        assert_eq!(loaded.conversation.len(), 1);
+        assert_eq!(loaded.conversation[0]["turn_id"], "turn-1");
+    }
+
+    #[test]
+    fn split_resume_uses_indexed_prefix_without_reading_later_rows() {
+        let dir = TempDir::new().unwrap();
+        let mut s = OnDiskSession::fresh(uuid_for(32), "0.0.0", "2026-05-16T10:00:00Z");
+        s.conversation = vec![
+            turn_user("turn-1", "go"),
+            turn_assistant_with_tool("turn-2", "reading", "tc-a"),
+            turn_tool_result("turn-3", "tc-a", "contents"),
+            turn_assistant_with_tool("turn-4", "orphan", "tc-b"),
+        ];
+        s.save_split_to(dir.path()).unwrap();
+
+        let mut sidecar = std::fs::read_to_string(dir.path().join(CONVERSATION_LOG_FILE)).unwrap();
+        sidecar.push_str("{not-valid-json}\n");
+        std::fs::write(dir.path().join(CONVERSATION_LOG_FILE), sidecar).unwrap();
+
+        let prefix = OnDiskSession::resume_conversation_prefix_from_dir(dir.path()).unwrap();
+        assert_eq!(prefix.len(), 3);
+        assert_eq!(prefix.last().unwrap().tool_call_id.as_deref(), Some("tc-a"));
+    }
+
+    #[test]
+    fn split_compaction_rewrites_complete_rows_and_refreshes_resume_index() {
+        let dir = TempDir::new().unwrap();
+        let s = OnDiskSession::fresh(uuid_for(33), "0.0.0", "2026-05-16T10:00:00Z");
+        s.save_split_to(dir.path()).unwrap();
+        std::fs::write(
+            dir.path().join(CONVERSATION_LOG_FILE),
+            b"{\"turn_id\":\"turn-1\",\"role\":\"user\",\"content\":\"ok\"}\n{\"turn_id\"",
+        )
+        .unwrap();
+
+        OnDiskSession::compact_split_sidecars(dir.path()).unwrap();
+
+        let compacted = std::fs::read_to_string(dir.path().join(CONVERSATION_LOG_FILE)).unwrap();
+        assert!(compacted.ends_with('\n'));
+        assert_eq!(compacted.lines().count(), 1);
+        let row: serde_json::Value =
+            serde_json::from_str(compacted.lines().next().unwrap()).unwrap();
+        assert_eq!(row["turn_id"], "turn-1");
+        assert_eq!(row["role"], "user");
+        assert_eq!(row["content"], "ok");
+        let index_bytes = std::fs::read(dir.path().join(RESUME_INDEX_FILE)).unwrap();
+        let index: ResumeIndex = serde_json::from_slice(&index_bytes).unwrap();
+        assert_eq!(index.conversation_rows, 1);
     }
 
     // ---------- registry ----------

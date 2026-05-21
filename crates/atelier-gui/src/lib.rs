@@ -2280,15 +2280,28 @@ fn start_chat_run(
         };
         let mut final_resp: Option<atelier_core::adapter::ChatResponse> = None;
         let mut chunk_count: u32 = 0;
+        let mut pending_delta = String::new();
+        let mut last_delta_emit = std::time::Instant::now();
         loop {
             match stream.next().await {
                 Some(atelier_core::adapter::StreamChunk::Text { delta }) => {
                     chunk_count += 1;
                     tracing::debug!(chunk = chunk_count, len = delta.len(), "stream text chunk");
-                    emit_event(&app_clone, &SessionEvent::AssistantTextDelta { delta });
+                    pending_delta.push_str(&delta);
+                    if pending_delta.len() >= 1024
+                        || last_delta_emit.elapsed() >= std::time::Duration::from_millis(16)
+                    {
+                        let delta = std::mem::take(&mut pending_delta);
+                        emit_event(&app_clone, &SessionEvent::AssistantTextDelta { delta });
+                        last_delta_emit = std::time::Instant::now();
+                    }
                 }
                 Some(atelier_core::adapter::StreamChunk::Complete { response }) => {
                     tracing::debug!(chunks = chunk_count, "stream complete");
+                    if !pending_delta.is_empty() {
+                        let delta = std::mem::take(&mut pending_delta);
+                        emit_event(&app_clone, &SessionEvent::AssistantTextDelta { delta });
+                    }
                     final_resp = Some(response);
                     break;
                 }
