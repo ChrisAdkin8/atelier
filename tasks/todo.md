@@ -5,33 +5,39 @@
 
 Change history in `../CHANGELOG.md`.
 
+**Tracker discipline:** keep this file up to date whenever a plan lands, a risk/remediation status changes, or gate counts change. Do not leave `tasks/todo.md` as a historical snapshot; move detailed release history to `../CHANGELOG.md` and keep this file focused on current state plus active/pending work.
+
+**v60.76 (2026-05-21)** — Design-risk remediation and documentation sweep. New artifacts: `CODE_QUALITY_METRICS.md`, `tasks/design_risks.md`, `tasks/plan_design_risks_critical_high.md`, and `docs/trust-boundary.md`. Bundle A of the critical/high design-risk plan is started with a shared `atelier_core::trust_boundary` provider credential-egress predicate, CLI profile checks, GUI provider helper extraction, and focused tests. Bundle B is started by extracting the §14 concurrent-edit resolver to `crates/atelier-cli/src/runner/concurrent_edit.rs`. Bundle C is started by extracting GUI provider allowlist/effective URL/preflight helpers to `crates/atelier-gui/src/provider.rs`. Bundle D is still pending.
+
+**v60.75 (2026-05-20)** — Split-session resume cursor + compaction. Session persistence uses schema-valid `session.json` plus `conversation.jsonl` / `ledger.jsonl` sidecars and `resume_index.json`; resume can read the indexed safe prefix without hydrating unrelated session state.
+
 **v60.28 (2026-05-18)** — Secrets & egress hardening bundle from `deep_code_scan_v60.27.md`. H2 swap_adapter base_url allowlist + `AdapterSwapPending`/`AdapterSwapRejected` consent flow; H3 `redact_response_body` wired into `AdapterError::{Auth,Provider}` construction sites; H4 disable reqwest auto-redirect on credential-bearing clients; H5 `allowed_hosts` field on MCP servers + `McpLaunchError::HostNotAllowed`; H6 per-`call_tool` `mcp-http-request` audit row; H7 32 MiB streamed body cap (`AdapterError::ResponseTooLarge`); H8 8 MiB per-event SSE accumulator cap (`AdapterError::SseEventTooLarge`); H16 `schemas/protocol/overhead.v1.json` `json_mode → json_sentinel` + schema-enum sweep test. H1 (rotate the leaked Anthropic key) remains an operator action.
 
 **Rig state (verified by `make check`):**
-- 21/21 schemas meta-validate
-- 52/52 artifacts validate against schemas
-- 112/112 rig self-tests pass
+- 26/26 schemas meta-validate
+- 81/81 artifacts validate against schemas
+- 185/185 rig self-tests pass
 - 11/11 canonical fixtures pass dry-run
-- 1018/1018 workspace Rust tests at v60.11 (782 atelier-core unit + 45 atelier-cli unit + 64 atelier-cli integration + 4 atelier-cli mcp_integration + 29 atelier-gui + 94 atelier-tui; 3 `#[ignore]`-gated). Trail: v54 506 → v60.5 755 → v60.6 788 → v60.7 861 → v60.8 928 → v60.9 963 → v60.10 974 → v60.11 1018; per-version test counts live in `CHANGELOG.md`
+- Rust workspace tests are tracked by `cargo test --workspace`; per-version test counts live in `CHANGELOG.md`
 - Reference machine spec populated (M1 Pro / 32 GB / macOS 26.4.1)
-- CI runs `make check` on push/PR (`.github/workflows/check.yml`); separate `rust` job runs `cargo fmt`, `cargo clippy -D warnings`, `cargo test -p atelier-core` on Ubuntu + macOS with the pinned 1.85.0 toolchain
+- CI runs `make check` on push/PR (`.github/workflows/check.yml`); the Rust job runs `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace` with the pinned 1.85.0 toolchain
 - Cross-schema `$ref` resolves via the shared registry in `tests/_schema_helpers.py` (session → envelope, subagent-type → routing, tool manifest → `_implementation.v1.json`)
 - Per-kind cost-ledger fields enforced via `allOf`/`if`/`then`; `tool_call` requires `tool_name` so replay can link the ledger entry to its `tool_fixtures` row
 - ATELIER.md seed template embedded at `crates/atelier-core/templates/ATELIER.md` for `atelier init`
-- Skills system (§15): schema + 3 bundled skills (`/review`, `/security-review`, `/test`) + 1 example
+- Skills system (§15): schema + bundled skills including `/review`, `/security-review`, `/test`, `/document-sweep`, and related authoring/quality helpers + examples
 - MCP server catalog: schema + bundled list of 8 servers (`filesystem`, `git`, `sqlite`, `fetch`, `memory`, `github`, `postgres`, `puppeteer`) for the GUI's "Browse catalog"
 - **Built-in tool manifests (§15)**: 8 bundled under `crates/atelier-core/tools/` — `read_file`, `write_file`, `edit_file`, `list_dir`, `grep`, `ast_grep`, `shell`, `spawn_subagent`. Matches spec §15 L722. All use the `implementation.kind: builtin` discriminator.
 - **BYOM vendor-neutral baselines**: `schemas/baselines/permission_prompts.v1.json` uses `baseline_harness_name` + `baseline_harness_version` (renamed from `claude_code_version`). The format accepts any harness; Atelier compares against whichever harness §8 selects as reference. `.gitignore` excludes `.claude/`, `.cursor/`, `.aider/`, `.copilot/` so per-user agent configs do not leak.
 - **Sub-agent delegation (§10.1, code-complete v60.56–v60.59)**: `SubagentTypeRegistry` + `SubagentSpawner` trait + `spawn_subagent` 8th built-in + `RunnerSpawner` wired into `Runner::run()` + typed `BTreeMap<String, PersistedSubagent>` persistence + `wait_all()` before §7 gate + end-to-end acceptance tests. v60.59 closes all remaining R-1–R-6 work items: resume safety (carry-forward + in-flight→cancelled), bus capacity fix (EVENT_BUFFER×BUS_FANOUT_FACTOR), schema/struct alignment (`PersistedSubagentCost` nested, `description` added to schema), cost-fields + resume-cancel tests, 5 R-4 rig schema tests, and TUI sub-agent list widget (top-right column below memory). Deferred: WU-6 trust-budget (spec says "future field"), R-7 GUI pane (blocked on Runner-backed GUI mode). Schema + 3 bundled types + 1 example.
 - Apache 2.0 license; SECURITY.md, CODE_OF_CONDUCT.md, CONTRIBUTING.md, PR + issue templates committed
 
-**Implementation language: Rust.** Three crates: `atelier-core`, `atelier-gui` (Tauri 2.x), `atelier-tui` (`ratatui` + `crossterm`). Agent loop: single-turn streaming state machine on `tokio`. Tool transport: **MCP-first via `rmcp`**, with built-in tools exposed through the same interface. See spec §2.5 and §15.
+**Implementation language: Rust.** Four crates: `atelier-core`, `atelier-cli`, `atelier-gui` (Tauri 2.x), and `atelier-tui` (`ratatui` + `crossterm`). Agent loop: single-turn streaming state machine on `tokio`. Tool transport: **MCP-first via `rmcp`**, with built-in tools exposed through the same interface. See spec §2.5 and §15.
 
-**Outside this session — two external-action items before Phase A coding begins:**
-1. **`experiments/rmcp_spike/`** — execute the spike procedure on the reference machine. ~30–60 min; outcome is GO / GO-WITH-CAVEATS / NO-GO on `rmcp` as the §15 client.
-2. **`tests/baselines/permission_prompts.json`** — capture Claude Code baseline per `tests/workload/canonical/baseline_procedure.md`. Required for §8's UX target; doesn't block Phase A code.
+**External-action items:**
+1. **`tests/baselines/permission_prompts.json`** — capture the selected reference-harness baseline per `tests/workload/canonical/baseline_procedure.md`. Required for §8's UX target; does not block current Phase B work.
+2. **`ANTHROPIC_API_KEY` GitHub Actions secret** — maintainer action for live Anthropic gates; until wired, the relevant live gate records `status: skipped`.
 
-**Phase A implementation order (per spec §"Phased build plan"):** §2.5 skeleton → §11 sandbox → §14 recovery scaffold → §15 MCP + built-in tools → §1 Anthropic adapter → §1 LiteLLM adapter → §15 hooks → §1 mechanical gate → §14 modal + §11 gate + crash test → Phase A gate.
+**Current design-risk remediation status:** see `tasks/design_risks.md` and `tasks/plan_design_risks_critical_high.md`. Critical trust-boundary consolidation is started; Runner decomposition and GUI backend split are in progress; TUI/dispatcher monolith split is pending.
 
 ## v60.36+ deep scan (closed, 2026-05-19)
 Six scan agents (three Rust + two non-Rust, two stalled and reran), synthesised into four severity-bucketed plan files (`tasks/plan_v60.36_critical.md`, `_v60.36_high.md`, `_v60.37_medium.md`, `_v60.38_low.md`). All in-scope items landed across three release bundles:
@@ -48,8 +54,7 @@ Outstanding: H1 (rotate the leaked Anthropic API key) is operator action, separa
 
 ## Working notes
 - Schemas live under `../schemas/`. Spec references them by path.
-- The Rust workspace scaffold compiles in principle (atelier-core has lib.rs + error.rs); the GUI and TUI crates are intentionally minimal stubs until `cargo tauri init` is run (see `crates/atelier-gui/README.md`).
-- No real harness code written yet; that's Phase A.
+- The harness is end-to-end runnable for Phase A/B/C scope across CLI, GUI, and TUI surfaces. Historical scaffold notes remain below only as release history.
 - v60.29 (2026-05-18): liveness & durability bundle landed (H9–H12 from `tasks/plan_high_severity_fixes.md`). `ToolContext.cancel/deadline` + `ToolError::{Cancelled,Deadline}` + `tool_manifest.v1.json:deadline_ms` (H9); SIGINT/SIGTERM handler in CLI `main` + `Runner::with_external_cancel` + new `sigint_resume.rs` integration test (H10); atomic `staging::write_with_sync` (tmp → fsync → rename → fsync-dir) (H11); canonicalize hoisted out of `file_watcher` lock + `canonicalize_for_track` helper (H12).
 - v60.30 — TUI / frontend hygiene: H13 TerminalGuard ordering + panic hook, H14 `KeyEventKind::Press` filter, H15 ANSI / control-char sanitiser (`safe_span` applied at all external-content `Span::raw` / `Span::styled` sites); GUI mediums: Mermaid `securityLevel: 'strict'` + DOM-id escape + `DOMParser`-based SVG injection, `resolveImageSrc` allow-list (`..` / abs-path / non-image rejected, markdown `![alt](path)` only), DiffPane `inert` while concurrent-edit modal open, `applyEvent` default arm `console.error`s + dev-only `throw`. See `tasks/plan_high_severity_fixes.md` § v60.30.
 - v60.32 — runner correctness + test-seam discipline (M01–M06): `OPENAI_BASE_URL` precedence pinned + traced; `AwaitingUser` exits 6; compact-retry re-projects `messages_for_call` from post-mutation context; `Runner::swap_adapter` is sync; `conformance-status` resolves its data file at run time (`ATELIER_PROJECT_DIR`/CWD); `test-seams` Cargo feature gates the test-only Runner builders.
@@ -67,7 +72,7 @@ Outstanding: H1 (rotate the leaked Anthropic API key) is operator action, separa
 | Q4 | Checkpoint storage backing | Phase D §4 | — | before Phase D | **resolved v13** (per-repo `.atelier/sessions/<uuid>/` + content-addressed diff blobs; see spec §14) |
 | Q5 | Baseline capture against Claude Code | Phase E §8 UX target | unassigned | before Phase E | open (external action) |
 | Q6 | Telemetry collector | Phase E §13 | unassigned | before Phase E | open |
-| Q7 | `rmcp` maturity assessment | Phase A §15 | unassigned | before Phase A | open (procedure documented at `experiments/rmcp_spike/`) |
+| Q7 | `rmcp` maturity assessment | Phase A §15 | — | before Phase A | **resolved v60.10** — GO WITH CAVEATS against `rmcp = "0.1.5"`; see `experiments/rmcp_spike/README.md` |
 
 ---
 
@@ -156,7 +161,7 @@ Accumulated from six rounds of deep-audit. None of these block Phase A; each is 
 
 ### Phase A blocker decisions (ratified in v10)
 - [x] Cargo workspace + `rust-toolchain.toml` (pinned 1.85.0; bumped from 1.83.0 when wiring `rmcp` into `atelier-core` — `rmcp-macros 0.1.5` requires `edition2024`) — scaffolded in repo root
-- [x] Three crates scaffolded under `crates/`: `atelier-core`, `atelier-gui`, `atelier-tui`
+- [x] Four crates scaffolded under `crates/`: `atelier-core`, `atelier-cli`, `atelier-gui`, `atelier-tui`
 - [x] Tauri 2.x pinned in `[workspace.dependencies]`
 - [x] Diff-application atomicity: all-or-nothing per turn, no opt-out (spec §3)
 - [x] Tool error taxonomy implemented in `crates/atelier-core/src/error.rs` with state-machine routing + unit tests

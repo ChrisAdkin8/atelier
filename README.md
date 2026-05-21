@@ -23,6 +23,10 @@ The spec is in [`coding-harness-spec.md`](coding-harness-spec.md). Where the bui
 
 Recent quality/design notes are tracked in [`CODE_QUALITY_METRICS.md`](CODE_QUALITY_METRICS.md), [`tasks/design_risks.md`](tasks/design_risks.md), and the critical/high remediation plan in [`tasks/plan_design_risks_critical_high.md`](tasks/plan_design_risks_critical_high.md).
 
+<p align="center">
+  <img src="assets/harness-architecture.png" alt="Atelier architecture diagram showing the CLI, TUI, GUI, Runner orchestration, atelier-core runtime, BYOM adapters, tool transport, persistence, verification, and external gates" width="100%">
+</p>
+
 ---
 
 ## What makes it different

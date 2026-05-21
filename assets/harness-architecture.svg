@@ -1,0 +1,184 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1150" viewBox="0 0 1800 1150">
+  <defs>
+    <style>
+      .bg { fill: #0f1117; }
+      .title { fill: #f0ead6; font: 700 44px "Iowan Old Style", Georgia, serif; }
+      .subtitle { fill: #c8c3b2; font: 22px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .section { fill: #171b24; stroke: #444b5c; stroke-width: 3; rx: 24; }
+      .panel { fill: #202634; stroke: #67708a; stroke-width: 2; rx: 18; }
+      .panel2 { fill: #182331; stroke: #4e8098; stroke-width: 2; rx: 18; }
+      .guard { fill: #241f2d; stroke: #b68cff; stroke-width: 2; rx: 18; }
+      .data { fill: #1d2a23; stroke: #64b486; stroke-width: 2; rx: 18; }
+      .external { fill: #2a211d; stroke: #c58b61; stroke-width: 2; rx: 18; }
+      .label { fill: #f0ead6; font: 700 20px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .small { fill: #d8d3c4; font: 15.5px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .tiny { fill: #b9b4a6; font: 13px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .note { fill: #9fb4d8; font: 15px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .arrow { stroke: #b8c7e6; stroke-width: 3.25; stroke-linejoin: round; fill: none; marker-end: url(#arrow); }
+      .arrow2 { stroke: #7cc7a2; stroke-width: 3.25; stroke-linejoin: round; fill: none; marker-end: url(#arrowGreen); }
+      .arrow3 { stroke: #d7a46f; stroke-width: 3.25; stroke-linejoin: round; fill: none; marker-end: url(#arrowOrange); }
+      .dash { stroke-dasharray: 10 8; }
+    </style>
+    <marker id="arrow" markerWidth="13.5" markerHeight="13.5" refX="12" refY="6.75" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M1.25,1.5 L12,6.75 L1.25,12 z" fill="#b8c7e6"/>
+    </marker>
+    <marker id="arrowGreen" markerWidth="13.5" markerHeight="13.5" refX="12" refY="6.75" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M1.25,1.5 L12,6.75 L1.25,12 z" fill="#7cc7a2"/>
+    </marker>
+    <marker id="arrowOrange" markerWidth="13.5" markerHeight="13.5" refX="12" refY="6.75" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M1.25,1.5 L12,6.75 L1.25,12 z" fill="#d7a46f"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1800" height="1150"/>
+
+  <g transform="translate(0,-20)">
+  <rect class="section" x="55" y="150" width="430" height="430"/>
+  <text class="label" x="85" y="190">User-facing surfaces</text>
+
+  <rect class="panel" x="85" y="220" width="370" height="82"/>
+  <text class="label" x="110" y="250">atelier CLI</text>
+  <text class="small" x="110" y="276">Headless runs, skills, profiles</text>
+
+  <rect class="panel" x="85" y="330" width="370" height="92"/>
+  <text class="label" x="110" y="360">ratatui TUI</text>
+  <text class="small" x="110" y="386">Live agent workspace</text>
+  <text class="tiny" x="110" y="408">Diff, approval, skills, LSP prompts</text>
+
+  <rect class="panel" x="85" y="450" width="370" height="98"/>
+  <text class="label" x="110" y="480">Tauri GUI</text>
+  <text class="small" x="110" y="506">Chat-REPL workspace</text>
+  <text class="tiny" x="110" y="528">Context, memory, plan, meters</text>
+
+  <rect class="section" x="535" y="150" width="500" height="430"/>
+  <text class="label" x="565" y="190">Runner orchestration</text>
+
+  <rect class="guard" x="565" y="220" width="440" height="78"/>
+  <text class="label" x="590" y="250">Provider resolution</text>
+  <text class="small" x="590" y="276">Profiles, base_url, credential guard</text>
+
+  <rect class="panel" x="565" y="320" width="205" height="86"/>
+  <text class="label" x="590" y="350">Model call</text>
+  <text class="tiny" x="590" y="374">Probe/profile</text>
+  <text class="tiny" x="590" y="394">Strategy selection</text>
+
+  <rect class="panel" x="800" y="320" width="205" height="86"/>
+  <text class="label" x="825" y="350">Tool phase</text>
+  <text class="tiny" x="825" y="374">Dispatcher calls</text>
+  <text class="tiny" x="825" y="394">Subagent wait_all</text>
+
+  <rect class="panel" x="565" y="430" width="205" height="98"/>
+  <text class="label" x="590" y="460">Verification</text>
+  <text class="tiny" x="590" y="484">Claimed changes</text>
+  <text class="tiny" x="590" y="504">DoD + LSP tiering</text>
+
+  <rect class="panel" x="800" y="430" width="205" height="98"/>
+  <text class="label" x="825" y="460">Run durability</text>
+  <text class="tiny" x="825" y="484">Resume/recovery</text>
+  <text class="tiny" x="825" y="504">Concurrent edits</text>
+
+  <rect class="section" x="1085" y="150" width="660" height="430"/>
+  <text class="label" x="1115" y="190">atelier-core runtime</text>
+
+  <rect class="panel2" x="1115" y="220" width="280" height="92"/>
+  <text class="label" x="1140" y="250">Session actor</text>
+  <text class="small" x="1140" y="276">State machine + cancellation</text>
+  <text class="tiny" x="1140" y="296">Broadcast to all surfaces</text>
+
+  <rect class="panel2" x="1425" y="220" width="290" height="92"/>
+  <text class="label" x="1450" y="250">Context / Memory</text>
+  <text class="small" x="1450" y="276">Typed state and mutators</text>
+  <text class="tiny" x="1450" y="296">Compaction + expand</text>
+
+  <rect class="guard" x="1115" y="335" width="280" height="92"/>
+  <text class="label" x="1140" y="365">Trust boundary</text>
+  <text class="small" x="1140" y="391">Path + provider policy</text>
+  <text class="tiny" x="1140" y="411">Containment, approvals, egress</text>
+
+  <rect class="panel2" x="1425" y="335" width="290" height="92"/>
+  <text class="label" x="1450" y="365">Cost ledger + audit</text>
+  <text class="small" x="1450" y="391">Model/tool/cache records</text>
+  <text class="tiny" x="1450" y="411">MCP/LSP/subprocess egress</text>
+
+  <rect class="panel2" x="1115" y="450" width="280" height="92"/>
+  <text class="label" x="1140" y="480">Dispatcher</text>
+  <text class="small" x="1140" y="506">Built-ins and MCP tools</text>
+  <text class="tiny" x="1140" y="526">Hooks, staging, approval, events</text>
+
+  <rect class="panel2" x="1425" y="450" width="290" height="92"/>
+  <text class="label" x="1450" y="480">Verification + LSP</text>
+  <text class="small" x="1450" y="506">Claim-vs-diff checks</text>
+  <text class="tiny" x="1450" y="526">Diagnostics catch symbol drift</text>
+
+  <rect class="section" x="55" y="635" width="520" height="340"/>
+  <text class="label" x="85" y="675">BYOM adapter layer</text>
+
+  <rect class="panel" x="85" y="710" width="140" height="80"/>
+  <text class="label" x="112" y="742">Mock</text>
+  <text class="tiny" x="112" y="766">Offline gates</text>
+
+  <rect class="panel" x="245" y="710" width="140" height="80"/>
+  <text class="label" x="272" y="742">Anthropic</text>
+  <text class="tiny" x="272" y="766">Messages API</text>
+
+  <rect class="panel" x="405" y="710" width="140" height="80"/>
+  <text class="label" x="426" y="742">OpenAI</text>
+  <text class="tiny" x="432" y="766">Local/cloud /v1</text>
+
+  <rect class="guard" x="85" y="825" width="460" height="108"/>
+  <text class="label" x="110" y="856">Credential guard</text>
+  <text class="small" x="110" y="884">Credentialed profiles need allowlist</text>
+  <text class="tiny" x="110" y="906">Explicit --base-url remains allowed</text>
+
+  <rect class="section" x="625" y="635" width="535" height="340"/>
+  <text class="label" x="655" y="675">Tool transport</text>
+
+  <rect class="panel2" x="655" y="710" width="220" height="96"/>
+  <text class="label" x="680" y="742">Built-in tools</text>
+  <text class="small" x="680" y="768">read, list, grep, edit</text>
+  <text class="tiny" x="680" y="788">spawn_subagent included</text>
+
+  <rect class="panel2" x="905" y="710" width="220" height="96"/>
+  <text class="label" x="930" y="742">MCP servers</text>
+  <text class="small" x="930" y="768">stdio + HTTP/SSE</text>
+  <text class="tiny" x="930" y="788">Resources enter context</text>
+
+  <rect class="data" x="655" y="840" width="470" height="92"/>
+  <text class="label" x="680" y="872">Staging + approval</text>
+  <text class="small" x="680" y="898">Contained writes + symlink recheck</text>
+  <text class="tiny" x="680" y="920">File-level accept/reject</text>
+
+  <rect class="section" x="1210" y="635" width="535" height="340"/>
+  <text class="label" x="1240" y="675">Persistence and gates</text>
+
+  <rect class="data" x="1240" y="710" width="470" height="124"/>
+  <text class="label" x="1265" y="740">Session persistence</text>
+  <text class="small" x="1265" y="771">Manifest + sidecars</text>
+  <text class="tiny" x="1265" y="800">Conversation / ledger JSONL</text>
+  <text class="tiny" x="1265" y="824">Resume cursor + recovery</text>
+
+  <rect class="external" x="1240" y="860" width="220" height="90"/>
+  <text class="label" x="1265" y="892">LLM endpoints</text>
+  <text class="tiny" x="1265" y="916">Cloud and local models</text>
+
+  <rect class="external" x="1490" y="860" width="220" height="90"/>
+  <text class="label" x="1515" y="892">CI / rig</text>
+  <text class="tiny" x="1515" y="916">Schemas, workloads, audit</text>
+
+  <path class="arrow" d="M455 260 L565 260"/>
+  <path class="arrow" d="M455 376 L565 376"/>
+  <path class="arrow dash" d="M455 500 L565 500"/>
+  <path class="arrow3" d="M315 548 L315 710"/>
+
+  <path class="arrow" d="M1005 260 L1115 260"/>
+  <path class="arrow" d="M1005 363 L1115 363"/>
+  <path class="arrow" d="M1005 480 L1115 480"/>
+  <path class="arrow2" d="M1395 496 L1425 496"/>
+  <path class="arrow3" d="M435 548 L435 710"/>
+  <path class="arrow" d="M892 580 L892 635"/>
+  <path class="arrow2" d="M1570 542 L1570 710"/>
+  <path class="arrow3" d="M315 933 L315 1040 L1350 1040 L1350 932"/>
+  <path class="arrow2" d="M1580 834 L1580 860"/>
+  </g>
+
+</svg>

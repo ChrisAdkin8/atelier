@@ -9,6 +9,9 @@ Full tree with one-line annotations. The top-level [README.md](../README.md) lis
 ├── coding-harness-spec.md             the spec
 ├── Cargo.toml                         Rust workspace root (pins `rmcp = "0.1"`)
 ├── rust-toolchain.toml                pinned Rust 1.85.0
+├── assets/
+│   ├── harness-architecture.svg       source for the README architecture diagram
+│   └── harness-architecture.png       rendered architecture diagram
 ├── crates/
 │   ├── atelier-core/                  agent loop, BYOM adapters, MCP client, session state
 │   │   ├── Cargo.toml                 declares `rmcp = { workspace = true }` — the MCP client lives here

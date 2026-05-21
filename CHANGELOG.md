@@ -20,7 +20,8 @@ Implements the first safe slices of the critical/high design-risk remediation pl
 
 - Added `CODE_QUALITY_METRICS.md` with gate health, maintainability hotspots, missing quality measures, production-path panic/unwrap proxies, frontend gates, dependency/doc proxies, and prioritized recommendations.
 - Added `tasks/design_risks.md` and `tasks/plan_design_risks_critical_high.md` to keep architecture risks and remediation work visible under `tasks/`.
-- Refreshed README, STATUS, and layout docs for current rig counts, trust-boundary documentation, quality/design-risk references, and GUI/TUI wording.
+- Refreshed README, STATUS, and layout docs for current rig counts, trust-boundary documentation, quality/design-risk references, GUI/TUI wording, and the source-backed architecture diagram.
+- Updated `tasks/todo.md` with a tracker-discipline note: keep the file current whenever plans land, risk/remediation state changes, or gate counts move.
 
 ## v60.75 — 2026-05-20 (split-session resume cursor + compaction)
 
