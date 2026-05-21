@@ -42,6 +42,7 @@ pub mod subprocess;
 pub mod text_safety;
 pub mod time;
 pub mod tools;
+pub mod trust_boundary;
 pub mod verify;
 
 pub use adapter::{
@@ -132,5 +133,9 @@ pub use state::{
 };
 pub use subprocess::{
     run as run_subprocess, sandboxed_argv, SubprocessError, SubprocessOutcome, SubprocessSpec,
+};
+pub use trust_boundary::{
+    http_host as trust_http_host, provider_base_url_allowed,
+    provider_profile_base_url_may_receive_credential, PROVIDER_BASE_URL_ALLOWLIST,
 };
 pub use verify::{compare as compare_envelope_to_diff, Discrepancy, ObservedChange, ObservedKind};

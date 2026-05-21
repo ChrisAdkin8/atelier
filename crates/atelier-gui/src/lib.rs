@@ -31,6 +31,10 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager};
 
+mod provider;
+use provider::{effective_openai_base_url, ensure_base_url_allowed, preflight_base_url};
+pub use provider::{is_base_url_allowed, SWAP_BASE_URL_ALLOWLIST};
+
 /// Wrapper Tauri emits to the webview. `kind` is the variant tag; `payload`
 /// is the variant's JSON body. The TypeScript side only depends on `kind`
 /// — `payload` shape is per-variant and evolves with the spec.
@@ -677,67 +681,6 @@ pub struct SwapResult {
     pub swapped_at: String,
 }
 
-/// v60.28 H2 — built-in base_url allowlist for the `swap_adapter` Tauri
-/// command. A future revision will fold in user-configured entries from
-/// `providers.toml`; the wired-in set covers the two public providers
-/// the binary supports plus loopback.
-pub const SWAP_BASE_URL_ALLOWLIST: &[&str] = &[
-    "api.anthropic.com",
-    "api.openai.com",
-    "localhost",
-    "127.0.0.1",
-    "::1",
-];
-
-/// v60.28 H2 — predicate for whether a `swap_adapter` base_url is
-/// allowed. `None` base_url (e.g. anthropic uses no `base_url`) is
-/// allowed; only an explicit value off the allowlist is refused.
-pub fn is_base_url_allowed(base_url: Option<&str>) -> bool {
-    let Some(url) = base_url else {
-        return true;
-    };
-    let host = match host_of_url(url) {
-        Some(h) => h,
-        None => return false,
-    };
-    SWAP_BASE_URL_ALLOWLIST.iter().any(|h| *h == host)
-}
-
-/// Bare host extraction matching `atelier_core::mcp::mcp_tool::host_of_url`
-/// (kept local to avoid pulling in the mcp module for this single helper).
-///
-/// v60.37 B1 — now requires an explicit `http://` or `https://` prefix.
-/// Without this, `host_of_url("localhost")` returned `Some("localhost")`
-/// which the allowlist happily accepted, and `host_of_url("gopher://api.anthropic.com/x")`
-/// returned `Some("api.anthropic.com")` — both defence-in-depth thinness
-/// that a copy-paste of this helper into a future adapter could exploit.
-/// Scheme comparison is case-insensitive.
-fn host_of_url(url: &str) -> Option<String> {
-    let (scheme, rest) = url.split_once("://")?;
-    let scheme_lc = scheme.to_ascii_lowercase();
-    if scheme_lc != "http" && scheme_lc != "https" {
-        return None;
-    }
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    let authority = authority
-        .rsplit_once('@')
-        .map(|(_, h)| h)
-        .unwrap_or(authority);
-    let host = if let Some(stripped) = authority.strip_prefix('[') {
-        stripped.split_once(']').map(|(h, _)| h).unwrap_or(stripped)
-    } else {
-        authority
-            .rsplit_once(':')
-            .map(|(h, _)| h)
-            .unwrap_or(authority)
-    };
-    if host.is_empty() {
-        None
-    } else {
-        Some(host.to_ascii_lowercase())
-    }
-}
-
 /// v60.37 B5 — wire shape returned by [`list_provider_profiles`]. One
 /// row per resolved named profile in `<workspace>/.atelier/providers.toml`
 /// (or `~/.atelier/providers.toml` per [`ProvidersConfig::load`]'s
@@ -1057,23 +1000,6 @@ fn build_swap_adapter(
             }
             Ok(std::sync::Arc::new(adapter))
         }
-    }
-}
-
-fn effective_openai_base_url(base_url: Option<String>) -> String {
-    base_url.unwrap_or_else(|| {
-        std::env::var("OPENAI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".to_string())
-    })
-}
-
-fn ensure_base_url_allowed(base_url: Option<&str>) -> Result<(), String> {
-    if is_base_url_allowed(base_url) {
-        Ok(())
-    } else {
-        Err(format!(
-            "base_url {:?} not in swap_adapter allowlist",
-            base_url.unwrap_or("<none>")
-        ))
     }
 }
 
@@ -1987,46 +1913,6 @@ fn resolve_default_adapter(
         },
     };
     build_swap_adapter(wire)
-}
-
-/// Extract `host:port` from an HTTP/HTTPS base URL for TCP reachability checks.
-fn extract_host_port(base_url: &str) -> Option<String> {
-    let rest = base_url
-        .strip_prefix("https://")
-        .or_else(|| base_url.strip_prefix("http://"))?;
-    let host_port = rest.split('/').next()?;
-    if host_port.is_empty() {
-        return None;
-    }
-    if host_port.contains(':') {
-        Some(host_port.to_string())
-    } else {
-        let default_port = if base_url.starts_with("https://") {
-            "443"
-        } else {
-            "80"
-        };
-        Some(format!("{host_port}:{default_port}"))
-    }
-}
-
-/// Returns `true` when the host:port in `base_url` accepts a TCP connection
-/// within 1 second. Optimistically returns `true` if the URL can't be parsed.
-fn preflight_base_url(base_url: &str) -> bool {
-    use std::net::ToSocketAddrs;
-    let Some(addr_str) = extract_host_port(base_url) else {
-        return true;
-    };
-    let addrs: Vec<_> = match addr_str.to_socket_addrs() {
-        Ok(a) => a.collect(),
-        Err(_) => return true,
-    };
-    for sa in addrs {
-        if std::net::TcpStream::connect_timeout(&sa, std::time::Duration::from_secs(1)).is_ok() {
-            return true;
-        }
-    }
-    false
 }
 
 /// §1 per-task routing — build the executor adapter from the profile

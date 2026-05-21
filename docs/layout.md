@@ -4,7 +4,7 @@ Full tree with one-line annotations. The top-level [README.md](../README.md) lis
 
 ```
 .
-├── README.md                          you are here
+├── README.md                          top-level overview
 ├── CHANGELOG.md                       spec + rig revisions
 ├── coding-harness-spec.md             the spec
 ├── Cargo.toml                         Rust workspace root (pins `rmcp = "0.1"`)
@@ -13,18 +13,25 @@ Full tree with one-line annotations. The top-level [README.md](../README.md) lis
 │   ├── atelier-core/                  agent loop, BYOM adapters, MCP client, session state
 │   │   ├── Cargo.toml                 declares `rmcp = { workspace = true }` — the MCP client lives here
 │   │   ├── catalog/                   bundled MCP server catalog
-│   │   ├── skills/                    bundled skills (/review, /security-review, /test)
+│   │   ├── skills/                    bundled skills (/review, /security-review, /test, /document-sweep, ...)
 │   │   ├── subagents/                 bundled sub-agent types (researcher, test-runner, general-purpose)
 │   │   ├── tools/                     bundled built-in tool manifests (read_file, write_file, edit_file, list_dir, grep, ast_grep, shell, spawn_subagent) — matches spec §15
 │   │   └── templates/                 ATELIER.md seed template
 │   ├── atelier-cli/                   hybrid lib+bin: the `atelier` binary (`init`, `run`) + a `Runner` library the GUI/TUI link against
-│   ├── atelier-gui/                   Tauri 2.x + Svelte 5 driver (multi-pane workspace, hunk accept/reject)
+│   ├── atelier-gui/                   Tauri 2.x + Svelte 5 chat-REPL workspace
 │   └── atelier-tui/                   ratatui + crossterm driver (same panes; `cargo run -p atelier-tui -- "<prompt>"` for driver mode)
 ├── pyproject.toml                     rig manifest (jsonschema, pytest)
 ├── Makefile                           one-command rig orchestration
-├── schemas/                           21 JSON Schemas (see schemas/README.md)
+├── schemas/                           26 JSON Schemas (see schemas/README.md)
 ├── tasks/
-│   └── todo.md                        phased build plan + open questions
+│   ├── todo.md                        phased build plan + open questions
+│   ├── design_risks.md                architecture/design risk register
+│   └── plan_design_risks_critical_high.md
+│                                          remediation plan for critical/high design risks
+├── docs/
+│   ├── layout.md                      repository layout reference
+│   ├── toolchain.md                   Rust toolchain setup notes
+│   └── trust-boundary.md              security/trust-boundary contract
 ├── tests/
 │   ├── _schema_helpers.py             shared registry for cross-schema $ref resolution
 │   ├── validate_schemas.py            meta-validate every schema

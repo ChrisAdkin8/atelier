@@ -1,5 +1,27 @@
 # Atelier Spec — Changelog
 
+## v60.76 — 2026-05-21 (design-risk remediation + docs sweep)
+
+Implements the first safe slices of the critical/high design-risk remediation plan and refreshes the public documentation around quality metrics, risk tracking, and current gate counts.
+
+### Architecture and trust boundary
+
+- Added `docs/trust-boundary.md` as the shared contract for workspace containment, persistence writes, dispatcher/tool policy, network egress, approvals, UI policy delegation, and required regression tests.
+- Added `atelier_core::trust_boundary`, centralising provider base-URL allowlist checks and the rule that repo/profile-sourced OpenAI-compatible URLs cannot silently receive `OPENAI_API_KEY` unless allowlisted or explicitly supplied by the user for that run.
+- CLI provider resolution and executor-adapter routing now use the shared credential-egress predicate.
+- GUI provider helpers now live in `crates/atelier-gui/src/provider.rs` and delegate allowlist decisions to core, reducing provider-policy drift between GUI and CLI paths.
+
+### Runner and GUI decomposition
+
+- Extracted the §14 concurrent-edit resolver from `crates/atelier-cli/src/runner.rs` into `crates/atelier-cli/src/runner/concurrent_edit.rs` with focused tests.
+- Documented the remaining critical/high remediation state in `tasks/plan_design_risks_critical_high.md`: Bundle A started/covered for provider trust boundaries, Bundle B/C started with first module extractions, Bundle D still pending.
+
+### Quality and documentation
+
+- Added `CODE_QUALITY_METRICS.md` with gate health, maintainability hotspots, missing quality measures, production-path panic/unwrap proxies, frontend gates, dependency/doc proxies, and prioritized recommendations.
+- Added `tasks/design_risks.md` and `tasks/plan_design_risks_critical_high.md` to keep architecture risks and remediation work visible under `tasks/`.
+- Refreshed README, STATUS, and layout docs for current rig counts, trust-boundary documentation, quality/design-risk references, and GUI/TUI wording.
+
 ## v60.75 — 2026-05-20 (split-session resume cursor + compaction)
 
 Completes the focused performance bundle that followed the v60.73/v60.74 UI and runner churn reductions.

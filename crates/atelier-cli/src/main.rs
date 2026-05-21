@@ -1283,6 +1283,13 @@ fn resolve_provider_choice(
                      sent verbatim to the server."
                     .into());
             };
+            atelier_core::provider_profile_base_url_may_receive_credential(
+                base_url.as_deref(),
+                cli.base_url.is_some(),
+                std::env::var("OPENAI_API_KEY")
+                    .map(|s| !s.is_empty())
+                    .unwrap_or(false),
+            )?;
             let cache_prompt = profile.and_then(|p| p.cache_prompt).unwrap_or(false);
             Ok(runner::ProviderChoice::OpenAiCompat {
                 model_id,
@@ -1405,6 +1412,13 @@ fn build_executor_adapter(
     match kind {
         ProviderKind::OpenaiCompat => {
             let base_url = profile.base_url.clone().unwrap_or_default();
+            atelier_core::provider_profile_base_url_may_receive_credential(
+                profile.base_url.as_deref(),
+                false,
+                std::env::var("OPENAI_API_KEY")
+                    .map(|s| !s.is_empty())
+                    .unwrap_or(false),
+            )?;
             if !preflight_base_url(&base_url) {
                 return Err(format!(
                     "executor profile {profile_name:?}: server at {base_url:?} is unreachable \
@@ -1775,4 +1789,59 @@ fn read_prompt_from_cli(cli: &CliArgs) -> Result<String, ExitCode> {
         return Err(ExitCode::from(2));
     }
     Ok(prompt)
+}
+
+#[cfg(test)]
+mod trust_boundary_tests {
+    use super::*;
+
+    fn openai_profile(base_url: &str) -> ProviderProfile {
+        ProviderProfile {
+            provider: Some(ProviderKind::OpenaiCompat),
+            model: Some("local:test".to_string()),
+            base_url: Some(base_url.to_string()),
+            cache_prompt: None,
+        }
+    }
+
+    #[test]
+    fn explicit_cli_base_url_is_allowed_by_provider_resolution() {
+        let mut cli = CliArgs::empty();
+        cli.provider = Some("openai-compat".to_string());
+        cli.model = Some("local:test".to_string());
+        cli.base_url = Some("https://custom.example/v1".to_string());
+
+        let choice = resolve_provider_choice(&cli, None).expect("explicit endpoint is user intent");
+        match choice {
+            runner::ProviderChoice::OpenAiCompat { base_url, .. } => {
+                assert_eq!(base_url.as_deref(), Some("https://custom.example/v1"));
+            }
+            _ => panic!("unexpected provider choice"),
+        }
+    }
+
+    #[test]
+    fn core_trust_boundary_rejects_credentialed_profile_base_url() {
+        let err = atelier_core::provider_profile_base_url_may_receive_credential(
+            Some("https://evil.example/v1"),
+            false,
+            true,
+        )
+        .expect_err("repo profile must not silently receive credentials");
+        assert!(err.contains("allowlist"), "got: {err}");
+    }
+
+    #[test]
+    fn profile_base_url_resolution_still_accepts_allowlisted_hosts() {
+        let cli = CliArgs::empty();
+        let profile = openai_profile("https://api.openai.com/v1");
+
+        let choice = resolve_provider_choice(&cli, Some(&profile)).expect("allowlisted profile");
+        match choice {
+            runner::ProviderChoice::OpenAiCompat { base_url, .. } => {
+                assert_eq!(base_url.as_deref(), Some("https://api.openai.com/v1"));
+            }
+            _ => panic!("unexpected provider choice"),
+        }
+    }
 }

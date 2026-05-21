@@ -1,6 +1,6 @@
 //! Phase C unblock (1) — `atelier run` runtime.
 //!
-//! Wires the §2.5 actor + §15 dispatcher (with all 7 built-in tools) + §15
+//! Wires the §2.5 actor + §15 dispatcher (with all 8 built-in tools) + §15
 //! hook loader + §7 DoD config + §11 sandbox + §1 typed cost ledger into a
 //! runnable agent loop. Reads a prompt, loops turns against an adapter
 //! until `claimed_done: true`, transitions to `Verifying` for DoD checks,
@@ -36,9 +36,7 @@ use atelier_core::{
     protocol::Envelope,
     protocol_strategy::{parse_json_sentinel, parse_native_tool, NativeToolCall, Strategy},
     sandbox::SandboxPolicy,
-    session::{
-        self, try_emit, Command as SessionCommand, ConcurrentEditOutcome, Event, MessageRole,
-    },
+    session::{self, try_emit, Command as SessionCommand, Event, MessageRole},
     state::NoopHook,
     subagents::{SubagentSpawner, SubagentStatus, SubagentTypeRegistry},
     tools::{register_builtins, BuiltinDeps},
@@ -46,6 +44,10 @@ use atelier_core::{
 };
 
 use crate::subagent_spawner::RunnerSpawner;
+
+#[path = "runner/concurrent_edit.rs"]
+mod concurrent_edit;
+use concurrent_edit::spawn_concurrent_edit_resolver;
 
 /// How `atelier run` reports events. The binary uses `Stdout` (one line per
 /// event); tests use `Capture` to assert on the recorded sequence without
@@ -2953,77 +2955,6 @@ fn extract_native_envelope(calls: &[ToolCallRequest]) -> Option<Envelope> {
         }
     }
     None
-}
-
-/// v61 — concurrent-edit resolver. Subscribes to the session bus and
-/// either auto-acknowledges (`AutoReload` policy, no human in the loop)
-/// or starts a 5-minute auto-pause timer per spec §14 (`Modal` policy,
-/// fires `FilesChangedAcknowledged { outcome: PauseTimedOut }` if the
-/// user doesn't intervene).
-///
-/// Returns a `JoinHandle` so the caller can drop the task at session
-/// teardown. The task exits naturally when the broadcast channel closes
-/// (`session_handle` dropped).
-fn spawn_concurrent_edit_resolver(
-    bus: tokio::sync::broadcast::Sender<Event>,
-    policy: ConcurrentEditPolicy,
-    pause_timeout: std::time::Duration,
-) -> tokio::task::JoinHandle<()> {
-    let mut rx = bus.subscribe();
-    tokio::spawn(async move {
-        loop {
-            // Wait for a FilesChanged event (skip others).
-            let next = rx.recv().await;
-            match next {
-                Ok(Event::FilesChanged { .. }) => match policy {
-                    ConcurrentEditPolicy::AutoReload => {
-                        // Headless: auto-resolve immediately.
-                        let _ = try_emit(
-                            &bus,
-                            Event::FilesChangedAcknowledged {
-                                outcome: ConcurrentEditOutcome::AutoReload,
-                            },
-                        );
-                    }
-                    ConcurrentEditPolicy::Modal => {
-                        // Interactive: start the 5-minute auto-pause
-                        // timer. Cancel it if a user-driven
-                        // FilesChangedAcknowledged arrives first.
-                        let mut local_rx = bus.subscribe();
-                        let timer = tokio::time::sleep(pause_timeout);
-                        tokio::pin!(timer);
-                        loop {
-                            tokio::select! {
-                                _ = &mut timer => {
-                                    let _ = try_emit(
-                                        &bus,
-                                        Event::FilesChangedAcknowledged {
-                                            outcome: ConcurrentEditOutcome::PauseTimedOut,
-                                        },
-                                    );
-                                    break;
-                                }
-                                ev = local_rx.recv() => match ev {
-                                    Ok(Event::FilesChangedAcknowledged { .. }) => {
-                                        // User (or auto-arm) resolved
-                                        // the modal — stand down the
-                                        // timer.
-                                        break;
-                                    }
-                                    Ok(Event::Shutdown) => return,
-                                    Err(_) => return,
-                                    _ => continue,
-                                },
-                            }
-                        }
-                    }
-                },
-                Ok(Event::Shutdown) => return,
-                Err(_) => return,
-                _ => continue,
-            }
-        }
-    })
 }
 
 /// v61 — reverse of the JSON shape `OnDiskSession::append_conversation_turn`

@@ -2,7 +2,7 @@
 
 [← back to README](README.md)
 
-The harness is **end-to-end runnable** for the Phase A/B/C scope, against Mock, Anthropic, and any OpenAI-compatible server (LM Studio, llama-server, vLLM, sglang, Ollama, OpenAI itself). The Tauri GUI is currently a chat-REPL workspace with context/memory/plan/sub-agent surfaces; the `ratatui` TUI remains the live agent workspace with diff and file-level approval controls. The spec, schemas, canonical workload, and self-testing rig are fully wired and verify the harness as it grows. This file tracks **what has landed**, **what is in flight**, and **what gates each phase**. Ordered build plan: [`tasks/todo.md`](tasks/todo.md); version-by-version trail: [`CHANGELOG.md`](CHANGELOG.md) (latest **v60.75**).
+The harness is **end-to-end runnable** for the Phase A/B/C scope, against Mock, Anthropic, and any OpenAI-compatible server (LM Studio, llama-server, vLLM, sglang, Ollama, OpenAI itself). The Tauri GUI is currently a chat-REPL workspace with context/memory/plan/sub-agent surfaces; the `ratatui` TUI remains the live agent workspace with diff and file-level approval controls. The spec, schemas, canonical workload, and self-testing rig are fully wired and verify the harness as it grows. This file tracks **what has landed**, **what is in flight**, and **what gates each phase**. Ordered build plan: [`tasks/todo.md`](tasks/todo.md); version-by-version trail: [`CHANGELOG.md`](CHANGELOG.md) (latest **v60.76**).
 
 ---
 
@@ -26,6 +26,7 @@ The Phase A foundation, Phase B protocol/verification subset, and Phase C worksp
 - §1 typed cost ledger — `LedgerEntry::{ModelCall, ToolCall, CacheBust}` with per-kind required fields enforced at compile time.
 - §1 probe-on-first-use (v51) — `crates/atelier-core/src/adapter/model_profile.rs`. Caches per-model strategy observations to `~/.atelier/model_profiles/<hash>.json`; `Event::ModelProfileLoaded` surfaces to UIs; `ProfileStore::load_or_probe` is the entry point.
 - **`.atelier/providers.toml` loader (v53)** — `crates/atelier-core/src/config.rs`. Multi-profile TOML at `<repo>/.atelier/providers.toml` (project) then `~/.atelier/providers.toml` (user); `default = "<name>"` + `[providers.<name>]` tables; `--profile <NAME>` switches between them; CLI flags still win field-by-field. GUI + TUI footers render the active model id + §2 strategy + probe outcome in the bottom-right.
+- **Trust-boundary helpers (v60.76)** — `crates/atelier-core/src/trust_boundary.rs`. CLI and GUI provider paths share the same credential-egress predicate so repo-controlled OpenAI-compatible base URLs cannot silently receive `OPENAI_API_KEY` unless allowlisted or explicitly supplied by the user.
 - **§5 Context panel (v53)** — `crates/atelier-core/src/context.rs::ContextItemSummary` + `ContextManager::summarise()` + `Event::ContextItems`; rendered by both UIs (Svelte `ContextPane.svelte`, TUI `render_context_pane`) as per-row token counts + provenance badges. Closes the stated §5 mechanical gate ("API assertions for token counts and why-here; cache-bust ledger entry on eviction").
 - **§5 Memory panel (v54)** — `crates/atelier-core/src/memory.rs::MemoryCardSummary` + `MemoryStore::summarise()` + `Event::MemoryCards`; rendered by both UIs (Svelte `MemoryPane.svelte`, TUI `render_memory_pane`) above their respective Plan panes. Empty until a card source wires in; event surface in place so future cards-from-tool / cards-from-replay are purely additive.
 
@@ -35,19 +36,17 @@ The Phase A foundation, Phase B protocol/verification subset, and Phase C worksp
 - `atelier-gui` (Tauri 2.x + Svelte 5) — chat-REPL workspace (Header / ConversationPane / ContextPane / MemoryPane / PlanPane / SubagentPane / MetersPane / Composer), native folder picker, provider swap, memory auto-drafting/promotion, skills autocomplete, and Runner-backed agent flows where needed. Concurrent-run guard via `Arc<AtomicBool>`; 64 KB prompt cap; per-run UUID workspaces with drop-guard cleanup.
 - `atelier-tui` (ratatui + crossterm) — conversation pane, textual diff, plan/context/memory/sub-agent panes, slash-skill completion, LSP install prompt, cost + context meters, scrubber keys `[`/`]`/`g`. Driver mode via `cargo run -p atelier-tui -- "<prompt>"`; `y` / `n` route through `SessionDispatcher::submit_approval`.
 
-### Rig counts (as of v51)
+### Gate counts (as of v60.76)
 
 | | Count | Where |
 |---|---|---|
 | Specification sections | — | [`coding-harness-spec.md`](coding-harness-spec.md) |
-| JSON schemas (Draft 2020-12) | 21 | [`schemas/`](schemas/) |
+| JSON schemas (Draft 2020-12) | 26 | [`schemas/`](schemas/) |
 | Canonical workload fixtures | 11 (10 Py + 1 TS) | [`tests/workload/canonical/`](tests/workload/canonical/) |
-| Validated artifacts | 52 | [`tests/`](tests/) |
-| Rig self-tests | 112 | [`tests/`](tests/) |
-| `atelier-core` Rust unit tests | 506 | [`crates/atelier-core/src/`](crates/atelier-core/src/) |
-| `atelier-cli` integration tests | 19 | [`crates/atelier-cli/tests/`](crates/atelier-cli/tests/) |
-| `atelier-gui` unit tests | 15 | [`crates/atelier-gui/src/lib.rs`](crates/atelier-gui/src/lib.rs) |
-| `atelier-tui` unit tests | 65 | [`crates/atelier-tui/src/lib.rs`](crates/atelier-tui/src/lib.rs) |
+| Validated artifacts | 81 | [`tests/`](tests/) |
+| Rig self-tests | 185 | [`tests/`](tests/) |
+| Rust tests | `cargo test --workspace` | [`crates/`](crates/) |
+| GUI frontend diagnostics | `npm --prefix crates/atelier-gui/ui run check` | [`crates/atelier-gui/ui/`](crates/atelier-gui/ui/) |
 | Phased build plan | see file | [`tasks/todo.md`](tasks/todo.md) |
 
 `make check` runs schema meta-validation → artifact validation → rig self-tests → workload dry-run. All currently green; CI runs the same pipeline on every push/PR alongside `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace`.

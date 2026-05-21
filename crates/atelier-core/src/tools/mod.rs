@@ -200,7 +200,7 @@ pub fn register_builtins(
 
     // §10 spawn_subagent — registered only when runtime deps are supplied.
     // Callers that haven't wired a SubagentSpawner (e.g. bare unit tests)
-    // pass `None` and get the original 7-tool set.
+    // pass `None` and get the static 7-tool set.
     if let Some(d) = deps {
         let name = "spawn_subagent";
         let inner = Arc::new(spawn_subagent::SpawnSubagent::new(
@@ -232,7 +232,7 @@ mod register_tests {
     use super::*;
     use crate::dispatcher::SideEffectClass;
 
-    /// All seven built-ins land in the registry, the order matches
+    /// All seven static built-ins land in the registry, the order matches
     /// the table, every name resolves, and the manifest-declared
     /// side-effect class flows through the wrapper.
     #[test]

@@ -21,6 +21,8 @@
 
 The spec is in [`coding-harness-spec.md`](coding-harness-spec.md). Where the build currently stands — what has landed, what is in flight — is in [`STATUS.md`](STATUS.md).
 
+Recent quality/design notes are tracked in [`CODE_QUALITY_METRICS.md`](CODE_QUALITY_METRICS.md), [`tasks/design_risks.md`](tasks/design_risks.md), and the critical/high remediation plan in [`tasks/plan_design_risks_critical_high.md`](tasks/plan_design_risks_critical_high.md).
+
 ---
 
 ## What makes it different
@@ -119,7 +121,7 @@ policy = "auto"                          # "auto" | "skip" | "force"
 - **`default`** *(top-level, optional)* — name of the `[providers.<name>]` table to use when `--profile` isn't passed. Must reference an existing table; a typo here is a config error, not a silent fall-through.
 - **`[providers.<name>].provider`** — which adapter. `"mock"` (no network), `"anthropic"` (Messages API; reads `ANTHROPIC_API_KEY`), or `"openai-compat"` (any `POST /v1/chat/completions` server: LM Studio, llama-server, vLLM, sglang, Ollama, OpenAI itself; reads `OPENAI_API_KEY` — empty allowed for local servers).
 - **`[providers.<name>].model`** — the model id sent verbatim to the server. By convention `<provider>:<model>` (`anthropic:claude-opus-4-7`, `local:qwen2.5-coder:7b`, `openai:gpt-4o-mini`). The `<provider>:` prefix is the cost-ledger label; the part after the colon is what the server matches against.
-- **`[providers.<name>].base_url`** — full URL ending in `/v1`. **Only valid with `provider = "openai-compat"`** — combining it with `anthropic` or `mock` is a config error. Omit to default to `https://api.openai.com/v1` (OpenAI itself).
+- **`[providers.<name>].base_url`** — full URL ending in `/v1`. **Only valid with `provider = "openai-compat"`** — combining it with `anthropic` or `mock` is a config error. Omit to default to `https://api.openai.com/v1` (OpenAI itself). If `OPENAI_API_KEY` is present, repo/profile-sourced URLs must be loopback or known provider hosts unless the user supplied `--base-url` explicitly for that run; see [`docs/trust-boundary.md`](docs/trust-boundary.md).
 - **`[runner].max_turns`** *(top-level)* — bail after N turns without `claimed_done`. Maps onto `--max-turns`. Built-in default `32`.
 - **`[probe].policy`** *(top-level)* — v51 probe-on-first-use. `"auto"` (cache-first; probe on miss; default for `openai-compat`), `"skip"` (never probe; default for `mock` + `anthropic`), or `"force"` (re-probe even when cached).
 
@@ -227,14 +229,14 @@ Top-level tree:
 ├── Cargo.toml               Rust workspace root (pins rmcp = "0.1")
 ├── rust-toolchain.toml      pinned Rust 1.85.0
 ├── crates/                  atelier-core / -cli / -gui / -tui
-├── schemas/                 21 JSON Schemas (see schemas/README.md)
+├── schemas/                 26 JSON Schemas (see schemas/README.md)
 ├── tests/                   the calibration rig (validators, fixtures, runner)
 ├── examples/                reference manifests (tools, hooks, skills, subagents, config)
 ├── prompts/                 Model Protocol few-shot examples
 ├── experiments/             one-off spikes (e.g. rmcp_spike)
-├── tasks/todo.md            phased build plan + open questions
+├── tasks/                   build plan, design risks, remediation plans
 ├── ci/                      nightly CI job stubs
-├── docs/                    toolchain & full-tree reference docs
+├── docs/                    toolchain, layout, and trust-boundary reference docs
 └── .github/                 workflows, PR template, issue templates
 ```
 
@@ -342,9 +344,9 @@ cargo test  -p atelier-core
 
 ```sh
 cargo fmt --check
-cargo clippy -- -D warnings
-cargo test  -p atelier-core
-make check                # rig: schemas + artifacts + 112 self-tests + dry-runs
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test  --workspace
+make check                # rig: schemas + artifacts + 185 self-tests + dry-runs
 ```
 
 CI runs the same set on every push/PR (`.github/workflows/check.yml` + `rust` job).
@@ -363,7 +365,7 @@ Under the hood, each run: loads `ATELIER.md` into the system prompt, opens a ses
 
 ## The rig
 
-The rig is the agent-loop verifier. It runs the 11 canonical workload fixtures in dry-run mode, validates every artifact against its schema, and runs 112 self-tests. CI runs it on every push and PR.
+The rig is the agent-loop verifier. It runs the 11 canonical workload fixtures in dry-run mode, validates every artifact against its schema, and runs 185 self-tests. CI runs it on every push and PR.
 
 ```sh
 make install-rig      # one-time: creates .venv/ and installs ".[rig]" into it
