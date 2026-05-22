@@ -97,6 +97,11 @@ pub struct SessionState {
     /// submits. Cleared when the workspace changes (new session context).
     /// Arc so the spawned async task can clone it without a raw-pointer hack.
     pub active_session_id: Arc<std::sync::Mutex<Option<uuid::Uuid>>>,
+    /// Stateful zero-tool chat transcript. `start_chat_run` sends this
+    /// bounded prefix before the new user prompt so follow-up questions
+    /// resolve against the prior prompt/reply instead of starting fresh.
+    /// Cleared on workspace changes alongside `active_session_id`.
+    pub chat_history: Arc<std::sync::Mutex<Vec<Message>>>,
     /// Cancellation token for the currently running `start_agent_run` task.
     /// `cancel_run` calls `token.cancel()` on it; cleared when the run exits.
     pub cancel_token: Arc<std::sync::Mutex<Option<tokio_util::sync::CancellationToken>>>,
@@ -182,6 +187,7 @@ pub fn run() {
                 workspace_override,
                 pending_swaps: tokio::sync::Mutex::new(std::collections::HashMap::new()),
                 active_session_id: Arc::new(std::sync::Mutex::new(None)),
+                chat_history: Arc::new(std::sync::Mutex::new(Vec::new())),
                 cancel_token: Arc::new(std::sync::Mutex::new(None)),
             });
             Ok(())
@@ -663,6 +669,8 @@ pub enum SwapProviderWire {
         model_id: String,
         #[serde(default)]
         base_url: Option<String>,
+        #[serde(default)]
+        api_key: Option<String>,
         /// Maps to `"cache_prompt": true` on the wire. See
         /// `OpenAiCompatAdapter::with_cache_prompt`.
         #[serde(default)]
@@ -706,6 +714,8 @@ pub struct SwapOptionWire {
     /// Anthropic and Mock (the swap-allowlist gate rejects a `base_url`
     /// on those kinds anyway).
     pub base_url: Option<String>,
+    /// Credential reference from providers.toml; never the secret itself.
+    pub api_key: Option<String>,
     /// v60.55 — `true` iff this row matches `providers.toml`'s
     /// `default = "<name>"` selector. The webview renders a `★` next
     /// to default rows so the user can tell at a glance which profile
@@ -771,16 +781,19 @@ pub fn list_provider_profiles_with_home(
                     // that would fail downstream when the user clicks it.
                     continue;
                 };
-                let (kind_str, base_url) = match kind {
-                    ProviderKind::Mock => ("mock", None),
-                    ProviderKind::Anthropic => ("anthropic", None),
-                    ProviderKind::OpenaiCompat => ("openai_compat", prof.base_url.clone()),
+                let (kind_str, base_url, api_key) = match kind {
+                    ProviderKind::Mock => ("mock", None, None),
+                    ProviderKind::Anthropic => ("anthropic", None, prof.api_key.clone()),
+                    ProviderKind::OpenaiCompat => {
+                        ("openai_compat", prof.base_url.clone(), prof.api_key.clone())
+                    }
                 };
                 out.push(SwapOptionWire {
                     kind: kind_str.to_string(),
                     model_id: model.clone(),
                     label: format!("{name} · {model}"),
                     base_url,
+                    api_key,
                     is_default: default_name == Some(name.as_str()),
                 });
             }
@@ -808,6 +821,7 @@ fn builtin_swap_defaults() -> Vec<SwapOptionWire> {
             model_id: "mock:default".into(),
             label: "mock".into(),
             base_url: None,
+            api_key: None,
             // v60.55 — mock is what `Runner::new` falls back to in the
             // absence of `providers.toml`, so the dropdown's default
             // marker should match.
@@ -818,6 +832,7 @@ fn builtin_swap_defaults() -> Vec<SwapOptionWire> {
             model_id: "anthropic:claude-opus-4-7".into(),
             label: "anthropic · claude-opus-4-7".into(),
             base_url: None,
+            api_key: None,
             is_default: false,
         },
         SwapOptionWire {
@@ -825,6 +840,7 @@ fn builtin_swap_defaults() -> Vec<SwapOptionWire> {
             model_id: "anthropic:claude-sonnet-4-6".into(),
             label: "anthropic · claude-sonnet-4-6".into(),
             base_url: None,
+            api_key: None,
             is_default: false,
         },
         SwapOptionWire {
@@ -832,6 +848,7 @@ fn builtin_swap_defaults() -> Vec<SwapOptionWire> {
             model_id: "local:qwen2.5-coder:7b".into(),
             label: "openai-compat · local qwen2.5-coder:7b".into(),
             base_url: None,
+            api_key: None,
             is_default: false,
         },
     ]
@@ -989,9 +1006,11 @@ fn build_swap_adapter(
         SwapProviderWire::OpenAiCompat {
             model_id,
             base_url,
+            api_key,
             cache_prompt,
         } => {
-            let api_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
+            let api_key = atelier_core::resolve_openai_api_key(api_key.as_deref())
+                .map_err(|e| e.to_string())?;
             let base = effective_openai_base_url(base_url);
             ensure_base_url_allowed(Some(&base))?;
             let mut adapter = OpenAiCompatAdapter::new(api_key, model_id, base);
@@ -1644,6 +1663,9 @@ fn set_workspace(state: tauri::State<'_, SessionState>, path: String) -> Result<
     if let Ok(mut guard) = state.active_session_id.lock() {
         *guard = None;
     }
+    if let Ok(mut guard) = state.chat_history.lock() {
+        guard.clear();
+    }
     if let Err(e) = persist_workspace(&canonical) {
         // Persistence failure is non-fatal — the swap is already in
         // effect; just warn so the user sees it via tracing.
@@ -1749,6 +1771,26 @@ fn persist_workspace(path: &std::path::Path) -> std::io::Result<()> {
 /// or empty after exclusions) so the caller can skip the system
 /// message entirely instead of sending an empty preamble.
 const MEMORY_RECALL_BYTE_CAP: usize = 16 * 1024;
+const CHAT_HISTORY_MAX_MESSAGES: usize = 12;
+const CHAT_HISTORY_BYTE_CAP: usize = 24 * 1024;
+
+fn bounded_chat_history(history: &[Message]) -> Vec<Message> {
+    let mut out: Vec<Message> = history
+        .iter()
+        .rev()
+        .take(CHAT_HISTORY_MAX_MESSAGES)
+        .cloned()
+        .collect();
+    out.reverse();
+
+    while out.iter().map(|m| m.content.len()).sum::<usize>() > CHAT_HISTORY_BYTE_CAP {
+        if out.is_empty() {
+            break;
+        }
+        out.remove(0);
+    }
+    out
+}
 
 fn load_promoted_memory(workspace_root: Option<&std::path::Path>) -> Option<String> {
     // v60.47 — workspace-scope cards (auto-drafts from chat errors,
@@ -1909,6 +1951,7 @@ fn resolve_default_adapter(
         ProviderKind::OpenaiCompat => SwapProviderWire::OpenAiCompat {
             model_id: model,
             base_url: prof.base_url.clone(),
+            api_key: prof.api_key.clone(),
             cache_prompt: prof.cache_prompt.unwrap_or(false),
         },
     };
@@ -1962,6 +2005,7 @@ fn resolve_executor_adapter(
             build_swap_adapter(SwapProviderWire::OpenAiCompat {
                 model_id: model,
                 base_url: Some(base),
+                api_key: prof.api_key.clone(),
                 cache_prompt: prof.cache_prompt.unwrap_or(false),
             })?
         }
@@ -2051,6 +2095,7 @@ fn start_chat_run(
     // before spawning so the async task can write workspace-scope
     // auto-cards without re-locking `state.workspace_override`.
     let workspace_override = state.workspace_override.lock().ok().and_then(|g| g.clone());
+    let chat_history = Arc::clone(&state.chat_history);
     let app_clone = app.clone();
     let run_in_flight = state.run_in_flight.clone();
     tauri::async_runtime::spawn(async move {
@@ -2105,17 +2150,23 @@ fn start_chat_run(
                 text: prompt.clone(),
             },
         );
+        let user_prompt = prompt.clone();
         // v60.44 — memory recall. Prepend a system message built from
         // every promoted card in `~/.atelier/memory/` so the model
         // starts every chat with the user's durable cross-session
         // context. No write-back: chat mode doesn't have a tool surface
         // for the model to create cards. Cards still get added/promoted
         // via the MemoryPane.
-        let mut messages = Vec::with_capacity(2);
+        let prior_history = chat_history
+            .lock()
+            .map(|guard| bounded_chat_history(&guard))
+            .unwrap_or_default();
+        let mut messages = Vec::with_capacity(prior_history.len() + 2);
         if let Some(sys) = load_promoted_memory(workspace_override.as_deref()) {
             messages.push(Message::text(Role::System, sys));
         }
-        messages.push(Message::text(Role::User, prompt));
+        messages.extend(prior_history);
+        messages.push(Message::text(Role::User, user_prompt.clone()));
         // Stream the response so the conversation pane renders text
         // word-by-word and the footer token meter updates continuously.
         let mut stream = match adapter.stream(&messages, &[]).await {
@@ -2302,6 +2353,11 @@ fn start_chat_run(
                 pinned: false,
             });
             emit_event(&app_clone, &SessionEvent::ContextItems { items });
+            if let Ok(mut guard) = chat_history.lock() {
+                guard.push(Message::text(Role::User, user_prompt));
+                guard.push(Message::text(Role::Assistant, resp.text));
+                *guard = bounded_chat_history(&guard);
+            }
         }
     });
     Ok(())
@@ -2447,6 +2503,13 @@ fn start_agent_run(
                 }
             }
             Err(e) => {
+                emit_event(
+                    &app_for_finish,
+                    &SessionEvent::MessageCommitted {
+                        role: MessageRole::System,
+                        text: format!("[agent error] {e}"),
+                    },
+                );
                 tracing::warn!(error = %e, "agent run failed");
             }
         }
@@ -2887,6 +2950,17 @@ pub fn bridge_event(evt: &SessionEvent) -> BridgedEvent {
             "id": id,
             "tool": tool,
         }),
+        SessionEvent::SubagentTokensUpdated {
+            id,
+            prompt_tokens,
+            completion_tokens,
+            cached_tokens,
+        } => json!({
+            "id": id,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "cached_tokens": cached_tokens,
+        }),
         SessionEvent::SubagentCompleted {
             id,
             status,
@@ -2964,6 +3038,30 @@ mod tests {
         assert!(v.is_object());
         assert_eq!(v["kind"], "Cancelled");
         assert!(v.get("payload").is_some());
+    }
+
+    #[test]
+    fn bounded_chat_history_keeps_recent_messages() {
+        let history: Vec<Message> = (0..(CHAT_HISTORY_MAX_MESSAGES + 3))
+            .map(|i| {
+                Message::text(
+                    if i % 2 == 0 {
+                        Role::User
+                    } else {
+                        Role::Assistant
+                    },
+                    format!("message-{i}"),
+                )
+            })
+            .collect();
+
+        let bounded = bounded_chat_history(&history);
+        assert_eq!(bounded.len(), CHAT_HISTORY_MAX_MESSAGES);
+        assert_eq!(bounded.first().unwrap().content, "message-3");
+        assert_eq!(
+            bounded.last().unwrap().content,
+            format!("message-{}", CHAT_HISTORY_MAX_MESSAGES + 2)
+        );
     }
 
     // ---------- PC-5: new bus variants ----------
@@ -3373,6 +3471,9 @@ mod tests {
     fn swap_allowlist_accepts_known_hosts_and_loopback() {
         assert!(is_base_url_allowed(Some("https://api.anthropic.com/v1")));
         assert!(is_base_url_allowed(Some("https://api.openai.com/v1")));
+        assert!(is_base_url_allowed(Some(
+            "http://atelier-gpu-vllm-dev-1460977764.us-east-1.elb.amazonaws.com/v1"
+        )));
         assert!(is_base_url_allowed(Some("http://localhost:11434/v1")));
         assert!(is_base_url_allowed(Some("http://127.0.0.1:8080/v1")));
         assert!(is_base_url_allowed(None));

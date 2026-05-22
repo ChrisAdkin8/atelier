@@ -75,6 +75,9 @@ mod tests {
     #[test]
     fn allowlist_delegates_to_core_trust_boundary() {
         assert!(is_base_url_allowed(Some("https://api.openai.com/v1")));
+        assert!(is_base_url_allowed(Some(
+            "http://atelier-gpu-vllm-dev-1460977764.us-east-1.elb.amazonaws.com/v1"
+        )));
         assert!(is_base_url_allowed(Some("http://localhost:11434/v1")));
         assert!(!is_base_url_allowed(Some("https://evil.example/v1")));
         assert!(!is_base_url_allowed(Some("gopher://api.openai.com/v1")));

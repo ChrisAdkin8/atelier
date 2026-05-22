@@ -56,7 +56,7 @@ Out of scope:
 
 - Run Atelier inside the §11 sandbox defaults; do not set `allow_net: true` on tools unless required.
 - Keep `mcp_servers.json` under version control if you want auditability; review additions before invoking.
-- Use `${env:…}` interpolation for secrets today; `${keychain:…}` is reserved and fails closed until OS keychain support lands. Avoid plaintext literals in committed manifests.
+- Use provider `api_key = "keyring:SERVICE/USER"` references for LLM credentials where possible; `env:NAME` remains available for CI and one-off runs. Avoid plaintext literals in committed manifests. `${keychain:…}` interpolation in MCP manifests is still reserved and fails closed.
 - Enable `--local-only` mode for sensitive sessions (§12).
 - Review the egress audit log (`schemas/audit/egress.v1.json`) periodically.
 

@@ -231,6 +231,9 @@ export type SubagentEntry = {
   status: string // "running" | "completed" | "failed" | "cancelled"
   turn: number
   maxTurns: number
+  promptTokens: number
+  completionTokens: number
+  cachedTokens: number
 }
 
 export type AppState = {
@@ -664,6 +667,9 @@ export function applyEvent(state: AppState, evt: BridgedEvent): AppState {
         status: 'running',
         turn: 0,
         maxTurns: p.max_turns ?? 0,
+        promptTokens: 0,
+        completionTokens: 0,
+        cachedTokens: 0,
       }
       return { ...state, events, subagents: [...state.subagents, entry] }
     }
@@ -677,6 +683,23 @@ export function applyEvent(state: AppState, evt: BridgedEvent): AppState {
     case 'SubagentToolCall':
       // No state change — event-log entry is sufficient.
       return { ...state, events }
+    case 'SubagentTokensUpdated': {
+      const p = evt.payload as {
+        id: string
+        prompt_tokens: number
+        completion_tokens: number
+        cached_tokens: number
+      }
+      const subagents = updateSubagentById(state.subagents, p.id, (e) =>
+        ({
+          ...e,
+          promptTokens: p.prompt_tokens ?? e.promptTokens,
+          completionTokens: p.completion_tokens ?? e.completionTokens,
+          cachedTokens: p.cached_tokens ?? e.cachedTokens,
+        }),
+      )
+      return { ...state, events, subagents }
+    }
     case 'SubagentCompleted': {
       const p = evt.payload as { id: string; status: string; turns_used: number }
       const subagents = updateSubagentById(state.subagents, p.id, (e) =>
@@ -1011,6 +1034,18 @@ export function projectEvent(evt: BridgedEvent): Omit<EventLogEntry, 'ts'> {
     case 'SubagentToolCall': {
       const p = evt.payload as { id?: string; tool?: string }
       return { kind, detail: `[${p.id ?? '?'}] tool: ${p.tool ?? '?'}` }
+    }
+    case 'SubagentTokensUpdated': {
+      const p = evt.payload as {
+        id?: string
+        prompt_tokens?: number
+        completion_tokens?: number
+        cached_tokens?: number
+      }
+      return {
+        kind,
+        detail: `[${p.id ?? '?'}] ↑${p.prompt_tokens ?? 0} ↓${p.completion_tokens ?? 0} cached ${p.cached_tokens ?? 0}`,
+      }
     }
     case 'SubagentCompleted': {
       const p = evt.payload as { id?: string; status?: string; turns_used?: number }

@@ -4793,6 +4793,7 @@ async fn phase_a_live_openai_compat_t01_add_pure_function() {
         ProviderChoice::OpenAiCompat {
             model_id,
             base_url,
+            api_key: None,
             cache_prompt: false,
         },
         "phase_a_live_openai_compat_t01",
@@ -4813,6 +4814,7 @@ async fn phase_a_live_openai_compat_t02_rename_symbol() {
         ProviderChoice::OpenAiCompat {
             model_id,
             base_url,
+            api_key: None,
             cache_prompt: false,
         },
         "phase_a_live_openai_compat_t02",
@@ -4833,6 +4835,7 @@ async fn phase_a_live_openai_compat_t05_bug_fix_resists_test_mod() {
         ProviderChoice::OpenAiCompat {
             model_id,
             base_url,
+            api_key: None,
             cache_prompt: false,
         },
         "phase_a_live_openai_compat_t05",
@@ -4853,6 +4856,7 @@ async fn phase_a_live_openai_compat_t06_add_cli_flag() {
         ProviderChoice::OpenAiCompat {
             model_id,
             base_url,
+            api_key: None,
             cache_prompt: false,
         },
         "phase_a_live_openai_compat_t06",
@@ -4873,6 +4877,7 @@ async fn phase_a_live_openai_compat_t10_lru_cache_from_spec() {
         ProviderChoice::OpenAiCompat {
             model_id,
             base_url,
+            api_key: None,
             cache_prompt: false,
         },
         "phase_a_live_openai_compat_t10",

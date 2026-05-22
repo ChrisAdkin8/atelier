@@ -19,8 +19,10 @@ use atelier_core::config::{
 };
 
 use std::env;
-use std::path::PathBuf;
-use std::process::ExitCode;
+use std::fs;
+use std::io::{self, Read};
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitCode};
 
 const USAGE: &str = "\
 atelier — coding harness CLI
@@ -45,6 +47,8 @@ SUBCOMMANDS:
                                    `find_probes.json` so the §5 UX target's
                                    median-elapsed-ms can be computed. Exits 0
                                    cleanly when no session exists yet.
+    providers <VERB> [ARGS]         Manage provider credentials and test
+                                   configured provider profiles.
 
 `atelier run` may read defaults from a TOML config (v53):
 
@@ -162,6 +166,7 @@ fn main() -> ExitCode {
         "run" => run_run(args),
         "protocol-overhead" => run_protocol_overhead(args),
         "find" => run_find(args),
+        "providers" => run_providers(args),
         "skills" => run_skills(args),
         other => {
             eprintln!("atelier: unknown subcommand `{other}`\n");
@@ -197,6 +202,384 @@ fn run_init(mut args: impl Iterator<Item = String>) -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+// ---------- `atelier providers` ----------
+
+const PROVIDERS_USAGE: &str = "atelier providers <VERB> [ARGS]\n\
+\n\
+VERBs:\n\
+    auth <profile> [--from-command <CMD>|--from-stdin|--env <NAME>] [--workspace <PATH>] [--no-update]\n\
+                  Store a provider API key in the OS keychain and, by default,\n\
+                  add/update `[providers.<profile>].api_key` in providers.toml.\n\
+    test <profile> [--workspace <PATH>]\n\
+                  Resolve the profile credential and call the OpenAI-compatible\n\
+                  `/models` endpoint without printing the secret.\n";
+
+fn run_providers(mut args: impl Iterator<Item = String>) -> ExitCode {
+    match args.next().as_deref() {
+        Some("-h" | "--help") => {
+            print!("{PROVIDERS_USAGE}");
+            ExitCode::SUCCESS
+        }
+        Some("auth") => providers_auth(args),
+        Some("test") => providers_test(args),
+        Some(other) => {
+            eprintln!("atelier providers: unknown verb `{other}`\n");
+            eprintln!("{PROVIDERS_USAGE}");
+            ExitCode::from(2)
+        }
+        None => {
+            eprintln!("{PROVIDERS_USAGE}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+enum ProviderSecretSource {
+    Command(String),
+    Stdin,
+    Env(String),
+}
+
+fn providers_auth(args: impl Iterator<Item = String>) -> ExitCode {
+    let mut profile = None;
+    let mut source = None;
+    let mut workspace = None;
+    let mut update_config = true;
+    let mut iter = args;
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                println!("{PROVIDERS_USAGE}");
+                return ExitCode::SUCCESS;
+            }
+            "--from-command" => match iter.next() {
+                Some(cmd) => source = Some(ProviderSecretSource::Command(cmd)),
+                None => {
+                    eprintln!("atelier providers auth: --from-command requires a command string");
+                    return ExitCode::from(2);
+                }
+            },
+            "--from-stdin" => source = Some(ProviderSecretSource::Stdin),
+            "--env" => match iter.next() {
+                Some(name) => source = Some(ProviderSecretSource::Env(name)),
+                None => {
+                    eprintln!("atelier providers auth: --env requires a variable name");
+                    return ExitCode::from(2);
+                }
+            },
+            "--workspace" => match iter.next() {
+                Some(path) => workspace = Some(PathBuf::from(path)),
+                None => {
+                    eprintln!("atelier providers auth: --workspace requires a path");
+                    return ExitCode::from(2);
+                }
+            },
+            "--no-update" => update_config = false,
+            other if other.starts_with('-') => {
+                eprintln!("atelier providers auth: unknown option `{other}`");
+                return ExitCode::from(2);
+            }
+            other => {
+                if profile.replace(other.to_string()).is_some() {
+                    eprintln!("atelier providers auth: only one profile name is accepted");
+                    return ExitCode::from(2);
+                }
+            }
+        }
+    }
+    let Some(profile) = profile else {
+        eprintln!("atelier providers auth: <profile> is required");
+        return ExitCode::from(2);
+    };
+    let Some(source) = source else {
+        eprintln!("atelier providers auth: choose --from-command, --from-stdin, or --env");
+        return ExitCode::from(2);
+    };
+    let workspace = match workspace.or_else(|| env::current_dir().ok()) {
+        Some(path) => path,
+        None => {
+            eprintln!("atelier providers auth: cannot determine current directory");
+            return ExitCode::from(1);
+        }
+    };
+    let loaded = match ProvidersConfig::load(&workspace) {
+        Ok(Some(loaded)) => loaded,
+        Ok(None) => {
+            eprintln!(
+                "atelier providers auth: no providers.toml found for {}",
+                workspace.display()
+            );
+            return ExitCode::from(2);
+        }
+        Err(e) => {
+            eprintln!("atelier providers auth: config error: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let Some(profile_config) = loaded.config.providers.get(&profile) else {
+        eprintln!(
+            "atelier providers auth: profile {profile:?} not found in {}",
+            loaded.path.display()
+        );
+        return ExitCode::from(2);
+    };
+    let key_ref = profile_config
+        .api_key
+        .clone()
+        .unwrap_or_else(|| atelier_core::default_provider_api_key_ref(&profile));
+    if !key_ref.starts_with("keyring:") {
+        eprintln!("atelier providers auth: profile {profile:?} has api_key = {key_ref:?}; auth can only write keyring: references");
+        return ExitCode::from(2);
+    }
+    let secret = match read_provider_secret(source) {
+        Ok(secret) => secret,
+        Err(e) => {
+            eprintln!("atelier providers auth: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    if secret.is_empty() {
+        eprintln!("atelier providers auth: secret source produced an empty value");
+        return ExitCode::from(1);
+    }
+    if let Err(e) = atelier_core::store_api_key_ref(&key_ref, &secret) {
+        eprintln!("atelier providers auth: {e}");
+        return ExitCode::from(1);
+    }
+    if update_config {
+        if let Err(e) = upsert_profile_api_key(&loaded.path, &profile, &key_ref) {
+            eprintln!(
+                "atelier providers auth: stored key, but failed to update {}: {e}",
+                loaded.path.display()
+            );
+            return ExitCode::from(1);
+        }
+    }
+    println!("atelier providers auth: stored credential for profile {profile:?} in {key_ref}");
+    if !update_config {
+        println!("Add this to [providers.{profile}]: api_key = {key_ref:?}");
+    }
+    ExitCode::SUCCESS
+}
+
+fn providers_test(args: impl Iterator<Item = String>) -> ExitCode {
+    let mut profile = None;
+    let mut workspace = None;
+    let mut iter = args;
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                println!("{PROVIDERS_USAGE}");
+                return ExitCode::SUCCESS;
+            }
+            "--workspace" => match iter.next() {
+                Some(path) => workspace = Some(PathBuf::from(path)),
+                None => {
+                    eprintln!("atelier providers test: --workspace requires a path");
+                    return ExitCode::from(2);
+                }
+            },
+            other if other.starts_with('-') => {
+                eprintln!("atelier providers test: unknown option `{other}`");
+                return ExitCode::from(2);
+            }
+            other => {
+                if profile.replace(other.to_string()).is_some() {
+                    eprintln!("atelier providers test: only one profile name is accepted");
+                    return ExitCode::from(2);
+                }
+            }
+        }
+    }
+    let Some(profile) = profile else {
+        eprintln!("atelier providers test: <profile> is required");
+        return ExitCode::from(2);
+    };
+    let workspace = match workspace.or_else(|| env::current_dir().ok()) {
+        Some(path) => path,
+        None => {
+            eprintln!("atelier providers test: cannot determine current directory");
+            return ExitCode::from(1);
+        }
+    };
+    let loaded = match ProvidersConfig::load(&workspace) {
+        Ok(Some(loaded)) => loaded,
+        Ok(None) => {
+            eprintln!(
+                "atelier providers test: no providers.toml found for {}",
+                workspace.display()
+            );
+            return ExitCode::from(2);
+        }
+        Err(e) => {
+            eprintln!("atelier providers test: config error: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let Some(profile_config) = loaded.config.providers.get(&profile) else {
+        eprintln!(
+            "atelier providers test: profile {profile:?} not found in {}",
+            loaded.path.display()
+        );
+        return ExitCode::from(2);
+    };
+    if profile_config.provider != Some(ProviderKind::OpenaiCompat) {
+        eprintln!(
+            "atelier providers test: profile {profile:?} is not provider = \"openai-compat\""
+        );
+        return ExitCode::from(2);
+    }
+    let api_key = match atelier_core::resolve_openai_api_key(profile_config.api_key.as_deref()) {
+        Ok(key) => key,
+        Err(e) => {
+            eprintln!("atelier providers test: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let base = effective_openai_base_url(profile_config.base_url.clone());
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("atelier providers test: tokio runtime build failed: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    match rt.block_on(test_openai_compat_models(&base, &api_key)) {
+        Ok(model_count) => {
+            println!(
+                "atelier providers test: profile {profile:?} reached {base}/models ({model_count} model(s))"
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("atelier providers test: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn read_provider_secret(source: ProviderSecretSource) -> Result<String, String> {
+    let raw = match source {
+        ProviderSecretSource::Command(cmd) => run_secret_command(&cmd)?,
+        ProviderSecretSource::Stdin => {
+            let mut input = String::new();
+            io::stdin()
+                .read_to_string(&mut input)
+                .map_err(|e| format!("read stdin: {e}"))?;
+            input
+        }
+        ProviderSecretSource::Env(name) => {
+            env::var(&name).map_err(|_| format!("environment variable {name} is not set"))?
+        }
+    };
+    Ok(raw.trim_end_matches(['\r', '\n']).to_string())
+}
+
+fn run_secret_command(cmd: &str) -> Result<String, String> {
+    #[cfg(unix)]
+    let output = Command::new("/bin/sh").arg("-c").arg(cmd).output();
+    #[cfg(windows)]
+    let output = Command::new("cmd").arg("/C").arg(cmd).output();
+    let output = output.map_err(|e| format!("run --from-command: {e}"))?;
+    if !output.status.success() {
+        return Err(format!("--from-command exited with {}", output.status));
+    }
+    String::from_utf8(output.stdout)
+        .map_err(|e| format!("--from-command output was not UTF-8: {e}"))
+}
+
+async fn test_openai_compat_models(base_url: &str, api_key: &str) -> Result<usize, String> {
+    let url = format!("{}/models", base_url.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("HTTP client: {e}"))?;
+    let mut req = client.get(&url);
+    if !api_key.is_empty() {
+        req = req.bearer_auth(api_key);
+    }
+    let res = req.send().await.map_err(|e| format!("GET {url}: {e}"))?;
+    let status = res.status();
+    let body = res
+        .text()
+        .await
+        .map_err(|e| format!("read response body: {e}"))?;
+    if !status.is_success() {
+        return Err(format!("GET {url} returned HTTP {status}: {body}"));
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| format!("parse /models response: {e}"))?;
+    Ok(value
+        .get("data")
+        .and_then(|v| v.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0))
+}
+
+fn effective_openai_base_url(base_url: Option<String>) -> String {
+    base_url
+        .or_else(|| env::var("OPENAI_BASE_URL").ok())
+        .unwrap_or_else(|| "https://api.openai.com/v1".to_string())
+}
+
+fn upsert_profile_api_key(path: &Path, profile: &str, key_ref: &str) -> io::Result<()> {
+    let body = fs::read_to_string(path)?;
+    let mut lines: Vec<String> = body.lines().map(ToString::to_string).collect();
+    let had_trailing_newline = body.ends_with('\n');
+    let Some(start) = lines
+        .iter()
+        .position(|line| provider_header_matches(line, profile))
+    else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("profile {profile:?} not found"),
+        ));
+    };
+    let end = lines
+        .iter()
+        .enumerate()
+        .skip(start + 1)
+        .find_map(|(idx, line)| {
+            let trimmed = line.trim();
+            (trimmed.starts_with('[') && trimmed.ends_with(']')).then_some(idx)
+        })
+        .unwrap_or(lines.len());
+    let replacement = format!("api_key = \"{}\"", toml_escape_string(key_ref));
+    if let Some(idx) = lines[start + 1..end]
+        .iter()
+        .position(|line| line.trim_start().starts_with("api_key"))
+        .map(|rel| start + 1 + rel)
+    {
+        lines[idx] = replacement;
+    } else {
+        lines.insert(end, replacement);
+    }
+    let mut out = lines.join("\n");
+    if had_trailing_newline {
+        out.push('\n');
+    }
+    fs::write(path, out)
+}
+
+fn provider_header_matches(line: &str, profile: &str) -> bool {
+    let trimmed = line.trim();
+    let Some(inner) = trimmed.strip_prefix('[').and_then(|s| s.strip_suffix(']')) else {
+        return false;
+    };
+    let Some(name) = inner.strip_prefix("providers.") else {
+        return false;
+    };
+    name == profile
+        || (name.starts_with('"') && name.ends_with('"') && &name[1..name.len() - 1] == profile)
+}
+
+fn toml_escape_string(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 // ---------- `atelier skills` ----------
@@ -1283,17 +1666,22 @@ fn resolve_provider_choice(
                      sent verbatim to the server."
                     .into());
             };
+            let api_key_ref = profile.and_then(|p| p.api_key.as_deref());
             atelier_core::provider_profile_base_url_may_receive_credential(
                 base_url.as_deref(),
                 cli.base_url.is_some(),
-                std::env::var("OPENAI_API_KEY")
-                    .map(|s| !s.is_empty())
-                    .unwrap_or(false),
+                atelier_core::api_key_ref_may_resolve(
+                    api_key_ref,
+                    atelier_core::OPENAI_API_KEY_ENV,
+                ),
             )?;
+            let api_key = atelier_core::resolve_openai_api_key(api_key_ref)
+                .map_err(|e| format!("provider credential: {e}"))?;
             let cache_prompt = profile.and_then(|p| p.cache_prompt).unwrap_or(false);
             Ok(runner::ProviderChoice::OpenAiCompat {
                 model_id,
                 base_url,
+                api_key: Some(api_key),
                 cache_prompt,
             })
         }
@@ -1415,9 +1803,10 @@ fn build_executor_adapter(
             atelier_core::provider_profile_base_url_may_receive_credential(
                 profile.base_url.as_deref(),
                 false,
-                std::env::var("OPENAI_API_KEY")
-                    .map(|s| !s.is_empty())
-                    .unwrap_or(false),
+                atelier_core::api_key_ref_may_resolve(
+                    profile.api_key.as_deref(),
+                    atelier_core::OPENAI_API_KEY_ENV,
+                ),
             )?;
             if !preflight_base_url(&base_url) {
                 return Err(format!(
@@ -1425,7 +1814,10 @@ fn build_executor_adapter(
                      (TCP connect timed out); skipping executor adapter"
                 ));
             }
-            let api_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
+            let api_key = atelier_core::resolve_openai_api_key(profile.api_key.as_deref())
+                .map_err(|e| {
+                    format!("executor profile {profile_name:?}: provider credential: {e}")
+                })?;
             let mut adapter = atelier_core::adapter::openai_compat::OpenAiCompatAdapter::new(
                 api_key, model_id, base_url,
             );
@@ -1800,6 +2192,7 @@ mod trust_boundary_tests {
             provider: Some(ProviderKind::OpenaiCompat),
             model: Some("local:test".to_string()),
             base_url: Some(base_url.to_string()),
+            api_key: None,
             cache_prompt: None,
         }
     }

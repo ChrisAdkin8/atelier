@@ -1,5 +1,24 @@
 # Atelier Spec — Changelog
 
+## v60.77 — 2026-05-22 (provider keychain auth + sub-agent token UI)
+
+Adds first-class OpenAI-compatible provider credential references and completes the sub-agent token-progress UI fan-out across GUI and TUI.
+
+### Provider credentials
+
+- Added `atelier_core::credentials` with `env:NAME` and `keyring:SERVICE/USER` credential references for provider API keys. Plaintext `api_key` values in `providers.toml` are rejected.
+- Added `atelier providers auth <profile>` to store a profile key in the OS keychain and update `[providers.<profile>].api_key`, plus `atelier providers test <profile>` to verify `/models` without printing secrets.
+- OpenAI-compatible CLI, GUI default-provider, GUI swap, and executor routing paths now resolve `OPENAI_API_KEY` first, then profile `api_key`, preserving env-var override semantics for CI and one-off runs.
+
+### Sub-agent progress
+
+- Sub-agent model-call ledger events now emit cumulative `SubagentTokensUpdated` bus events.
+- GUI and TUI sub-agent panes render prompt/completion token counters, and the TUI event projection now handles `SubagentTokensUpdated`, restoring full-workspace `cargo check`.
+
+### Documentation
+
+- README quick start, SECURITY, trust-boundary docs, crate docs, ATELIER project context, STATUS, and `tasks/todo.md` now describe provider keychain auth and the remaining MCP `${keychain:...}` interpolation scope separately.
+
 ## v60.76 — 2026-05-21 (design-risk remediation + docs sweep)
 
 Implements the first safe slices of the critical/high design-risk remediation plan and refreshes the public documentation around quality metrics, risk tracking, and current gate counts.

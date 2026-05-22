@@ -49,7 +49,15 @@
           <span class="badge">{statusBadge(sa.status)}</span>
           <span class="type">{sa.subagentType || '?'}</span>
           <span class="desc">"{sa.description}"</span>
-          <span class="turns">turn {sa.turn}/{sa.maxTurns}</span>
+          <span class="meta">
+            <span
+              class="tokens"
+              title={`prompt ${sa.promptTokens ?? 0}, completion ${sa.completionTokens ?? 0}, cached ${sa.cachedTokens ?? 0}`}
+            >
+              ↑{sa.promptTokens ?? 0} ↓{sa.completionTokens ?? 0}
+            </span>
+            <span class="turns">turn {sa.turn}/{sa.maxTurns}</span>
+          </span>
         </li>
       {/each}
     </ul>
@@ -95,7 +103,7 @@
   }
   .sa-row {
     display: grid;
-    grid-template-columns: 6ch 8ch 1fr auto;
+    grid-template-columns: 6ch minmax(6ch, 8ch) minmax(0, 1fr) minmax(12rem, max-content);
     gap: 0.4rem;
     padding: 0.15rem 0;
     font-size: 0.72rem;
@@ -136,6 +144,18 @@
   }
   .turns {
     color: var(--fg-dim);
+    white-space: nowrap;
+    font-size: 0.68rem;
+  }
+  .meta {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 0.2rem 0.6rem;
+    min-width: 0;
+  }
+  .tokens {
+    color: var(--accent-cyan);
     white-space: nowrap;
     font-size: 0.68rem;
   }

@@ -604,6 +604,15 @@ pub enum Event {
     /// A sub-agent dispatched a tool call.
     SubagentToolCall { id: String, tool: String },
 
+    /// A sub-agent consumed model tokens. Counts are cumulative for the
+    /// sub-agent and update after each child model call.
+    SubagentTokensUpdated {
+        id: String,
+        prompt_tokens: u32,
+        completion_tokens: u32,
+        cached_tokens: u32,
+    },
+
     /// A sub-agent reached a terminal state.
     SubagentCompleted {
         id: String,
@@ -661,6 +670,7 @@ impl Event {
             Self::SubagentSpawned { .. } => "SubagentSpawned",
             Self::SubagentTurnAdvanced { .. } => "SubagentTurnAdvanced",
             Self::SubagentToolCall { .. } => "SubagentToolCall",
+            Self::SubagentTokensUpdated { .. } => "SubagentTokensUpdated",
             Self::SubagentCompleted { .. } => "SubagentCompleted",
             Self::SubagentCancelled { .. } => "SubagentCancelled",
         }

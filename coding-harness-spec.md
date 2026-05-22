@@ -596,8 +596,8 @@ A low-cost model critiques every parent-agent output in an advisory side pane. O
 - **Primary:** OS keychain via the `keyring` Rust crate. macOS Keychain, Linux Secret Service (libsecret), Windows Credential Manager. Entries keyed by `service = "atelier"`, `user = "anthropic" | "openai" | "googleai" | <mcp-server-name>`.
 - **Override:** environment variables — `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, etc. Takes precedence over keychain. Used for CI and env-hygiene-conscious users.
 - **Forbidden:** plaintext keys in any committed config file. `mcp_servers.json` `headers` values support the interpolation tokens `${env:NAME}` and `${keychain:NAME}`; literal secrets are rejected at load.
-- **Resolution order at session start:** env var → keychain → typed error pointing the user at `atelier login <provider>`.
-- **CLI commands** (provided by `atelier-gui` / `atelier-tui`, backed by `atelier-core::secrets`):
+- **Resolution order at session start:** env var → keychain → typed error pointing the user at `atelier login <provider>`. Current OpenAI-compatible provider profiles implement the env → profile-keychain path via `[providers.<name>].api_key` and `atelier providers auth/test`; the generic `atelier login` surface remains the target abstraction.
+- **CLI commands** (provided by `atelier-gui` / `atelier-tui`, backed by `atelier-core::secrets`; current narrow OpenAI-compatible surface is `atelier providers auth/test`):
   - `atelier login <provider>` — stores a key (reads from stdin or prompts interactively).
   - `atelier logout <provider>` — removes the keychain entry.
   - `atelier rotate <provider>` — convenience for logout + login.

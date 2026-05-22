@@ -1,8 +1,7 @@
 <script lang="ts">
-  // Prompt composer. Non-slash path routes through `start_agent_run`
-  // (Runner-backed, full tools + sub-agent support). Slash path routes
-  // through `invoke_skill` which also calls `start_agent_run` after
-  // skill expansion. `start_chat_run` is no longer used here.
+  // Prompt composer. Plain prompts auto-route: simple chat uses
+  // `start_chat_run`, while prompts that look like repo/tool/sub-agent work
+  // use `start_agent_run`. Slash skills still route through `invoke_skill`.
   //
   // v60.52 §15 — when the input starts with `/`, surface a transient
   // skill autocomplete menu. `Tab` accepts the highlighted match;
@@ -96,6 +95,7 @@
       args[skill.args[0]] = tail
       return { name, args }
     }
+
     // key=value tokens, with double-quoted values supported.
     const tokRe = /([A-Za-z_][A-Za-z0-9_]*)=("([^"]*)"|(\S+))/g
     let m: RegExpExecArray | null
@@ -103,6 +103,21 @@
       args[m[1]] = m[3] ?? m[4]
     }
     return { name, args }
+  }
+
+  function shouldUseAgent(input: string): boolean {
+    const text = input.toLowerCase()
+    const agentPatterns = [
+      /\bin parallel\b/,
+      /\bsub[- ]?agents?\b/,
+      /\bspawn (?:agents?|sub[- ]?agents?)\b/,
+      /\bsplit (?:this|the task|work)\b/,
+      /\b(in|this|the) repo\b/,
+      /\bworkspace\b/,
+      /\bcount\b.*\b(lines?|files?|tokens?)\b/,
+      /\b(search|grep|find|scan|analy[sz]e|inspect|modify|edit|write|create|refactor|test|run)\b/,
+    ]
+    return agentPatterns.some((pattern) => pattern.test(text))
   }
 
   async function stopRun() {
@@ -123,8 +138,10 @@
       const slash = parseSlash(trimmed)
       if (slash) {
         await invoke('invoke_skill', { name: slash.name, args: slash.args })
-      } else {
+      } else if (shouldUseAgent(trimmed)) {
         await invoke('start_agent_run', { prompt: trimmed })
+      } else {
+        await invoke('start_chat_run', { prompt: trimmed })
       }
       prompt = ''
     } catch (e) {
@@ -167,6 +184,24 @@
         return
       }
     }
+    if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key === 'Enter') {
+      e.preventDefault()
+      const trimmed = prompt.trim()
+      if (!trimmed || busy || starting) return
+      starting = true
+      error = null
+      invoke('start_agent_run', { prompt: trimmed })
+        .then(() => {
+          prompt = ''
+        })
+        .catch((e) => {
+          error = String(e)
+        })
+        .finally(() => {
+          starting = false
+        })
+      return
+    }
     if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
       e.preventDefault()
       void commit()
@@ -176,6 +211,13 @@
   let canSubmit = $derived(
     !busy && !starting && prompt.trim().length > 0,
   )
+
+  let routeLabel = $derived.by(() => {
+    const trimmed = prompt.trim()
+    if (!trimmed) return 'Auto: Chat'
+    if (parseSlash(trimmed)) return 'Auto: Skill'
+    return shouldUseAgent(trimmed) ? 'Auto: Agent' : 'Auto: Chat'
+  })
 
   // v60.55 — auto-scroll the selected row into view as ↑/↓ moves the
   // highlight. Without this, pressing ↓ past the visible items moves
@@ -194,7 +236,7 @@
   <textarea
     placeholder={busy
       ? 'a turn is in progress — wait for it to finish'
-      : 'type a prompt and hit Cmd+Enter — or start with `/` for a skill (Tab to autocomplete)'}
+      : 'type a prompt and hit Cmd+Enter — auto-routes chat vs agent; `/` for skills'}
     bind:value={prompt}
     onkeydown={onKey}
     disabled={busy || starting}
@@ -214,9 +256,10 @@
   {/if}
   <div class="composer-actions">
     <span class="hint">
-      Cmd+Enter to send · `/` for skills (Tab to autocomplete, Esc to clear)
+      Cmd+Enter to send · Shift+Cmd+Enter forces Agent · `/` for skills
     </span>
     <div class="btn-group">
+      <span class:agent-route={routeLabel === 'Auto: Agent'} class="route-label">{routeLabel}</span>
       <button
         class="send"
         onclick={commit}
@@ -336,6 +379,20 @@
     align-items: center;
     gap: 0.5rem;
     flex-shrink: 0;
+  }
+  .route-label {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    color: var(--fg-dim);
+    border: 1px solid var(--border-pane-strong);
+    border-radius: 4px;
+    padding: 0.25rem 0.5rem;
+    background: var(--bg-pane-alt);
+    white-space: nowrap;
+  }
+  .route-label.agent-route {
+    color: var(--accent-cyan);
+    border-color: var(--accent-cyan);
   }
   .hint {
     color: var(--fg-dim);

@@ -429,6 +429,9 @@ pub struct SubagentEntry {
     pub status: String,
     pub turn: u32,
     pub max_turns: u32,
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+    pub cached_tokens: u32,
 }
 
 /// One event-log line. Stored as already-projected strings so the render
@@ -819,6 +822,9 @@ impl AppState {
                     status: "running".to_string(),
                     turn: 0,
                     max_turns: *max_turns,
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    cached_tokens: 0,
                 });
             }
             SessionEvent::SubagentTurnAdvanced {
@@ -831,6 +837,18 @@ impl AppState {
                 }
             }
             SessionEvent::SubagentToolCall { .. } => {}
+            SessionEvent::SubagentTokensUpdated {
+                ref id,
+                prompt_tokens,
+                completion_tokens,
+                cached_tokens,
+            } => {
+                if let Some(e) = self.subagents.iter_mut().find(|e| e.id == *id) {
+                    e.prompt_tokens = *prompt_tokens;
+                    e.completion_tokens = *completion_tokens;
+                    e.cached_tokens = *cached_tokens;
+                }
+            }
             // TUI renders committed messages only; streaming deltas are no-ops.
             SessionEvent::AssistantTextDelta { .. } => {}
             SessionEvent::SubagentCompleted {
@@ -1191,6 +1209,17 @@ pub fn project_event(evt: &SessionEvent) -> EventLine {
         }
         SessionEvent::SubagentToolCall { id, tool } => {
             format!("[subagent] {id} → {tool}")
+        }
+        SessionEvent::SubagentTokensUpdated {
+            id,
+            prompt_tokens,
+            completion_tokens,
+            cached_tokens,
+        } => {
+            let total = prompt_tokens.saturating_add(*completion_tokens);
+            format!(
+                "[subagent] {id} tokens: {total} total ({prompt_tokens} prompt, {completion_tokens} completion, {cached_tokens} cached)"
+            )
         }
         SessionEvent::SubagentCompleted { id, status, turns_used } => {
             format!("[subagent] {id} {status} ({turns_used} turns)")
@@ -2057,6 +2086,7 @@ fn render_subagents_pane(state: &AppState, area: Rect, buf: &mut Buffer) {
             } else {
                 e.turn.to_string()
             };
+            let token_label = format!("↑{} ↓{}", e.prompt_tokens, e.completion_tokens);
             ListItem::new(Line::from(vec![
                 Span::styled(format!("[{badge}] "), badge_style),
                 Span::styled(
@@ -2064,6 +2094,10 @@ fn render_subagents_pane(state: &AppState, area: Rect, buf: &mut Buffer) {
                     Style::default().fg(Color::Magenta),
                 ),
                 Span::raw(format!("{:<7} ", turn_label)),
+                Span::styled(
+                    format!("{:<11} ", token_label),
+                    Style::default().fg(Color::Cyan),
+                ),
                 Span::raw(safe_span(&e.description)),
             ]))
         })

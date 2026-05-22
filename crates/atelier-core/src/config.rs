@@ -18,6 +18,7 @@
 //! provider = "openai-compat"
 //! base_url = "http://localhost:11434/v1"
 //! model    = "local:qwen2.5-coder:7b"
+//! api_key  = "keyring:atelier/providers/local"
 //!
 //! [providers.cloud]
 //! provider = "anthropic"
@@ -143,6 +144,12 @@ pub struct ProviderProfile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
 
+    /// Optional credential reference for network providers. Plaintext
+    /// secrets are intentionally not accepted; use `env:NAME`,
+    /// `keyring:USER`, or `keyring:SERVICE/USER`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+
     /// When `true`, adds `"cache_prompt": true` to every request body.
     /// llama.cpp server uses this to save/restore the KV state for the
     /// stable prompt prefix across turns; mlx-lm ignores the field
@@ -163,7 +170,8 @@ pub enum ProviderKind {
     Anthropic,
     /// Any `POST <base_url>/chat/completions` server: LM Studio,
     /// llama-server, vLLM, sglang, Ollama (via `/v1/`), or OpenAI
-    /// itself. Reads `OPENAI_API_KEY` (optional — empty allowed).
+    /// itself. Reads `OPENAI_API_KEY` when set, otherwise
+    /// `[providers.<name>].api_key` (optional — empty allowed).
     OpenaiCompat,
 }
 
@@ -343,6 +351,8 @@ impl ProvidersConfig {
     ///     "openai-compat"`. Combining `base_url` with any other
     ///     adapter is a clear mistake (anthropic + a `base_url` does
     ///     nothing useful).
+    ///   - Each profile's `api_key` must be a credential reference
+    ///     (`env:...` or `keyring:...`), never a plaintext key.
     fn validate(&self, path: &Path) -> Result<(), ConfigError> {
         if let Some(name) = &self.default {
             if !self.providers.contains_key(name) {
@@ -370,6 +380,12 @@ impl ProvidersConfig {
                         profile.provider.unwrap().as_str()
                     ),
                 });
+            }
+            if let Some(api_key) = &profile.api_key {
+                crate::validate_api_key_ref(api_key).map_err(|e| ConfigError::Invalid {
+                    path: path.to_path_buf(),
+                    message: format!("[providers.{name}].api_key: {e}"),
+                })?;
             }
         }
         Ok(())
@@ -486,6 +502,7 @@ default = "local"
 provider = "openai-compat"
 base_url = "http://localhost:11434/v1"
 model    = "local:qwen2.5-coder:7b"
+api_key  = "keyring:atelier/providers/local"
 
 [providers.cloud]
 provider = "anthropic"
@@ -499,6 +516,10 @@ model    = "anthropic:claude-opus-4-7"
         assert_eq!(local.provider, Some(ProviderKind::OpenaiCompat));
         assert_eq!(local.base_url.as_deref(), Some("http://localhost:11434/v1"));
         assert_eq!(local.model.as_deref(), Some("local:qwen2.5-coder:7b"));
+        assert_eq!(
+            local.api_key.as_deref(),
+            Some("keyring:atelier/providers/local")
+        );
 
         let cloud = parsed.providers.get("cloud").unwrap();
         assert_eq!(cloud.provider, Some(ProviderKind::Anthropic));
@@ -680,6 +701,23 @@ base_url = "https://api.anthropic.com/v1"
         let x = loaded.config.providers.get("x").unwrap();
         assert_eq!(x.base_url.as_deref(), Some("http://x/v1"));
         assert!(x.provider.is_none());
+    }
+
+    #[test]
+    fn plaintext_api_key_is_rejected() {
+        let tmp_repo = TempDir::new().unwrap();
+        write_project_config(
+            tmp_repo.path(),
+            "[providers.x]\nprovider = \"openai-compat\"\napi_key = \"sk-plaintext\"\n",
+        );
+        let err = ProvidersConfig::load(tmp_repo.path()).unwrap_err();
+        match err {
+            ConfigError::Invalid { message, .. } => {
+                assert!(message.contains("api_key"));
+                assert!(message.contains("env:NAME") || message.contains("keyring"));
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
     }
 
     // ---------- profile resolution ----------

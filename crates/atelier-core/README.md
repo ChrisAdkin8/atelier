@@ -97,7 +97,7 @@ The table above lists what exists today. Outstanding (in roughly the order they 
 - LiteLLM-shaped adapter — likely subsumed by `openai_compat` if the LiteLLM gateway speaks the OpenAI chat-completions surface, which it does. Re-evaluate once a concrete LiteLLM regression is in the canonical workload.
 - Bedrock + Vertex adapters (Phase E/F).
 - DoD-check executor — the loader is in but the runtime that actually shells out to `dod.checks[].command` and folds results into the `Verifying` transition is stubbed. The Runner emits a one-shot warning when a DoD config is present so callers see that checks aren't being honoured.
-- `secrets` — OS keychain (`keyring`) integration for `${keychain:…}` interpolation. Today `${env:…}` interpolation is supported in MCP/hook config, `${keychain:…}` fails closed, and provider API keys are read directly from the environment.
+- `credentials` — provider API-key resolution from `OPENAI_API_KEY` or profile `api_key = "keyring:SERVICE/USER"` / `env:NAME`, backed by the OS keychain via `keyring`. MCP/hook `${env:…}` interpolation remains supported; MCP `${keychain:…}` interpolation still fails closed until the generic credentials provider lands.
 - `checkpoint` — §4 diff-blob storage under `.atelier/sessions/<uuid>/diffs/`; integrates with `persistence::OnDiskSession::checkpoints`.
 
 The 8 built-in tool manifests live under `tools/`; subagent type manifests under `subagents/`; skill manifests under `skills/`; the MCP catalog at `catalog/mcp_servers.json`. The dispatcher reads the tool manifests at session start.

@@ -21,17 +21,34 @@ shared helpers and tests.
 
 OpenAI-compatible endpoints are intentionally flexible because Atelier is
 BYOM. The dangerous case is a repo-controlled profile silently combining an
-arbitrary remote `base_url` with a credential from `OPENAI_API_KEY`.
+arbitrary remote `base_url` with a credential from `OPENAI_API_KEY` or a
+profile `api_key = "keyring:..."` reference.
 
 The shared rule is:
 
-1. Allow known public provider hosts and loopback endpoints.
+1. Allow known public provider hosts, loopback endpoints, and explicitly
+   reviewed project-owned OpenAI-compatible infrastructure.
 2. Allow arbitrary endpoints when no credential is present.
 3. Allow arbitrary endpoints when the user supplied `--base-url` explicitly for
    the current run.
 4. Reject repo-profile endpoints that are both unallowlisted and credentialed.
 
 The shared predicate lives in `atelier_core::trust_boundary`.
+
+The current built-in provider credential allowlist is:
+
+| Host | Intended use |
+|---|---|
+| `api.anthropic.com` | Anthropic cloud provider endpoint. |
+| `api.openai.com` | OpenAI cloud provider endpoint. |
+| `atelier-gpu-vllm-dev-1460977764.us-east-1.elb.amazonaws.com` | Project-owned Atelier dev vLLM ALB for OpenAI-compatible GPU inference. |
+| `localhost`, `127.0.0.1`, `::1` | Local OpenAI-compatible servers and local proxies/tunnels. |
+
+The GUI adapter swap path uses the same host list. This means a profile such as
+`base_url = "http://atelier-gpu-vllm-dev-1460977764.us-east-1.elb.amazonaws.com/v1"`
+can receive OpenAI-compatible credentials without being rejected by
+`swap_adapter`, while other repo-controlled remote hosts still require explicit
+user action at the invoking surface.
 
 ## Required regression tests
 

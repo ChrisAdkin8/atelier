@@ -12,9 +12,13 @@
 /// remote OpenAI-compatible endpoints are still supported when explicitly
 /// supplied by the user at the invoking surface; repo-controlled profile
 /// files should not silently route `OPENAI_API_KEY` to them.
+///
+/// The Atelier dev vLLM ALB is included as a project-owned OpenAI-compatible
+/// endpoint used by the GUI and repo profile during local development.
 pub const PROVIDER_BASE_URL_ALLOWLIST: &[&str] = &[
     "api.anthropic.com",
     "api.openai.com",
+    "atelier-gpu-vllm-dev-1460977764.us-east-1.elb.amazonaws.com",
     "localhost",
     "127.0.0.1",
     "::1",
@@ -107,6 +111,9 @@ mod tests {
         assert!(provider_base_url_allowed(Some("https://api.openai.com/v1")));
         assert!(provider_base_url_allowed(Some(
             "https://api.anthropic.com/v1"
+        )));
+        assert!(provider_base_url_allowed(Some(
+            "http://atelier-gpu-vllm-dev-1460977764.us-east-1.elb.amazonaws.com/v1"
         )));
         assert!(provider_base_url_allowed(Some("http://localhost:11434/v1")));
         assert!(provider_base_url_allowed(Some("http://127.0.0.1:8080/v1")));

@@ -7,7 +7,7 @@ Atelier is a **coding harness, end-to-end runnable on Phase A/B/C scope**: agent
 - **Rust workspace**, pinned to 1.85 (`rust-toolchain.toml`). Four crates: `atelier-core` (agent loop, BYOM adapters, session state, ledger — no UI), `atelier-cli` (hybrid lib+bin; the `atelier` binary plus a `Runner` library the GUI/TUI link against), `atelier-gui` (Tauri 2.x + Svelte 5 driver), `atelier-tui` (ratatui + crossterm driver). GUI and TUI both consume `atelier-core` via a broadcast channel and embed `atelier-cli::Runner` to drive scripted runs.
 - **Python rig** in `tests/` validates schemas, artifacts, and workload runs. Pinned via `pyproject.toml [optional-dependencies.rig]`.
 - **MCP-first tool transport** via `rmcp` crate (gated on the spike at `experiments/rmcp_spike/`). Built-in tools (eight landed: `read_file`, `list_dir`, `grep`, `write_file`, `edit_file`, `ast_grep`, `shell`, `spawn_subagent`) share the dispatcher with the future MCP-hosted external tools — hooks, ledger, trust budget, and verification gates treat them uniformly.
-- **BYOM providers landed (v51):** Mock (always), Anthropic Messages API (`anthropic:` model prefix, `ANTHROPIC_API_KEY`), OpenAI-compatible (`openai-compat` with `--base-url`; works against LM Studio, llama-server, vLLM, sglang, Ollama's `/v1/` compat surface, and OpenAI itself; `OPENAI_API_KEY` honoured but optional). Bedrock + Vertex sit in Phase E/F.
+- **BYOM providers landed (v51 + v60.77 auth):** Mock (always), Anthropic Messages API (`anthropic:` model prefix, `ANTHROPIC_API_KEY`), OpenAI-compatible (`openai-compat` with `--base-url`; works against LM Studio, llama-server, vLLM, sglang, Ollama's `/v1/` compat surface, and OpenAI itself; `OPENAI_API_KEY` override or profile `api_key = "keyring:..."` / `env:...`). Bedrock + Vertex sit in Phase E/F.
 
 ## Canonical commands
 
@@ -40,7 +40,7 @@ cargo run -p atelier-cli -- run \
     "<prompt>"
 ```
 
-On first use the harness fires a short calibration probe (one tool-call test + one JSON-sentinel test) and caches the resulting `ModelProfile` to `~/.atelier/model_profiles/<hash>.json`. Override with `--no-probe` (skip; use capability defaults) or `--force-probe` (re-probe even if cached). LM Studio (`:1234`), llama-server (`:8080`), vLLM (`:8000`), and OpenAI itself (no `--base-url`, set `OPENAI_API_KEY`) all work through the same flag.
+On first use the harness fires a short calibration probe (one tool-call test + one JSON-sentinel test) and caches the resulting `ModelProfile` to `~/.atelier/model_profiles/<hash>.json`. Override with `--no-probe` (skip; use capability defaults) or `--force-probe` (re-probe even if cached). LM Studio (`:1234`), llama-server (`:8080`), vLLM (`:8000`), and OpenAI itself (no `--base-url`, set `OPENAI_API_KEY` or configure a profile `api_key`) all work through the same flag.
 
 To skip re-typing the flags every invocation, drop them into `<repo>/.atelier/providers.toml` (v53; renamed + reshaped from v52's `config.toml`). The binary loads it automatically:
 

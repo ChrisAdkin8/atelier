@@ -61,6 +61,16 @@ atelier run --provider openai-compat \
     --model local:qwen2.5-coder:7b "<prompt>"
 ```
 
+For OpenAI-compatible endpoints that require a bearer token, store it once in
+the OS keychain and keep `providers.toml` secret-free:
+
+```sh
+atelier providers auth qwen2.5-72b-awq \
+  --from-command "terraform -chdir=../atelier-bedrock-infra/terraform output -raw openai_api_key"
+atelier providers test qwen2.5-72b-awq
+atelier run --profile qwen2.5-72b-awq "<prompt>"
+```
+
 ### Bootstrap — what `atelier init` lays down
 
 ```sh
@@ -105,6 +115,7 @@ default = "local"
 provider = "openai-compat"
 base_url = "http://localhost:11434/v1"
 model    = "local:qwen2.5-coder:7b"
+api_key  = "keyring:atelier/providers/local"  # optional; no plaintext secrets
 
 [providers.cloud]
 provider = "anthropic"
@@ -123,9 +134,10 @@ policy = "auto"                          # "auto" | "skip" | "force"
 <summary><b>Field-by-field reference</b></summary>
 
 - **`default`** *(top-level, optional)* — name of the `[providers.<name>]` table to use when `--profile` isn't passed. Must reference an existing table; a typo here is a config error, not a silent fall-through.
-- **`[providers.<name>].provider`** — which adapter. `"mock"` (no network), `"anthropic"` (Messages API; reads `ANTHROPIC_API_KEY`), or `"openai-compat"` (any `POST /v1/chat/completions` server: LM Studio, llama-server, vLLM, sglang, Ollama, OpenAI itself; reads `OPENAI_API_KEY` — empty allowed for local servers).
+- **`[providers.<name>].provider`** — which adapter. `"mock"` (no network), `"anthropic"` (Messages API; reads `ANTHROPIC_API_KEY`), or `"openai-compat"` (any `POST /v1/chat/completions` server: LM Studio, llama-server, vLLM, sglang, Ollama, OpenAI itself; reads `OPENAI_API_KEY` when set, otherwise `[providers.<name>].api_key` — empty allowed for local servers).
 - **`[providers.<name>].model`** — the model id sent verbatim to the server. By convention `<provider>:<model>` (`anthropic:claude-opus-4-7`, `local:qwen2.5-coder:7b`, `openai:gpt-4o-mini`). The `<provider>:` prefix is the cost-ledger label; the part after the colon is what the server matches against.
-- **`[providers.<name>].base_url`** — full URL ending in `/v1`. **Only valid with `provider = "openai-compat"`** — combining it with `anthropic` or `mock` is a config error. Omit to default to `https://api.openai.com/v1` (OpenAI itself). If `OPENAI_API_KEY` is present, repo/profile-sourced URLs must be loopback or known provider hosts unless the user supplied `--base-url` explicitly for that run; see [`docs/trust-boundary.md`](docs/trust-boundary.md).
+- **`[providers.<name>].base_url`** — full URL ending in `/v1`. **Only valid with `provider = "openai-compat"`** — combining it with `anthropic` or `mock` is a config error. Omit to default to `https://api.openai.com/v1` (OpenAI itself). If `OPENAI_API_KEY` is present, repo/profile-sourced URLs must be loopback or known provider hosts unless the user supplied `--base-url` explicitly for that run. The built-in trusted host list includes OpenAI, Anthropic, loopback, and the project-owned Atelier dev vLLM ALB (`http://atelier-gpu-vllm-dev-1460977764.us-east-1.elb.amazonaws.com/v1`); see [`docs/trust-boundary.md`](docs/trust-boundary.md).
+- **`[providers.<name>].api_key`** — optional credential reference, never a plaintext secret. Supported forms are `keyring:USER`, `keyring:SERVICE/USER`, and `env:NAME`. Use `atelier providers auth <profile> --from-command "<command>"` or `--from-stdin` to store a key in the OS keychain and add/update this field automatically. `OPENAI_API_KEY` still overrides this for CI and one-off runs.
 - **`[runner].max_turns`** *(top-level)* — bail after N turns without `claimed_done`. Maps onto `--max-turns`. Built-in default `32`.
 - **`[probe].policy`** *(top-level)* — v51 probe-on-first-use. `"auto"` (cache-first; probe on miss; default for `openai-compat`), `"skip"` (never probe; default for `mock` + `anthropic`), or `"force"` (re-probe even when cached).
 
@@ -163,7 +175,7 @@ atelier run --provider openai-compat \
     --model local:qwen2.5-coder:7b "<prompt>"
 ```
 
-Other servers, same `--provider openai-compat` switch — only `--base-url` changes: LM Studio (`http://localhost:1234/v1`), llama-server (`http://localhost:8080/v1`), vLLM / sglang (`http://localhost:8000/v1`), OpenAI itself (omit `--base-url`; set `OPENAI_API_KEY`).
+Other servers, same `--provider openai-compat` switch — only `--base-url` changes: LM Studio (`http://localhost:1234/v1`), llama-server (`http://localhost:8080/v1`), vLLM / sglang (`http://localhost:8000/v1`), OpenAI itself (omit `--base-url`; set `OPENAI_API_KEY` or configure `api_key = "keyring:..."`).
 
 First use against a given `(model, base_url)` fires a short calibration probe (one native tool-call test + one JSON-sentinel envelope test) and caches the resulting `ModelProfile` to `~/.atelier/model_profiles/<hash>.json` for subsequent runs. The §1 conformance tracker still degrades at runtime if the live model misbehaves — the cached profile is the *initial* strategy hint, not a contract.
 

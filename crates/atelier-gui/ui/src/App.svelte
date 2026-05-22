@@ -256,6 +256,7 @@
     model_id: string
     label: string
     base_url?: string | null
+    api_key?: string | null
     // v60.55 — `true` iff this row matches `providers.toml`'s
     // `default = "<name>"` selector (or, in the built-in fallback,
     // the row `Runner::new` would pick). The dropdown prefixes a
@@ -320,6 +321,9 @@
     if (opt.kind === 'openai_compat' && opt.base_url) {
       provider.base_url = opt.base_url
     }
+    if (opt.kind === 'openai_compat' && opt.api_key) {
+      provider.api_key = opt.api_key
+    }
     try {
       await invoke('swap_adapter', { provider })
     } catch (err) {
@@ -366,17 +370,13 @@
       <ConversationPane conversation={app.conversation} streamingAssistant={app.streamingAssistant} />
     </div>
     <div class="pane-slot plan-slot">
-      <!-- v54: the top-right slot stacks the Plan canvas above
-           the Memory panel. Plan reflects what the agent is about
-           to do; Memory reflects what it remembers long-term. The
-           two are upstream of every other §5 surface so they
-           share the highest-visibility column. -->
-      <div class="plan-stack" class:has-subagents={app.subagents.length > 0}>
+      <!-- v54/v60: the top-right slot stacks Plan, Memory, and Sub-agents.
+           Each row is explicitly bounded so the always-mounted sub-agent
+           panel cannot paint over Memory when the column is short. -->
+      <div class="plan-stack has-subagents">
         <PlanPane planSteps={app.planSteps} />
         <MemoryPane cards={app.memoryCards} />
-        {#if app.subagents.length > 0}
-          <SubagentPane subagents={app.subagents} />
-        {/if}
+        <SubagentPane subagents={app.subagents} />
       </div>
     </div>
     <div class="pane-slot context-slot">
@@ -540,7 +540,7 @@
   .grid {
     display: grid;
     grid-template-columns: minmax(0, 3fr) minmax(0, 2fr);
-    grid-template-rows: minmax(0, 1fr) minmax(0, 1fr);
+    grid-template-rows: minmax(0, 3fr) minmax(0, 2fr);
     gap: var(--gap-pane);
     padding: var(--gap-pane);
     min-height: 0;
@@ -586,20 +586,27 @@
     grid-row: 2;
     grid-column: 2;
   }
-  /* v54 — Plan stays at the top (typically 4-8 short rows, so a
-     soft `auto` height suits it); Memory takes the remaining
-     vertical space because card counts can grow. */
+  /* v54/v60 — Plan stays at the top, Memory gets the flexible middle,
+     and Sub-agents gets a bounded bottom row. All direct children must be
+     shrinkable; otherwise their own scroll containers can overflow into
+     the neighbouring rows and visually overlap. */
   .plan-stack {
     display: grid;
-    grid-template-rows: auto 1fr;
+    grid-template-rows: auto minmax(0, 1fr);
     gap: var(--gap-pane, 0.5rem);
     width: 100%;
     min-height: 0;
+    overflow: hidden;
   }
-  /* When sub-agents are running, add a third row capped at 10rem so
-     the sub-agent panel doesn't crowd out Plan and Memory. */
+  /* Keep the sub-agent panel mounted so Agent mode has an obvious place to
+     report "no sub-agents spawned" instead of disappearing entirely. */
   .plan-stack.has-subagents {
-    grid-template-rows: auto 1fr minmax(5rem, 10rem);
+    grid-template-rows: auto minmax(0, 1fr) clamp(5rem, 22%, 10rem);
+  }
+  .plan-stack > :global(*) {
+    min-width: 0;
+    min-height: 0;
+    overflow: hidden;
   }
   .context-stack {
     display: grid;

@@ -12,6 +12,7 @@ pub mod adapter;
 pub mod audit;
 pub mod config;
 pub mod context;
+pub mod credentials;
 pub mod diff;
 pub mod dispatcher;
 pub mod dod;
@@ -56,6 +57,11 @@ pub use audit::{
 pub use context::{
     CacheBustEvent, ContextError, ContextItem, ContextItemId, ContextManager, Payload, Provenance,
     TokenCount, TokenSnapshot, TokenSource,
+};
+pub use credentials::{
+    api_key_ref_may_resolve, default_provider_api_key_ref, resolve_api_key, resolve_api_key_ref,
+    resolve_openai_api_key, store_api_key_ref, validate_api_key_ref, CredentialError,
+    DEFAULT_KEYRING_SERVICE, OPENAI_API_KEY_ENV,
 };
 pub use diff::{hunks_for, hunks_for_created, hunks_for_deleted, Hunk, Hunks, LineRange};
 pub use dispatcher::{

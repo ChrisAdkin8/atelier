@@ -1,4 +1,4 @@
-default = "qwen27b"
+default = "qwen2.5-72b-awq"
 
 # Local Qwen3 4B (DWQ-quantized) via mlx-lm server.
 # Start the server with:
@@ -28,12 +28,19 @@ provider = "openai-compat"
 base_url = "http://localhost:11434/v1"
 model    = "local:qwen3.5:27b"
 
+# Qwen2.5 72B AWQ via the self-hosted vLLM OpenAI-compatible endpoint.
+[providers."qwen2.5-72b-awq"]
+provider = "openai-compat"
+base_url = "http://atelier-gpu-vllm-dev-1460977764.us-east-1.elb.amazonaws.com/v1"
+model    = "qwen2.5-72b-instruct-awq"
+api_key = "keyring:atelier/providers/qwen2.5-72b-awq"
+
 # Per-task routing: tool-result turns go to the fast 4B executor; planning
 # turns and user-facing replies stay on the primary (27B) planner.
 # Set executor = "qwen3-4b-dwq" to activate once both servers are running.
 [routing]
-executor = "qwen3-4b-dwq"
-planner  = "qwen27b"
+executor = "qwen2.5-72b-awq"
+planner  = "qwen2.5-72b-awq"
 
 [runner]
 max_turns = 32

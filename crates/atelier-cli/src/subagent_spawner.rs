@@ -33,6 +33,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use atelier_core::adapter::model_profile::ModelProfile;
+use atelier_core::ledger::LedgerEntry;
 use atelier_core::session::{try_emit, Event as SessionEvent};
 use atelier_core::state::State as ActorState;
 use atelier_core::subagents::{
@@ -162,6 +163,9 @@ impl SubagentSpawner for RunnerSpawner {
             match self.bus_slot.lock().clone() {
                 Some(parent_bus) => {
                     let turn_ctr = Arc::new(std::sync::atomic::AtomicU32::new(0));
+                    let prompt_tokens = Arc::new(std::sync::atomic::AtomicU32::new(0));
+                    let completion_tokens = Arc::new(std::sync::atomic::AtomicU32::new(0));
+                    let cached_tokens = Arc::new(std::sync::atomic::AtomicU32::new(0));
                     EventSink::Callback(Arc::new(move |ev: &SessionEvent| match ev {
                         SessionEvent::Transitioned { to, .. } if *to == ActorState::Streaming => {
                             let t = turn_ctr.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
@@ -182,6 +186,35 @@ impl SubagentSpawner for RunnerSpawner {
                                 SessionEvent::SubagentToolCall {
                                     id: id_str.clone(),
                                     tool: String::from("dispatching"),
+                                },
+                            );
+                        }
+                        SessionEvent::LedgerAppended {
+                            entry:
+                                LedgerEntry::ModelCall {
+                                    prompt_tokens: p,
+                                    completion_tokens: c,
+                                    cached_tokens: k,
+                                    ..
+                                },
+                        } => {
+                            let prompt_total = prompt_tokens
+                                .fetch_add(*p, std::sync::atomic::Ordering::Relaxed)
+                                + *p;
+                            let completion_total = completion_tokens
+                                .fetch_add(*c, std::sync::atomic::Ordering::Relaxed)
+                                + *c;
+                            let cached = (*k).unwrap_or(0);
+                            let cached_total = cached_tokens
+                                .fetch_add(cached, std::sync::atomic::Ordering::Relaxed)
+                                + cached;
+                            let _ = try_emit(
+                                &parent_bus,
+                                SessionEvent::SubagentTokensUpdated {
+                                    id: id_str.clone(),
+                                    prompt_tokens: prompt_total,
+                                    completion_tokens: completion_total,
+                                    cached_tokens: cached_total,
                                 },
                             );
                         }
@@ -349,8 +382,18 @@ fn run_report_to_subagent_result(id: &SubagentId, report: RunReport, _depth: u8)
     // we use the run status as a proxy and leave result empty until the
     // RunReport grows a `final_assistant_message` field.
     use atelier_core::state::State;
+    let has_final_answer = report
+        .final_assistant_text
+        .as_deref()
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
     let status = match report.final_state {
         State::Done => SubagentStatus::Completed,
+        // Local/openai-compatible models sometimes answer the delegated task
+        // in prose but miss the harness_meta completion tool. For sub-agents
+        // the parent can still use that standalone final answer; reporting it
+        // as timed out makes successful delegated work look like a failure.
+        State::AwaitingUser if has_final_answer => SubagentStatus::Completed,
         State::AwaitingUser => SubagentStatus::TimedOut,
         _ => SubagentStatus::Failed,
     };

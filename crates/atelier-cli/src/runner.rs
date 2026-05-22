@@ -101,6 +101,7 @@ pub enum ProviderChoice {
     OpenAiCompat {
         model_id: String,
         base_url: Option<String>,
+        api_key: Option<String>,
         /// Enable llama.cpp / mlx-lm KV-cache prefix reuse on every
         /// request. Maps to `"cache_prompt": true` on the wire. See
         /// `OpenAiCompatAdapter::with_cache_prompt`.
@@ -618,6 +619,7 @@ impl Runner {
             ProviderChoice::OpenAiCompat {
                 model_id,
                 base_url,
+                api_key,
                 cache_prompt,
             } => {
                 // Empty OPENAI_API_KEY is OK — most local servers
@@ -631,7 +633,8 @@ impl Runner {
                 // OPENAI_BASE_URL via from_env), since pointing at
                 // OpenAI by accident with a `local:` model id would
                 // 404 in a confusing way.
-                let api_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
+                let api_key =
+                    api_key.unwrap_or_else(|| std::env::var("OPENAI_API_KEY").unwrap_or_default());
                 // v60.32 M01 — only consult `OPENAI_BASE_URL` when no
                 // CLI flag and no profile entry set the base url.
                 // Documented precedence is `CLI > profile > env >
@@ -1522,6 +1525,7 @@ impl Runner {
                         "resume: cannot load conversation prefix for session {resume_uuid}: {e}"
                     ))
                 })?;
+            let resume_prefix = bounded_resume_prefix(resume_prefix);
             for entry in resume_prefix {
                 let role = match entry.role.as_str() {
                     "user" => Role::User,
@@ -1767,7 +1771,10 @@ impl Runner {
                 };
                 let mut overflow_retries: usize = 0;
                 loop {
-                    let messages_for_call = project_messages_for_call(&messages);
+                    let mut messages_for_call = project_messages_for_call(&messages);
+                    if self.subagent_depth > 0 {
+                        messages_for_call = bounded_subagent_messages(messages_for_call);
+                    }
                     match call_adapter
                         .chat(&messages_for_call, &turn_tools_spec)
                         .await
@@ -2215,7 +2222,7 @@ impl Runner {
                         }
                     }
                     let result_str = match &outcome.result {
-                        Ok(r) => serde_json::to_string(&r.output).unwrap_or_default(),
+                        Ok(r) => tool_result_string_for_model(&r.output, self.subagent_depth > 0),
                         Err(e) => serde_json::json!({ "error": e.to_string() }).to_string(),
                     };
                     let _ = try_emit(
@@ -2841,6 +2848,12 @@ fn build_atelier_system_prompt(
          must be repo-relative (no leading `/`, no `..`). The shell tool runs \
          with the workspace as cwd.\n\
          \n\
+         When the user explicitly asks for independent work to happen \"in \
+         parallel\", or the task naturally splits into independent research or \
+         counting subtasks, prefer spawning one `spawn_subagent` call per \
+         independent subtask and then combine the returned results. Do not use \
+         sub-agents for trivial single-tool work.\n\
+         \n\
          {completion_clause}\n\
          \n\
          Be concise. Use tools to make changes and verify them; do not ask the \
@@ -2989,6 +3002,104 @@ fn approx_tokens(s: &str) -> u32 {
     u32::try_from(count).unwrap_or(u32::MAX)
 }
 
+fn bounded_subagent_messages(messages: Vec<Message>) -> Vec<Message> {
+    if messages.len() <= 4 {
+        return messages;
+    }
+
+    let mut compacted: Vec<Message> = messages
+        .iter()
+        .take_while(|m| matches!(m.role, Role::System))
+        .cloned()
+        .collect();
+
+    if let Some(user) = messages
+        .iter()
+        .find(|m| matches!(m.role, Role::User))
+        .cloned()
+    {
+        compacted.push(user);
+    }
+
+    if matches!(messages.last().map(|m| m.role), Some(Role::Tool)) {
+        if let Some(last_assistant_idx) = messages
+            .iter()
+            .rposition(|m| matches!(m.role, Role::Assistant) && !m.tool_calls.is_empty())
+        {
+            compacted.push(messages[last_assistant_idx].clone());
+            compacted.extend(
+                messages
+                    .iter()
+                    .skip(last_assistant_idx + 1)
+                    .filter(|m| matches!(m.role, Role::Tool))
+                    .cloned(),
+            );
+            return compacted;
+        }
+    }
+
+    if let Some(last) = messages
+        .iter()
+        .rev()
+        .find(|m| !matches!(m.role, Role::System | Role::User))
+        .cloned()
+    {
+        compacted.push(last);
+    }
+
+    compacted
+}
+
+const RESUME_PREFIX_MAX_MESSAGES: usize = 10;
+const RESUME_PREFIX_BYTE_CAP: usize = 16 * 1024;
+
+fn bounded_resume_prefix(
+    entries: Vec<atelier_core::persistence::ConversationEntry>,
+) -> Vec<atelier_core::persistence::ConversationEntry> {
+    let prose_only = entries.iter().all(|e| {
+        e.role == "system"
+            || (matches!(e.role.as_str(), "user" | "assistant")
+                && e.tool_call_id.is_none()
+                && e.tool_calls.is_empty())
+    });
+    if prose_only
+        && entries.len() <= RESUME_PREFIX_MAX_MESSAGES
+        && entries.iter().map(|e| e.content.len()).sum::<usize>() <= RESUME_PREFIX_BYTE_CAP
+    {
+        return entries;
+    }
+
+    let mut out: Vec<atelier_core::persistence::ConversationEntry> = entries
+        .iter()
+        .filter(|e| e.role == "system")
+        .cloned()
+        .collect();
+
+    let mut tail: Vec<atelier_core::persistence::ConversationEntry> = entries
+        .iter()
+        .filter(|e| {
+            matches!(e.role.as_str(), "user" | "assistant")
+                && e.tool_call_id.is_none()
+                && e.tool_calls.is_empty()
+                && !e.content.trim().is_empty()
+        })
+        .rev()
+        .take(RESUME_PREFIX_MAX_MESSAGES)
+        .cloned()
+        .collect();
+    tail.reverse();
+
+    while tail.iter().map(|e| e.content.len()).sum::<usize>() > RESUME_PREFIX_BYTE_CAP {
+        if tail.is_empty() {
+            break;
+        }
+        tail.remove(0);
+    }
+
+    out.extend(tail);
+    out
+}
+
 fn context_item_for_user_prompt(text: &str, now: &str) -> ContextItem {
     ContextItem {
         id: ContextItemId::new(),
@@ -3040,6 +3151,109 @@ fn context_item_for_tool_result(text: &str, tool_call_id: &str, now: &str) -> Co
         added_at: now.to_string(),
         last_used: now.to_string(),
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ToolResultBudget {
+    max_string_chars: usize,
+    max_array_items: usize,
+    max_json_chars: usize,
+}
+
+const ROOT_TOOL_RESULT_BUDGET: ToolResultBudget = ToolResultBudget {
+    max_string_chars: 2_000,
+    max_array_items: 80,
+    max_json_chars: 6_000,
+};
+const SUBAGENT_TOOL_RESULT_BUDGET: ToolResultBudget = ToolResultBudget {
+    max_string_chars: 600,
+    max_array_items: 30,
+    max_json_chars: 2_500,
+};
+const TOOL_RESULT_TRUNCATION_MARKER: &str =
+    "\n...[truncated by Atelier before returning to the model; rerun a narrower command if more detail is needed]";
+
+fn tool_result_string_for_model(output: &serde_json::Value, subagent: bool) -> String {
+    let budget = if subagent {
+        SUBAGENT_TOOL_RESULT_BUDGET
+    } else {
+        ROOT_TOOL_RESULT_BUDGET
+    };
+    let mut compacted = output.clone();
+    let mut truncated = false;
+    compact_tool_result_value(&mut compacted, budget, &mut truncated);
+    if truncated {
+        annotate_tool_result_truncation(&mut compacted);
+    }
+
+    let result = serde_json::to_string(&compacted).unwrap_or_default();
+    if result.chars().count() <= budget.max_json_chars {
+        return result;
+    }
+
+    let preview = truncate_for_model(&result, budget.max_json_chars);
+    serde_json::json!({
+        "atelier_model_truncated": true,
+        "original_json_chars": result.chars().count(),
+        "preview": preview,
+    })
+    .to_string()
+}
+
+fn compact_tool_result_value(
+    value: &mut serde_json::Value,
+    budget: ToolResultBudget,
+    truncated: &mut bool,
+) {
+    match value {
+        serde_json::Value::String(s) => {
+            if s.chars().count() > budget.max_string_chars {
+                *s = truncate_for_model(s, budget.max_string_chars);
+                *truncated = true;
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items.iter_mut().take(budget.max_array_items) {
+                compact_tool_result_value(item, budget, truncated);
+            }
+            if items.len() > budget.max_array_items {
+                let omitted = items.len() - budget.max_array_items;
+                items.truncate(budget.max_array_items);
+                items.push(serde_json::json!({
+                    "atelier_model_truncated": true,
+                    "omitted_items": omitted,
+                    "note": "rerun the tool with a narrower query if more items are needed",
+                }));
+                *truncated = true;
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for child in map.values_mut() {
+                compact_tool_result_value(child, budget, truncated);
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
+}
+
+fn annotate_tool_result_truncation(value: &mut serde_json::Value) {
+    if let serde_json::Value::Object(map) = value {
+        map.insert(
+            "atelier_model_truncated".into(),
+            serde_json::Value::Bool(true),
+        );
+        for flag in ["stdout_truncated", "stderr_truncated", "truncated"] {
+            if map.contains_key(flag) {
+                map.insert(flag.into(), serde_json::Value::Bool(true));
+            }
+        }
+    }
+}
+
+fn truncate_for_model(s: &str, max_chars: usize) -> String {
+    let mut out: String = s.chars().take(max_chars).collect();
+    out.push_str(TOOL_RESULT_TRUNCATION_MARKER);
+    out
 }
 
 // v57 (H6 fix): `now_rfc3339` lifted into `atelier_core::time::now_rfc3339`.
@@ -3329,6 +3543,152 @@ mod tests {
             Provenance::ToolResult { tool_call_id } => assert_eq!(tool_call_id, "tc-1"),
             other => panic!("expected ToolResult provenance, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn tool_result_string_for_model_truncates_large_stdout() {
+        let output = serde_json::json!({
+            "exit_code": 0,
+            "stdout": "x".repeat(ROOT_TOOL_RESULT_BUDGET.max_string_chars + 100),
+            "stderr": "",
+            "stdout_truncated": false,
+            "stderr_truncated": false,
+        });
+        let rendered = tool_result_string_for_model(&output, false);
+        let parsed: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(parsed["atelier_model_truncated"], true);
+        assert_eq!(parsed["stdout_truncated"], true);
+        assert!(
+            parsed["stdout"]
+                .as_str()
+                .unwrap()
+                .contains("truncated by Atelier"),
+            "{parsed:?}"
+        );
+        assert!(rendered.chars().count() < ROOT_TOOL_RESULT_BUDGET.max_json_chars);
+    }
+
+    #[test]
+    fn subagent_tool_result_budget_is_smaller_than_root_budget() {
+        let output = serde_json::json!({
+            "stdout": "x".repeat(ROOT_TOOL_RESULT_BUDGET.max_string_chars + 100),
+        });
+        let root = tool_result_string_for_model(&output, false);
+        let subagent = tool_result_string_for_model(&output, true);
+        assert!(subagent.chars().count() < root.chars().count());
+        assert!(subagent.chars().count() < SUBAGENT_TOOL_RESULT_BUDGET.max_json_chars);
+    }
+
+    #[test]
+    fn bounded_subagent_messages_keeps_latest_tool_roundtrip() {
+        let latest_call = ToolCallRequest {
+            id: "latest".into(),
+            name: "shell".into(),
+            arguments: serde_json::json!({"command": "wc -l src/lib.rs"}),
+        };
+        let messages = vec![
+            Message::text(Role::System, "system"),
+            Message::text(Role::User, "count lines"),
+            Message {
+                role: Role::Assistant,
+                content: String::new(),
+                tool_call_id: None,
+                tool_calls: vec![ToolCallRequest {
+                    id: "old".into(),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({"command": "find ."}),
+                }],
+            },
+            Message {
+                role: Role::Tool,
+                content: "old bulky output".into(),
+                tool_call_id: Some("old".into()),
+                tool_calls: Vec::new(),
+            },
+            Message {
+                role: Role::Assistant,
+                content: String::new(),
+                tool_call_id: None,
+                tool_calls: vec![latest_call],
+            },
+            Message {
+                role: Role::Tool,
+                content: "42".into(),
+                tool_call_id: Some("latest".into()),
+                tool_calls: Vec::new(),
+            },
+        ];
+
+        let compacted = bounded_subagent_messages(messages);
+        assert_eq!(
+            compacted.iter().map(|m| m.role).collect::<Vec<_>>(),
+            vec![Role::System, Role::User, Role::Assistant, Role::Tool]
+        );
+        assert!(!compacted.iter().any(|m| m.content == "old bulky output"));
+        assert_eq!(compacted[2].tool_calls[0].id, "latest");
+        assert_eq!(compacted[3].tool_call_id.as_deref(), Some("latest"));
+    }
+
+    #[test]
+    fn bounded_resume_prefix_keeps_system_and_recent_tail() {
+        let mut entries = vec![atelier_core::persistence::ConversationEntry {
+            role: "system".into(),
+            content: "system".into(),
+            tool_call_id: None,
+            tool_calls: Vec::new(),
+        }];
+        for i in 0..(RESUME_PREFIX_MAX_MESSAGES + 4) {
+            entries.push(atelier_core::persistence::ConversationEntry {
+                role: if i % 2 == 0 { "user" } else { "assistant" }.into(),
+                content: format!("turn-{i}"),
+                tool_call_id: None,
+                tool_calls: Vec::new(),
+            });
+        }
+
+        let bounded = bounded_resume_prefix(entries);
+        assert_eq!(bounded.first().unwrap().role, "system");
+        assert_eq!(bounded.len(), RESUME_PREFIX_MAX_MESSAGES + 1);
+        assert_eq!(bounded[1].content, "turn-4");
+        assert_eq!(
+            bounded.last().unwrap().content,
+            format!("turn-{}", RESUME_PREFIX_MAX_MESSAGES + 3)
+        );
+    }
+
+    #[test]
+    fn bounded_resume_prefix_drops_tool_protocol_rows() {
+        let entries = vec![
+            atelier_core::persistence::ConversationEntry {
+                role: "system".into(),
+                content: "system".into(),
+                tool_call_id: None,
+                tool_calls: Vec::new(),
+            },
+            atelier_core::persistence::ConversationEntry {
+                role: "assistant".into(),
+                content: String::new(),
+                tool_call_id: None,
+                tool_calls: vec![serde_json::json!({"name": "shell"})],
+            },
+            atelier_core::persistence::ConversationEntry {
+                role: "tool".into(),
+                content: "large tool output".into(),
+                tool_call_id: Some("tool-1".into()),
+                tool_calls: Vec::new(),
+            },
+            atelier_core::persistence::ConversationEntry {
+                role: "assistant".into(),
+                content: "Final answer from the prior task.".into(),
+                tool_call_id: None,
+                tool_calls: Vec::new(),
+            },
+        ];
+
+        let bounded = bounded_resume_prefix(entries);
+        assert_eq!(bounded.len(), 2);
+        assert_eq!(bounded[0].role, "system");
+        assert_eq!(bounded[1].content, "Final answer from the prior task.");
     }
 
     #[test]

@@ -36,6 +36,7 @@ atelier-core = { workspace = true }
 # adapter trait itself uses it internally.
 tokio = { workspace = true, features = ["full"] }
 serde_json = { workspace = true }
+reqwest = { workspace = true }
 # Sink::Capture is part of the runner's public API (driven by integration
 # tests + future GUI/TUI wiring), so parking_lot belongs in regular deps,
 # not dev-dependencies.
