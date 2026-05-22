@@ -248,7 +248,7 @@ dependencies = [
 
 [[package]]
 name = "atelier-cli"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "assert_cmd",
  "async-trait",
@@ -270,7 +270,7 @@ dependencies = [
 
 [[package]]
 name = "atelier-core"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "async-lsp",
  "async-trait",
@@ -306,7 +306,7 @@ dependencies = [
 
 [[package]]
 name = "atelier-gui"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "atelier-cli",
  "atelier-core",
@@ -326,7 +326,7 @@ dependencies = [
 
 [[package]]
 name = "atelier-tui"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "atelier-cli",
  "atelier-core",
