@@ -1581,6 +1581,19 @@ fn write_workspace_auto_card(
     tmp.write_all(card.body.as_bytes())?;
     tmp.flush()?;
     tmp.persist(&path).map_err(|e| e.error)?;
+    let index_path = atelier_core::memory_index::project_memory_index_path(workspace);
+    if let Err(e) = atelier_core::memory_index::upsert_memory_card_file(
+        &path,
+        &index_path,
+        atelier_core::memory_index::MemoryScope::Project,
+    ) {
+        tracing::warn!(
+            error = %e,
+            path = %path.display(),
+            index = %index_path.display(),
+            "write_workspace_auto_card: card persisted but memory index update failed"
+        );
+    }
     Ok(Some(path))
 }
 
@@ -1800,15 +1813,40 @@ fn load_promoted_memory(workspace_root: Option<&std::path::Path>) -> Option<Stri
     // sort after global so a project-specific note overrides a
     // global one when they describe the same topic (the chat is
     // free to read both — the order is just deterministic).
-    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+    let mut dirs: Vec<(
+        std::path::PathBuf,
+        std::path::PathBuf,
+        atelier_core::memory_index::MemoryScope,
+    )> = Vec::new();
     if let Some(home) = std::env::var_os("HOME") {
-        dirs.push(std::path::PathBuf::from(home).join(".atelier/memory"));
+        let home = std::path::PathBuf::from(home);
+        dirs.push((
+            atelier_core::memory_index::user_memory_dir(&home),
+            atelier_core::memory_index::user_memory_index_path(&home),
+            atelier_core::memory_index::MemoryScope::User,
+        ));
     }
     if let Some(ws) = workspace_root {
-        dirs.push(ws.join(".atelier/memory"));
+        dirs.push((
+            atelier_core::memory_index::project_memory_dir(ws),
+            atelier_core::memory_index::project_memory_index_path(ws),
+            atelier_core::memory_index::MemoryScope::Project,
+        ));
     }
     let mut entries: Vec<std::path::PathBuf> = Vec::new();
-    for dir in &dirs {
+    for (dir, index_path, scope) in &dirs {
+        if dir.exists() {
+            if let Err(e) =
+                atelier_core::memory_index::rebuild_memory_index(dir, index_path, *scope)
+            {
+                tracing::warn!(
+                    error = %e,
+                    dir = %dir.display(),
+                    index = %index_path.display(),
+                    "load_promoted_memory: failed to refresh memory index"
+                );
+            }
+        }
         let Ok(read) = std::fs::read_dir(dir) else {
             continue;
         };

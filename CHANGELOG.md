@@ -1,5 +1,16 @@
 # Atelier Spec — Changelog
 
+## v60.79 — 2026-05-22 (derived memory index)
+
+Adds a rebuildable SQLite/FTS memory index while keeping Markdown memory cards as the canonical source of truth.
+
+- Added `atelier_core::memory_index`, which indexes `<repo>/.atelier/memory/*.md` and `~/.atelier/memory/*.md` into `.atelier/indexes/memory.sqlite` with FTS5 search over ids, titles, descriptions, tags, and bodies.
+- Added project/user path helpers so derived indexes live under `.atelier/indexes/` rather than beside editable memory cards.
+- GUI memory recall now refreshes the derived index for existing memory directories before reading cards, so hand-edited Markdown stays discoverable.
+- GUI auto-drafted workspace cards and CLI/GUI promoted user cards now upsert the corresponding SQLite index row after the atomic Markdown write; index failures are logged but do not block the canonical card write.
+- `.gitignore` now excludes `.atelier/indexes/` because indexes are local, rebuildable cache data.
+- README Memory docs now describe the Markdown-card source-of-truth plus derived SQLite index layout.
+
 ## v60.78 — 2026-05-22 (durable GUI resume + README end-user sweep)
 
 Fixes the GUI follow-up prompt failure caused by stale resume state and refreshes the public docs for first-time users.

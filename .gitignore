@@ -39,6 +39,10 @@ CLAUDE.md
 # partial completions, compaction blobs). Per-user runtime data; never tracked.
 .atelier/sessions/
 
+# Derived local indexes. Canonical memory remains in `.atelier/memory/*.md`;
+# SQLite indexes are rebuildable caches and should not be committed.
+.atelier/indexes/
+
 # direnv per-project shell config. Holds developer-local secrets
 # (ANTHROPIC_API_KEY, OPENAI_API_KEY) that are loaded on `cd` into the
 # repo. NEVER commit — secrets-in-git is an irreversible leak that

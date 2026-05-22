@@ -2,7 +2,7 @@
 
 [← back to README](README.md)
 
-The harness is **end-to-end runnable** for the Phase A/B/C scope, against Mock, Anthropic, and any OpenAI-compatible server (LM Studio, llama-server, vLLM, sglang, Ollama, OpenAI itself). The Tauri GUI is currently a chat/agent workspace with context/memory/plan/sub-agent surfaces; the `ratatui` TUI remains the live agent workspace with diff and file-level approval controls. The spec, schemas, canonical workload, and self-testing rig are fully wired and verify the harness as it grows. This file tracks **what has landed**, **what is in flight**, and **what gates each phase**. Ordered build plan: [`tasks/todo.md`](tasks/todo.md); version-by-version trail: [`CHANGELOG.md`](CHANGELOG.md) (latest **v60.78**).
+The harness is **end-to-end runnable** for the Phase A/B/C scope, against Mock, Anthropic, and any OpenAI-compatible server (LM Studio, llama-server, vLLM, sglang, Ollama, OpenAI itself). The Tauri GUI is currently a chat/agent workspace with context/memory/plan/sub-agent surfaces; the `ratatui` TUI remains the live agent workspace with diff and file-level approval controls. The spec, schemas, canonical workload, and self-testing rig are fully wired and verify the harness as it grows. This file tracks **what has landed**, **what is in flight**, and **what gates each phase**. Ordered build plan: [`tasks/todo.md`](tasks/todo.md); version-by-version trail: [`CHANGELOG.md`](CHANGELOG.md) (latest **v60.79**).
 
 ---
 
@@ -28,6 +28,7 @@ The Phase A foundation, Phase B protocol/verification subset, and Phase C worksp
 - **`.atelier/providers.toml` loader (v53)** — `crates/atelier-core/src/config.rs`. Multi-profile TOML at `<repo>/.atelier/providers.toml` (project) then `~/.atelier/providers.toml` (user); `default = "<name>"` + `[providers.<name>]` tables; `--profile <NAME>` switches between them; CLI flags still win field-by-field. GUI + TUI footers render the active model id + §2 strategy + probe outcome in the bottom-right.
 - **Provider credentials + trust boundary (v60.76–v60.77)** — `crates/atelier-core/src/trust_boundary.rs` and `credentials.rs`. CLI and GUI provider paths share the same credential-egress predicate so repo-controlled OpenAI-compatible base URLs cannot silently receive `OPENAI_API_KEY` or profile `api_key` credentials unless allowlisted or explicitly supplied by the user. `atelier providers auth/test` stores and verifies OpenAI-compatible profile keys through the OS keychain.
 - **Durable resume state (v60.78)** — resumed Runner calls report the persisted session UUID rather than a transient actor UUID, and the GUI validates `session.json` before chaining a follow-up Agent submit. Missing/deleted session manifests clear the in-memory resume pointer and start a fresh durable session instead of failing the next prompt.
+- **Derived memory index (v60.79)** — Markdown memory cards remain the source of truth under `<workspace>/.atelier/memory/` and `~/.atelier/memory/`; rebuildable SQLite/FTS indexes live under `.atelier/indexes/memory.sqlite` for fast recall/search and are ignored by git.
 - **§5 Context panel (v53)** — `crates/atelier-core/src/context.rs::ContextItemSummary` + `ContextManager::summarise()` + `Event::ContextItems`; rendered by both UIs (Svelte `ContextPane.svelte`, TUI `render_context_pane`) as per-row token counts + provenance badges. Closes the stated §5 mechanical gate ("API assertions for token counts and why-here; cache-bust ledger entry on eviction").
 - **§5 Memory panel (v54)** — `crates/atelier-core/src/memory.rs::MemoryCardSummary` + `MemoryStore::summarise()` + `Event::MemoryCards`; rendered by both UIs (Svelte `MemoryPane.svelte`, TUI `render_memory_pane`) above their respective Plan panes. Empty until a card source wires in; event surface in place so future cards-from-tool / cards-from-replay are purely additive.
 
@@ -37,7 +38,7 @@ The Phase A foundation, Phase B protocol/verification subset, and Phase C worksp
 - `atelier-gui` (Tauri 2.x + Svelte 5) — chat/agent workspace (Header / ConversationPane / ContextPane / MemoryPane / PlanPane / SubagentPane / MetersPane / Composer), native folder picker, provider swap, memory auto-drafting/promotion, skills autocomplete, and Runner-backed Agent flows where needed. Concurrent-run guard via `Arc<AtomicBool>`; 64 KB prompt cap; durable session-resume pointer validation; per-run UUID workspaces with drop-guard cleanup.
 - `atelier-tui` (ratatui + crossterm) — conversation pane, textual diff, plan/context/memory/sub-agent panes, slash-skill completion, LSP install prompt, cost + context meters, scrubber keys `[`/`]`/`g`. Driver mode via `cargo run -p atelier-tui -- "<prompt>"`; `y` / `n` route through `SessionDispatcher::submit_approval`.
 
-### Gate counts (as of v60.78)
+### Gate counts (as of v60.79)
 
 | | Count | Where |
 |---|---|---|

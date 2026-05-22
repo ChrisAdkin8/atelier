@@ -131,6 +131,19 @@ pub fn write_promoted_card(output: &PromoteOutput) -> Result<PromotedWrite, Stri
         .map_err(|e| format!("persist {target:?}: {e}"))?;
     atelier_core::path_safety::fsync_dir(&canonical_root)
         .map_err(|e| format!("fsync_dir {canonical_root:?}: {e}"))?;
+    let index_path = atelier_core::memory_index::user_memory_index_path(&canonical_home);
+    if let Err(e) = atelier_core::memory_index::upsert_memory_card_file(
+        &target,
+        &index_path,
+        atelier_core::memory_index::MemoryScope::User,
+    ) {
+        tracing::warn!(
+            error = %e,
+            path = %target.display(),
+            index = %index_path.display(),
+            "promote_memory_card: promoted card persisted but memory index update failed"
+        );
+    }
     Ok(PromotedWrite {
         path: target,
         bytes: output.bytes.len(),

@@ -26,6 +26,7 @@ pub mod lsp;
 pub mod mcp;
 pub mod mcp_config;
 pub mod memory;
+pub mod memory_index;
 pub mod mental_model;
 pub mod path_safety;
 pub mod persistence;
@@ -99,6 +100,12 @@ pub use mcp_config::{
     MCP_SERVERS_DIR, MCP_SERVERS_FILE, MCP_SERVERS_VERSION,
 };
 pub use memory::{MemoryCard, MemoryError, MemoryStore, PromoteOutput};
+pub use memory_index::{
+    project_memory_dir, project_memory_index_path, rebuild_memory_index,
+    rebuild_project_memory_index, rebuild_user_memory_index, remove_memory_card_file,
+    search_memory_index, upsert_memory_card_file, user_memory_dir, user_memory_index_path,
+    IndexedMemoryCard, MemoryIndexError, MemoryIndexStats, MemoryScope, MemorySearchHit,
+};
 pub use mental_model::{MentalModel, MentalModelError, MentalModelSnapshot};
 pub use persistence::{
     Checkpoints, ConversationEntry, OnDiskSession, PersistenceError, Plan, RecoveryEntry,
