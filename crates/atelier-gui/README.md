@@ -4,14 +4,14 @@ Tauri 2.x shell. Consumes `atelier-core` over a broadcast channel; renders the w
 
 ## Current state
 
-**Chat-REPL workspace.** Svelte 5 layout backed by a Tauri shell. The Composer talks to the configured adapter directly for chat turns, while the same Rust shell exposes workspace state, provider swapping, memory, context, plan, skills, and selected Runner-backed agent flows.
+**Chat/Agent workspace.** Svelte 5 layout backed by a Tauri shell. Chat mode talks to the configured adapter directly for conversational turns; Agent mode uses `atelier-cli::Runner` for tool-using flows. The same Rust shell exposes workspace state, provider swapping, memory, context, plan, skills, and sub-agent progress.
 
 What's wired:
 
 - **Panes**: Header / ConversationPane / ContextPane / MemoryPane / PlanPane / SubagentPane / MetersPane / Composer, composed in `App.svelte` as a CSS grid.
 - **Event bus**: subscribes to `atelier://event` and folds events through a pure-TS `applyEvent` reducer mirroring the TUI state machine. The new v51 `ModelProfileLoaded` event is projected through `bridge_event` so the strategy badge can render off it.
 - **Chat turns**: the Composer has explicit **Chat** and **Agent** modes. Chat mode uses `start_chat_run` and sends messages to `adapter.chat(messages, &[])` so chat-only OpenAI-compatible providers work without tool-call support. Agent mode uses `start_agent_run` for Runner-backed flows that need tools and sub-agent events; the selected provider must support tool calls.
-- **Defensive plumbing**: concurrent-run guard via `Arc<AtomicBool>`, 64 KB prompt cap, per-run workspace cleanup via `RunCleanup` drop guard, `listenerReady` gate so a fast user can't lose the first run's events, provider-swap base-URL allowlist shared with `atelier-core` (OpenAI, Anthropic, loopback, and the project-owned Atelier dev vLLM ALB), bounded `~/.atelier/gui.toml` parsing, and TOML-based workspace persistence.
+- **Defensive plumbing**: concurrent-run guard via `Arc<AtomicBool>`, 64 KB prompt cap, per-run workspace cleanup via `RunCleanup` drop guard, `listenerReady` gate so a fast user can't lose the first run's events, provider-swap base-URL allowlist shared with `atelier-core` (OpenAI, Anthropic, loopback, and the project-owned Atelier dev vLLM ALB), bounded `~/.atelier/gui.toml` parsing, TOML-based workspace persistence, and durable resume-pointer validation before every Runner-backed Agent submit.
 - **Model badge** (v52): footer's bottom-right renders `model_id · strategy · outcome` (cyan id, green strategy, dim outcome) for the lifetime of the run. Populated when the Runner emits its one-shot `ModelProfileLoaded` at session start. `App.svelte` uses the canonical `margin-left: auto` flexbox idiom to push the badge to the right edge of the existing footer.
 - **§5 Context panel** (v53): bottom-right slot stacks `MetersPane` (fixed) above the new `ContextPane.svelte` (flex). Renders one row per `ContextItemSummary` from `Event::ContextItems` — right-aligned token count (colour-cued: cyan exact / yellow approx / dim unavailable), short provenance badge (`init`/`usr`/`tool`/`mem`/`pin`/`asst`), and the item's label with a tooltip carrying the full provenance trace. Empty-state placeholder before the first `ContextItems` event.
 - **§5 Memory panel**: top-right slot stacks `PlanPane`, `MemoryPane`, and `SubagentPane`. Memory rows support add/delete/promote interactions; promoted cards persist to `~/.atelier/memory/`, while workspace-scoped auto-drafts live under `<workspace>/.atelier/memory/`.
@@ -32,6 +32,8 @@ cd crates/atelier-gui && cargo tauri dev              # spins up Vite + Rust she
 ```
 
 `cargo tauri dev` runs the Vite dev server (port 1420), waits for it to be ready, builds the Rust shell, and opens the webview. Hot-reload works for the Svelte side; the Rust shell rebuilds on save and the webview re-opens.
+
+Use **Browse…** in the header to select the repo/workspace you want Atelier to operate on. The selection is persisted in `~/.atelier/gui.toml`. Agent-mode follow-up submits resume from the last durable session in that workspace; if `session.json` has been deleted or cleaned up, the GUI clears the stale pointer and starts a fresh session instead of failing the next prompt.
 
 For tests without the webview:
 

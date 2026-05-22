@@ -744,14 +744,14 @@ The **primary tool transport is the Model Context Protocol (MCP)**. `atelier-cor
 
 - Lists registered servers from `mcp_servers.json` with status (running / stopped / errored), last-used timestamp, advertised tool count, enable/disable toggle.
 - **Add server** button → form that writes a schema-valid entry to `mcp_servers.json`. Transport-conditional form (stdio: command + args; http/sse: url + headers) mirrors the schema's `oneOf`.
-- **Browse catalog** button → opens an in-app curated catalog of well-known MCP servers (`@modelcontextprotocol/server-filesystem`, GitHub, Slack, web-search providers) bundled with the harness as a versioned JSON list at `crates/atelier-core/catalog/mcp_servers.json`. Adding from the catalog generates the registration entry pre-filled; user just supplies any required secrets (via `${keychain:NAME}` interpolation, §11).
+- **Browse catalog** button → opens an in-app curated catalog of well-known MCP servers (`@modelcontextprotocol/server-filesystem`, GitHub, Slack, web-search providers) bundled with the harness as a versioned JSON list at `crates/atelier-core/catalog/mcp_servers.json`. Adding from the catalog generates the registration entry pre-filled; user just supplies any required secrets. v1 supports `${env:NAME}` interpolation for MCP/hook secrets; generic MCP/hook `${keychain:NAME}` interpolation is reserved and must fail closed until the broader credentials surface lands.
 - **Edit / remove** per row. Edits write back through the schema validator; invalid edits show the validation error in the form, not silently.
 
 Bundled catalog refresh: a `make refresh-catalog` target pulls the latest catalog from the harness's release artifacts; users can override with their own catalog path via `~/.atelier/catalog.json` if they want a private/internal list. Remote catalog auto-fetch is deferred to v0.2.
 
 TUI does not get the catalog browser in v1 — the TUI subset per §3 stays focused; TUI users edit JSON or use the GUI for first-time setup.
 
-**Built-in tools** (in `atelier-core`, exposed via the same MCP interface internally — no special case): `read_file`, `write_file`, `edit_file`, `list_dir`, `grep`, `ast_grep`, `shell` (sandboxed). Built-in tools are surfaced exactly like external MCP tools so the rest of the harness (verification gates, hooks, ledger, trust budget) treats them uniformly.
+**Built-in tools** (in `atelier-core`, exposed via the same MCP interface internally — no special case): `read_file`, `write_file`, `edit_file`, `list_dir`, `grep`, `ast_grep`, `shell` (sandboxed), and `spawn_subagent`. Built-in tools are surfaced exactly like external MCP tools so the rest of the harness (verification gates, hooks, ledger, trust budget) treats them uniformly.
 
 **Tool dispatch:** flows through the §2.5 `ToolDispatching → ToolExecuting` state transitions regardless of origin. Bounded parallelism, checkpoint/ledger writes, cancellation semantics, and sandbox model are uniform.
 

@@ -41,28 +41,32 @@ Recent quality/design notes are tracked in [`CODE_QUALITY_METRICS.md`](CODE_QUAL
 
 ## Quick start
 
-Install, bootstrap, configure, and drive — all in this section. The Mock provider runs the full agent loop with **no network and no model** — a 30-second smoke test that loop, dispatcher, staging, and persistence are all wired up.
+Use this path when you want to try Atelier from a checkout. The first run below uses the Mock provider, so it needs **no API key, no network, and no model server**. It still exercises the real agent loop, dispatcher, staging, and session persistence.
 
 ```sh
-cargo install --path crates/atelier-cli          # builds + installs the `atelier` binary
-atelier init                                      # bootstraps .atelier/ + a seeded ATELIER.md
-atelier run --provider mock "rename foo to bar"   # runs a turn; session lands in .atelier/sessions/<uuid>/
+cargo install --path crates/atelier-cli
+atelier init
+atelier run --provider mock "rename foo to bar"
 ```
 
-To drive a real model, swap the provider:
+That creates `.atelier/`, seeds `ATELIER.md` if needed, and writes the run record under `.atelier/sessions/<uuid>/`.
+
+### Run against a model
+
+Pick whichever provider you already have:
 
 ```sh
-# Anthropic — Messages API (set ANTHROPIC_API_KEY)
+# Anthropic Messages API. Requires ANTHROPIC_API_KEY in your environment.
 atelier run --provider anthropic --model anthropic:claude-opus-4-7 "<prompt>"
 
-# Any OpenAI-compatible server — local (Ollama / LM Studio / llama-server / vLLM / sglang) or cloud
+# OpenAI-compatible servers: Ollama, LM Studio, llama-server, vLLM, sglang, OpenAI.
 atelier run --provider openai-compat \
-    --base-url http://localhost:11434/v1 \
-    --model local:qwen2.5-coder:7b "<prompt>"
+  --base-url http://localhost:11434/v1 \
+  --model local:qwen2.5-coder:7b \
+  "<prompt>"
 ```
 
-For OpenAI-compatible endpoints that require a bearer token, store it once in
-the OS keychain and keep `providers.toml` secret-free:
+If your OpenAI-compatible endpoint needs a bearer token, store it in your OS keychain instead of committing it to `providers.toml`:
 
 ```sh
 atelier providers auth qwen2.5-72b-awq \
@@ -70,6 +74,19 @@ atelier providers auth qwen2.5-72b-awq \
 atelier providers test qwen2.5-72b-awq
 atelier run --profile qwen2.5-72b-awq "<prompt>"
 ```
+
+`OPENAI_API_KEY` still wins for CI and one-off shells. Profile keys are only references such as `keyring:atelier/providers/qwen2.5-72b-awq` or `env:NAME`; plaintext secrets are rejected.
+
+### Open the GUI
+
+```sh
+cargo install tauri-cli --version "^2.0" --locked
+npm --prefix crates/atelier-gui/ui install
+cd crates/atelier-gui
+cargo tauri dev
+```
+
+The GUI opens as a Tauri desktop window and uses Vite at `http://127.0.0.1:1420/` during development. Use **Browse…** in the top-right to select the repo you want Atelier to operate on; the choice is saved to `~/.atelier/gui.toml`. Chat mode is for conversational model turns, while Agent mode uses the Runner and writes resumable sessions under the selected workspace. If a previous session has been deleted or cleaned up, the GUI drops that stale resume pointer and starts a fresh durable session rather than failing the next prompt.
 
 ### Bootstrap — what `atelier init` lays down
 
@@ -93,7 +110,7 @@ Idempotent — re-running on an initialised repo prints `atelier init: no change
 
 `ATELIER.md` is the project-level user-config file — injected into the system prompt at session start, equivalent to Cursor's `.cursorrules` / Claude Code's `CLAUDE.md`. Reference manifests for tools, hooks, skills, sub-agents, and config (`mcp_servers.json`, `permission_shapes.json`, …) live in [`examples/`](examples/); validate against `schemas/` before wiring them in.
 
-### Pin defaults — `.atelier/providers.toml`  *(v53)*
+### Pin defaults — `.atelier/providers.toml`
 
 Re-typing `--provider … --base-url … --model …` gets old fast. Drop a small TOML file in the repo and `atelier run` picks it up automatically — keep several named profiles (`local`, `cloud`, `staging`, …) side by side and switch with `--profile <NAME>`.
 
@@ -153,7 +170,7 @@ policy = "auto"                          # "auto" | "skip" | "force"
 
 The resolved profile is whichever `[providers.<name>]` matches `--profile <NAME>`, or the file's `default`, or nothing (then the CLI must specify the relevant flags). Per-field flags (`--provider`, `--model`, `--base-url`, `--max-turns`, `--no-probe`/`--force-probe`) still override individual fields of the resolved profile. With the file above, `atelier run "…"` uses `local`/openai-compat; `atelier run --profile cloud "…"` flips to Anthropic; `atelier run --provider mock "…"` overrides the resolved profile's provider only (its `model`/`base_url` drop because they don't apply to `mock`).
 
-**Verifying what's active.** Every `atelier run` prints which config file (if any) loaded and which profile resolved (`atelier run: using config /Users/you/proj/.atelier/providers.toml (profile "local")`). Once the loop starts, the GUI footer (bottom-right) and TUI footer render the active model id + §2 strategy + probe outcome, e.g. `local:qwen2.5-coder:7b · json_sentinel · cache_hit`. The same surfaces also show the v53 §5 **Context panel** — per-row listing of every item in the agent's context window with a token count (cyan exact / yellow approx / dim unavailable) and why-here badge (`init` / `usr` / `tool` / `mem` / `pin` / `asst`). If what's active isn't what you expected, re-check the precedence above — most surprises are "user-scope file edited but project-scope file is winning."
+**Verifying what's active.** Every `atelier run` prints which config file (if any) loaded and which profile resolved (`atelier run: using config /Users/you/proj/.atelier/providers.toml (profile "local")`). Once the loop starts, the GUI footer and TUI footer render the active model id + §2 strategy + probe outcome, e.g. `local:qwen2.5-coder:7b · json_sentinel · cache_hit`. The same surfaces show the §5 **Context panel**: each row lists a context item, token count, and why-here badge (`init` / `usr` / `tool` / `mem` / `pin` / `asst`). If what's active isn't what you expected, re-check the precedence above — most surprises are "user-scope file edited but project-scope file is winning."
 
 **Errors are fatal.** A file that exists but doesn't parse (typo, wrong type, unknown field, `default` referencing a missing profile, `base_url` paired with a non-openai-compat provider) exits with code 2 and a message naming the file + what's wrong — no silent fall-through to defaults.
 
@@ -197,7 +214,9 @@ First use against a given `(model, base_url)` fires a short calibration probe (o
 
 ### Multi-pane workspace
 
-The Tauri GUI (`cargo tauri dev` from `crates/atelier-gui/`) and the ratatui TUI (`cargo run -p atelier-tui -- "<prompt>"`) expose the same engine through different surfaces: the GUI is currently a chat-REPL workspace with Context, Memory, and Plan side panels, while the TUI provides the live agent workspace with conversation, context/memory/plan, diff, meters, and file-level accept/reject.
+The Tauri GUI (`cargo tauri dev` from `crates/atelier-gui/`) and the ratatui TUI (`cargo run -p atelier-tui -- "<prompt>"`) expose the same engine through different surfaces. The GUI is the easiest daily workspace: chat/agent composer, provider swapping, Context, Memory, Plan, Sub-agent, and meters panels. The TUI is the most complete live-agent surface today: conversation, context/memory/plan, diff, meters, scrubber keys, sub-agent token counts, and file-level accept/reject.
+
+Runner-backed GUI Agent turns persist through the same `.atelier/sessions/<uuid>/` layout as the CLI. Follow-up prompts resume from the durable session UUID, and the GUI validates the manifest before resuming so a deleted session directory does not poison the next submit.
 
 For first-time build prerequisites (rustup, pinned toolchain), see [Build](#build) below. For what each run actually does inside the agent loop, see [How a run works](#how-a-run-works). Piece-by-piece state of the build is in [`STATUS.md`](STATUS.md#phase-a--piece-by-piece-tracker).
 
@@ -211,7 +230,7 @@ Atelier is a **Rust workspace**. Four crates under [`crates/`](crates/):
 |---|---|
 | [`atelier-core`](crates/atelier-core/) | Agent loop, BYOM adapters (Mock + Anthropic + OpenAI-compatible as of v50), session state, dispatcher, eight built-in tools, cost ledger, §1 probe-on-first-use cache (v51). **No UI dependencies.** The §2.5 state machine lives here. |
 | [`atelier-cli`](crates/atelier-cli/) | Hybrid lib + binary. The `atelier` binary provides `atelier init` and `atelier run` (the end-to-end agent-loop driver); the library exports a `Runner` the GUI and TUI link against for their own driver modes. |
-| [`atelier-gui`](crates/atelier-gui/) | Tauri 2.x + Svelte 5 shell. Chat-REPL composer that talks to the adapter with Context, Memory, and Plan side panels, inline Mermaid / image rendering, drag-and-drop plan reorder, concurrent-run guard, and per-run UUID workspaces. |
+| [`atelier-gui`](crates/atelier-gui/) | Tauri 2.x + Svelte 5 shell. Chat/Agent composer with Context, Memory, Plan, Sub-agent, and meters panels; provider swapping; inline Mermaid / image rendering; drag-and-drop plan reorder; concurrent-run guard; and durable session-resume validation. |
 | [`atelier-tui`](crates/atelier-tui/) | `ratatui` + `crossterm` driver. Live agent workspace with conversation, context/memory/plan, diff, meters, scrubber keys `[` `]` `g`, and file-level accept/reject from the diff pane. Run with `cargo run -p atelier-tui -- "<prompt>"` for driver mode, no argument for viewer mode. |
 
 ### Rust stack
@@ -373,9 +392,9 @@ For `rmcp` dependency wiring and troubleshooting (`edition2024` error, proxy/net
 
 ## How a run works
 
-`atelier run` is the end-to-end agent-loop driver. Three providers live today (v51): Mock, Anthropic Messages API, and any OpenAI-compatible `POST /v1/chat/completions` server. Invocations + configuration are in [Quick start](#quick-start).
+`atelier run` is the end-to-end agent-loop driver. Three provider families are live today: Mock, Anthropic Messages API, and any OpenAI-compatible `POST /v1/chat/completions` server. Invocations + configuration are in [Quick start](#quick-start).
 
-Under the hood, each run: loads `ATELIER.md` into the system prompt, opens a session under `.atelier/sessions/<uuid>/`, calls the configured BYOM adapter, streams tool calls through the §15 dispatcher (eight built-in tools plus registered MCP tools), applies edits atomically (`tempfile` + tree-sitter pre-commit check, spec §3), and either transitions to `Verifying` on `claimed_done: true` or bails after `--max-turns`. The session manifest (`session.json`) conforms to `schemas/session/v1.json`; long append-like arrays are split into `conversation.jsonl` and `ledger.jsonl` sidecars with a `resume_index.json` cursor so `--resume` can reconstruct the last safe prefix without hydrating unrelated session sections.
+Under the hood, each run loads `ATELIER.md` into the system prompt, opens a session under `.atelier/sessions/<uuid>/`, calls the configured BYOM adapter, streams tool calls through the §15 dispatcher (eight built-in tools plus registered MCP tools), applies edits atomically (`tempfile` + tree-sitter pre-commit check, spec §3), and either transitions to `Verifying` on `claimed_done: true` or bails after `--max-turns`. The session manifest (`session.json`) conforms to `schemas/session/v1.json`; long append-like arrays are split into `conversation.jsonl` and `ledger.jsonl` sidecars with a `resume_index.json` cursor so `--resume` and GUI follow-up turns can reconstruct the last safe prefix without hydrating unrelated session sections.
 
 ---
 
@@ -404,8 +423,9 @@ make clean            # remove __pycache__ and .pytest_cache trees
 ## What's intentionally absent
 
 - **No CI provider beyond GitHub Actions.** The Makefile is portable; other providers (Buildkite, GitLab CI) can wrap `make check` similarly.
-- **No MCP client yet.** Built-in tools (file ops + shell + search) run end-to-end through the dispatcher; the `rmcp`-based MCP client for external tool servers is gated on the spike at [`experiments/rmcp_spike/`](experiments/rmcp_spike/).
-- **No Bedrock / Vertex adapters yet.** Phase E/F. The OpenAI-compatible adapter covers the bulk of the local-LLM space and OpenAI itself; the LiteLLM-shaped gateway may not need a separate adapter once that surface is in.
+- **No Bedrock / Vertex adapters yet.** Phase E/F. The OpenAI-compatible adapter already covers the bulk of the local-LLM space, OpenAI itself, vLLM, and LiteLLM-shaped gateways that expose chat-completions.
+- **No signed desktop release yet.** The GUI is a Tauri dev/build target with placeholder icons and no notarized installers.
+- **No generic keychain interpolation for MCP/hook manifests yet.** Provider API keys support OS-keychain references today. MCP/hook `${env:...}` interpolation remains supported; generic `${keychain:...}` interpolation still fails closed until that broader credentials surface lands.
 
 ---
 

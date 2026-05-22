@@ -1,5 +1,21 @@
 # Atelier Spec — Changelog
 
+## v60.78 — 2026-05-22 (durable GUI resume + README end-user sweep)
+
+Fixes the GUI follow-up prompt failure caused by stale resume state and refreshes the public docs for first-time users.
+
+### Resume robustness
+
+- `Runner::run` now reports the durable persisted session UUID in `RunReport.session_id`. Resume runs persist back to `resume_from`, so callers no longer receive a transient actor UUID that has no matching `.atelier/sessions/<uuid>/session.json`.
+- GUI Agent mode validates the active resume pointer before calling `with_resume`. If the session manifest is missing, it clears the stale in-memory pointer, logs the condition, and starts a fresh durable session instead of surfacing `[agent error] config: resume: cannot load session ...`.
+- Added regression coverage for both sides: CLI resume tests assert the durable UUID is reported, and GUI tests cover stale-pointer drop vs. valid-pointer retention.
+
+### Documentation
+
+- Reworked the README quick start into a more end-user-readable flow: mock smoke test, real-model provider choices, OS-keychain API-key setup, GUI launch, workspace selection, and resume behavior.
+- Removed stale README wording that said no MCP client existed, and clarified the remaining absence is generic MCP/hook keychain interpolation rather than provider credential storage.
+- Updated STATUS, crate READMEs, and `tasks/todo.md` so the current docs reflect provider keychain auth, durable GUI resume behavior, and the latest release pointer.
+
 ## v60.77 — 2026-05-22 (provider keychain auth + sub-agent token UI)
 
 Adds first-class OpenAI-compatible provider credential references and completes the sub-agent token-progress UI fan-out across GUI and TUI.

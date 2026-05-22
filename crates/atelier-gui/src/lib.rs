@@ -24,6 +24,7 @@ use std::sync::Arc;
 use atelier_cli::runner::{DispatcherHandle, EventSink, MockResponse, ProviderChoice, Runner};
 use atelier_core::adapter::{Message, Role, ToolCallRequest};
 use atelier_core::dispatcher::ApprovalPolicy;
+use atelier_core::persistence::OnDiskSession;
 use atelier_core::protocol::Envelope;
 use atelier_core::protocol_strategy::HARNESS_META_NAME;
 use atelier_core::session::{Event as SessionEvent, MessageRole};
@@ -2432,7 +2433,7 @@ fn start_agent_run(
     // Clone the Arc so the spawned task can write the new session UUID back
     // without needing to hold a reference to `state` across an await point.
     let session_id_arc = Arc::clone(&state.active_session_id);
-    let prior_session_id = session_id_arc.lock().ok().and_then(|g| *g);
+    let prior_session_id = take_valid_resume_session_id(&workspace, &session_id_arc);
     // Create a fresh cancellation token for this run and park it in the
     // shared slot so `cancel_run` can reach it.
     let cancel_token = tokio_util::sync::CancellationToken::new();
@@ -2563,6 +2564,29 @@ impl Drop for ChatRunCleanup {
 struct RunCleanup {
     in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
     workspace_to_remove: Option<std::path::PathBuf>,
+}
+
+fn take_valid_resume_session_id(
+    workspace: &std::path::Path,
+    session_id_arc: &Arc<std::sync::Mutex<Option<uuid::Uuid>>>,
+) -> Option<uuid::Uuid> {
+    let prior = session_id_arc.lock().ok().and_then(|g| *g)?;
+    let session_dir = OnDiskSession::session_dir(workspace, prior);
+    if session_dir.join("session.json").is_file() {
+        return Some(prior);
+    }
+
+    tracing::warn!(
+        session_id = %prior,
+        path = %session_dir.display(),
+        "dropping stale GUI resume pointer; session manifest is missing"
+    );
+    if let Ok(mut guard) = session_id_arc.lock() {
+        if *guard == Some(prior) {
+            *guard = None;
+        }
+    }
+    None
 }
 
 impl Drop for RunCleanup {
@@ -3547,6 +3571,36 @@ model = "local:evil"
         let err = parse_persisted_workspace("[workspace]\npath = \"unterminated\n")
             .expect_err("invalid TOML must not be hand-parsed");
         assert!(err.contains("invalid gui.toml"), "got: {err}");
+    }
+
+    #[test]
+    fn stale_resume_pointer_is_dropped_when_manifest_is_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stale_uuid = uuid::Uuid::new_v4();
+        let active = Arc::new(std::sync::Mutex::new(Some(stale_uuid)));
+
+        assert_eq!(take_valid_resume_session_id(tmp.path(), &active), None);
+        assert_eq!(
+            *active.lock().unwrap(),
+            None,
+            "missing session.json must clear the GUI resume pointer"
+        );
+    }
+
+    #[test]
+    fn durable_resume_pointer_is_kept_when_manifest_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_uuid = uuid::Uuid::new_v4();
+        let session_dir = OnDiskSession::session_dir(tmp.path(), session_uuid);
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(session_dir.join("session.json"), "{}").unwrap();
+        let active = Arc::new(std::sync::Mutex::new(Some(session_uuid)));
+
+        assert_eq!(
+            take_valid_resume_session_id(tmp.path(), &active),
+            Some(session_uuid)
+        );
+        assert_eq!(*active.lock().unwrap(), Some(session_uuid));
     }
 
     // ---------- v60.37 B5 list_provider_profiles ----------

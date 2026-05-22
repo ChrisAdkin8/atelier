@@ -5497,6 +5497,10 @@ async fn resume_marks_inflight_subagents_cancelled() {
         .expect("resumed run must succeed");
 
     assert_eq!(report.final_state, atelier_core::State::Done);
+    assert_eq!(
+        report.session_id.0, stale_uuid,
+        "resumed runs must report the durable persisted session UUID"
+    );
 
     // The SubagentCancelled event must have fired for the in-flight entry.
     let captured = events.lock();

@@ -6,7 +6,7 @@ Spec references: §11 (project bootstrap, credential storage), §1 (BYOM Runner)
 
 ## Current state
 
-Two subcommands implemented:
+Core subcommands implemented:
 
 - `atelier init [PATH]` — bootstrap a repo at `PATH` (defaults to `cwd`). Idempotent; never overwrites an existing `ATELIER.md`. Backed by `atelier_core::init`.
 - `atelier run [OPTIONS] [PROMPT]` — drive the agent loop. Wires the §2.5 actor + §15 dispatcher + eight built-in tools + registered MCP tools + §15 hooks + §7 DoD + §11 sandbox + §1 typed ledger + §1 probe-on-first-use against the chosen adapter; loops turns until `claimed_done: true`; transitions to `Verifying` for DoD checks; persists the session to `<repo>/.atelier/sessions/<uuid>/`. Flags:
@@ -15,8 +15,10 @@ Two subcommands implemented:
   - `--base-url <URL>` — `openai-compat` only. Full URL ending in `/v1`. Omit to use OpenAI itself.
   - `--workspace PATH`, `--max-turns N`, `--prompt-file PATH` (or `-` for stdin).
   - `--no-probe` / `--force-probe` (v51) — skip or force the probe-on-first-use calibration.
+- `atelier providers auth <profile>` — store an OpenAI-compatible profile API key in the OS keychain from `--from-command`, `--from-stdin`, or `--env`, and write a secret-free `api_key = "keyring:..."` reference back to `providers.toml`.
+- `atelier providers test <profile>` — resolve the effective OpenAI-compatible profile credential and call `<base_url>/models` without printing the secret.
 
-Planned (spec §11 credential storage; not yet implemented):
+Planned broader credential/account UX:
 
 - `atelier login <provider>` — extends to non-API-key shapes too (`atelier login bedrock` verifies the AWS chain; `atelier login vertex` verifies ADC; `atelier login ollama` is a no-op).
 - `atelier logout <provider>`
@@ -28,6 +30,8 @@ Planned (spec §11 credential storage; not yet implemented):
 `atelier-cli` is a hybrid lib+bin (v47). The agent-loop logic lives in `src/runner.rs` as a pure `Runner` API; `src/lib.rs` re-exports the blessed types (`Runner`, `ProviderChoice`, `MockResponse`, `EventSink`, `RunError`, `RunReport`, `DispatcherHandle`, `ApprovalPolicy`, `ProbePolicy`). Integration tests and the GUI/TUI driver modes link against this library; the binary `src/main.rs` is argv parsing + `Runner::new(...).run(prompt)`. Sink choice is `EventSink::{Stdout, Capture, Null, Callback}` — `Stdout` for the binary, `Capture` for tests asserting on event sequences, `Null` for tests that don't care, `Callback` for the GUI's webview bridge.
 
 `Runner::new` is fallible: real providers (`Anthropic`) need credentials at construction time, so a missing `ANTHROPIC_API_KEY` surfaces as `RunError::Config` rather than failing on the first chat call. The `Mock` and `OpenAiCompat` branches are infallible (empty OpenAI-compatible credentials are allowed — most local servers don't require auth; a 401 from a server that does surfaces as `AdapterError::Auth` on first call). OpenAI-compatible credentials resolve from `OPENAI_API_KEY` first, then profile `api_key = "keyring:..."` / `env:...`.
+
+`RunReport.session_id` is the durable session id that was written under `.atelier/sessions/<uuid>/`. Fresh runs report the actor's new UUID; resumed runs report the original `resume_from` UUID because that is the path updated on disk. GUI/TUI callers should chain future resume requests from this value.
 
 ## Provider notes
 
@@ -51,7 +55,7 @@ CLI flags layer on top of an optional `.atelier/providers.toml` that can declare
 
 The "resolved profile" is whichever `[providers.<name>]` table matches `--profile <NAME>` from the CLI, or the file's top-level `default = "<name>"` field. Per-field flags (`--provider`, `--model`, `--base-url`, `--max-turns`, `--no-probe`/`--force-probe`) still override individual fields of the resolved profile.
 
-The binary prints `atelier run: using config <path> (profile "<name>")` on every run so you can confirm what's active. A malformed file is fatal (exit 2 with the path + parse-error message) — silently ignoring it would let a typo slip the runtime back to defaults. Schema, discovery rules, and validation live in [`crates/atelier-core/src/config.rs`](../atelier-core/src/config.rs); the top-level [README §5](../../README.md#5-configure-with-atelierproviderstoml--v53) walks through the format and worked examples.
+The binary prints `atelier run: using config <path> (profile "<name>")` on every run so you can confirm what's active. A malformed file is fatal (exit 2 with the path + parse-error message) — silently ignoring it would let a typo slip the runtime back to defaults. Schema, discovery rules, and validation live in [`crates/atelier-core/src/config.rs`](../atelier-core/src/config.rs); the top-level [README provider section](../../README.md#pin-defaults--atelierproviderstoml) walks through the format and worked examples.
 
 In `main.rs` the layering is implemented as a flat top-down narrative — `parse_cli` → resolve workspace → `ProvidersConfig::load` → `resolve_profile` → `resolve_provider_choice` / `resolve_probe_policy` → build `Runner`. Each stage hands typed values to the next; nothing reaches the Runner that hasn't been validated.
 

@@ -12,6 +12,7 @@ shared helpers and tests.
 |---|---|---|
 | Workspace file reads/writes | Model-supplied paths are repo-relative, contain no `..`, and canonicalize inside the workspace before I/O. Directory creation walks one component at a time and rejects symlink escapes before mutation. | `atelier_core::path_safety` |
 | Persistence writes | Session, registry, compaction, and split-sidecar writes use atomic temp-file persistence, parent-directory sync where supported, and workspace-contained directory creation for `.atelier/` paths. | `persistence`, `compaction_blob`, `path_safety` |
+| Resume pointers | UI/driver resume pointers must refer to the durable session UUID that was written on disk, and UI surfaces must validate `session.json` before chaining a follow-up run. Stale in-memory pointers are cleared rather than retried indefinitely. | `atelier-cli::Runner`, `atelier-gui::take_valid_resume_session_id` |
 | Tool dispatch | Built-in and MCP tools are registered into the same `ToolRegistry` and dispatched through the same dispatcher lifecycle: validation, hooks, concurrent-edit policy, execution, ledger, audit/event projection, and verification input. | `dispatcher`, `tools::register_builtins`, `mcp::register_mcp_servers` |
 | Network egress | Subprocess network access is denied by default. MCP HTTP/SSE egress is explicit, host-checked, and audited. Provider endpoints that can receive credentials must be allowlisted or explicitly supplied by the user at the invoking surface. | `sandbox`, `subprocess`, `mcp`, `trust_boundary` |
 | Approval state | MCP, hook, LSP, and adapter-swap approvals are scoped to the workspace or current surface and must not silently carry across unrelated repositories. | `mcp_config`, `hooks`, `lsp`, GUI provider swap |
@@ -57,6 +58,8 @@ user action at the invoking surface.
 - Persistence and compaction writes reject symlinked `.atelier` escapes.
 - GUI provider default/swap/executor resolution and CLI profile resolution use
   the shared provider credential-egress predicate.
+- Resumed Runner reports return the durable persisted UUID, and GUI resume
+  validation drops missing/deleted session manifests before `with_resume`.
 - Built-in and MCP tools register through the same dispatcher abstraction and
   produce compatible audit/ledger/event behavior.
 - Non-interactive concurrent-edit resolution still uses the dispatcher's

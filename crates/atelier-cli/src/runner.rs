@@ -2738,7 +2738,10 @@ impl Runner {
 
         let ledger_snapshot = ledger.to_vec();
         Ok(RunReport {
-            session_id,
+            // Report the durable session id, not the transient actor id.
+            // Resume runs deliberately persist back to `resume_from`; callers
+            // such as the GUI chain follow-up submits from this value.
+            session_id: SessionId(persist_uuid),
             turns,
             turns_used: turns,
             final_state,
