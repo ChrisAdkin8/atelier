@@ -1,24 +1,24 @@
 {
   "version": 1,
-  "run_id": "2026-05-21T10:18:18Z",
-  "git_sha": "785ff0c",
-  "workflow_run_url": "https://github.com/ChrisAdkin8/atelier/actions/runs/26219624428",
+  "run_id": "2026-05-22T10:04:51Z",
+  "git_sha": "9457fa1",
+  "workflow_run_url": "https://github.com/ChrisAdkin8/atelier/actions/runs/26281128491",
   "all_passed": false,
   "gates": [
     {
       "name": "fmt",
       "status": "passed",
-      "duration_secs": 0
+      "duration_secs": 1
     },
     {
       "name": "clippy",
       "status": "passed",
-      "duration_secs": 108
+      "duration_secs": 110
     },
     {
       "name": "cargo_test_workspace",
-      "status": "passed",
-      "duration_secs": 243
+      "status": "failed",
+      "duration_secs": 248
     },
     {
       "name": "rig_check",
@@ -28,12 +28,12 @@
     {
       "name": "mcp_integration_npx",
       "status": "passed",
-      "duration_secs": 47
+      "duration_secs": 52
     },
     {
       "name": "phase_a_live_anthropic",
       "status": "failed",
-      "duration_secs": 9
+      "duration_secs": 7
     }
   ]
 }
