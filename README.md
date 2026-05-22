@@ -25,7 +25,7 @@ It is not tied to one model vendor. You can use Anthropic, OpenAI-compatible ser
 
 | You want... | Atelier provides... |
 |---|---|
-| A desktop coding workspace | Tauri GUI with Chat/Agent modes, provider switching, Context, Memory, Plan, Sub-agent, and meters panels. |
+| A desktop coding workspace | Tauri GUI with Chat/Agent modes, provider switching, Context, Memory, Sub-agent, and meters panels. |
 | A terminal workflow | `atelier` CLI plus a `ratatui` TUI for live agent runs and file-level approval. |
 | Bring-your-own-model support | Mock, Anthropic Messages API, and OpenAI-compatible chat-completions endpoints. |
 | Safe API-key handling | OS keychain-backed provider credentials; plaintext provider keys in config are rejected. |
@@ -33,11 +33,32 @@ It is not tied to one model vendor. You can use Anthropic, OpenAI-compatible ser
 | Tooling with guardrails | Built-in tools and MCP tools go through the same dispatcher, hooks, sandbox, audit, and ledger path. |
 | Better "done" semantics | The harness treats done as a verifiable state transition, not just a model claim. |
 
+## Install
+
+Released CLI builds are published on GitHub Releases for macOS and Linux.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ChrisAdkin8/atelier/main/scripts/install.sh | sh
+atelier --version
+```
+
+To install a specific release:
+
+```sh
+ATELIER_VERSION=v0.1.0 sh -c "$(curl -fsSL https://raw.githubusercontent.com/ChrisAdkin8/atelier/main/scripts/install.sh)"
+```
+
+The installer downloads the matching `atelier-cli-<target>.tar.gz` release asset, verifies its `.sha256` file when present, and places `atelier` in `~/.local/bin` unless `ATELIER_INSTALL_DIR` is set.
+
+GUI bundles are attached to the same GitHub Releases as unsigned `.dmg`, `.AppImage`, and `.deb` artifacts.
+
 ## Quick start
 
-This path starts from a source checkout. The first run uses the Mock provider, so it needs no API key, no network, and no model server.
+The first run uses the Mock provider, so it needs no API key, no network, and no model server.
 
 ### 1. Install the CLI
+
+Use the release installer above, or install from a source checkout while developing Atelier:
 
 ```sh
 cargo install --path crates/atelier-cli
@@ -165,6 +186,17 @@ Other common base URLs:
 
 The first run against a new OpenAI-compatible `(model, base_url)` pair performs a short capability probe and caches the result in `~/.atelier/model_profiles/`.
 
+You can score a configured profile before relying on it for Agent mode:
+
+```sh
+atelier providers score qwen2.5-72b-awq
+atelier providers score qwen2.5-72b-awq --force-probe --json
+```
+
+The score is 0-100 and explains the model's fit for Atelier's harness: native tool calls, structured-output strategy, streaming, context window, UTF-8 cleanliness, max output budget, and prompt-cache support.
+
+In the GUI, the active model badge shows the same fit score and opens an explanation popover when clicked. If an Agent-routed prompt would use a marginal or poor model, the Composer shows a warning before you send.
+
 ## Store provider API keys safely
 
 For one-off shells and CI, environment variables are still supported:
@@ -233,7 +265,7 @@ Atelier can remember useful facts across sessions:
 - Personal memory lives in `~/.atelier/memory/`.
 - Derived search indexes live outside the canonical card directories at `<workspace>/.atelier/indexes/memory.sqlite` and `~/.atelier/indexes/memory.sqlite`.
 - The GUI Memory panel can add, delete, and promote memory cards.
-- Auto-drafted cards are written for known fixable adapter errors such as auth failures or unreachable providers.
+- Chat and Agent runs auto-draft cards for known fixable provider/config problems such as auth failures, missing API-key environment variables, unreachable providers, rate limits, and context overflows. The Memory panel refreshes as soon as the card is written.
 
 Memory cards are the source of truth: they stay human-readable Markdown and can be edited or deleted by hand. The SQLite indexes are rebuildable FTS caches used for fast recall/search; they are refreshed when the GUI loads memory and updated when cards are promoted or auto-drafted.
 

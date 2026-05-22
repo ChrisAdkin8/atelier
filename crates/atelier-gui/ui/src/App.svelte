@@ -4,7 +4,7 @@
   // Layout mirrors the TUI subset (`crates/atelier-tui/src/lib.rs`):
   //
   //   +-- header ----------------------------------------------+
-  //   | Conversation (60%)            | Plan (40%)             |
+  //   | Conversation (60%)            | Memory/Subagents       |
   //   +-------------------------------+------------------------+
   //   | Diff (60%)                    | Meters (40%)           |
   //   +-- footer (key hints, scrub) ---------------------------+
@@ -21,6 +21,7 @@
     CapabilityMatrixRow,
     CurrentModel,
     MentalModel,
+    ModelSuitability,
   } from './lib/state'
   import {
     initialState,
@@ -30,7 +31,6 @@
   } from './lib/state'
   import Header from './lib/components/Header.svelte'
   import ConversationPane from './lib/components/ConversationPane.svelte'
-  import PlanPane from './lib/components/PlanPane.svelte'
   import ContextPane from './lib/components/ContextPane.svelte'
   import MemoryPane from './lib/components/MemoryPane.svelte'
   import MentalModelPane from './lib/components/MentalModelPane.svelte'
@@ -50,8 +50,8 @@
 
   // v60.49 — right-column collapse toggle. Persists to localStorage
   // so the user's choice survives a relaunch. When collapsed, the
-  // Conversation pane gets the full window width and the Plan / Memory
-  // / Meters / Context panels are hidden via a class on `.grid`.
+  // Conversation pane gets the full window width and the Memory /
+  // Subagent / Context panels are hidden via a class on `.grid`.
   let rightPanelCollapsed: boolean = $state(
     (() => {
       try {
@@ -87,6 +87,7 @@
   // events of the run (MessageCommitted for the user prompt, possibly
   // even StagingPendingApproval) would be dropped.
   let listenerReady = $state(false)
+  let showModelDetails = $state(false)
 
   // A run is "in flight" between the first Transitioned-into-non-Idle
   // and the next time we land in a terminal state. Feeds into `composerBusy`
@@ -130,6 +131,7 @@
     } catch (err) {
       console.warn('list_provider_profiles failed; keeping inline fallback', err)
     }
+    await hydrateCurrentModel()
   })
 
   // Re-fetch provider profiles after the user sets a new workspace so
@@ -144,6 +146,16 @@
       }
     } catch (err) {
       console.warn('list_provider_profiles reload failed', err)
+    }
+    await hydrateCurrentModel()
+  }
+
+  async function hydrateCurrentModel() {
+    try {
+      const evt = await invoke<BridgedEvent>('snapshot_current_model')
+      app = applyEvent(app, evt)
+    } catch (err) {
+      console.warn('snapshot_current_model failed', err)
     }
   }
 
@@ -198,7 +210,7 @@
   }
 
   // v60.7 §1 BYOM — tooltip and badge helpers for the footer's
-  // model-id span. When the model carries a capability matrix row,
+  // model fit badge. When the model carries a capability matrix row,
   // the tooltip lists each capability with its claim (and the row's
   // provenance — static / adapter / probe) so the user can audit
   // the §1 matrix without opening a separate panel. Falls back to
@@ -236,6 +248,16 @@
     if (row.structured_output === 'claimed_but_broken') broken.push('structured_output')
     if (row.long_context === 'claimed_but_broken') broken.push('long_context')
     return broken.length === 0 ? null : `broken: ${broken.join(', ')}`
+  }
+
+  function suitabilityLabel(s: ModelSuitability | null | undefined): string {
+    if (!s) return 'Not scored'
+    return `${s.grade[0].toUpperCase()}${s.grade.slice(1)} ${s.score}`
+  }
+
+  function suitabilityClass(s: ModelSuitability | null | undefined): string {
+    if (!s) return 'unknown'
+    return s.grade
   }
 
   // v60.10 B2 follow-on — footer provider swap dropdown.
@@ -369,12 +391,8 @@
     <div class="pane-slot conversation-slot">
       <ConversationPane conversation={app.conversation} streamingAssistant={app.streamingAssistant} />
     </div>
-    <div class="pane-slot plan-slot">
-      <!-- v54/v60: the top-right slot stacks Plan, Memory, and Sub-agents.
-           Each row is explicitly bounded so the always-mounted sub-agent
-           panel cannot paint over Memory when the column is short. -->
-      <div class="plan-stack has-subagents">
-        <PlanPane planSteps={app.planSteps} />
+    <div class="pane-slot memory-slot">
+      <div class="memory-stack">
         <MemoryPane cards={app.memoryCards} />
         <SubagentPane subagents={app.subagents} />
       </div>
@@ -391,6 +409,7 @@
     busy={composerBusy}
     thinking={app.runInFlight}
     activeSubagents={app.subagents.filter((s) => s.status === 'running')}
+    modelSuitability={app.currentModel?.suitability ?? null}
   />
 
   <footer class="help">
@@ -400,8 +419,13 @@
         {@const used = app.contextTokens.known}
         {@const cap = app.contextWindowTokens}
         {@const pct = Math.min(100, Math.round((used / cap) * 100))}
-        <span class="ctx-meter" title="context window usage">
-          <span class="ctx-label">ctx</span>
+        <span
+          class="ctx-meter"
+          title={app.currentModel
+            ? `context window usage for ${app.currentModel.modelId}`
+            : 'context window usage'}
+        >
+          <span class="ctx-label">context</span>
           <span class="ctx-bar"
             ><span class="ctx-fill" style="width: {pct}%"></span></span>
           <span class="ctx-text">{used.toLocaleString()} / {cap.toLocaleString()} ({pct}%)</span>
@@ -426,7 +450,7 @@
       </span>
     </span>
 
-    <!-- Right column: provider swap dropdown only. -->
+    <!-- Right column: provider swap dropdown + active model fit badge. -->
     <span class="footer-right">
       <select
         class="swap-select"
@@ -444,6 +468,63 @@
           </option>
         {/each}
       </select>
+      {#if app.currentModel}
+        <span class="model-wrap">
+          <button
+            type="button"
+            class="model-badge {suitabilityClass(app.currentModel.suitability)}"
+            title={modelBadgeTooltip(app.currentModel)}
+            aria-expanded={showModelDetails}
+            onclick={() => (showModelDetails = !showModelDetails)}
+          >
+            <span class="model-fit">{suitabilityLabel(app.currentModel.suitability)}</span>
+            <span class="model-strategy">{app.currentModel.strategy}</span>
+          </button>
+          {#if showModelDetails}
+            <div class="model-popover" role="dialog" aria-label="model suitability details">
+              {#if app.currentModel.suitability}
+                {@const fit = app.currentModel.suitability}
+                <div class="popover-title">
+                  Model fit: {suitabilityLabel(fit)}/100
+                </div>
+                <p class="model-name">{app.currentModel.modelId}</p>
+                <p>{fit.recommendation}</p>
+                {#if fit.strengths.length > 0}
+                  <h3>Strengths</h3>
+                  <ul>
+                    {#each fit.strengths as item}
+                      <li>✓ {item}</li>
+                    {/each}
+                  </ul>
+                {/if}
+                {#if fit.risks.length > 0}
+                  <h3>Risks</h3>
+                  <ul>
+                    {#each fit.risks as item}
+                      <li>! {item}</li>
+                    {/each}
+                  </ul>
+                {/if}
+                <h3>Score breakdown</h3>
+                <div class="factor-list">
+                  {#each fit.factors as factor}
+                    <div class="factor-row">
+                      <span>{factor.name}</span>
+                      <span>{factor.awarded}/{factor.max}</span>
+                    </div>
+                  {/each}
+                </div>
+                {#if capabilityBrokenLabel(app.currentModel.capabilityRow)}
+                  <p class="risk-note">{capabilityBrokenLabel(app.currentModel.capabilityRow)}</p>
+                {/if}
+              {:else}
+                <div class="popover-title">Model fit: not scored</div>
+                <p>Run an Agent turn or use <code>atelier providers score</code> to score this model.</p>
+              {/if}
+            </div>
+          {/if}
+        </span>
+      {/if}
     </span>
   </footer>
 
@@ -552,7 +633,7 @@
   .grid.right-collapsed {
     grid-template-columns: minmax(0, 1fr);
   }
-  .grid.right-collapsed .plan-slot,
+  .grid.right-collapsed .memory-slot,
   .grid.right-collapsed .context-slot {
     display: none;
   }
@@ -578,7 +659,7 @@
     grid-row: 1 / span 2;
     grid-column: 1;
   }
-  .plan-slot {
+  .memory-slot {
     grid-row: 1;
     grid-column: 2;
   }
@@ -586,24 +667,19 @@
     grid-row: 2;
     grid-column: 2;
   }
-  /* v54/v60 — Plan stays at the top, Memory gets the flexible middle,
-     and Sub-agents gets a bounded bottom row. All direct children must be
+  /* Memory gets the flexible top row and Sub-agents gets a bounded bottom
+     row. All direct children must be
      shrinkable; otherwise their own scroll containers can overflow into
      the neighbouring rows and visually overlap. */
-  .plan-stack {
+  .memory-stack {
     display: grid;
-    grid-template-rows: auto minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr) clamp(5rem, 22%, 10rem);
     gap: var(--gap-pane, 0.5rem);
     width: 100%;
     min-height: 0;
     overflow: hidden;
   }
-  /* Keep the sub-agent panel mounted so Agent mode has an obvious place to
-     report "no sub-agents spawned" instead of disappearing entirely. */
-  .plan-stack.has-subagents {
-    grid-template-rows: auto minmax(0, 1fr) clamp(5rem, 22%, 10rem);
-  }
-  .plan-stack > :global(*) {
+  .memory-stack > :global(*) {
     min-width: 0;
     min-height: 0;
     overflow: hidden;
@@ -690,6 +766,7 @@
     display: flex;
     align-items: center;
     justify-content: flex-end;
+    gap: 0.5rem;
   }
   .help .tok-meter {
     display: inline-flex;
@@ -724,6 +801,102 @@
   .help .cost-value {
     font-variant-numeric: tabular-nums;
     color: var(--accent-green, #4ec9b0);
+  }
+  .model-wrap {
+    position: relative;
+    display: inline-flex;
+  }
+  .model-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    max-width: 34rem;
+    padding: 0.15rem 0.45rem;
+    border: 1px solid var(--border-pane);
+    border-radius: 999px;
+    background: var(--bg-pane-alt);
+    color: var(--fg-default);
+    font-family: var(--font-mono);
+    cursor: pointer;
+  }
+  .model-badge.excellent,
+  .model-badge.good {
+    border-color: color-mix(in srgb, var(--accent-green) 65%, var(--border-pane));
+  }
+  .model-badge.marginal {
+    border-color: color-mix(in srgb, var(--accent-yellow) 70%, var(--border-pane));
+  }
+  .model-badge.poor {
+    border-color: color-mix(in srgb, var(--diff-remove) 70%, var(--border-pane));
+  }
+  .model-fit {
+    color: var(--accent-green);
+    white-space: nowrap;
+  }
+  .model-badge.marginal .model-fit {
+    color: var(--accent-yellow);
+  }
+  .model-badge.poor .model-fit {
+    color: var(--diff-remove);
+  }
+  .model-badge.unknown .model-fit,
+  .model-strategy {
+    color: var(--fg-dim);
+    white-space: nowrap;
+  }
+  .model-popover {
+    position: absolute;
+    right: 0;
+    bottom: calc(100% + 0.45rem);
+    z-index: 20;
+    width: min(28rem, 80vw);
+    max-height: 70vh;
+    overflow: auto;
+    padding: 0.75rem;
+    border: 1px solid var(--border-pane-strong);
+    border-radius: 6px;
+    background: var(--bg-pane);
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+    color: var(--fg-default);
+    font-size: 0.78rem;
+  }
+  .popover-title {
+    color: var(--accent-cyan);
+    font-weight: 700;
+    margin-bottom: 0.35rem;
+  }
+  .model-popover h3 {
+    margin: 0.55rem 0 0.25rem;
+    color: var(--fg-muted);
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  .model-popover p {
+    margin: 0.2rem 0;
+    white-space: normal;
+  }
+  .model-name {
+    color: var(--fg-dim);
+    font-family: var(--font-mono);
+    overflow-wrap: anywhere;
+  }
+  .model-popover ul {
+    margin: 0;
+    padding-left: 1rem;
+  }
+  .factor-list {
+    display: grid;
+    gap: 0.2rem;
+  }
+  .factor-row {
+    display: flex;
+    justify-content: space-between;
+    gap: 1rem;
+    font-variant-numeric: tabular-nums;
+  }
+  .risk-note {
+    color: var(--accent-yellow);
   }
   .help .swap-select {
     margin-left: 0;

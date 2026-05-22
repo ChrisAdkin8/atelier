@@ -9,6 +9,8 @@
 #   make summary       — one-line summary of dry-run for all tasks
 #   make install-rig   — create .venv/ and install the rig dependencies into it
 #   make quality-cheap — cargo-audit + cargo-machete (low-cost supply-chain + dead-dep gate)
+#   make release-cli   — build a local release CLI binary
+#   make release-gui   — build local unsigned Tauri GUI bundles
 #   make clean         — remove pytest cache and pycache from the tree
 
 # Prefer the project-local venv created by `make install-rig` when it exists.
@@ -21,7 +23,7 @@ else
 PY ?= python3
 endif
 
-.PHONY: check schemas artifacts rig-tests dry-run summary install-rig quality-cheap audit audit-install npm-ioc-sweep clean
+.PHONY: check schemas artifacts rig-tests dry-run summary install-rig quality-cheap audit audit-install npm-ioc-sweep release-cli release-gui clean
 
 check: schemas artifacts rig-tests summary
 
@@ -138,6 +140,13 @@ audit:
 # directly.
 npm-ioc-sweep:
 	$(PY) scripts/npm_ioc_sweep.py
+
+release-cli:
+	cargo build --locked --release -p atelier-cli
+
+release-gui:
+	npm --prefix crates/atelier-gui/ui ci
+	cd crates/atelier-gui && cargo tauri build
 
 audit-install:
 	cargo install cargo-audit --locked

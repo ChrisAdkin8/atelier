@@ -29,15 +29,6 @@ export type ConversationLine = {
   text: string
 }
 
-export type PlanStatus = 'pending' | 'in_progress' | 'done' | 'skipped'
-
-export type PlanStep = {
-  id: string
-  text: string
-  status: PlanStatus
-  constraints?: string[]
-}
-
 // Mirror of `atelier_core::ledger::LedgerEntry`. Serde tag is `kind`.
 export type LedgerEntry =
   | {
@@ -199,6 +190,25 @@ export type CapabilityMatrixRow = {
   source: CapabilityRowSource
 }
 
+export type SuitabilityGrade = 'excellent' | 'good' | 'marginal' | 'poor'
+
+export type SuitabilityFactor = {
+  name: string
+  awarded: number
+  max: number
+  detail: string
+}
+
+export type ModelSuitability = {
+  model_id: string
+  score: number
+  grade: SuitabilityGrade
+  recommendation: string
+  factors: SuitabilityFactor[]
+  strengths: string[]
+  risks: string[]
+}
+
 /// v52 — the active BYOM model, populated by `ModelProfileLoaded`.
 /// Rendered in the footer (`App.svelte`) on the right-hand side so the
 /// user always knows which model + strategy the run is using.
@@ -220,6 +230,7 @@ export type CurrentModel = {
   /// Surfaced as a tooltip on the badge; `null` until the
   /// Runner emits a `ModelProfileLoaded` carrying it.
   capabilityRow: CapabilityMatrixRow | null
+  suitability: ModelSuitability | null
 }
 
 /// §10 — one row in the sub-agent panel. Updated by the 5 SubagentXxx
@@ -240,7 +251,6 @@ export type AppState = {
   events: EventLogEntry[]
   currentState: string
   conversation: ConversationLine[]
-  planSteps: PlanStep[]
   totalCostUsd: number
   contextTokens: { known: number; unknown: number }
   contextWindowTokens: number
@@ -324,7 +334,6 @@ export function initialState(): AppState {
     events: [],
     currentState: '',
     conversation: [],
-    planSteps: [],
     totalCostUsd: 0,
     contextTokens: { known: 0, unknown: 0 },
     contextWindowTokens: DEFAULT_CONTEXT_WINDOW_TOKENS,
@@ -422,10 +431,6 @@ export function applyEvent(state: AppState, evt: BridgedEvent): AppState {
       }
       return { ...state, events, streamingAssistant, lastTurnTokens }
     }
-    case 'PlanSnapshot': {
-      const p = evt.payload as { steps: PlanStep[] }
-      return { ...state, events, planSteps: p.steps ?? [] }
-    }
     case 'LedgerAppended': {
       const p = evt.payload as { entry: LedgerEntry }
       const c = ledgerEntryCost(p.entry)
@@ -455,6 +460,7 @@ export function applyEvent(state: AppState, evt: BridgedEvent): AppState {
         strategy: string
         outcome: string
         capability_row?: CapabilityMatrixRow | null
+        suitability?: ModelSuitability | null
       }
       const currentModel: CurrentModel = {
         modelId: p.model_id,
@@ -462,8 +468,13 @@ export function applyEvent(state: AppState, evt: BridgedEvent): AppState {
         strategy: p.strategy,
         outcome: p.outcome,
         capabilityRow: p.capability_row ?? null,
+        suitability: p.suitability ?? null,
       }
-      return { ...state, events, currentModel }
+      const contextWindowTokens =
+        p.capability_row && p.capability_row.context_window_tokens > 0
+          ? p.capability_row.context_window_tokens
+          : state.contextWindowTokens
+      return { ...state, events, currentModel, contextWindowTokens }
     }
     case 'ContextItems': {
       // v53 — replace the panel's items wholesale. Snapshots come
@@ -865,10 +876,6 @@ export function projectEvent(evt: BridgedEvent): Omit<EventLogEntry, 'ts'> {
     case 'AssistantTextDelta': {
       const p = evt.payload as { delta: string }
       return { kind, detail: `+${(p.delta ?? '').length}chars` }
-    }
-    case 'PlanSnapshot': {
-      const p = evt.payload as { steps: PlanStep[] }
-      return { kind, detail: `${p.steps?.length ?? 0} steps` }
     }
     case 'LedgerAppended': {
       const p = evt.payload as { entry: LedgerEntry }

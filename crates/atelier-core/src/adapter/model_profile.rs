@@ -29,6 +29,8 @@ use sha2::{Digest, Sha256};
 
 use crate::protocol_strategy::{parse_json_sentinel, Strategy, SENTINEL_CLOSE, SENTINEL_OPEN};
 
+use super::capability_matrix::CapabilityMatrixRow;
+use super::CapabilityClaim;
 use super::{Adapter, AdapterError, Message, Role, ToolSpec};
 
 /// Schema version of the on-disk profile. Bumped when the probe
@@ -89,6 +91,253 @@ pub struct ModelProfile {
     /// returned arguments as a non-JSON-string"). Surfaced via
     /// `tracing::info!` when the profile is loaded.
     pub notes: Vec<String>,
+}
+
+/// Harness-suitability score derived from a probed [`ModelProfile`] and the
+/// cross-walked §1 [`CapabilityMatrixRow`]. The score is intentionally
+/// explainable: every point comes from a named factor so CLI/GUI callers can
+/// show why a model is or is not a good fit for tool-using agent runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelSuitability {
+    pub model_id: String,
+    /// 0-100, higher is better.
+    pub score: u8,
+    pub grade: SuitabilityGrade,
+    pub recommendation: String,
+    pub factors: Vec<SuitabilityFactor>,
+    pub strengths: Vec<String>,
+    pub risks: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SuitabilityGrade {
+    Excellent,
+    Good,
+    Marginal,
+    Poor,
+}
+
+impl SuitabilityGrade {
+    pub fn wire_label(self) -> &'static str {
+        match self {
+            Self::Excellent => "excellent",
+            Self::Good => "good",
+            Self::Marginal => "marginal",
+            Self::Poor => "poor",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SuitabilityFactor {
+    pub name: String,
+    pub awarded: u8,
+    pub max: u8,
+    pub detail: String,
+}
+
+pub fn score_model_suitability(
+    profile: &ModelProfile,
+    row: &CapabilityMatrixRow,
+) -> ModelSuitability {
+    let mut factors = Vec::new();
+    let mut strengths = Vec::new();
+    let mut risks = Vec::new();
+
+    let native = if profile.supports_native_tools
+        && row.native_tool_use == CapabilityClaim::Supported
+    {
+        strengths.push("native tool calls round-tripped successfully".to_string());
+        factor(
+            "native_tool_use",
+            30,
+            30,
+            "native tool use is supported and probed",
+        )
+    } else if row.native_tool_use == CapabilityClaim::ClaimedButBroken {
+        risks.push("provider claims native tools but the probe did not confirm them".to_string());
+        factor(
+            "native_tool_use",
+            5,
+            30,
+            "native tool support is claimed-but-broken",
+        )
+    } else if profile.supports_native_tools {
+        strengths.push("probe observed native tool calls".to_string());
+        factor(
+            "native_tool_use",
+            24,
+            30,
+            "probe observed native tools but the matrix is conservative",
+        )
+    } else {
+        risks.push(
+            "native tool calls are unavailable; agent runs need a fallback strategy".to_string(),
+        );
+        factor("native_tool_use", 0, 30, "native tools unavailable")
+    };
+    factors.push(native);
+
+    let structured = match profile.strategy {
+        Strategy::NativeTool => {
+            strengths.push("best strategy is native tool envelopes".to_string());
+            factor("structured_output", 25, 25, "native tool strategy selected")
+        }
+        Strategy::JsonSentinel => {
+            strengths.push("JSON sentinel envelopes parsed successfully".to_string());
+            factor(
+                "structured_output",
+                21,
+                25,
+                "JSON sentinel strategy selected",
+            )
+        }
+        Strategy::RegexProse => {
+            risks.push(
+                "model fell back to regex/prose parsing; completion reliability is lower"
+                    .to_string(),
+            );
+            factor(
+                "structured_output",
+                6,
+                25,
+                "structured envelope probe failed",
+            )
+        }
+    };
+    factors.push(structured);
+
+    if profile.supports_streaming && row.streaming == CapabilityClaim::Supported {
+        strengths.push("streaming is available for responsive UI updates".to_string());
+        factors.push(factor("streaming", 10, 10, "streaming supported"));
+    } else if row.streaming == CapabilityClaim::ClaimedButBroken {
+        risks.push("streaming is claimed but marked broken".to_string());
+        factors.push(factor("streaming", 2, 10, "streaming claimed-but-broken"));
+    } else {
+        risks.push("streaming is unavailable; UI updates may be less responsive".to_string());
+        factors.push(factor("streaming", 0, 10, "streaming unavailable"));
+    }
+
+    let window = profile.context_window_tokens.max(row.context_window_tokens);
+    let (context_points, context_detail) = if window >= 128_000 {
+        (15, "128k+ context window")
+    } else if window >= 32_000 {
+        (12, "32k+ context window")
+    } else if window >= 16_000 {
+        (8, "16k+ context window")
+    } else if window >= 8_000 {
+        (4, "8k+ context window")
+    } else {
+        (0, "small context window")
+    };
+    if context_points >= 12 {
+        strengths.push(format!("large context window ({window} tokens)"));
+    } else {
+        risks.push(format!("limited context window ({window} tokens)"));
+    }
+    factors.push(factor("context_window", context_points, 15, context_detail));
+
+    if profile.utf8_clean {
+        factors.push(factor(
+            "utf8_clean",
+            10,
+            10,
+            "probe responses were UTF-8 clean",
+        ));
+    } else {
+        risks.push("probe responses contained replacement characters".to_string());
+        factors.push(factor("utf8_clean", 0, 10, "UTF-8 cleanliness failed"));
+    }
+
+    let (max_points, max_detail) = if profile.max_tokens >= 4096 {
+        (5, "4096+ max output tokens")
+    } else if profile.max_tokens >= 2048 {
+        (3, "2048+ max output tokens")
+    } else if profile.max_tokens > 0 {
+        (1, "small max output budget")
+    } else {
+        (0, "unknown max output budget")
+    };
+    if max_points <= 1 {
+        risks.push(format!(
+            "small max output budget ({} tokens)",
+            profile.max_tokens
+        ));
+    }
+    factors.push(factor("max_output", max_points, 5, max_detail));
+
+    match row.prompt_cache {
+        CapabilityClaim::Supported => {
+            strengths.push("prompt caching is available".to_string());
+            factors.push(factor("prompt_cache", 5, 5, "prompt cache supported"));
+        }
+        CapabilityClaim::ClaimedButBroken => {
+            risks.push("prompt caching is claimed but marked broken".to_string());
+            factors.push(factor(
+                "prompt_cache",
+                1,
+                5,
+                "prompt cache claimed-but-broken",
+            ));
+        }
+        CapabilityClaim::Unsupported => {
+            factors.push(factor("prompt_cache", 0, 5, "prompt cache unsupported"));
+        }
+    }
+
+    for note in &profile.notes {
+        if !note.starts_with("well_known:") {
+            risks.push(note.clone());
+        }
+    }
+
+    let score = factors
+        .iter()
+        .map(|f| f.awarded as u16)
+        .sum::<u16>()
+        .min(100) as u8;
+    let grade = if score >= 85 {
+        SuitabilityGrade::Excellent
+    } else if score >= 70 {
+        SuitabilityGrade::Good
+    } else if score >= 50 {
+        SuitabilityGrade::Marginal
+    } else {
+        SuitabilityGrade::Poor
+    };
+    let recommendation = match grade {
+        SuitabilityGrade::Excellent => "Recommended for full Atelier agent runs.".to_string(),
+        SuitabilityGrade::Good => {
+            "Usable for Atelier agent runs; monitor any listed risks.".to_string()
+        }
+        SuitabilityGrade::Marginal => {
+            "Usable only with degraded harness features; prefer a stronger coding model."
+                .to_string()
+        }
+        SuitabilityGrade::Poor => {
+            "Not recommended for this harness except for simple chat or diagnostics.".to_string()
+        }
+    };
+
+    ModelSuitability {
+        model_id: profile.model_id.clone(),
+        score,
+        grade,
+        recommendation,
+        factors,
+        strengths,
+        risks,
+    }
+}
+
+fn factor(name: &str, awarded: u8, max: u8, detail: &str) -> SuitabilityFactor {
+    SuitabilityFactor {
+        name: name.to_string(),
+        awarded,
+        max,
+        detail: detail.to_string(),
+    }
 }
 
 /// Raw evidence collected by the probe driver (PROBE-3). The pure
@@ -766,6 +1015,21 @@ mod tests {
         }
     }
 
+    fn matrix_row() -> CapabilityMatrixRow {
+        CapabilityMatrixRow {
+            model_id: "openai-compat:test".into(),
+            display_label: "Test model".into(),
+            native_tool_use: CapabilityClaim::Supported,
+            streaming: CapabilityClaim::Supported,
+            vision: CapabilityClaim::Unsupported,
+            prompt_cache: CapabilityClaim::Supported,
+            structured_output: CapabilityClaim::Supported,
+            long_context: CapabilityClaim::Supported,
+            context_window_tokens: 128_000,
+            source: super::super::capability_matrix::CapabilityRowSource::Adapter,
+        }
+    }
+
     #[test]
     fn probe_load_outcome_wire_label_agrees_with_serde() {
         // Regression for v58 HIGH-bug-1 — pin `wire_label` to the
@@ -787,6 +1051,46 @@ mod tests {
                 "wire_label({outcome:?}) must match serde projection",
             );
         }
+    }
+
+    #[test]
+    fn suitability_scores_full_harness_model_as_excellent() {
+        let profile = fixture(
+            "openai-compat:test",
+            "http://localhost:11434/v1",
+            Strategy::NativeTool,
+        );
+        let score = score_model_suitability(&profile, &matrix_row());
+        assert_eq!(score.score, 100);
+        assert_eq!(score.grade, SuitabilityGrade::Excellent);
+        assert!(score
+            .strengths
+            .iter()
+            .any(|s| s.contains("native tool calls")));
+    }
+
+    #[test]
+    fn suitability_penalizes_regex_only_small_context_model() {
+        let mut profile = fixture(
+            "openai-compat:weak",
+            "http://localhost:11434/v1",
+            Strategy::RegexProse,
+        );
+        profile.supports_native_tools = false;
+        profile.supports_streaming = false;
+        profile.utf8_clean = false;
+        profile.context_window_tokens = 4096;
+        profile.max_tokens = 1024;
+        let mut row = matrix_row();
+        row.native_tool_use = CapabilityClaim::ClaimedButBroken;
+        row.streaming = CapabilityClaim::Unsupported;
+        row.prompt_cache = CapabilityClaim::Unsupported;
+        row.context_window_tokens = 4096;
+
+        let score = score_model_suitability(&profile, &row);
+        assert!(score.score < 50, "score was {}", score.score);
+        assert_eq!(score.grade, SuitabilityGrade::Poor);
+        assert!(score.risks.iter().any(|s| s.contains("regex/prose")));
     }
 
     #[test]

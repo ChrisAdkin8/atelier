@@ -24,9 +24,10 @@
     busy: boolean
     thinking: boolean
     activeSubagents?: SubagentEntry[]
+    modelSuitability?: { score: number; grade: string; recommendation: string } | null
   }
 
-  let { busy, thinking, activeSubagents = [] }: Props = $props()
+  let { busy, thinking, activeSubagents = [], modelSuitability = null }: Props = $props()
 
   type SkillEntry = {
     name: string
@@ -178,6 +179,12 @@
         acceptHighlighted()
         return
       }
+      if (e.key === 'Enter' && !e.metaKey && !e.ctrlKey && !e.shiftKey && !e.altKey) {
+        e.preventDefault()
+        acceptHighlighted()
+        void commit()
+        return
+      }
       if (e.key === 'Escape') {
         e.preventDefault()
         prompt = ''
@@ -218,6 +225,12 @@
     if (parseSlash(trimmed)) return 'Auto: Skill'
     return shouldUseAgent(trimmed) ? 'Auto: Agent' : 'Auto: Chat'
   })
+
+  let showAgentSuitabilityWarning = $derived(
+    routeLabel === 'Auto: Agent'
+      && modelSuitability != null
+      && (modelSuitability.grade === 'marginal' || modelSuitability.grade === 'poor'),
+  )
 
   // v60.55 — auto-scroll the selected row into view as ↑/↓ moves the
   // highlight. Without this, pressing ↓ past the visible items moves
@@ -281,6 +294,12 @@
           sub-agent ({sa.subagentType}): turn {sa.turn}/{sa.maxTurns}
         </span>
       {/each}
+    </div>
+  {/if}
+  {#if showAgentSuitabilityWarning && modelSuitability}
+    <div class="agent-warning" role="status">
+      This model is rated {modelSuitability.grade} for Agent mode ({modelSuitability.score}/100).
+      {modelSuitability.recommendation}
     </div>
   {/if}
   {#if error}
@@ -435,6 +454,14 @@
     display: flex;
     flex-wrap: wrap;
     gap: 0.4rem;
+  }
+  .agent-warning {
+    padding: 0.35rem 0.55rem;
+    border: 1px solid color-mix(in srgb, var(--accent-yellow) 70%, transparent);
+    border-radius: 4px;
+    background: color-mix(in srgb, var(--accent-yellow) 12%, transparent);
+    color: var(--accent-yellow);
+    font-size: 0.78rem;
   }
   .sa-row {
     font-family: var(--font-mono);

@@ -13,6 +13,7 @@
 // Import the binary's view via the library name.
 use atelier_cli::overhead;
 use atelier_cli::runner;
+use atelier_core::Adapter;
 
 use atelier_core::config::{
     LoadedConfig, ProbePolicyName, ProviderKind, ProviderProfile, ProvidersConfig,
@@ -214,7 +215,10 @@ VERBs:\n\
                   add/update `[providers.<profile>].api_key` in providers.toml.\n\
     test <profile> [--workspace <PATH>]\n\
                   Resolve the profile credential and call the OpenAI-compatible\n\
-                  `/models` endpoint without printing the secret.\n";
+                  `/models` endpoint without printing the secret.\n\
+    score <profile> [--workspace <PATH>] [--force-probe] [--json]\n\
+                  Probe/cache the profile and score the model's suitability\n\
+                  for Atelier tool-using agent runs.\n";
 
 fn run_providers(mut args: impl Iterator<Item = String>) -> ExitCode {
     match args.next().as_deref() {
@@ -224,6 +228,7 @@ fn run_providers(mut args: impl Iterator<Item = String>) -> ExitCode {
         }
         Some("auth") => providers_auth(args),
         Some("test") => providers_test(args),
+        Some("score") => providers_score(args),
         Some(other) => {
             eprintln!("atelier providers: unknown verb `{other}`\n");
             eprintln!("{PROVIDERS_USAGE}");
@@ -459,6 +464,270 @@ fn providers_test(args: impl Iterator<Item = String>) -> ExitCode {
         Err(e) => {
             eprintln!("atelier providers test: {e}");
             ExitCode::from(1)
+        }
+    }
+}
+
+fn providers_score(args: impl Iterator<Item = String>) -> ExitCode {
+    let mut profile = None;
+    let mut workspace = None;
+    let mut force_probe = false;
+    let mut json = false;
+    let mut iter = args;
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                println!("{PROVIDERS_USAGE}");
+                return ExitCode::SUCCESS;
+            }
+            "--workspace" => match iter.next() {
+                Some(path) => workspace = Some(PathBuf::from(path)),
+                None => {
+                    eprintln!("atelier providers score: --workspace requires a path");
+                    return ExitCode::from(2);
+                }
+            },
+            "--force-probe" => force_probe = true,
+            "--json" => json = true,
+            other if other.starts_with('-') => {
+                eprintln!("atelier providers score: unknown option `{other}`");
+                return ExitCode::from(2);
+            }
+            other => {
+                if profile.replace(other.to_string()).is_some() {
+                    eprintln!("atelier providers score: only one profile name is accepted");
+                    return ExitCode::from(2);
+                }
+            }
+        }
+    }
+    let Some(profile_name) = profile else {
+        eprintln!("atelier providers score: <profile> is required");
+        return ExitCode::from(2);
+    };
+    let workspace = match workspace.or_else(|| env::current_dir().ok()) {
+        Some(path) => path,
+        None => {
+            eprintln!("atelier providers score: cannot determine current directory");
+            return ExitCode::from(1);
+        }
+    };
+    let loaded = match ProvidersConfig::load(&workspace) {
+        Ok(Some(loaded)) => loaded,
+        Ok(None) => {
+            eprintln!(
+                "atelier providers score: no providers.toml found for {}",
+                workspace.display()
+            );
+            return ExitCode::from(2);
+        }
+        Err(e) => {
+            eprintln!("atelier providers score: config error: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let Some(profile_config) = loaded.config.providers.get(&profile_name) else {
+        eprintln!(
+            "atelier providers score: profile {profile_name:?} not found in {}",
+            loaded.path.display()
+        );
+        return ExitCode::from(2);
+    };
+
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("atelier providers score: tokio runtime build failed: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    match rt.block_on(score_provider_profile(
+        &profile_name,
+        profile_config,
+        force_probe,
+    )) {
+        Ok((profile, outcome, row, suitability)) => {
+            if json {
+                let value = serde_json::json!({
+                    "profile": profile_name,
+                    "probe_outcome": outcome.wire_label(),
+                    "model_profile": profile,
+                    "capability_matrix": row,
+                    "suitability": suitability,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".into())
+                );
+            } else {
+                print_suitability_report(&profile_name, outcome, &row, &suitability);
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("atelier providers score: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+async fn score_provider_profile(
+    profile_name: &str,
+    profile: &ProviderProfile,
+    force_probe: bool,
+) -> Result<ProviderScore, String> {
+    let (adapter, base_url, force_profile) = build_scoring_adapter(profile_name, profile)?;
+    let caps = adapter.capabilities();
+    let (model_profile, outcome) = if let Some(profile) = force_profile {
+        (
+            profile,
+            atelier_core::adapter::model_profile::ProbeLoadOutcome::NotCached,
+        )
+    } else {
+        atelier_core::adapter::model_profile::ProfileStore::user_default()
+            .load_or_probe(
+                adapter.as_ref(),
+                &base_url,
+                force_probe,
+                atelier_core::time::now_rfc3339(),
+            )
+            .await
+            .map_err(|e| e.to_string())?
+    };
+    let base_row =
+        atelier_core::adapter::capability_matrix::matrix_row_for(adapter.model_id(), &caps);
+    let row =
+        atelier_core::adapter::capability_matrix::crosswalk_with_profile(base_row, &model_profile);
+    let suitability =
+        atelier_core::adapter::model_profile::score_model_suitability(&model_profile, &row);
+    Ok((model_profile, outcome, row, suitability))
+}
+
+type ProviderScore = (
+    atelier_core::adapter::model_profile::ModelProfile,
+    atelier_core::adapter::model_profile::ProbeLoadOutcome,
+    atelier_core::adapter::capability_matrix::CapabilityMatrixRow,
+    atelier_core::adapter::model_profile::ModelSuitability,
+);
+
+type ScoringAdapterParts = (
+    std::sync::Arc<dyn Adapter>,
+    String,
+    Option<atelier_core::adapter::model_profile::ModelProfile>,
+);
+
+fn build_scoring_adapter(
+    profile_name: &str,
+    profile: &ProviderProfile,
+) -> Result<ScoringAdapterParts, String> {
+    let kind = profile
+        .provider
+        .ok_or_else(|| format!("profile {profile_name:?} has no `provider` field"))?;
+    let model_id = profile.model.clone().unwrap_or_else(|| match kind {
+        ProviderKind::Mock => "mock:default".to_string(),
+        ProviderKind::Anthropic => "anthropic:claude-opus-4-7".to_string(),
+        ProviderKind::OpenaiCompat => String::new(),
+    });
+    if model_id.is_empty() {
+        return Err(format!(
+            "profile {profile_name:?}: provider `openai-compat` requires a `model`"
+        ));
+    }
+
+    match kind {
+        ProviderKind::Mock => {
+            let adapter =
+                std::sync::Arc::new(atelier_core::adapter::MockAdapter::new(model_id.clone()));
+            let profile =
+                atelier_core::adapter::model_profile::ModelProfile::skipped_for_well_known(
+                    model_id,
+                    atelier_core::protocol_strategy::Strategy::NativeTool,
+                    adapter.capabilities().context_window_tokens,
+                    atelier_core::adapter::model_profile::DEFAULT_PROFILE_MAX_TOKENS,
+                    atelier_core::time::now_rfc3339(),
+                );
+            Ok((adapter, String::new(), Some(profile)))
+        }
+        ProviderKind::Anthropic => {
+            if !model_id.starts_with("anthropic:") {
+                return Err(format!(
+                    "profile {profile_name:?}: anthropic model must be prefixed `anthropic:`"
+                ));
+            }
+            let adapter = atelier_core::adapter::anthropic::AnthropicAdapter::from_env(model_id)
+                .map_err(|e| e.to_string())?;
+            Ok((std::sync::Arc::new(adapter), String::new(), None))
+        }
+        ProviderKind::OpenaiCompat => {
+            atelier_core::provider_profile_base_url_may_receive_credential(
+                profile.base_url.as_deref(),
+                false,
+                atelier_core::api_key_ref_may_resolve(
+                    profile.api_key.as_deref(),
+                    atelier_core::OPENAI_API_KEY_ENV,
+                ),
+            )?;
+            let base_url = effective_openai_base_url(profile.base_url.clone());
+            if !preflight_base_url(&base_url) {
+                return Err(format!(
+                    "profile {profile_name:?}: server at {base_url:?} is unreachable \
+                     (TCP connect timed out)"
+                ));
+            }
+            let api_key = atelier_core::resolve_openai_api_key(profile.api_key.as_deref())
+                .map_err(|e| format!("provider credential: {e}"))?;
+            let mut adapter = atelier_core::adapter::openai_compat::OpenAiCompatAdapter::new(
+                api_key,
+                model_id,
+                base_url.clone(),
+            );
+            if profile.cache_prompt.unwrap_or(false) {
+                adapter = adapter.with_cache_prompt(true);
+            }
+            Ok((std::sync::Arc::new(adapter), base_url, None))
+        }
+    }
+}
+
+fn print_suitability_report(
+    profile_name: &str,
+    outcome: atelier_core::adapter::model_profile::ProbeLoadOutcome,
+    row: &atelier_core::adapter::capability_matrix::CapabilityMatrixRow,
+    suitability: &atelier_core::adapter::model_profile::ModelSuitability,
+) {
+    println!(
+        "atelier providers score: profile {profile_name:?} model {} scored {}/100 ({})",
+        suitability.model_id,
+        suitability.score,
+        suitability.grade.wire_label()
+    );
+    println!("probe outcome: {}", outcome.wire_label());
+    println!("matrix source: {}", row.source.wire_label());
+    println!("recommendation: {}", suitability.recommendation);
+    println!();
+    println!("factors:");
+    for factor in &suitability.factors {
+        println!(
+            "  - {:<18} {:>2}/{:<2} {}",
+            factor.name, factor.awarded, factor.max, factor.detail
+        );
+    }
+    if !suitability.strengths.is_empty() {
+        println!();
+        println!("strengths:");
+        for strength in &suitability.strengths {
+            println!("  - {strength}");
+        }
+    }
+    if !suitability.risks.is_empty() {
+        println!();
+        println!("risks:");
+        for risk in &suitability.risks {
+            println!("  - {risk}");
         }
     }
 }

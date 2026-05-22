@@ -1,5 +1,54 @@
 # Atelier Spec — Changelog
 
+## v60.85 — 2026-05-22 (deep-scan hardening follow-up)
+
+Closes the actionable findings from the May 22 deep scan while preserving the Rust 1.85 toolchain policy.
+
+- Hardened the TUI model footer by routing model id, strategy, probe outcome, and broken-capability label text through `safe_span(...)`; added regression coverage for ESC/BEL/bidi stripping in the footer badge.
+- Fixed GUI slash-skill autocomplete so plain `Enter` accepts and commits the highlighted skill, matching the existing v60.52 UX contract.
+- Factored the provider-scoring tuple returns in `atelier providers score` into named aliases so the workspace Clippy gate no longer trips `clippy::type-complexity`.
+- Re-ran the Shai-Hulud/npm IoC sweep and audit checks. The npm/Shai-Hulud surface remains clean. RustSec advisories for `time`, `lru`, and `glib` remain explicit audit-ignore debt under the pinned Rust 1.85 policy: `time >= 0.3.47` requires Rust 1.88, `ratatui 0.30` requires Rust 1.86, and the current Tauri/GTK path still carries the `glib` advisory.
+
+## v60.84 — 2026-05-22 (startup model fit badge)
+
+Makes the GUI model-fit badge visible immediately on launch.
+
+- Added `snapshot_current_model`, a Tauri command that activates the default provider if needed and returns the same `ModelProfileLoaded` projection used by runs/swaps.
+- `App.svelte` now invokes that snapshot after subscribing to `atelier://event`, so the score badge appears before the first Chat/Agent turn.
+
+## v60.83 — 2026-05-22 (GUI model fit badge)
+
+Surfaces model suitability scoring in the GUI at the point of use.
+
+- `ModelProfileLoaded` now carries the optional `ModelSuitability` score alongside the strategy and capability matrix.
+- The GUI footer renders the active model as a clickable fit badge (`Excellent 95`, `Good 78`, etc.) with an expandable popover showing recommendation, strengths, risks, and factor breakdown.
+- The Composer shows a non-blocking warning when an Agent-routed prompt would use a marginal or poor model.
+
+## v60.82 — 2026-05-22 (model suitability scoring)
+
+Adds an explainable score for deciding whether a configured model is a good fit for Atelier's tool-using harness.
+
+- Added `ModelSuitability`, `SuitabilityGrade`, and factor-level scoring in `adapter::model_profile`, derived from the probed `ModelProfile` plus the cross-walked capability matrix row.
+- Added `atelier providers score <profile> [--workspace <PATH>] [--force-probe] [--json]`, which builds the configured adapter, reuses the probe/profile cache, and prints a 0-100 score, grade, recommendation, strengths, risks, and factor breakdown.
+- The score weights native tool use, structured-output strategy, streaming, context window, UTF-8 cleanliness, max output budget, and prompt-cache support. Core/TUI/GUI runtime behaviour is unchanged.
+
+## v60.81 — 2026-05-22 (GUI Plan pane removal)
+
+Removes the Plan pane from the Tauri GUI and drops the GUI-only plan editing surface.
+
+- Deleted `PlanPane.svelte` and removed it from the right-column layout; Memory and Sub-agent panels now share the top-right slot.
+- Removed the GUI Tauri commands for adding, removing, marking, constraining, and reordering plan steps.
+- Removed frontend plan state/types/reducer handling and plan-specific style tokens. `PlanSnapshot` remains exhaustively handled in the Rust bridge but is no longer projected to the webview.
+- Core and TUI plan support remain unchanged.
+
+## v60.80 — 2026-05-22 (GUI Agent auto-memory refresh)
+
+Makes auto-drafted memory cards visible from GUI Agent runs, not just direct Chat adapter calls.
+
+- GUI Agent failures now classify fixable Runner errors and draft the same workspace memory cards as Chat mode: authentication failures, missing environment variable credentials, unreachable providers, rate limits, and context overflows.
+- After an auto-card write, the GUI emits a refreshed `MemoryCards` snapshot so the Memory pane updates immediately instead of requiring a reload or a later memory refresh.
+- Added focused regression tests for Agent-path auth, missing-env config, and context-overflow memory-card classification.
+
 ## v60.79 — 2026-05-22 (derived memory index)
 
 Adds a rebuildable SQLite/FTS memory index while keeping Markdown memory cards as the canonical source of truth.

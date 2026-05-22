@@ -609,6 +609,7 @@ impl AppState {
                 strategy,
                 outcome,
                 capability_row,
+                ..
             } => {
                 // v52 — record the active model so the footer can
                 // render it.
@@ -2400,23 +2401,23 @@ fn render_help_left(state: &AppState) -> String {
 fn render_help_right_model(model: &CurrentModel) -> Paragraph<'static> {
     let mut spans = vec![
         Span::styled(
-            model.model_id.clone(),
+            safe_span(&model.model_id),
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(" · ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            model.strategy.to_string(),
-            Style::default().fg(Color::Green),
-        ),
+        Span::styled(safe_span(model.strategy), Style::default().fg(Color::Green)),
         Span::styled(" · ", Style::default().fg(Color::DarkGray)),
-        Span::styled(model.outcome.clone(), Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            safe_span(&model.outcome),
+            Style::default().fg(Color::DarkGray),
+        ),
     ];
     if let Some(broken) = capability_broken_label(model.capability_row.as_ref()) {
         spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
         spans.push(Span::styled(
-            broken,
+            safe_span(&broken),
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
@@ -3852,6 +3853,7 @@ mod tests {
             strategy: Strategy::JsonSentinel,
             outcome: ProbeLoadOutcome::CacheHit,
             capability_row: None,
+            suitability: None,
         });
         let m = s.current_model.expect("current_model populated");
         assert_eq!(m.model_id, "local:qwen2.5-coder:7b");
@@ -3873,6 +3875,23 @@ mod tests {
         );
         assert!(rendered.contains("json_sentinel"), "got:\n{rendered}");
         assert!(rendered.contains("cache_hit"), "got:\n{rendered}");
+    }
+
+    #[test]
+    fn footer_sanitizes_model_badge_strings() {
+        let mut s = AppState::new();
+        s.current_model = Some(CurrentModel {
+            model_id: "local:\x1b[2Jbad\u{202e}".into(),
+            base_url: "http://localhost:11434/v1".into(),
+            strategy: "native_tool",
+            outcome: "cache\x07hit".into(),
+            capability_row: None,
+        });
+        let rendered = render_to_string(&s, Rect::new(0, 0, 120, 24));
+        assert!(!rendered.contains('\x1b'), "got:\n{rendered:?}");
+        assert!(!rendered.contains('\x07'), "got:\n{rendered:?}");
+        assert!(!rendered.contains('\u{202e}'), "got:\n{rendered:?}");
+        assert!(rendered.contains("<RLO>"), "got:\n{rendered}");
     }
 
     #[test]

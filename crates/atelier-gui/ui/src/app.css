@@ -49,12 +49,6 @@
   --diff-context: var(--fg-muted);
   --diff-hunk-header: var(--accent-blue);
 
-  /* Plan-step status glyph colours */
-  --status-pending: var(--fg-dim);
-  --status-in-progress: var(--accent-yellow);
-  --status-done: var(--accent-green);
-  --status-skipped: var(--fg-dim);
-
   /* Type */
   --font-ui:
     -apple-system,

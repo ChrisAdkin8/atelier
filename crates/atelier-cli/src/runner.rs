@@ -1393,6 +1393,10 @@ impl Runner {
             );
             atelier_core::adapter::capability_matrix::crosswalk_with_profile(base_row, &profile)
         };
+        let suitability = atelier_core::adapter::model_profile::score_model_suitability(
+            &profile,
+            &capability_row,
+        );
         let _ = try_emit(
             &bus,
             Event::ModelProfileLoaded {
@@ -1401,6 +1405,7 @@ impl Runner {
                 strategy: profile.strategy,
                 outcome,
                 capability_row: Some(capability_row),
+                suitability: Some(suitability),
             },
         );
         // v60.10 §1 BYOM — consume the swap announcement queued by an

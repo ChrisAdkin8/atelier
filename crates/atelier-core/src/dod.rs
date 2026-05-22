@@ -191,7 +191,11 @@ impl DodConfig {
     /// Global path: `$HOME/.atelier/dod.json`. Returns `None` when home
     /// cannot be resolved.
     pub fn global_path() -> Option<PathBuf> {
-        std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".atelier").join(DOD_FILE))
+        Self::global_path_with_home(std::env::var_os("HOME").as_deref().map(Path::new))
+    }
+
+    fn global_path_with_home(home: Option<&Path>) -> Option<PathBuf> {
+        home.map(|h| h.join(".atelier").join(DOD_FILE))
     }
 
     /// Discovery: per-repo file overrides global. Missing both is
@@ -207,11 +211,18 @@ impl DodConfig {
     /// See [`Self::paths_searched`] if you want to log where discovery
     /// looked.
     pub fn load(repo_root: &Path) -> Result<Option<Self>, DodError> {
+        Self::load_with_home(
+            repo_root,
+            std::env::var_os("HOME").as_deref().map(Path::new),
+        )
+    }
+
+    fn load_with_home(repo_root: &Path, home: Option<&Path>) -> Result<Option<Self>, DodError> {
         let per_repo = Self::per_repo_path(repo_root);
         if per_repo.is_file() {
             return Ok(Some(Self::load_from(&per_repo)?));
         }
-        if let Some(global) = Self::global_path() {
+        if let Some(global) = Self::global_path_with_home(home) {
             if global.is_file() {
                 return Ok(Some(Self::load_from(&global)?));
             }
@@ -224,8 +235,15 @@ impl DodConfig {
     /// e.g. logging `no DoD configured (searched: <paths>)` instead of
     /// silently degrading.
     pub fn paths_searched(repo_root: &Path) -> Vec<PathBuf> {
+        Self::paths_searched_with_home(
+            repo_root,
+            std::env::var_os("HOME").as_deref().map(Path::new),
+        )
+    }
+
+    fn paths_searched_with_home(repo_root: &Path, home: Option<&Path>) -> Vec<PathBuf> {
         let mut out = vec![Self::per_repo_path(repo_root)];
-        if let Some(global) = Self::global_path() {
+        if let Some(global) = Self::global_path_with_home(home) {
             out.push(global);
         }
         out
@@ -426,19 +444,7 @@ mod tests {
     #[test]
     fn load_returns_none_when_no_dod_present() {
         let dir = TempDir::new().unwrap();
-        // Empty repo; no global path expected to exist either, but to be
-        // safe we point HOME at the temp dir so the global lookup also
-        // misses cleanly.
-        let saved_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", dir.path());
-        let result = DodConfig::load(dir.path()).unwrap();
-        // Restore HOME before assertion to avoid corrupting the env on
-        // failure.
-        if let Some(h) = saved_home {
-            std::env::set_var("HOME", h);
-        } else {
-            std::env::remove_var("HOME");
-        }
+        let result = DodConfig::load_with_home(dir.path(), Some(dir.path())).unwrap();
         assert!(result.is_none());
     }
 
@@ -465,14 +471,9 @@ mod tests {
         )
         .unwrap();
 
-        let saved_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", home.path());
-        let loaded = DodConfig::load(repo.path()).unwrap().unwrap();
-        if let Some(h) = saved_home {
-            std::env::set_var("HOME", h);
-        } else {
-            std::env::remove_var("HOME");
-        }
+        let loaded = DodConfig::load_with_home(repo.path(), Some(home.path()))
+            .unwrap()
+            .unwrap();
         assert_eq!(loaded.checks[0].name, "from_repo");
     }
 

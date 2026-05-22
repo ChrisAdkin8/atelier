@@ -21,7 +21,9 @@
 
 use std::sync::Arc;
 
-use atelier_cli::runner::{DispatcherHandle, EventSink, MockResponse, ProviderChoice, Runner};
+use atelier_cli::runner::{
+    DispatcherHandle, EventSink, MockResponse, ProviderChoice, RunError, Runner,
+};
 use atelier_core::adapter::{Message, Role, ToolCallRequest};
 use atelier_core::dispatcher::ApprovalPolicy;
 use atelier_core::persistence::OnDiskSession;
@@ -208,11 +210,6 @@ pub fn run() {
             add_memory_card,
             delete_memory_card,
             promote_memory_card,
-            add_plan_step,
-            remove_plan_step,
-            mark_plan_step_status,
-            add_plan_step_constraint,
-            reorder_plan_steps,
             // v60.5 §5 non-destructive compaction.
             compact_context_items,
             // v60.6 §5 Expand.
@@ -228,6 +225,8 @@ pub fn run() {
             respond_to_swap,
             // v60.37 B5 — hydrate the dropdown from .atelier/providers.toml.
             list_provider_profiles,
+            // v60.84 — hydrate the model fit badge before the first run.
+            snapshot_current_model,
             // v60.45 — workspace selector (set + read live workspace path).
             get_workspace,
             set_workspace,
@@ -350,10 +349,6 @@ fn evict_context_item(
 /// `tauri.conf.json` and these caps become defence-in-depth rather
 /// than the primary boundary.
 const MAX_MEMORY_CARD_BYTES: usize = 32 * 1024;
-const MAX_PLAN_STEP_BYTES: usize = 4 * 1024;
-const MAX_PLAN_CONSTRAINT_BYTES: usize = 1024;
-const MAX_PLAN_STEPS: usize = 256;
-
 /// Returns `true` iff `p` is a safe repo-relative path: non-empty, relative
 /// (no leading `/`), and contains no `..` components. Only compiled in test
 /// mode; retained as a regression guard for path-safety logic.
@@ -430,73 +425,6 @@ fn promote_memory_card(
     })
 }
 
-#[tauri::command]
-fn add_plan_step(state: tauri::State<'_, SessionState>, text: String) -> Result<String, String> {
-    check_bytes("plan step text", &text, MAX_PLAN_STEP_BYTES)?;
-    let sd = require_dispatcher(&state)?;
-    sd.add_plan_step(text).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-fn remove_plan_step(state: tauri::State<'_, SessionState>, id: String) -> Result<(), String> {
-    let sd = require_dispatcher(&state)?;
-    sd.remove_plan_step(&id).map_err(|e| e.to_string())
-}
-
-/// Map a wire-format status string onto [`atelier_core::plan::PlanStatus`].
-/// Rejects unknown labels rather than coercing silently.
-///
-/// v58 (MED-smell-2 fix) — routes through
-/// `PlanStatus::from_wire_label`, the single source of truth shared
-/// with the serde `rename_all = "snake_case"` projection.
-fn parse_plan_status(s: &str) -> Result<atelier_core::plan::PlanStatus, String> {
-    atelier_core::plan::PlanStatus::from_wire_label(s)
-        .ok_or_else(|| format!("unknown plan status {s:?}"))
-}
-
-#[tauri::command]
-fn mark_plan_step_status(
-    state: tauri::State<'_, SessionState>,
-    id: String,
-    status: String,
-) -> Result<(), String> {
-    let sd = require_dispatcher(&state)?;
-    let parsed = parse_plan_status(&status)?;
-    sd.mark_plan_step_status(&id, parsed)
-        .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-fn add_plan_step_constraint(
-    state: tauri::State<'_, SessionState>,
-    id: String,
-    constraint: String,
-) -> Result<(), String> {
-    check_bytes(
-        "plan step constraint",
-        &constraint,
-        MAX_PLAN_CONSTRAINT_BYTES,
-    )?;
-    let sd = require_dispatcher(&state)?;
-    sd.add_plan_step_constraint(&id, constraint)
-        .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-fn reorder_plan_steps(
-    state: tauri::State<'_, SessionState>,
-    ordering: Vec<String>,
-) -> Result<(), String> {
-    if ordering.len() > MAX_PLAN_STEPS {
-        return Err(format!(
-            "reorder list too long: {} items (max {MAX_PLAN_STEPS})",
-            ordering.len()
-        ));
-    }
-    let sd = require_dispatcher(&state)?;
-    sd.reorder_plan_steps(ordering).map_err(|e| e.to_string())
-}
-
 /// v60.5 — wire shape returned by the Compact toast in the §5 Context
 /// pane. Carries enough to populate "Compacted N items, freed ~Mk
 /// tokens; summary card mem-…" without a follow-up query.
@@ -510,9 +438,8 @@ pub struct CompactionResult {
 }
 
 /// v60.5 — cap on the number of items a single compaction call may
-/// touch. Matches the `MAX_PLAN_STEPS` discipline on the v55 mutators:
-/// a hostile or buggy webview shouldn't be able to push a 1M-id list
-/// through the IPC boundary.
+/// touch. A hostile or buggy webview shouldn't be able to push a 1M-id
+/// list through the IPC boundary.
 const MAX_COMPACTION_IDS: usize = 256;
 const MAX_GUI_SETTINGS_BYTES: u64 = 64 * 1024;
 
@@ -746,6 +673,28 @@ pub struct SwapOptionWire {
 #[tauri::command]
 fn list_provider_profiles(state: tauri::State<'_, SessionState>) -> Vec<SwapOptionWire> {
     list_provider_profiles_in(&state.workspace_root())
+}
+
+#[tauri::command]
+fn snapshot_current_model(state: tauri::State<'_, SessionState>) -> Result<BridgedEvent, String> {
+    let adapter = match state.adapter_handle.get() {
+        Some(adapter) => adapter,
+        None => {
+            let adapter = resolve_default_adapter(&state.workspace_root()).unwrap_or_else(|e| {
+                tracing::debug!(
+                    error = %e,
+                    "snapshot_current_model: falling back to mock default"
+                );
+                std::sync::Arc::new(atelier_core::adapter::MockAdapter::new("mock:default"))
+            });
+            state.adapter_handle.swap(adapter.clone());
+            adapter
+        }
+    };
+    Ok(bridge_event(&model_profile_loaded_event(
+        adapter.as_ref(),
+        atelier_core::adapter::model_profile::ProbeLoadOutcome::CacheHit,
+    )))
 }
 
 /// Test-visible inner helper for [`list_provider_profiles`]. Splitting
@@ -1218,6 +1167,8 @@ async fn swap_adapter(
             atelier_core::adapter::capability_matrix::matrix_row_for(new_adapter.model_id(), &caps);
         atelier_core::adapter::capability_matrix::crosswalk_with_profile(base, &profile)
     };
+    let suitability =
+        atelier_core::adapter::model_profile::score_model_suitability(&profile, &capability_row);
     emit_event(
         &app,
         &SessionEvent::ModelProfileLoaded {
@@ -1226,6 +1177,7 @@ async fn swap_adapter(
             strategy: profile.strategy,
             outcome: atelier_core::adapter::model_profile::ProbeLoadOutcome::CacheHit,
             capability_row: Some(capability_row),
+            suitability: Some(suitability),
         },
     );
     Ok(SwapResult {
@@ -1451,6 +1403,8 @@ use atelier_core::adapter::AdapterError;
 /// `<workspace>/.atelier/memory/auto_<slug>.md`.
 struct AutoCard {
     slug: &'static str,
+    description: String,
+    body_preview: String,
     body: String,
 }
 
@@ -1551,7 +1505,183 @@ fn auto_card_for_error(err: &AdapterError) -> Option<AutoCard> {
     let body = format!(
         "---\nname: auto-{slug}\ndescription: {description}\nmetadata:\n  type: feedback\n  auto: true\n  created_at: \"{now}\"\n---\n\n{body_md}"
     );
-    Some(AutoCard { slug, body })
+    Some(AutoCard {
+        slug,
+        description: description.to_string(),
+        body_preview: body_md.chars().take(200).collect(),
+        body,
+    })
+}
+
+fn auto_card_for_run_error(err: &RunError) -> Option<AutoCard> {
+    match err {
+        RunError::ContextOverflow {
+            needed_tokens,
+            limit_tokens,
+        } => auto_card_for_error(&AdapterError::ContextOverflow {
+            needed_tokens: *needed_tokens,
+            limit_tokens: *limit_tokens,
+        }),
+        RunError::Config(msg) if msg.contains("environment variable") => {
+            auto_card_for_error(&AdapterError::NotConfigured(msg.clone()))
+        }
+        RunError::Adapter(msg) if msg.contains("authentication failed") => {
+            auto_card_for_error(&AdapterError::Auth(msg.clone()))
+        }
+        RunError::Adapter(msg) if msg.contains("provider unreachable") => {
+            auto_card_for_error(&AdapterError::Unreachable(msg.clone()))
+        }
+        RunError::Adapter(msg) if msg.contains("rate-limited") => {
+            auto_card_for_error(&AdapterError::RateLimited { retry_after_ms: 0 })
+        }
+        RunError::Adapter(msg) if msg.contains("provider error: status 5") => {
+            auto_card_for_error(&AdapterError::Provider {
+                status: 500,
+                body: msg.clone(),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn emit_auto_memory_card(
+    app: &AppHandle,
+    real_workspace: Option<&std::path::Path>,
+    card: &AutoCard,
+    source: &'static str,
+) {
+    match write_workspace_auto_card(real_workspace, card) {
+        Ok(Some(path)) => {
+            tracing::info!(
+                path = %path.display(),
+                slug = card.slug,
+                source,
+                "auto-drafted workspace memory card"
+            );
+            emit_event(
+                app,
+                &SessionEvent::MessageCommitted {
+                    role: MessageRole::System,
+                    text: format!(
+                        "[auto-memory] drafted workspace card at {} — review in MemoryPane or edit by hand",
+                        path.display()
+                    ),
+                },
+            );
+            let cards = load_memory_card_summaries(real_workspace);
+            emit_event(
+                app,
+                &SessionEvent::MemoryCards {
+                    cards: if cards.is_empty() {
+                        vec![atelier_core::memory::MemoryCardSummary {
+                            id: format!("auto-{}", card.slug),
+                            title: card.description.clone(),
+                            body_preview: card.body_preview.clone(),
+                            created_at: atelier_core::time::now_rfc3339(),
+                            last_used: atelier_core::time::now_rfc3339(),
+                            pinned: false,
+                            compacted_from: None,
+                            cache_rewarm_tokens: None,
+                        }]
+                    } else {
+                        cards
+                    },
+                },
+            );
+        }
+        Ok(None) => {
+            tracing::debug!("auto-card skipped: no workspace selected (still on tempdir)");
+        }
+        Err(io_err) => {
+            tracing::warn!(
+                error = %io_err,
+                source,
+                "failed to write auto memory card"
+            );
+        }
+    }
+}
+
+fn load_memory_card_summaries(
+    workspace_root: Option<&std::path::Path>,
+) -> Vec<atelier_core::memory::MemoryCardSummary> {
+    let mut dirs = Vec::new();
+    if let Some(home) = std::env::var_os("HOME") {
+        dirs.push(atelier_core::memory_index::user_memory_dir(
+            &std::path::PathBuf::from(home),
+        ));
+    }
+    if let Some(ws) = workspace_root {
+        dirs.push(atelier_core::memory_index::project_memory_dir(ws));
+    }
+
+    let mut entries = Vec::new();
+    for dir in dirs {
+        let Ok(read) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in read.flatten() {
+            let path = entry.path();
+            let keep = path.extension().map(|x| x == "md").unwrap_or(false)
+                && path
+                    .file_name()
+                    .and_then(|f| f.to_str())
+                    .map(|n| n != "MEMORY.md" && n != "README.md")
+                    .unwrap_or(false);
+            if keep {
+                entries.push(path);
+            }
+        }
+    }
+    entries.sort();
+
+    entries
+        .into_iter()
+        .filter_map(|path| {
+            let body = std::fs::read_to_string(&path).ok()?;
+            let rendered = strip_frontmatter(&body).trim();
+            if rendered.is_empty() {
+                return None;
+            }
+            let mut lines = rendered
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty());
+            let title = lines
+                .next()
+                .unwrap_or_else(|| {
+                    path.file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("memory")
+                })
+                .trim_start_matches('#')
+                .trim()
+                .to_string();
+            let mut body_preview = lines.collect::<Vec<_>>().join("\n");
+            if body_preview.chars().count() > atelier_core::memory::MEMORY_BODY_PREVIEW_CHARS {
+                body_preview = body_preview
+                    .chars()
+                    .take(atelier_core::memory::MEMORY_BODY_PREVIEW_CHARS)
+                    .collect::<String>();
+                body_preview.push_str("...");
+            }
+            let now = atelier_core::time::now_rfc3339();
+            Some(atelier_core::memory::MemoryCardSummary {
+                id: path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("memory")
+                    .to_string(),
+                title,
+                body_preview,
+                created_at: now.clone(),
+                last_used: now,
+                pinned: false,
+                compacted_from: None,
+                cache_rewarm_tokens: None,
+            })
+        })
+        .collect()
 }
 
 /// Write an auto-card to `<workspace>/.atelier/memory/auto_<slug>.md`.
@@ -2168,6 +2298,10 @@ fn start_chat_run(
                 );
                 atelier_core::adapter::capability_matrix::crosswalk_with_profile(base, &profile)
             };
+            let suitability = atelier_core::adapter::model_profile::score_model_suitability(
+                &profile,
+                &capability_row,
+            );
             emit_event(
                 &app_clone,
                 &SessionEvent::ModelProfileLoaded {
@@ -2176,6 +2310,7 @@ fn start_chat_run(
                     strategy: profile.strategy,
                     outcome: atelier_core::adapter::model_profile::ProbeLoadOutcome::CacheHit,
                     capability_row: Some(capability_row),
+                    suitability: Some(suitability),
                 },
             );
         }
@@ -2220,36 +2355,12 @@ fn start_chat_run(
                 );
                 tracing::warn!(error = %e, "start_chat_run: adapter.stream failed");
                 if let Some(card) = auto_card_for_error(&e) {
-                    match write_workspace_auto_card(workspace_override.as_deref(), &card) {
-                        Ok(Some(path)) => {
-                            tracing::info!(
-                                path = %path.display(),
-                                slug = card.slug,
-                                "start_chat_run: auto-drafted workspace memory card"
-                            );
-                            emit_event(
-                                &app_clone,
-                                &SessionEvent::MessageCommitted {
-                                    role: MessageRole::System,
-                                    text: format!(
-                                        "[auto-memory] drafted workspace card at {} — review in MemoryPane or edit by hand",
-                                        path.display()
-                                    ),
-                                },
-                            );
-                        }
-                        Ok(None) => {
-                            tracing::debug!(
-                                "auto-card skipped: no workspace selected (still on tempdir)"
-                            );
-                        }
-                        Err(io_err) => {
-                            tracing::warn!(
-                                error = %io_err,
-                                "start_chat_run: failed to write auto memory card"
-                            );
-                        }
-                    }
+                    emit_auto_memory_card(
+                        &app_clone,
+                        workspace_override.as_deref(),
+                        &card,
+                        "start_chat_run",
+                    );
                 }
                 return;
             }
@@ -2530,6 +2641,7 @@ fn start_agent_run(
     );
 
     let app_for_finish = app.clone();
+    let real_workspace_for_auto_card = workspace_override.clone();
     tauri::async_runtime::spawn(async move {
         let _cleanup = RunCleanup {
             in_flight: run_in_flight,
@@ -2550,6 +2662,14 @@ fn start_agent_run(
                     },
                 );
                 tracing::warn!(error = %e, "agent run failed");
+                if let Some(card) = auto_card_for_run_error(&e) {
+                    emit_auto_memory_card(
+                        &app_for_finish,
+                        real_workspace_for_auto_card.as_deref(),
+                        &card,
+                        "start_agent_run",
+                    );
+                }
             }
         }
         // Release the cancellation token so cancel_run no longer fires
@@ -2679,6 +2799,40 @@ fn emit_event(app: &AppHandle, evt: &SessionEvent) {
     }
 }
 
+fn model_profile_loaded_event(
+    adapter: &dyn atelier_core::adapter::Adapter,
+    outcome: atelier_core::adapter::model_profile::ProbeLoadOutcome,
+) -> SessionEvent {
+    let caps = adapter.capabilities();
+    let strategy = if caps.native_tool_use.is_usable() {
+        atelier_core::protocol_strategy::Strategy::NativeTool
+    } else {
+        atelier_core::protocol_strategy::Strategy::JsonSentinel
+    };
+    let profile = atelier_core::adapter::model_profile::ModelProfile::skipped_for_well_known(
+        adapter.model_id(),
+        strategy,
+        caps.context_window_tokens,
+        atelier_core::adapter::model_profile::DEFAULT_PROFILE_MAX_TOKENS,
+        now_rfc3339(),
+    );
+    let capability_row = {
+        let base =
+            atelier_core::adapter::capability_matrix::matrix_row_for(adapter.model_id(), &caps);
+        atelier_core::adapter::capability_matrix::crosswalk_with_profile(base, &profile)
+    };
+    let suitability =
+        atelier_core::adapter::model_profile::score_model_suitability(&profile, &capability_row);
+    SessionEvent::ModelProfileLoaded {
+        model_id: profile.model_id.clone(),
+        base_url: profile.base_url.clone(),
+        strategy: profile.strategy,
+        outcome,
+        capability_row: Some(capability_row),
+        suitability: Some(suitability),
+    }
+}
+
 /// Project an [`atelier_core::session::Event`] onto the JSON shape the
 /// webview consumes. Pure function — exercised by the unit tests below
 /// without booting Tauri.
@@ -2716,9 +2870,9 @@ pub fn bridge_event(evt: &SessionEvent) -> BridgedEvent {
         SessionEvent::AssistantTextDelta { delta } => json!({
             "delta": delta,
         }),
-        SessionEvent::PlanSnapshot { steps } => json!({
-            "steps": serde_json::to_value(steps).unwrap_or(Value::Null),
-        }),
+        // The GUI no longer renders a Plan pane; keep the event exhaustively
+        // handled but avoid projecting unused plan data into the webview.
+        SessionEvent::PlanSnapshot { .. } => Value::Null,
         SessionEvent::LedgerAppended { entry } => json!({
             "entry": serde_json::to_value(entry).unwrap_or(Value::Null),
         }),
@@ -2760,6 +2914,7 @@ pub fn bridge_event(evt: &SessionEvent) -> BridgedEvent {
             strategy,
             outcome,
             capability_row,
+            suitability,
         } => json!({
             "model_id": model_id,
             "base_url": base_url,
@@ -2776,6 +2931,7 @@ pub fn bridge_event(evt: &SessionEvent) -> BridgedEvent {
             // `CapabilityMatrixRow` already derives Serialize with
             // serde-rename-all=snake_case so pass through verbatim.
             "capability_row": serde_json::to_value(capability_row).unwrap_or(Value::Null),
+            "suitability": serde_json::to_value(suitability).unwrap_or(Value::Null),
         }),
         SessionEvent::ContextItems { items } => json!({
             // `ContextItemSummary` already derives Serialize with
@@ -3103,6 +3259,43 @@ mod tests {
     }
 
     #[test]
+    fn agent_adapter_auth_error_drafts_auth_card() {
+        let card = auto_card_for_run_error(&RunError::Adapter(
+            "authentication failed: 401 Unauthorized".to_string(),
+        ))
+        .expect("auth adapter errors should draft a card");
+        assert_eq!(card.slug, "auth_failure");
+    }
+
+    #[test]
+    fn agent_missing_env_config_error_drafts_not_configured_card() {
+        let card = auto_card_for_run_error(&RunError::Config(
+            "environment variable ATELIER_MEMORY_DEMO_BAD_KEY is not set or is empty".to_string(),
+        ))
+        .expect("missing env config errors should draft a card");
+        assert_eq!(card.slug, "adapter_not_configured");
+    }
+
+    #[test]
+    fn agent_context_overflow_error_drafts_context_card() {
+        let card = auto_card_for_run_error(&RunError::ContextOverflow {
+            needed_tokens: 42,
+            limit_tokens: 24,
+        })
+        .expect("context overflow should draft a card");
+        assert_eq!(card.slug, "context_overflow");
+    }
+
+    #[test]
+    fn agent_provider_5xx_error_drafts_provider_card() {
+        let card = auto_card_for_run_error(&RunError::Adapter(
+            "provider error: status 503, body: unavailable".to_string(),
+        ))
+        .expect("provider 5xx errors should draft a card");
+        assert_eq!(card.slug, "provider_5xx");
+    }
+
+    #[test]
     fn bounded_chat_history_keeps_recent_messages() {
         let history: Vec<Message> = (0..(CHAT_HISTORY_MAX_MESSAGES + 3))
             .map(|i| {
@@ -3137,22 +3330,6 @@ mod tests {
         assert_eq!(b.kind, "MessageCommitted");
         assert_eq!(b.payload["role"], "assistant");
         assert_eq!(b.payload["text"], "starting the rename");
-    }
-
-    #[test]
-    fn bridge_plan_snapshot_carries_steps_array() {
-        use atelier_core::plan::{PlanStatus, PlanStep};
-        let b = bridge_event(&SessionEvent::PlanSnapshot {
-            steps: vec![PlanStep {
-                id: "step-0".into(),
-                text: "first".into(),
-                status: PlanStatus::Pending,
-                constraints: vec![],
-            }],
-        });
-        assert_eq!(b.kind, "PlanSnapshot");
-        assert!(b.payload["steps"].is_array());
-        assert_eq!(b.payload["steps"][0]["text"], "first");
     }
 
     #[test]
@@ -3293,24 +3470,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_plan_status_accepts_all_four_labels() {
-        use atelier_core::plan::PlanStatus;
-        assert_eq!(parse_plan_status("pending").unwrap(), PlanStatus::Pending);
-        assert_eq!(
-            parse_plan_status("in_progress").unwrap(),
-            PlanStatus::InProgress
-        );
-        assert_eq!(parse_plan_status("done").unwrap(), PlanStatus::Done);
-        assert_eq!(parse_plan_status("skipped").unwrap(), PlanStatus::Skipped);
-    }
-
-    #[test]
-    fn parse_plan_status_rejects_unknown_label() {
-        let err = parse_plan_status("blocked").unwrap_err();
-        assert!(err.contains("blocked"));
-    }
-
-    #[test]
     fn check_bytes_rejects_oversize_input() {
         // Regression for M-sec-1 — Tauri command sizes are bounded so
         // the webview can't ship arbitrarily large strings through the
@@ -3348,6 +3507,7 @@ mod tests {
             strategy: Strategy::JsonSentinel,
             outcome: ProbeLoadOutcome::CacheHit,
             capability_row: None,
+            suitability: None,
         });
         assert_eq!(b.kind, "ModelProfileLoaded");
         assert_eq!(b.payload["model_id"], "local:qwen2.5-coder:7b");
@@ -3384,6 +3544,7 @@ mod tests {
             strategy: Strategy::NativeTool,
             outcome: ProbeLoadOutcome::CacheHit,
             capability_row: Some(row),
+            suitability: None,
         });
         assert_eq!(
             b.payload["capability_row"]["model_id"],

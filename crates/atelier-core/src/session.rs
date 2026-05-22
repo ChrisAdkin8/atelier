@@ -340,6 +340,10 @@ pub enum Event {
         /// updated still render the model badge without the
         /// tooltip), but the runner always populates it.
         capability_row: Option<crate::adapter::capability_matrix::CapabilityMatrixRow>,
+        /// v60.83 — explainable 0-100 suitability score for using this
+        /// model with the harness. Optional so older fixture emitters can
+        /// still construct this event without running the scorer.
+        suitability: Option<crate::adapter::model_profile::ModelSuitability>,
     },
 
     /// v60.5 — terminal marker for a successful §5 non-destructive
