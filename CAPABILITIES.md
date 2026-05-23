@@ -211,7 +211,7 @@ Set expectations honestly:
 - **No multi-session orchestration.** One workspace, one active session at a time. The session registry knows about your past sessions, but launching a fan-out of agents is not a v1 feature.
 - **No web UI or remote backend.** Atelier runs entirely on your machine. Your prompts go to your chosen model provider; nothing else phones home.
 - **No built-in fine-tuning or local-model training.** Use the model you have; the harness is the loop around it, not a model factory.
-- **Live-API CI gates are operator-wired.** The Phase A nightly gate runs `anthropic:claude-haiku-4-5` against five canonical tasks if (and only if) `ANTHROPIC_API_KEY` is wired into GitHub Actions secrets. Without that, the gate records `status: skipped` and stays out of your way.
+- **Live-provider tests are operator-run.** The canonical live Anthropic/OpenAI-compatible tests remain available, but there is no scheduled Phase A live-model GitHub Actions gate. Run them manually when a suitable API budget or local model is available.
 
 ---
 
