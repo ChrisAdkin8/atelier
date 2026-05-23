@@ -35,16 +35,18 @@ It is not tied to one model vendor. You can use Anthropic, OpenAI-compatible ser
 
 ## Install
 
-Released CLI builds are published on GitHub Releases for macOS and Linux.
+The v0.1.0 release supports Apple Silicon macOS and x86_64 Linux. Intel macOS is intentionally not shipped.
 
-With Homebrew:
+### CLI
+
+Install with Homebrew:
 
 ```sh
 brew install ChrisAdkin8/atelier/atelier
 atelier --version
 ```
 
-Or with the install script:
+Or install with the release script:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/ChrisAdkin8/atelier/main/scripts/install.sh | sh
@@ -57,9 +59,47 @@ To install a specific release:
 ATELIER_VERSION=v0.1.0 sh -c "$(curl -fsSL https://raw.githubusercontent.com/ChrisAdkin8/atelier/main/scripts/install.sh)"
 ```
 
-The installer downloads the matching `atelier-cli-<target>.tar.gz` release asset, verifies its `.sha256` file when present, and places `atelier` in `~/.local/bin` unless `ATELIER_INSTALL_DIR` is set. The v0.1.0 release supports Apple Silicon macOS and x86_64 Linux; Intel macOS is intentionally not shipped.
+The installer downloads the matching `atelier-cli-<target>.tar.gz` release asset, verifies its `.sha256` file when present, and places `atelier` in `~/.local/bin` unless `ATELIER_INSTALL_DIR` is set.
 
-GUI bundles are attached to the same GitHub Releases as unsigned `.dmg`, `.AppImage`, and `.deb` artifacts.
+### GUI
+
+GUI bundles are attached to the same GitHub Release as unsigned `.dmg`, `.AppImage`, and `.deb` artifacts.
+
+On Apple Silicon macOS:
+
+```sh
+curl -L -o Atelier_0.1.0_aarch64.dmg \
+  https://github.com/ChrisAdkin8/atelier/releases/download/v0.1.0/Atelier_0.1.0_aarch64.dmg
+
+open Atelier_0.1.0_aarch64.dmg
+```
+
+Drag **Atelier** into **Applications**. Because the app is not yet signed/notarized, first launch may require:
+
+```sh
+xattr -dr com.apple.quarantine /Applications/Atelier.app
+open /Applications/Atelier.app
+```
+
+On Linux with AppImage:
+
+```sh
+curl -L -o Atelier_0.1.0_amd64.AppImage \
+  https://github.com/ChrisAdkin8/atelier/releases/download/v0.1.0/Atelier_0.1.0_amd64.AppImage
+
+chmod +x Atelier_0.1.0_amd64.AppImage
+./Atelier_0.1.0_amd64.AppImage
+```
+
+On Debian/Ubuntu:
+
+```sh
+curl -L -o Atelier_0.1.0_amd64.deb \
+  https://github.com/ChrisAdkin8/atelier/releases/download/v0.1.0/Atelier_0.1.0_amd64.deb
+
+sudo apt install ./Atelier_0.1.0_amd64.deb
+atelier-gui
+```
 
 ## Quick start
 
