@@ -37,6 +37,15 @@ It is not tied to one model vendor. You can use Anthropic, OpenAI-compatible ser
 
 Released CLI builds are published on GitHub Releases for macOS and Linux.
 
+With Homebrew:
+
+```sh
+brew install ChrisAdkin8/atelier/atelier
+atelier --version
+```
+
+Or with the install script:
+
 ```sh
 curl -fsSL https://raw.githubusercontent.com/ChrisAdkin8/atelier/main/scripts/install.sh | sh
 atelier --version
@@ -48,7 +57,7 @@ To install a specific release:
 ATELIER_VERSION=v0.1.0 sh -c "$(curl -fsSL https://raw.githubusercontent.com/ChrisAdkin8/atelier/main/scripts/install.sh)"
 ```
 
-The installer downloads the matching `atelier-cli-<target>.tar.gz` release asset, verifies its `.sha256` file when present, and places `atelier` in `~/.local/bin` unless `ATELIER_INSTALL_DIR` is set.
+The installer downloads the matching `atelier-cli-<target>.tar.gz` release asset, verifies its `.sha256` file when present, and places `atelier` in `~/.local/bin` unless `ATELIER_INSTALL_DIR` is set. The v0.1.0 release supports Apple Silicon macOS and x86_64 Linux; Intel macOS is intentionally not shipped.
 
 GUI bundles are attached to the same GitHub Releases as unsigned `.dmg`, `.AppImage`, and `.deb` artifacts.
 
