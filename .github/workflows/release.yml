@@ -143,6 +143,7 @@ jobs:
     name: publish draft release
     needs: [cli, gui]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: write
     steps:
