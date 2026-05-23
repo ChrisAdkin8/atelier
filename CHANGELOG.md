@@ -1,5 +1,13 @@
 # Atelier Spec — Changelog
 
+## v60.88 — 2026-05-23 (bundled workflow skills)
+
+Expands the bundled skill catalogue and prepares the next packaged release.
+
+- Added ten bundled skills that ship inside `atelier-core`: `/ci-failure`, `/dependency-upgrade`, `/issue-to-plan`, `/pr-polish`, `/perf-investigate`, `/config-doctor`, `/release-publish`, `/migration`, `/bug-report`, and `/new-contributor`.
+- Registered the new manifests in the embedded skill catalogue so release binaries installed from Homebrew or GitHub Releases include them without separate files.
+- Bumped the packaged app version to `0.1.1` and updated install docs to point at the new release line.
+
 ## v60.87 — 2026-05-23 (remove Phase A nightly gate action)
 
 Removes the Phase A nightly GitHub Actions workflow.

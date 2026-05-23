@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "name": "perf-investigate",
+  "description": "Investigate a slow command, test, or code path before proposing optimizations.",
+  "prompt_template": "Investigate this performance problem:\n\n```\n${target}\n```\n\nApproach:\n\n1. **Define the metric** — identify what is slow and how it should be measured (wall time, allocations, query count, startup time, etc.).\n2. **Establish baseline** — run a repeatable measurement with command, input size, environment, and timing.\n3. **Localize bottleneck** — use available profilers/logging/tracing or targeted instrumentation. Prefer evidence over guesses.\n4. **Propose fixes** — rank options by expected impact, risk, and implementation cost.\n5. **Implement only safe changes** — if asked to fix, make the smallest evidence-backed change and keep behaviour identical.\n6. **Compare** — show before/after measurements and note variance.\n\nAvoid speculative rewrites without a baseline.",
+  "args": [
+    {
+      "name": "target",
+      "description": "Slow command, test name, route, function, or user-visible scenario.",
+      "required": true
+    }
+  ],
+  "pinned_context": ["ATELIER.md"],
+  "tools_required": ["shell"],
+  "proactive_trigger": "Suggest when the user mentions performance, slow tests, latency, CPU, memory, startup time, or optimization.",
+  "side_effect_class": "local-risky"
+}

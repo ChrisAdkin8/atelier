@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "name": "new-contributor",
+  "description": "Orient a newcomer with repo layout, commands, conventions, and safe first tasks.",
+  "prompt_template": "Prepare a newcomer guide for this repository.\n\nInclude:\n\n1. **What this project does** — concise, user-facing explanation.\n2. **Repo map** — key directories/files and what each owns.\n3. **Setup** — install/build/test commands from ATELIER.md/README, with platform caveats.\n4. **Development loop** — common commands, where to add tests, and how to validate changes.\n5. **Conventions** — coding style, security/trust-boundary rules, docs expectations, commit/PR norms.\n6. **Good first tasks** — 3-5 safe starter tasks grounded in current TODOs/issues, with why each is low risk.\n\nPrefer links/file paths over long prose. Do not invent tasks if the repo has no evidence for them.",
+  "pinned_context": ["ATELIER.md", "README.md", "CONTRIBUTING.md", "tasks/todo.md"],
+  "tools_required": ["shell"],
+  "proactive_trigger": "Suggest when the user asks how to contribute, onboard, understand the repo, or find a first task.",
+  "side_effect_class": "local-safe"
+}

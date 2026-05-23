@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "name": "pr-polish",
+  "description": "Prepare a branch for review: diff audit, docs/tests check, and PR body draft.",
+  "prompt_template": "Polish the current branch for a pull request.\n\nChecklist:\n\n1. **Diff audit** — compare against the base branch (`main` unless the repo says otherwise). Flag unrelated changes, debug output, generated files, secrets, and risky behaviour changes.\n2. **Docs/tests alignment** — check whether changed behaviour has matching docs and tests. Add only small missing docs/tests when clearly required.\n3. **Local validation** — run the narrowest useful checks from ATELIER.md. Surface failures with next actions.\n4. **Commit hygiene** — summarize staged/unstaged state and whether commits should be squashed or split.\n5. **PR draft** — write a concise title and body with summary, validation, screenshots/artifacts if relevant, and known limitations.\n\nDo not push, squash, or open the PR unless explicitly asked.",
+  "pinned_context": ["ATELIER.md", "README.md"],
+  "tools_required": ["shell"],
+  "proactive_trigger": "Suggest when the user asks to prepare, polish, review, or open a PR.",
+  "side_effect_class": "local-risky"
+}

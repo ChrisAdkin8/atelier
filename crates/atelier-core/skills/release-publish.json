@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "name": "release-publish",
+  "description": "Publish release artifacts: verify assets, checksums, Homebrew tap, install paths, and release notes.",
+  "prompt_template": "Run the release publishing checklist for `${version}`.\n\nSteps:\n\n1. **Release state** — inspect the GitHub release/tag, draft/prerelease flags, asset list, and workflow run status.\n2. **Asset coverage** — verify expected CLI/GUI artifacts and checksums for supported platforms. Do not add unsupported platforms silently.\n3. **Checksums/signatures** — verify `.sha256` files; report missing signing/notarization separately from blocking packaging errors.\n4. **Installer paths** — test the release install script in a temporary directory where feasible.\n5. **Homebrew tap** — update or verify the tap formula URL/version/SHA, then validate with `brew fetch` when Homebrew is available.\n6. **Docs** — update install instructions and platform-support notes.\n7. **Publish** — only publish drafts, push tags, or update taps when explicitly requested.\n\nReport exactly what was published, what was validated, and what remains blocked by credentials.",
+  "args": [
+    {
+      "name": "version",
+      "description": "Release version/tag, e.g. v0.1.1.",
+      "required": true
+    }
+  ],
+  "pinned_context": ["ATELIER.md", "README.md", ".github/workflows/release.yml", "packaging/homebrew/atelier.rb.template", "scripts/install.sh"],
+  "tools_required": ["shell"],
+  "proactive_trigger": "Suggest when the user asks to publish a release, update Homebrew, verify release assets, or package the app.",
+  "side_effect_class": "shared-state"
+}

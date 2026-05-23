@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "name": "migration",
+  "description": "Plan and implement schema, config, API, or data migrations with compatibility checks.",
+  "prompt_template": "Handle this migration:\n\n```\n${migration}\n```\n\nMigration discipline:\n\n1. **Inventory** — identify old and new shapes, readers, writers, schemas, fixtures, docs, and compatibility boundaries.\n2. **Compatibility plan** — decide whether to support both formats, auto-migrate, fail loudly, or require a manual step. Preserve existing user data unless explicitly impossible.\n3. **Implementation** — update types/parsers/writers first, then fixtures/tests/docs. Keep migration code narrow and observable.\n4. **Validation** — add old-format and new-format tests, including malformed input and idempotency when relevant.\n5. **Operator notes** — document any user/admin action required to complete the migration.\n\nDo not silently ignore unknown or invalid fields unless that is already the repo's documented compatibility policy.",
+  "args": [
+    {
+      "name": "migration",
+      "description": "Description of the schema/config/API/data migration to perform.",
+      "required": true
+    }
+  ],
+  "pinned_context": ["ATELIER.md", "schemas/**/*.json", "README.md"],
+  "tools_required": ["shell"],
+  "proactive_trigger": "Suggest when the user mentions migration, schema changes, config format changes, backward compatibility, or data upgrades.",
+  "side_effect_class": "local-risky"
+}

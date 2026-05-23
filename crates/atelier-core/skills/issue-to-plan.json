@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "name": "issue-to-plan",
+  "description": "Turn a GitHub issue or bug report into a concrete implementation plan with acceptance criteria.",
+  "prompt_template": "Convert this issue into an implementation plan:\n\n```\n${issue}\n```\n\nProduce:\n\n1. **Problem statement** — one concise paragraph in user-facing terms.\n2. **Acceptance criteria** — observable behaviours that make the issue done.\n3. **Affected surfaces** — likely files/modules/docs/tests to inspect.\n4. **Implementation plan** — ordered, minimal steps; separate investigation from code changes.\n5. **Test plan** — exact tests to add/run, including edge cases.\n6. **Risks/open questions** — only blockers that materially affect the approach.\n\nIf the issue references a GitHub URL or number and `gh` is available, fetch the issue details first. Do not implement until the user approves or asks you to proceed.",
+  "args": [
+    {
+      "name": "issue",
+      "description": "Issue URL, issue number, or pasted issue text.",
+      "required": true
+    }
+  ],
+  "pinned_context": ["ATELIER.md", "README.md"],
+  "tools_required": ["shell"],
+  "proactive_trigger": "Suggest when the user pastes an issue, asks for a plan, or says to scope/triage a GitHub issue.",
+  "side_effect_class": "local-safe"
+}

@@ -7,6 +7,8 @@ Change history in `../CHANGELOG.md`.
 
 **Tracker discipline:** keep this file up to date whenever a plan lands, a risk/remediation status changes, or gate counts change. Do not leave `tasks/todo.md` as a historical snapshot; move detailed release history to `../CHANGELOG.md` and keep this file focused on current state plus active/pending work.
 
+**v60.88 (2026-05-23)** — Bundled workflow skills. Added ten embedded skills for CI diagnosis, dependency upgrades, issue planning, PR polish, performance investigation, config doctoring, release publishing, migrations, bug reports, and new-contributor onboarding. Packaged app version moves to `0.1.1` so Homebrew/GitHub Release installs receive the expanded catalogue.
+
 **v60.87 (2026-05-23)** — Removed the Phase A nightly gate action. `.github/workflows/nightly_phase_a_gate.yml` is gone; Phase A live-provider tests remain manually runnable, while regular CI keeps the offline Mock canonical coverage green.
 
 **v60.86 (2026-05-23)** — Self-contained Phase A local LLM gate experiment. This was superseded by v60.87 and is no longer an active workflow.

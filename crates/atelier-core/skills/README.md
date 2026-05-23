@@ -12,6 +12,20 @@ into one of:
 
 Per-repo wins over your scope, which wins over bundled.
 
+## Bundled catalogue
+
+Release binaries embed the bundled catalogue at compile time. The current set
+covers review/security, testing, docs, refactors, release work, workflow
+diagnostics, migrations, and onboarding:
+
+```sh
+atelier skills
+```
+
+Notable workflow helpers include `/ci-failure`, `/dependency-upgrade`,
+`/issue-to-plan`, `/pr-polish`, `/perf-investigate`, `/config-doctor`,
+`/release-publish`, `/migration`, `/bug-report`, and `/new-contributor`.
+
 ## Writing your first skill
 
 The fastest path:

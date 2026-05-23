@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "name": "dependency-upgrade",
+  "description": "Upgrade one dependency safely with changelog review, lockfile updates, tests, and rollback notes.",
+  "prompt_template": "Upgrade the requested dependency safely: `${dependency}`.\n\nProcess:\n\n1. **Find ownership** — identify the manifest(s), lockfile(s), and package manager involved.\n2. **Review compatibility** — inspect release notes/changelog when available, with attention to MSRV/runtime/toolchain constraints, breaking changes, and security fixes.\n3. **Update with ecosystem tooling** — use the package manager (`cargo`, `npm`, `pip`, etc.) rather than hand-editing lockfiles where possible.\n4. **Adapt code only if required** — keep changes scoped to compatibility with the dependency upgrade.\n5. **Validate** — run the narrowest relevant tests first, then the repo's standard check if the change is broad.\n6. **Document** — note the old version, new version, reason, validation, and any rollback command.\n\nIf the requested version is incompatible with this repo's pinned toolchain or platform support, stop and explain the blocker instead of forcing the upgrade.",
+  "args": [
+    {
+      "name": "dependency",
+      "description": "Dependency name and optional target version/range, e.g. 'serde to 1.0.220'.",
+      "required": true
+    }
+  ],
+  "pinned_context": ["ATELIER.md", "Cargo.toml", "package.json", "pyproject.toml"],
+  "tools_required": ["shell"],
+  "proactive_trigger": "Suggest when the user asks to bump, update, upgrade, pin, unpin, or audit a dependency.",
+  "side_effect_class": "local-risky"
+}

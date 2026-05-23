@@ -13,7 +13,7 @@ case "$os:$arch" in
     target="x86_64-unknown-linux-gnu"
     ;;
   Darwin:x86_64)
-    echo "unsupported platform for v0.1.0 release assets: Intel macOS" >&2
+    echo "unsupported platform for Atelier ${version} release assets: Intel macOS" >&2
     echo "Build from source with: cargo install --path crates/atelier-cli" >&2
     exit 1
     ;;

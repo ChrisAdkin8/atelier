@@ -93,6 +93,28 @@ fn bundled_manifests() -> &'static [(&'static str, &'static str)] {
         ("diagram", include_str!("../skills/diagram.json")),
         ("triage", include_str!("../skills/triage.json")),
         ("release", include_str!("../skills/release.json")),
+        ("ci-failure", include_str!("../skills/ci-failure.json")),
+        (
+            "dependency-upgrade",
+            include_str!("../skills/dependency-upgrade.json"),
+        ),
+        ("issue-to-plan", include_str!("../skills/issue-to-plan.json")),
+        ("pr-polish", include_str!("../skills/pr-polish.json")),
+        (
+            "perf-investigate",
+            include_str!("../skills/perf-investigate.json"),
+        ),
+        ("config-doctor", include_str!("../skills/config-doctor.json")),
+        (
+            "release-publish",
+            include_str!("../skills/release-publish.json"),
+        ),
+        ("migration", include_str!("../skills/migration.json")),
+        ("bug-report", include_str!("../skills/bug-report.json")),
+        (
+            "new-contributor",
+            include_str!("../skills/new-contributor.json"),
+        ),
     ]
 }
 
@@ -703,12 +725,14 @@ mod tests {
     fn bundled_only_load() {
         let repo = temp_repo();
         let reg = SkillRegistry::load(repo.path(), None).unwrap();
-        // 19 bundled (3 original + 11 added in v60.50.5 + 5 added in v60.55:
-        // /plan, /diagram, /triage, /release, /document-sweep).
-        assert_eq!(reg.len(), 19);
+        // 29 bundled (19 existing + 10 workflow/onboarding skills).
+        assert_eq!(reg.len(), 29);
         assert!(reg.get("review").is_some());
         assert!(reg.get("security-review").is_some());
         assert!(reg.get("test").is_some());
+        assert!(reg.get("ci-failure").is_some());
+        assert!(reg.get("config-doctor").is_some());
+        assert!(reg.get("release-publish").is_some());
         // `/`-prefixed lookup also works.
         assert!(reg.get("/review").is_some());
         // Source is bundled.
@@ -1034,9 +1058,9 @@ mod tests {
     }
 
     #[test]
-    fn bundled_help_renders_all_nineteen() {
+    fn bundled_help_renders_all_skills() {
         let repo = temp_repo();
         let reg = SkillRegistry::load(repo.path(), None).unwrap();
-        assert_eq!(reg.len(), 19);
+        assert_eq!(reg.len(), 29);
     }
 }

@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "name": "ci-failure",
+  "description": "Inspect failed GitHub Actions runs, identify the root cause, and patch the smallest safe fix.",
+  "prompt_template": "Diagnose the failing CI for this repository.\n\nWorkflow:\n\n1. **Inspect** — use `gh run list` and `gh run view --log-failed` to find the latest failed run(s). Name the workflow, job, failing step, and commit SHA.\n2. **Localize** — map the failure back to the smallest relevant file/test/config. Avoid broad rewrites.\n3. **Reproduce locally** — run the closest local command when feasible. If the failure is GitHub-only, explain why.\n4. **Fix** — apply the smallest change that addresses the root cause without masking failures.\n5. **Validate** — run the targeted local check and any repo CI policy tests that cover the changed workflow/config.\n6. **Report** — summarize the failed run URL, root cause, fix, and validation result.\n\nDo not delete or rerun CI runs unless explicitly asked. Do not claim a remote workflow is fixed until the relevant run is green or the local equivalent is clearly validated.",
+  "pinned_context": ["ATELIER.md", ".github/workflows/*.yml", ".github/workflows/*.yaml"],
+  "tools_required": ["shell"],
+  "proactive_trigger": "Suggest when the user mentions GitHub Actions, CI, a red check, failed workflow, failing run, or a log from a CI job.",
+  "side_effect_class": "local-risky"
+}

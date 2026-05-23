@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "name": "config-doctor",
+  "description": "Diagnose local setup problems: providers, auth, model endpoints, PATH, and project config.",
+  "prompt_template": "Diagnose this setup/configuration problem:\n\n```\n${symptom}\n```\n\nCheck, in order:\n\n1. **Environment** — OS, shell, PATH, installed binary version, and current workspace.\n2. **Project config** — relevant config files and whether they parse. Do not print secrets.\n3. **Credentials** — verify references (`env:...`, keychain, CI secrets) without exposing secret values.\n4. **Provider/model endpoint** — for OpenAI-compatible providers, test `/models`/base URL contactability when safe. For cloud providers, validate required env/key references.\n5. **Minimal repro** — run the smallest command that demonstrates the issue.\n6. **Fix** — give exact commands/config edits and explain any trust-boundary implications.\n\nRedact tokens, API keys, passwords, private keys, and connection strings from all output.",
+  "args": [
+    {
+      "name": "symptom",
+      "description": "Error message or description of the setup problem.",
+      "required": true
+    }
+  ],
+  "pinned_context": ["ATELIER.md", ".atelier/providers.toml", "README.md"],
+  "tools_required": ["shell"],
+  "proactive_trigger": "Suggest when the user mentions provider setup, API keys, auth, keychain, base_url, model endpoint, PATH, install problems, or local configuration.",
+  "side_effect_class": "local-safe"
+}

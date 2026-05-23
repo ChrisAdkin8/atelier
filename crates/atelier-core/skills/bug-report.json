@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "name": "bug-report",
+  "description": "Turn symptoms, logs, or user reports into a minimal repro and likely root cause.",
+  "prompt_template": "Analyze this bug report:\n\n```\n${report}\n```\n\nDeliver:\n\n1. **Repro summary** — exact steps, inputs, expected behaviour, and actual behaviour.\n2. **Environment** — relevant versions/platform/config, without exposing secrets.\n3. **Minimal repro** — smallest command/test/case that demonstrates the bug. Create one if the repo has an obvious test harness and the user asked for implementation.\n4. **Suspected root cause** — point to likely file/function and why.\n5. **Fix direction** — smallest safe change and regression test.\n6. **Triage label** — severity and whether this is a regression, environment issue, docs gap, or feature request.\n\nIf the report is missing critical details, list the minimum extra information needed rather than guessing.",
+  "args": [
+    {
+      "name": "report",
+      "description": "Bug report text, logs, screenshots described in text, or error output.",
+      "required": true
+    }
+  ],
+  "pinned_context": ["ATELIER.md", "README.md"],
+  "tools_required": ["shell"],
+  "proactive_trigger": "Suggest when the user reports a bug, paste logs, says something is broken, or asks for a repro.",
+  "side_effect_class": "local-safe"
+}
