@@ -9,8 +9,7 @@ class Atelier < Formula
       url "https://github.com/ChrisAdkin8/atelier/releases/download/v#{version}/atelier-cli-aarch64-apple-darwin.tar.gz"
       sha256 "{{SHA256_MACOS_ARM64}}"
     else
-      url "https://github.com/ChrisAdkin8/atelier/releases/download/v#{version}/atelier-cli-x86_64-apple-darwin.tar.gz"
-      sha256 "{{SHA256_MACOS_X86_64}}"
+      odie "Atelier v#{version} does not ship an Intel macOS bottle yet; build from source or use Apple Silicon/Linux."
     end
   end
 
