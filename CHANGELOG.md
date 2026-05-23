@@ -1,5 +1,13 @@
 # Atelier Spec — Changelog
 
+## v60.86 — 2026-05-23 (self-contained Phase A local LLM gate)
+
+Removes the nightly Phase A dependency on Anthropic billing/secrets.
+
+- Replaced the `phase_a_live_anthropic` nightly step with a self-contained `phase_a_live_local_llm` gate.
+- The workflow now caches/downloads `Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF` (`q2_k`), starts `ghcr.io/ggml-org/llama.cpp:server` on the GitHub-hosted runner, waits for `/v1/models`, and runs the existing OpenAI-compatible live `t01` harness test against `http://127.0.0.1:8000/v1`.
+- The gate no longer uses `ANTHROPIC_API_KEY` or any paid hosted model. Because GitHub-hosted runners are CPU-only, the local gate is intentionally scoped to the smallest priority canonical task as a smoke test rather than the old five-task cloud-model suite.
+
 ## v60.85 — 2026-05-22 (deep-scan hardening follow-up)
 
 Closes the actionable findings from the May 22 deep scan while preserving the Rust 1.85 toolchain policy.

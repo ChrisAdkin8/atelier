@@ -13,12 +13,10 @@ name: nightly_phase_a_gate
 # (crates/atelier-cli/src/bin/phase_a_gate_status.rs) reads the
 # committed artifact for downstream consumers.
 #
-# Live-API gate against Anthropic (Track B / Phase A close, v60.19)
-# is one step below. It records `skipped` when `ANTHROPIC_API_KEY` is
-# absent so the workflow stays green for forks / before the maintainer
-# wires the secret in. The OpenAI-compat half of Track B is still
-# deferred (the local OSS models we'd test against don't reliably
-# claim_done on the canonical workload; hosted OpenAI is paid-tier).
+# Self-contained live-model gate (v60.86). The workflow starts a tiny
+# OpenAI-compatible llama.cpp server on the GitHub-hosted runner and drives
+# the harness against it. This deliberately avoids paid hosted APIs and repo
+# secrets while still exercising the real OpenAI-compatible adapter path.
 #
 # v60.36 H1/H2 — privilege-split:
 #   * `measure` job runs with `permissions: contents: read`, downloads
@@ -109,6 +107,12 @@ jobs:
             target
           key: nightly-phase-a-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', '**/Cargo.toml') }}
 
+      - name: Cache local LLM model
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/atelier-local-llm
+          key: nightly-phase-a-qwen2.5-coder-1.5b-instruct-q2-k-v1
+
       # The per-gate steps below run with `set +e` + `continue-on-error`
       # so a failure in one doesn't short-circuit the others — the
       # nightly is most useful when it tells you EVERY broken gate, not
@@ -186,37 +190,68 @@ jobs:
           echo "duration=$((end - start))" >> "$GITHUB_OUTPUT"
           exit $ec
 
-      # Phase A live-API gate. Runs the five priority canonical tasks
-      # (t01, t02, t05, t06, t10) against `anthropic:claude-haiku-4-5`
-      # — the spec text's "the §2.5 state machine drives t01/t02/t05/t06/t10
-      # end-to-end against the Anthropic adapter without bypassing any
-      # transition." Costs ~$0.20 of API credit per nightly. When
-      # `ANTHROPIC_API_KEY` is absent (forks, pre-maintainer-setup) the
-      # gate records `status: skipped` rather than `failed` — see the
-      # `is_skipped` branch in the compose step below.
-      - name: Gate — phase A live (Anthropic)
+      - name: Download local LLM model
+        run: |
+          set -euo pipefail
+          model_dir="$HOME/.cache/atelier-local-llm"
+          model_file="$model_dir/qwen2.5-coder-1.5b-instruct-q2_k.gguf"
+          mkdir -p "$model_dir"
+          if [ ! -s "$model_file" ]; then
+            curl -fL --retry 3 --retry-delay 5 \
+              "https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF/resolve/main/qwen2.5-coder-1.5b-instruct-q2_k.gguf" \
+              -o "$model_file"
+          fi
+          ls -lh "$model_file"
+
+      - name: Start local OpenAI-compatible LLM
+        run: |
+          set -euo pipefail
+          docker rm -f atelier-local-llm >/dev/null 2>&1 || true
+          docker run -d \
+            --name atelier-local-llm \
+            -p 127.0.0.1:8000:8000 \
+            -v "$HOME/.cache/atelier-local-llm:/models:ro" \
+            ghcr.io/ggml-org/llama.cpp:server \
+            -m /models/qwen2.5-coder-1.5b-instruct-q2_k.gguf \
+            --host 0.0.0.0 \
+            --port 8000 \
+            --ctx-size 4096 \
+            --n-predict 512 \
+            --threads 4 \
+            --parallel 1 \
+            --jinja
+
+          for _ in $(seq 1 90); do
+            if curl -fsS http://127.0.0.1:8000/v1/models >/dev/null; then
+              curl -fsS http://127.0.0.1:8000/v1/models
+              exit 0
+            fi
+            sleep 2
+          done
+
+          docker logs atelier-local-llm
+          exit 1
+
+      # Self-contained local-model gate. The runner has no GPU, so this
+      # intentionally uses a tiny quantized coder model and the smallest
+      # priority canonical task as a nightly smoke test. It replaces the
+      # previous Anthropic gate without needing ANTHROPIC_API_KEY or API credit.
+      - name: Gate — phase A live (local OpenAI-compatible LLM)
         id: phase_a_live
         continue-on-error: true
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ATELIER_LOCAL_LLM_URL: http://127.0.0.1:8000/v1
+          ATELIER_LOCAL_MODEL_ID: local:qwen2.5-coder-1.5b-instruct-q2_k
         run: |
           set +e
           start=$(date +%s)
-          if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
-            echo "ANTHROPIC_API_KEY not set; live gate will be recorded as skipped."
-            end=$(date +%s)
-            echo "exit_code=0" >> "$GITHUB_OUTPUT"
-            echo "duration=$((end - start))" >> "$GITHUB_OUTPUT"
-            echo "is_skipped=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          # The five priority tests share the `phase_a_live_anthropic_` prefix.
-          # `--include-ignored` opts them in; the pattern keeps the run scoped
-          # to this gate.
           cargo test -p atelier-cli --test run_integration \
-            phase_a_live_anthropic_ -- --include-ignored
+            phase_a_live_openai_compat_t01 -- --include-ignored --test-threads=1
           ec=$?
           end=$(date +%s)
+          if [ "$ec" -ne 0 ]; then
+            docker logs atelier-local-llm || true
+          fi
           echo "exit_code=$ec" >> "$GITHUB_OUTPUT"
           echo "duration=$((end - start))" >> "$GITHUB_OUTPUT"
           echo "is_skipped=false" >> "$GITHUB_OUTPUT"
@@ -272,8 +307,9 @@ jobs:
           else:
               phase_a_live_status = status_for("PHASE_A_LIVE_EXIT")
 
-          # The MCP gate is non-fatal. The live-API gate is fatal when
-          # it runs (failed flips all_passed) but neutral when skipped.
+          # The MCP gate is non-fatal. The local live-model gate is fatal:
+          # it has no external secret or paid-account prerequisite, so a
+          # failure means the self-contained smoke gate regressed.
           all_passed = (
               fmt_status == "passed"
               and clippy_status == "passed"
@@ -305,7 +341,7 @@ jobs:
                   {"name": "cargo_test_workspace", "status": cargo_status, "duration_secs": dur("CARGO_DUR")},
                   {"name": "rig_check", "status": rig_status, "duration_secs": dur("RIG_DUR")},
                   {"name": "mcp_integration_npx", "status": mcp_status, "duration_secs": dur("MCP_DUR")},
-                  {"name": "phase_a_live_anthropic", "status": phase_a_live_status, "duration_secs": dur("PHASE_A_LIVE_DUR")},
+                  {"name": "phase_a_live_local_llm", "status": phase_a_live_status, "duration_secs": dur("PHASE_A_LIVE_DUR")},
               ],
           }
           with open("tests/phase_a_gate/last_run.json", "w", encoding="utf-8") as f:
