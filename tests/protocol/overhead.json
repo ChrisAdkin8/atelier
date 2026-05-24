@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "measured_at": "2026-05-23T08:29:24Z",
+  "measured_at": "2026-05-24T08:40:08Z",
   "providers": [
     {
       "provider": "mock",
@@ -10,11 +10,11 @@
       "conformance_rate": 1.0,
       "bytes_on_wire": 256,
       "tokens_envelope": 64,
-      "parse_time_ns": 3016,
+      "parse_time_ns": 3196,
       "rolling_median": {
         "window_days": 7,
         "value": 64.0,
-        "samples": 6
+        "samples": 7
       }
     },
     {
@@ -25,11 +25,11 @@
       "conformance_rate": 1.0,
       "bytes_on_wire": 265,
       "tokens_envelope": 67,
-      "parse_time_ns": 34555,
+      "parse_time_ns": 28824,
       "rolling_median": {
         "window_days": 7,
         "value": 67.0,
-        "samples": 6
+        "samples": 7
       }
     },
     {
@@ -40,11 +40,11 @@
       "conformance_rate": 1.0,
       "bytes_on_wire": 129,
       "tokens_envelope": 33,
-      "parse_time_ns": 1242,
+      "parse_time_ns": 1322,
       "rolling_median": {
         "window_days": 7,
         "value": 33.0,
-        "samples": 6
+        "samples": 7
       }
     }
   ]
