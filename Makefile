@@ -9,6 +9,8 @@
 #   make summary       — one-line summary of dry-run for all tasks
 #   make install-rig   — create .venv/ and install the rig dependencies into it
 #   make quality-cheap — cargo-audit + cargo-machete (low-cost supply-chain + dead-dep gate)
+#   make metrics       — write a JSON code-quality snapshot to .atelier/metrics/snapshot.json
+#   make metrics-install — install the optional metric tools used by `make metrics`
 #   make release-cli   — build a local release CLI binary
 #   make release-gui   — build local unsigned Tauri GUI bundles
 #   make clean         — remove pytest cache and pycache from the tree
@@ -23,7 +25,7 @@ else
 PY ?= python3
 endif
 
-.PHONY: check schemas artifacts rig-tests dry-run summary install-rig quality-cheap audit audit-install npm-ioc-sweep release-cli release-gui clean
+.PHONY: check schemas artifacts rig-tests dry-run summary install-rig quality-cheap audit audit-install npm-ioc-sweep release-cli release-gui clean metrics metrics-install
 
 check: schemas artifacts rig-tests summary
 
@@ -150,6 +152,40 @@ release-gui:
 
 audit-install:
 	cargo install cargo-audit --locked
+
+# Static-analysis JSON snapshot of the four workspace crates. Always-available
+# metrics (LOC, largest files, production-path proxies, public-API proxy, dep
+# duplicates) require no external tools; optional metrics (per-file complexity,
+# unsafe density, module tree, public-API exact count, dep freshness) layer in
+# when the corresponding cargo subcommands or `rust-code-analysis-cli` are on
+# PATH. Missing tools are recorded in the output as null, never errors.
+#
+# Output: .atelier/metrics/snapshot.json plus a timestamped copy in
+# .atelier/metrics/history/. Intended for trend tracking: diff snapshots over
+# time rather than reading a single absolute number. See scripts/collect_metrics.py
+# for the schema.
+#
+# Coverage (`cargo llvm-cov`) is intentionally excluded: it requires a full
+# instrumented build. Run it separately when coverage trend is needed.
+metrics:
+	$(PY) scripts/collect_metrics.py
+
+# Install the optional tooling consumed by `make metrics`. None of these are
+# required for the script to run — they unlock additional metrics. The Rust
+# tools install into ~/.cargo/bin via `cargo install --locked`. `jscpd` is the
+# only non-Rust dep (npm); it powers the duplicate-block detector used by the
+# AI-slop indicators. `rust-code-analysis-cli` is upstream-maintained by
+# Mozilla and powers per-function CC / cognitive / Halstead / MI / sloc
+# distribution metrics.
+metrics-install:
+	cargo install --locked rust-code-analysis-cli
+	cargo install --locked cargo-geiger
+	cargo install --locked cargo-modules
+	cargo install --locked cargo-public-api
+	cargo install --locked cargo-outdated
+	@command -v npm >/dev/null 2>&1 && npm install -g jscpd \
+		|| echo "npm not on PATH; skip \`jscpd\` install (duplicate-block detector will stay disabled)"
+	@echo "metrics tooling installed; rerun \`make metrics\`"
 
 clean:
 	find . -type d -name "__pycache__" -prune -exec rm -rf {} +

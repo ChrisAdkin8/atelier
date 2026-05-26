@@ -64,7 +64,7 @@ The harness isn't read-only. The GUI and TUI both let you edit live state withou
 
 - **Context pane** — pin a file so the agent always sees it, unpin to free tokens, evict an item entirely (with a confirmation prompt that warns about cache busting).
 - **Memory pane** — add a memory card, delete one, or promote a per-session card to your global memory at `~/.atelier/memory/` so it survives across sessions.
-- **Plan pane** — add a step, mark it in-progress / done, attach a constraint, remove it, or drag-and-drop to reorder (GUI only; the TUI uses the same dispatcher surface via keyboard).
+- **Plan pane** — add a step, mark it in-progress / done, attach a constraint, or remove it. The TUI renders the plan pane and accepts keyboard edits; the GUI plan pane was removed in v60.81 (Memory and Sub-agent panels occupy that slot).
 - **Mental-model panel** — off by default. When you enable it, the text you write is injected as a second System message on every adapter call, so the model has your latest understanding of the codebase at hand. The cost is disclosed in the panel's header (`~N tokens / turn`).
 
 ---
@@ -128,7 +128,7 @@ Each hook needs explicit first-use approval, persisted to `.atelier/hook_approva
 
 ## Skills (§15)
 
-Skills are named slash-invoked prompt expansions. The harness ships 19 bundled (`/review`, `/security-review`, `/test`, `/explain`, `/fix`, `/document`, `/refactor`, `/optimize`, `/commit`, `/changelog`, `/audit`, `/spec`, `/sweep`, `/scan`, `/plan`, `/diagram`, `/triage`, `/release`, `/document-sweep`) and you can override or add new ones in `~/.atelier/skills/` (your scope) or `<workspace>/.atelier/skills/` (per-repo, checked into git).
+Skills are named slash-invoked prompt expansions. The harness ships 29 bundled skills and you can override or add new ones in `~/.atelier/skills/` (your scope) or `<workspace>/.atelier/skills/` (per-repo, checked into git). Core skills: `/review`, `/security-review`, `/test`, `/explain`, `/fix`, `/document`, `/refactor`, `/optimize`, `/commit`, `/changelog`, `/audit`, `/spec`, `/sweep`, `/scan`, `/plan`, `/diagram`, `/triage`, `/release`, `/document-sweep`. Workflow/onboarding skills added in v60.88: `/ci-failure`, `/config-doctor`, `/dependency-upgrade`, `/bug-report`, `/issue-to-plan`, `/migration`, `/new-contributor`, `/perf-investigate`, `/pr-polish`, `/release-publish`.
 
 Typing `/review` in the GUI Composer (or `atelier run /review` on the CLI) expands the skill's `prompt_template` with `${arg}` substitution and routes the expanded text as the next user turn. The §2.5 agent loop runs unchanged — skills are a prompt-expansion layer, not a new transport. Cost-ledger discipline: every skill invocation is annotated as `note: "skill: <name>"` on the next `model_call` ledger entry.
 
@@ -165,7 +165,7 @@ Key constraints:
 - **Executor pre-flight.** When `[routing].executor` is configured and points at a local server, the harness probes the server with a 1 s TCP connect before building the executor adapter. If the server is unreachable, the harness warns and runs without turn routing rather than hanging on the first tool-result turn.
 - **GUI progress badge.** While a sub-agent is running, the Composer shows a cyan `"turn N/M"` badge so the UI does not look idle during long child runs.
 
-Deferred: GUI sub-agent card, TUI sub-agent line, §4 time-travel checkpointing of sub-agent state, and the explicit trust-budget `reconcile_subagent` helper (spec line 550).
+Deferred: GUI sub-agent card (blocked on Runner-backed GUI mode), §4 time-travel checkpointing of sub-agent state, and the explicit trust-budget `reconcile_subagent` helper (spec line 550). The TUI sub-agent list widget (top-right column) is done as of v60.59.
 
 ---
 
@@ -187,6 +187,7 @@ Deferred: GUI sub-agent card, TUI sub-agent line, §4 time-travel checkpointing 
     compactions/          # reversible compaction blobs
     recovery_log          # partial output preserved across crashes
   memory/                 # per-project retrievable memory cards
+  indexes/memory.sqlite   # derived FTS5 index (rebuildable; gitignored)
   settings.json           # per-project hook + driver settings
 ```
 
@@ -197,6 +198,7 @@ Anything global lives in `~/.atelier/` instead:
   providers.toml          # cross-project provider defaults
   model_profiles/         # per-model probe-on-first-use cache
   memory/                 # cross-project memory cards
+  indexes/memory.sqlite   # derived FTS5 index (rebuildable; gitignored)
   registry.json           # session-uuid → workspace map (rebuildable)
 ```
 

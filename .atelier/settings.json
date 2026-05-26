@@ -1,5 +1,6 @@
 {
   "_comment": "Vendor-neutral hook commands: paths are relative to the project root (every BYOM-compatible host harness runs hook commands with cwd=project root). The scripts themselves derive ATELIER_PROJECT_DIR from BASH_SOURCE and do not depend on any host-set env var.",
+  "model": "claude-opus-4-7",
   "hooks": {
     "PreToolUse": [
       {

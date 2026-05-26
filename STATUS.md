@@ -46,7 +46,7 @@ The Phase A foundation, Phase B protocol/verification subset, and Phase C worksp
 - `atelier-gui` (Tauri 2.x + Svelte 5) — chat/agent workspace (Header / ConversationPane / ContextPane / MemoryPane / SubagentPane / MetersPane / Composer), native folder picker, provider swap, memory auto-drafting/promotion, skills autocomplete, and Runner-backed Agent flows where needed. Concurrent-run guard via `Arc<AtomicBool>`; 64 KB prompt cap; durable session-resume pointer validation; per-run UUID workspaces with drop-guard cleanup.
 - `atelier-tui` (ratatui + crossterm) — conversation pane, textual diff, plan/context/memory/sub-agent panes, slash-skill completion, LSP install prompt, cost + context meters, scrubber keys `[`/`]`/`g`. Driver mode via `cargo run -p atelier-tui -- "<prompt>"`; `y` / `n` route through `SessionDispatcher::submit_approval`.
 
-### Gate counts (as of v60.79)
+### Gate counts (as of v60.88)
 
 | | Count | Where |
 |---|---|---|
@@ -91,7 +91,7 @@ For the invariants the rig *enforces* (no-op-harness exploits, cross-schema `$re
 | §1 probe-on-first-use cache | [`crates/atelier-core/src/adapter/model_profile.rs`](crates/atelier-core/src/adapter/model_profile.rs) | **done** v51 (`ModelProfile` + `ProfileStore::load_or_probe`; CLI `--no-probe` / `--force-probe`; bus `Event::ModelProfileLoaded`) |
 | §1 typed cost ledger | [`crates/atelier-core/src/ledger.rs`](crates/atelier-core/src/ledger.rs) | **done** |
 | `atelier run` CLI subcommand | [`crates/atelier-cli/src/{main,runner,lib}.rs`](crates/atelier-cli/src/) | **done** (hybrid lib+bin; `Runner` linked by GUI/TUI for driver mode) |
-| Tauri GUI workspace | [`crates/atelier-gui/src/lib.rs`](crates/atelier-gui/src/lib.rs) + [`crates/atelier-gui/ui/src/`](crates/atelier-gui/ui/src/) | **done** (chat/agent workspace, provider swap, context/memory/plan/sub-agent panes, skills autocomplete, native workspace picker, durable resume-pointer validation) |
+| Tauri GUI workspace | [`crates/atelier-gui/src/lib.rs`](crates/atelier-gui/src/lib.rs) + [`crates/atelier-gui/ui/src/`](crates/atelier-gui/ui/src/) | **done** (chat/agent workspace, provider swap, context/memory/sub-agent panes, model-fit badge, skills autocomplete, native workspace picker, durable resume-pointer validation; plan pane removed v60.81) |
 | ratatui TUI driver mode | [`crates/atelier-tui/src/lib.rs`](crates/atelier-tui/src/lib.rs) | **done** v48 (driver + viewer modes; `y` / `n` approval keys) |
 | §15 MCP client (`rmcp`) | `crates/atelier-core/src/mcp/` | **done** — stdio + HTTP/SSE launchers, dispatcher registration, egress audit, MCP resources as context items |
 | §14 file-watcher (fsevents/inotify) + concurrent-edit modal | [`crates/atelier-core/src/file_watcher.rs`](crates/atelier-core/src/file_watcher.rs) + UI drivers | **done** — dispatcher read-set tracking, GUI/TUI resolution surfaces, non-interactive auto-reload |

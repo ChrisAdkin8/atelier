@@ -16,7 +16,7 @@ Full tree with one-line annotations. The top-level [README.md](../README.md) lis
 │   ├── atelier-core/                  agent loop, BYOM adapters, MCP client, session state
 │   │   ├── Cargo.toml                 declares `rmcp = { workspace = true }` — the MCP client lives here
 │   │   ├── catalog/                   bundled MCP server catalog
-│   │   ├── skills/                    bundled skills (/review, /security-review, /test, /document-sweep, ...)
+│   │   ├── skills/                    29 bundled skills (/review, /security-review, /test, /document-sweep, /ci-failure, /config-doctor, /pr-polish, ...)
 │   │   ├── subagents/                 bundled sub-agent types (researcher, test-runner, general-purpose)
 │   │   ├── tools/                     bundled built-in tool manifests (read_file, write_file, edit_file, list_dir, grep, ast_grep, shell, spawn_subagent) — matches spec §15
 │   │   └── templates/                 ATELIER.md seed template

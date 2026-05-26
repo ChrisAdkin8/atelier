@@ -43,6 +43,10 @@ CLAUDE.md
 # SQLite indexes are rebuildable caches and should not be committed.
 .atelier/indexes/
 
+# Static-analysis snapshots produced by `make metrics`. Derived per-run; users
+# diff against their own history under .atelier/metrics/history/.
+.atelier/metrics/
+
 # direnv per-project shell config. Holds developer-local secrets
 # (ANTHROPIC_API_KEY, OPENAI_API_KEY) that are loaded on `cd` into the
 # repo. NEVER commit — secrets-in-git is an irreversible leak that

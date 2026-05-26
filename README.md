@@ -134,7 +134,7 @@ In the GUI:
 1. Click **Browse...** in the header and select the repo you want Atelier to work in.
 2. Use **Chat** mode for normal conversation with the selected model.
 3. Use **Agent** mode when you want tool-using runs that write durable sessions.
-4. Watch the right-side panels for context, memory, plan, sub-agent progress, and token/cost meters.
+4. Watch the right-side panels for context, memory, sub-agent progress, and token/cost meters.
 
 ## Use the CLI
 
