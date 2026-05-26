@@ -17,9 +17,7 @@
 [![check](https://github.com/ChrisAdkin8/atelier/actions/workflows/check.yml/badge.svg)](https://github.com/ChrisAdkin8/atelier/actions/workflows/check.yml)
 [![license](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-Atelier is a **coding harness for AI software engineering**. It gives an AI model a safe, observable workspace for reading code, proposing edits, running tools, remembering project context, and proving that work is done.
-
-It is not tied to one model vendor. You can use Anthropic, OpenAI-compatible servers such as Ollama/LM Studio/vLLM/sglang/OpenAI, or the built-in Mock provider for offline testing.
+Atelier is a **coding harness for AI software engineering** — a safe, observable workspace where any model (Anthropic, OpenAI-compatible, or the built-in Mock) can read code, propose edits, run tools, remember context, and prove that work is done.
 
 ## What Atelier gives you
 
@@ -63,42 +61,25 @@ The installer downloads the matching `atelier-cli-<target>.tar.gz` release asset
 
 ### GUI
 
-GUI bundles are attached to the same GitHub Release as unsigned `.dmg`, `.AppImage`, and `.deb` artifacts.
+GUI bundles are attached to the same GitHub Release as unsigned artifacts.
 
-On Apple Silicon macOS:
+| Platform | Asset |
+|---|---|
+| Apple Silicon macOS | `Atelier_0.1.1_aarch64.dmg` |
+| Linux (AppImage) | `Atelier_0.1.1_amd64.AppImage` |
+| Debian / Ubuntu | `Atelier_0.1.1_amd64.deb` |
 
-```sh
-curl -L -o Atelier_0.1.1_aarch64.dmg \
-  https://github.com/ChrisAdkin8/atelier/releases/download/v0.1.1/Atelier_0.1.1_aarch64.dmg
-
-open Atelier_0.1.1_aarch64.dmg
-```
-
-Drag **Atelier** into **Applications**. Because the app is not yet signed/notarized, first launch may require:
+Download and install for your platform:
 
 ```sh
-xattr -dr com.apple.quarantine /Applications/Atelier.app
-open /Applications/Atelier.app
-```
+# macOS — drag Atelier into Applications, then clear quarantine on first launch:
+xattr -dr com.apple.quarantine /Applications/Atelier.app && open /Applications/Atelier.app
 
-On Linux with AppImage:
+# Linux AppImage:
+chmod +x Atelier_0.1.1_amd64.AppImage && ./Atelier_0.1.1_amd64.AppImage
 
-```sh
-curl -L -o Atelier_0.1.1_amd64.AppImage \
-  https://github.com/ChrisAdkin8/atelier/releases/download/v0.1.1/Atelier_0.1.1_amd64.AppImage
-
-chmod +x Atelier_0.1.1_amd64.AppImage
-./Atelier_0.1.1_amd64.AppImage
-```
-
-On Debian/Ubuntu:
-
-```sh
-curl -L -o Atelier_0.1.1_amd64.deb \
-  https://github.com/ChrisAdkin8/atelier/releases/download/v0.1.1/Atelier_0.1.1_amd64.deb
-
-sudo apt install ./Atelier_0.1.1_amd64.deb
-atelier-gui
+# Debian / Ubuntu:
+sudo apt install ./Atelier_0.1.1_amd64.deb && atelier-gui
 ```
 
 ## Quick start
@@ -133,7 +114,7 @@ The Mock provider exercises the real runner, dispatcher, staging, and persistenc
 
 ### 4. Choose a real model
 
-Use one of the options in [Choose a model](#choose-a-model), then either open the GUI or keep using the CLI.
+See [Choose a model](#choose-a-model) for Anthropic, Ollama, LM Studio, vLLM, and OpenAI setup.
 
 ## Open the GUI
 
@@ -154,8 +135,6 @@ In the GUI:
 2. Use **Chat** mode for normal conversation with the selected model.
 3. Use **Agent** mode when you want tool-using runs that write durable sessions.
 4. Watch the right-side panels for context, memory, plan, sub-agent progress, and token/cost meters.
-
-The selected workspace is saved in `~/.atelier/gui.toml`. Agent follow-up prompts resume from the last durable session in that workspace. If a session directory was deleted, the GUI clears the stale resume pointer and starts fresh instead of failing the next prompt.
 
 ## Use the CLI
 
@@ -316,7 +295,6 @@ Atelier can remember useful facts across sessions:
 - The GUI Memory panel can add, delete, and promote memory cards.
 - Chat and Agent runs auto-draft cards for known fixable provider/config problems such as auth failures, missing API-key environment variables, unreachable providers, rate limits, and context overflows. The Memory panel refreshes as soon as the card is written.
 
-Memory cards are the source of truth: they stay human-readable Markdown and can be edited or deleted by hand. The SQLite indexes are rebuildable FTS caches used for fast recall/search; they are refreshed when the GUI loads memory and updated when cards are promoted or auto-drafted.
 
 ### Skills
 
@@ -356,7 +334,7 @@ Atelier is MCP-first. Built-in tools and registered MCP tools share the same dis
 | GUI starts on a temp workspace | Click **Browse...** and select a real repo; the choice persists to `~/.atelier/gui.toml`. |
 | A profile is ignored | Project `.atelier/providers.toml` wins over `~/.atelier/providers.toml`; check which file `atelier run` reports. |
 | Config fails to load | Fix the TOML error. Atelier intentionally treats malformed config as fatal. |
-| A GUI Agent follow-up starts fresh | The previous session manifest was missing or deleted, so the GUI cleared the stale resume pointer. |
+| A GUI Agent follow-up starts fresh | The previous session directory was deleted; the GUI cleared the stale resume pointer and started fresh. The workspace choice persists in `~/.atelier/gui.toml`. |
 
 ## Architecture at a glance
 
@@ -373,13 +351,7 @@ Atelier is a Rust workspace:
 | [`atelier-gui`](crates/atelier-gui/) | Tauri 2.x + Svelte 5 desktop workspace. |
 | [`atelier-tui`](crates/atelier-tui/) | `ratatui` terminal workspace. |
 
-Key design choices:
-
-- **Bring your own model.** Provider adapters are pluggable and not SDK-locked.
-- **Verification is explicit.** The agent loop has a real verification transition.
-- **Sessions are durable.** Runs persist enough state to resume safely.
-- **Tooling is policy-aware.** Built-in and MCP tools share dispatch, hooks, sandboxing, audit, and ledger behavior.
-- **Secrets stay out of config.** Provider API keys use env vars or OS keychain references.
+See [`coding-harness-spec.md`](coding-harness-spec.md) for the full design rationale.
 
 ## Project map
 
