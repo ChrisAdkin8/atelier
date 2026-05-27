@@ -98,13 +98,19 @@ fn bundled_manifests() -> &'static [(&'static str, &'static str)] {
             "dependency-upgrade",
             include_str!("../skills/dependency-upgrade.json"),
         ),
-        ("issue-to-plan", include_str!("../skills/issue-to-plan.json")),
+        (
+            "issue-to-plan",
+            include_str!("../skills/issue-to-plan.json"),
+        ),
         ("pr-polish", include_str!("../skills/pr-polish.json")),
         (
             "perf-investigate",
             include_str!("../skills/perf-investigate.json"),
         ),
-        ("config-doctor", include_str!("../skills/config-doctor.json")),
+        (
+            "config-doctor",
+            include_str!("../skills/config-doctor.json"),
+        ),
         (
             "release-publish",
             include_str!("../skills/release-publish.json"),
