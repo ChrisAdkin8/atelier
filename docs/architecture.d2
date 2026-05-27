@@ -1,0 +1,509 @@
+vars: {
+  d2-config: {
+    layout-engine: elk
+  }
+}
+
+direction: right
+
+classes: {
+  frontend: {
+    style: {
+      fill: "#1e3a5f"
+      stroke: "#60a5fa"
+      stroke-width: 2
+      font-color: "#f9fafb"
+      border-radius: 6
+    }
+  }
+  runner: {
+    style: {
+      fill: "#312e81"
+      stroke: "#a78bfa"
+      stroke-width: 2
+      font-color: "#f9fafb"
+      border-radius: 6
+    }
+  }
+  loop: {
+    style: {
+      fill: "#1c3a2a"
+      stroke: "#34d399"
+      stroke-width: 2
+      font-color: "#f9fafb"
+      border-radius: 6
+    }
+  }
+  adapter: {
+    style: {
+      fill: "#422006"
+      stroke: "#fbbf24"
+      stroke-width: 2
+      font-color: "#f9fafb"
+      border-radius: 6
+    }
+  }
+  tool: {
+    style: {
+      fill: "#1e1b4b"
+      stroke: "#818cf8"
+      stroke-width: 2
+      font-color: "#f9fafb"
+      border-radius: 6
+    }
+  }
+  gate: {
+    style: {
+      fill: "#4c0519"
+      stroke: "#f87171"
+      stroke-width: 2
+      font-color: "#f9fafb"
+      border-radius: 6
+    }
+  }
+  account: {
+    style: {
+      fill: "#134e4a"
+      stroke: "#2dd4bf"
+      stroke-width: 2
+      font-color: "#f9fafb"
+      border-radius: 6
+    }
+  }
+  persist: {
+    style: {
+      fill: "#1e293b"
+      stroke: "#94a3b8"
+      stroke-width: 2
+      font-color: "#f9fafb"
+      border-radius: 6
+    }
+  }
+  security: {
+    style: {
+      fill: "#3b0764"
+      stroke: "#d946ef"
+      stroke-width: 2
+      font-color: "#f9fafb"
+      border-radius: 6
+    }
+  }
+  hook: {
+    style: {
+      fill: "#292524"
+      stroke: "#d97706"
+      stroke-width: 2
+      font-color: "#f9fafb"
+      border-radius: 6
+    }
+  }
+  provider: {
+    style: {
+      fill: "#172554"
+      stroke: "#38bdf8"
+      stroke-width: 2
+      font-color: "#f9fafb"
+      border-radius: 6
+    }
+  }
+}
+
+# ─── Frontends (atelier-gui, atelier-tui) ────────────────────────────────────
+
+frontends: "Frontends" {
+  style: {
+    fill: "#0f172a"
+    stroke: "#60a5fa"
+    stroke-width: 2
+    font-color: "#60a5fa"
+    border-radius: 8
+    font-size: 15
+    bold: true
+  }
+
+  gui: "atelier-gui\n(Tauri 2 + Svelte 5)" {
+    class: frontend
+  }
+  tui: "atelier-tui\n(ratatui + crossterm)" {
+    class: frontend
+  }
+}
+
+# ─── atelier-cli: Runner ─────────────────────────────────────────────────────
+
+cli: "atelier-cli  ·  Runner (lib + bin)" {
+  style: {
+    fill: "#0f172a"
+    stroke: "#a78bfa"
+    stroke-width: 2
+    font-color: "#a78bfa"
+    border-radius: 8
+    font-size: 15
+    bold: true
+  }
+
+  runner: "Runner\n(runner.rs)" {
+    class: runner
+  }
+}
+
+# ─── atelier-core ────────────────────────────────────────────────────────────
+
+core: "atelier-core  (no UI)" {
+  style: {
+    fill: "#0a0f1e"
+    stroke: "#34d399"
+    stroke-width: 2
+    font-color: "#34d399"
+    border-radius: 8
+    font-size: 15
+    bold: true
+  }
+
+  # Agent loop
+  loop_cluster: "Agent Loop  §2 · §2.5" {
+    style: {
+      fill: "#0d1f18"
+      stroke: "#34d399"
+      stroke-width: 1
+      stroke-dash: 4
+      font-color: "#34d399"
+      border-radius: 6
+      font-size: 13
+    }
+
+    state: "State Machine\n(state.rs)" {
+      class: loop
+    }
+    protocol: "Model Protocol\nEnvelope (protocol.rs)" {
+      class: loop
+    }
+    context: "Context Manager\n(context.rs)" {
+      class: loop
+    }
+    memory: "Memory + Plan\n(memory.rs · plan.rs)" {
+      class: loop
+    }
+
+    state -> protocol: "structured\nenvelope" {
+      style.stroke: "#34d399"
+      style.font-color: "#34d399"
+    }
+    state -> context: "token\nbudget" {
+      style.stroke: "#34d399"
+      style.font-color: "#34d399"
+    }
+    context -> memory: "evict /\ncompact" {
+      style.stroke: "#34d399"
+      style.font-color: "#34d399"
+    }
+  }
+
+  # BYOM adapter
+  byom_cluster: "BYOM Adapters  §1" {
+    style: {
+      fill: "#1c0f00"
+      stroke: "#fbbf24"
+      stroke-width: 1
+      stroke-dash: 4
+      font-color: "#fbbf24"
+      border-radius: 6
+      font-size: 13
+    }
+
+    trait: "Adapter Trait\nchat · stream\ncount_tokens · capabilities" {
+      class: adapter
+    }
+    mock: "Mock" {
+      class: adapter
+    }
+    anthropic: "Anthropic\nMessages API" {
+      class: adapter
+    }
+    openai: "OpenAI-compat\n(Ollama · LM Studio\nvLLM · sglang · OpenAI)" {
+      class: adapter
+    }
+    probe: "ModelProfile\nProbe-on-first-use\n(model_profile.rs)" {
+      class: adapter
+    }
+
+    mock -> trait {
+      style.stroke: "#fbbf24"
+    }
+    anthropic -> trait {
+      style.stroke: "#fbbf24"
+    }
+    openai -> trait {
+      style.stroke: "#fbbf24"
+    }
+    trait -> probe: "capability\ncache" {
+      style.stroke: "#fbbf24"
+      style.font-color: "#fbbf24"
+    }
+  }
+
+  # Dispatcher + tools
+  dispatch_cluster: "Dispatcher + Tools  §15" {
+    style: {
+      fill: "#0d0b2e"
+      stroke: "#818cf8"
+      stroke-width: 1
+      stroke-dash: 4
+      font-color: "#818cf8"
+      border-radius: 6
+      font-size: 13
+    }
+
+    dispatcher: "Dispatcher\n(dispatcher.rs)" {
+      class: tool
+    }
+    builtin: "Built-in Tools\nread_file · list_dir · grep\nwrite_file · edit_file\nast_grep · shell · spawn_subagent" {
+      class: tool
+    }
+    mcp: "MCP Client\n(rmcp · mcp/)" {
+      class: tool
+    }
+    subagents: "Sub-agents\n(subagents.rs)" {
+      class: tool
+    }
+
+    dispatcher -> builtin {
+      style.stroke: "#818cf8"
+    }
+    dispatcher -> mcp {
+      style.stroke: "#818cf8"
+    }
+    dispatcher -> subagents {
+      style.stroke: "#818cf8"
+    }
+  }
+
+  # Verification gates
+  verify_cluster: "Verification Gates  §7" {
+    style: {
+      fill: "#1a0508"
+      stroke: "#f87171"
+      stroke-width: 1
+      stroke-dash: 4
+      font-color: "#f87171"
+      border-radius: 6
+      font-size: 13
+    }
+
+    staging: "Staging\n(staging.rs)" {
+      class: gate
+    }
+    verify: "Verify Gate\n(verify.rs)" {
+      class: gate
+    }
+    lsp: "LSP Tier-1\n(lsp/)" {
+      class: gate
+    }
+
+    staging -> verify: "staged\nedits" {
+      style.stroke: "#f87171"
+      style.font-color: "#f87171"
+    }
+    verify -> lsp: "diagnostics" {
+      style.stroke: "#f87171"
+      style.font-color: "#f87171"
+    }
+  }
+
+  # Cost + trust
+  account_cluster: "Accounting  §1 · §8" {
+    style: {
+      fill: "#051f1e"
+      stroke: "#2dd4bf"
+      stroke-width: 1
+      stroke-dash: 4
+      font-color: "#2dd4bf"
+      border-radius: 6
+      font-size: 13
+    }
+
+    ledger: "Cost Ledger\n(ledger.rs)" {
+      class: account
+    }
+    trust: "Trust Budget\n(trust_boundary.rs)" {
+      class: account
+    }
+  }
+
+  # Persistence + checkpoints
+  persist_cluster: "Persistence  §4 · §14" {
+    style: {
+      fill: "#0a111e"
+      stroke: "#94a3b8"
+      stroke-width: 1
+      stroke-dash: 4
+      font-color: "#94a3b8"
+      border-radius: 6
+      font-size: 13
+    }
+
+    session: "Session\n(session.rs)" {
+      class: persist
+    }
+    persistence: "Checkpoints\n(persistence.rs)" {
+      class: persist
+    }
+    diff: "Diff Engine\n(diff.rs)" {
+      class: persist
+    }
+
+    session -> persistence: "checkpoint" {
+      style.stroke: "#94a3b8"
+      style.font-color: "#94a3b8"
+    }
+    persistence -> diff: "diff-based\nsnapshot" {
+      style.stroke: "#94a3b8"
+      style.font-color: "#94a3b8"
+    }
+  }
+
+  # Security
+  security_cluster: "Security  §11" {
+    style: {
+      fill: "#1a0328"
+      stroke: "#d946ef"
+      stroke-width: 1
+      stroke-dash: 4
+      font-color: "#d946ef"
+      border-radius: 6
+      font-size: 13
+    }
+
+    sandbox: "Sandbox\n(sandbox.rs)" {
+      class: security
+    }
+    path_safety: "Path Safety\n(path_safety.rs)" {
+      class: security
+    }
+    text_safety: "Text Safety\n(text_safety.rs)" {
+      class: security
+    }
+  }
+
+  # Hooks + skills
+  hooks_cluster: "Hooks + Skills  §15" {
+    style: {
+      fill: "#1c1009"
+      stroke: "#d97706"
+      stroke-width: 1
+      stroke-dash: 4
+      font-color: "#d97706"
+      border-radius: 6
+      font-size: 13
+    }
+
+    hooks: "Hooks\n(hooks.rs)" {
+      class: hook
+    }
+    skills: "Skills\n(.atelier/skills/)" {
+      class: hook
+    }
+  }
+}
+
+# ─── External providers ───────────────────────────────────────────────────────
+
+providers: "External Providers" {
+  style: {
+    fill: "#0a0f1e"
+    stroke: "#38bdf8"
+    stroke-width: 2
+    font-color: "#38bdf8"
+    border-radius: 8
+    font-size: 15
+    bold: true
+  }
+
+  anthropic_api: "Anthropic API" {
+    class: provider
+  }
+  openai_api: "OpenAI / LM Studio\nvLLM · Ollama · sglang" {
+    class: provider
+  }
+  mcp_servers: "MCP Servers\n(external)" {
+    class: provider
+  }
+}
+
+# ─── Cross-cluster connections ────────────────────────────────────────────────
+
+# Frontends → Runner
+frontends.gui -> cli.runner: "embed Runner\n(driver mode)" {
+  style.stroke: "#a78bfa"
+  style.font-color: "#a78bfa"
+}
+frontends.tui -> cli.runner: "embed Runner\n(driver mode)" {
+  style.stroke: "#a78bfa"
+  style.font-color: "#a78bfa"
+}
+
+# Runner → agent loop
+cli.runner -> core.loop_cluster.state: "drive loop" {
+  style.stroke: "#34d399"
+  style.font-color: "#34d399"
+}
+
+# Agent loop → dispatcher
+core.loop_cluster.state -> core.dispatch_cluster.dispatcher: "tool call" {
+  style.stroke: "#818cf8"
+  style.font-color: "#818cf8"
+}
+
+# Agent loop → BYOM
+core.loop_cluster.state -> core.byom_cluster.trait: "chat / stream" {
+  style.stroke: "#fbbf24"
+  style.font-color: "#fbbf24"
+}
+
+# Dispatcher → verification
+core.dispatch_cluster.dispatcher -> core.verify_cluster.staging: "stage edits\nbefore commit" {
+  style.stroke: "#f87171"
+  style.font-color: "#f87171"
+}
+
+# Dispatcher → accounting (uniform surface)
+core.dispatch_cluster.dispatcher -> core.account_cluster.ledger: "record tokens\n+ latency" {
+  style.stroke: "#2dd4bf"
+  style.font-color: "#2dd4bf"
+}
+core.dispatch_cluster.dispatcher -> core.account_cluster.trust: "check trust\nbudget" {
+  style.stroke: "#2dd4bf"
+  style.font-color: "#2dd4bf"
+}
+
+# Dispatcher → hooks
+core.dispatch_cluster.dispatcher -> core.hooks_cluster.hooks: "pre/post\ntool events" {
+  style.stroke: "#d97706"
+  style.font-color: "#d97706"
+}
+
+# Dispatcher → security
+core.dispatch_cluster.dispatcher -> core.security_cluster.sandbox: "gate every\ntool call" {
+  style.stroke: "#d946ef"
+  style.font-color: "#d946ef"
+}
+
+# Loop → persistence
+core.loop_cluster.state -> core.persist_cluster.session: "checkpoint\nstate" {
+  style.stroke: "#94a3b8"
+  style.font-color: "#94a3b8"
+}
+
+# BYOM → external providers
+core.byom_cluster.anthropic -> providers.anthropic_api: "HTTPS" {
+  style.stroke: "#38bdf8"
+  style.font-color: "#38bdf8"
+}
+core.byom_cluster.openai -> providers.openai_api: "HTTPS /v1/" {
+  style.stroke: "#38bdf8"
+  style.font-color: "#38bdf8"
+}
+core.dispatch_cluster.mcp -> providers.mcp_servers: "MCP protocol" {
+  style.stroke: "#38bdf8"
+  style.font-color: "#38bdf8"
+}
