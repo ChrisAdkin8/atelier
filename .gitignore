@@ -35,6 +35,11 @@ CLAUDE.md
 # in .atelier/settings.json which is tracked.
 .atelier/settings.local.json
 
+# Per-host BYOM provider profiles: endpoint URLs, model IDs, and keyring
+# references that differ on every developer's machine and every deployment.
+# atelier-bedrock-infra ships providers.toml.example to copy from.
+.atelier/providers.toml
+
 # On-disk session state from local runs (UUID-keyed dirs holding turn logs,
 # partial completions, compaction blobs). Per-user runtime data; never tracked.
 .atelier/sessions/
