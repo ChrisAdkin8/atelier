@@ -188,6 +188,11 @@ pub struct AppState {
     /// by `SubagentSpawned`; updated by `SubagentTurnAdvanced`, `SubagentCompleted`,
     /// and `SubagentCancelled`. Rendered by `render_subagents_pane`.
     pub subagents: Vec<SubagentEntry>,
+    /// Monotonic user-turn counter, incremented on every committed user
+    /// message. Newly-spawned sub-agents are tagged with this value so the
+    /// pane can demote prior-run sub-agents (generation `< current_generation`)
+    /// into a single collapsed summary line (§10). Defaults to 0.
+    pub current_generation: u32,
 }
 
 /// Phase C close — TUI's projection of
@@ -432,6 +437,11 @@ pub struct SubagentEntry {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub cached_tokens: u32,
+    /// User-turn index in which this sub-agent was spawned (see
+    /// [`AppState::current_generation`]). Sub-agents from the current
+    /// generation render in full; earlier generations collapse into a
+    /// single "prior" summary line in `render_subagents_pane`.
+    pub generation: u32,
 }
 
 /// One event-log line. Stored as already-projected strings so the render
@@ -559,6 +569,11 @@ impl AppState {
                 self.current_state = to.name().to_string();
             }
             SessionEvent::MessageCommitted { role, text } => {
+                // A new user turn opens the next generation, demoting any
+                // sub-agents from earlier runs into the collapsed summary.
+                if matches!(role, MessageRole::User) {
+                    self.current_generation = self.current_generation.saturating_add(1);
+                }
                 self.push_conversation(ConversationRole::from_message_role(*role), text.clone());
             }
             SessionEvent::PlanSnapshot { steps } => {
@@ -826,6 +841,7 @@ impl AppState {
                     prompt_tokens: 0,
                     completion_tokens: 0,
                     cached_tokens: 0,
+                    generation: self.current_generation,
                 });
             }
             SessionEvent::SubagentTurnAdvanced {
@@ -2071,38 +2087,54 @@ fn render_subagents_pane(state: &AppState, area: Rect, buf: &mut Buffer) {
         return;
     }
 
-    let rows: Vec<ListItem> = state
-        .subagents
-        .iter()
-        .take(inner.height as usize)
-        .map(|e| {
-            let (badge, badge_style) = match e.status.as_str() {
-                "completed" => ("done", Style::default().fg(Color::Green)),
-                "failed" => ("fail", Style::default().fg(Color::Red)),
-                "cancelled" => ("canc", Style::default().fg(Color::Yellow)),
-                _ => ("run ", Style::default().fg(Color::Cyan)),
-            };
-            let turn_label = if e.max_turns > 0 {
-                format!("{}/{}", e.turn, e.max_turns)
-            } else {
-                e.turn.to_string()
-            };
-            let token_label = format!("↑{} ↓{}", e.prompt_tokens, e.completion_tokens);
-            ListItem::new(Line::from(vec![
-                Span::styled(format!("[{badge}] "), badge_style),
-                Span::styled(
-                    format!("{:<18}", safe_span(&e.subagent_type)),
-                    Style::default().fg(Color::Magenta),
-                ),
-                Span::raw(format!("{:<7} ", turn_label)),
-                Span::styled(
-                    format!("{:<11} ", token_label),
-                    Style::default().fg(Color::Cyan),
-                ),
-                Span::raw(safe_span(&e.description)),
-            ]))
-        })
-        .collect();
+    // §10 demote — sub-agents spawned before the current user turn collapse
+    // into a single dimmed summary line; their per-event detail still lives
+    // in the event log. Current-generation sub-agents render in full.
+    let cur = state.current_generation;
+    let (prior, current): (Vec<&SubagentEntry>, Vec<&SubagentEntry>) =
+        state.subagents.iter().partition(|e| e.generation < cur);
+
+    let mut rows: Vec<ListItem> = Vec::with_capacity(current.len() + 1);
+    if !prior.is_empty() {
+        let prompt: u32 = prior.iter().map(|e| e.prompt_tokens).sum();
+        let completion: u32 = prior.iter().map(|e| e.completion_tokens).sum();
+        let plural = if prior.len() == 1 { "" } else { "s" };
+        rows.push(ListItem::new(Line::from(vec![Span::styled(
+            format!(
+                "{} prior sub-agent{plural} · ↑{prompt} ↓{completion}",
+                prior.len()
+            ),
+            Style::default().fg(Color::DarkGray),
+        )])));
+    }
+    rows.extend(current.iter().map(|e| {
+        let (badge, badge_style) = match e.status.as_str() {
+            "completed" => ("done", Style::default().fg(Color::Green)),
+            "failed" => ("fail", Style::default().fg(Color::Red)),
+            "cancelled" => ("canc", Style::default().fg(Color::Yellow)),
+            _ => ("run ", Style::default().fg(Color::Cyan)),
+        };
+        let turn_label = if e.max_turns > 0 {
+            format!("{}/{}", e.turn, e.max_turns)
+        } else {
+            e.turn.to_string()
+        };
+        let token_label = format!("↑{} ↓{}", e.prompt_tokens, e.completion_tokens);
+        ListItem::new(Line::from(vec![
+            Span::styled(format!("[{badge}] "), badge_style),
+            Span::styled(
+                format!("{:<18}", safe_span(&e.subagent_type)),
+                Style::default().fg(Color::Magenta),
+            ),
+            Span::raw(format!("{:<7} ", turn_label)),
+            Span::styled(
+                format!("{:<11} ", token_label),
+                Style::default().fg(Color::Cyan),
+            ),
+            Span::raw(safe_span(&e.description)),
+        ]))
+    }));
+    let rows: Vec<ListItem> = rows.into_iter().take(inner.height as usize).collect();
     Widget::render(List::new(rows), inner, buf);
 }
 
@@ -5471,6 +5503,103 @@ mod tests {
         assert!(
             rendered.contains("verify off"),
             "missing verify off badge in:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn subagent_generation_tracks_user_turns() {
+        let mut s = AppState::new();
+        // First user turn opens generation 1; a sub-agent spawned now is tagged 1.
+        s.apply(&SessionEvent::MessageCommitted {
+            role: MessageRole::User,
+            text: "first".to_string(),
+        });
+        s.apply(&SessionEvent::SubagentSpawned {
+            id: "a".to_string(),
+            parent_id: "root".to_string(),
+            subagent_type: "Explore".to_string(),
+            description: "scan".to_string(),
+            max_turns: 5,
+        });
+        assert_eq!(s.current_generation, 1);
+        assert_eq!(s.subagents[0].generation, 1);
+
+        // Assistant turns do NOT open a new generation.
+        s.apply(&SessionEvent::MessageCommitted {
+            role: MessageRole::Assistant,
+            text: "ok".to_string(),
+        });
+        assert_eq!(s.current_generation, 1);
+
+        // A second user turn opens generation 2.
+        s.apply(&SessionEvent::MessageCommitted {
+            role: MessageRole::User,
+            text: "second".to_string(),
+        });
+        s.apply(&SessionEvent::SubagentSpawned {
+            id: "b".to_string(),
+            parent_id: "root".to_string(),
+            subagent_type: "Planner".to_string(),
+            description: "design".to_string(),
+            max_turns: 3,
+        });
+        assert_eq!(s.current_generation, 2);
+        assert_eq!(s.subagents[1].generation, 2);
+    }
+
+    #[test]
+    fn render_subagents_pane_collapses_prior_generation() {
+        let mut s = AppState::new();
+        // Run 1: a sub-agent that consumes tokens.
+        s.apply(&SessionEvent::MessageCommitted {
+            role: MessageRole::User,
+            text: "t1".to_string(),
+        });
+        s.apply(&SessionEvent::SubagentSpawned {
+            id: "old".to_string(),
+            parent_id: "root".to_string(),
+            subagent_type: "Explore".to_string(),
+            description: "old work".to_string(),
+            max_turns: 5,
+        });
+        s.apply(&SessionEvent::SubagentTokensUpdated {
+            id: "old".to_string(),
+            prompt_tokens: 100,
+            completion_tokens: 40,
+            cached_tokens: 0,
+        });
+        // Run 2: a fresh sub-agent.
+        s.apply(&SessionEvent::MessageCommitted {
+            role: MessageRole::User,
+            text: "t2".to_string(),
+        });
+        s.apply(&SessionEvent::SubagentSpawned {
+            id: "new".to_string(),
+            parent_id: "root".to_string(),
+            subagent_type: "Planner".to_string(),
+            description: "new work".to_string(),
+            max_turns: 3,
+        });
+
+        let area = Rect::new(0, 0, 80, 6);
+        let mut buf = Buffer::empty(area);
+        render_subagents_pane(&s, area, &mut buf);
+        let rendered = buffer_to_string(&buf, area);
+
+        // Prior sub-agent collapses into a summary line with rolled-up tokens.
+        assert!(
+            rendered.contains("1 prior sub-agent · ↑100 ↓40"),
+            "missing prior rollup in:\n{rendered}"
+        );
+        // Its description is no longer rendered in full.
+        assert!(
+            !rendered.contains("old work"),
+            "prior sub-agent should be collapsed, found detail in:\n{rendered}"
+        );
+        // The current-run sub-agent still renders in full.
+        assert!(
+            rendered.contains("new work"),
+            "missing current sub-agent in:\n{rendered}"
         );
     }
 

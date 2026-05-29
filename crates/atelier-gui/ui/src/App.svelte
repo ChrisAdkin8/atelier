@@ -394,7 +394,7 @@
     <div class="pane-slot memory-slot">
       <div class="memory-stack">
         <MemoryPane cards={app.memoryCards} />
-        <SubagentPane subagents={app.subagents} />
+        <SubagentPane subagents={app.subagents} currentGeneration={app.currentGeneration} />
       </div>
     </div>
     <div class="pane-slot context-slot">

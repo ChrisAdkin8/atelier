@@ -245,6 +245,11 @@ export type SubagentEntry = {
   promptTokens: number
   completionTokens: number
   cachedTokens: number
+  /// User-turn index in which this sub-agent was spawned (mirrors the TUI's
+  /// `SubagentEntry.generation`). Sub-agents from the current generation
+  /// render in full; earlier generations collapse into a single "prior"
+  /// rollup in `SubagentPane`.
+  generation: number
 }
 
 export type AppState = {
@@ -315,6 +320,11 @@ export type AppState = {
   /// §10 sub-agent panel rows. Populated by SubagentSpawned, updated by
   /// SubagentTurnAdvanced / SubagentCompleted / SubagentCancelled events.
   subagents: SubagentEntry[]
+  /// Monotonic user-turn counter (mirrors the TUI's `current_generation`).
+  /// Incremented on every committed user message; newly-spawned sub-agents
+  /// are tagged with this value so `SubagentPane` can demote prior-run
+  /// sub-agents (generation `< currentGeneration`) into a collapsed rollup.
+  currentGeneration: number
   /// AgentStalled timestamp (ms since epoch). Non-null while the runner is
   /// waiting for the user to nudge after the model replied without tool calls
   /// or a claimed_done envelope. Cleared when the user submits the next turn.
@@ -349,6 +359,7 @@ export function initialState(): AppState {
     verificationStatus: initialVerificationStatus(),
     lastOverflowResolution: null,
     subagents: [],
+    currentGeneration: 0,
     stalledAt: null,
     runInFlight: false,
     lspInstallRequest: null,
@@ -417,7 +428,20 @@ export function applyEvent(state: AppState, evt: BridgedEvent): AppState {
         : state.lastTurnTokens
       // A new user turn clears the stalled banner.
       const stalledAt = role === 'user' ? null : state.stalledAt
-      return { ...state, events, conversation, streamingAssistant, lastTurnTokens, stalledAt }
+      // A new user turn opens the next generation, demoting any sub-agents
+      // from earlier runs into the collapsed rollup.
+      const currentGeneration = role === 'user'
+        ? state.currentGeneration + 1
+        : state.currentGeneration
+      return {
+        ...state,
+        events,
+        conversation,
+        streamingAssistant,
+        lastTurnTokens,
+        stalledAt,
+        currentGeneration,
+      }
     }
     case 'AssistantTextDelta': {
       const p = evt.payload as { delta: string }
@@ -681,6 +705,7 @@ export function applyEvent(state: AppState, evt: BridgedEvent): AppState {
         promptTokens: 0,
         completionTokens: 0,
         cachedTokens: 0,
+        generation: state.currentGeneration,
       }
       return { ...state, events, subagents: [...state.subagents, entry] }
     }
