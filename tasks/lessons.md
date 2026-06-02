@@ -189,3 +189,13 @@ Lessons distilled from the v52–v60.17 trail: four deep-scan audit rounds, four
 **Failure**: v60.10 candor — B2's CHANGELOG claimed a merge that had never happened (survived through the push); B3's agent edited the parent repo's working tree before catching itself. Cross-project memory file `feedback_worktree_isolation_drift.md` exists but is invisible to CI.
 
 **Prevention**: extend the `quality-cheap` CI job (v60.14) with a check that, given a PR body claiming "this lands bundles X, Y, Z," runs `git log --grep="Merge .*: <bundle>" main` and fails on any unmatched claim. Cheap, mechanical, and catches the failure mode at the moment of risk.
+
+---
+
+## 2026-06-02 — Deep-scan subagent severity is unreliable without context verification
+
+### Explore subagents flag panic/unwrap constructs but mis-classify prod vs test (and unwrap vs unwrap_or)
+
+**Failure**: the 2026-06-02 deep-scan reported 2 P0 "production panics" and ~15 P1s. On verification, both P0s were `panic!`/`.unwrap()` inside `#[test]` functions (`runner.rs:3552/3566`, test module starts at 3494), not production. Several P1s were also false: `runner.rs:1442` was `Option::unwrap_or` (infallible, not a panic), `main.rs:969` was a provably-safe unwrap after an `is_empty()` guard, `main.rs:2476/2481` were test assertions, and `gui:1070` / `tui:3634` / `provider.rs:59` / `staging.rs:813` were either mis-identified or already-correct intentional code. Of ~25 findings, only the complexity hotspot (tool-corroborated) and the coverage gaps (tool-measured) plus a few minor quality nits survived. The false "2 production panics" had already propagated into draft LinkedIn copy.
+
+**Prevention**: never assign severity to an Explore-subagent finding without (1) checking the cited line against the file's `#[cfg(test)]` boundary (`grep -n '#\[cfg(test)\]' <file>` — anything after it is test code), and (2) reading the construct in context (`unwrap_or`/`unwrap_or_default`/`unwrap_or_else` cannot panic; `.expect("...infallible")` on a builder is idiomatic, not a defect). Per the skill's own design, Explore *locates* code, it does not *audit* it — route severity-bearing findings through `rust-reviewer` (full-context reader), and trust the deterministic layer (clippy, cargo-audit, rust-code-analysis, llvm-cov) over subagent prose.

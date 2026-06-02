@@ -700,18 +700,28 @@ def cargo_geiger(crate_name: str) -> dict[str, Any] | None:
     return {"used_total": used, "unused_total": unused, "packages_scanned": len(pkgs)}
 
 
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+_TREE_PREFIX_RE = re.compile(r"^((?:│   |    )*)(├── |└── )")
+
+
+def _modules_depth(line: str) -> int:
+    clean = _ANSI_RE.sub("", line)
+    m = _TREE_PREFIX_RE.match(clean)
+    return len(m.group(1)) // 4 + 1 if m else 0
+
+
 def cargo_modules(crate_name: str) -> dict[str, Any] | None:
     if not have("cargo-modules"):
         return None
-    p = run(
-        ["cargo", "modules", "structure", "--package", crate_name, "--no-fns", "--no-types"],
-        timeout=TIMEOUTS["default"],
-    )
+    base_cmd = ["cargo", "modules", "structure", "--package", crate_name, "--no-fns", "--no-types"]
+    p = run(base_cmd, timeout=TIMEOUTS["default"])
+    # Multi-target crates (lib + bin) require an explicit --lib flag.
+    if (not p or p.returncode != 0) and (not p or "Multiple targets" in (p.stderr or "")):
+        p = run(base_cmd + ["--lib"], timeout=TIMEOUTS["default"])
     if not p or p.returncode != 0:
         return {"error": "cargo-modules failed", "stderr": (p.stderr[:400] if p else None)}
-    # Each line is one module entry; depth ~ leading indentation (2 spaces per level).
     lines = [ln for ln in p.stdout.splitlines() if ln.strip()]
-    depths = [(len(ln) - len(ln.lstrip())) // 2 for ln in lines]
+    depths = [_modules_depth(ln) for ln in lines]
     return {
         "module_count": len(lines),
         "max_depth": max(depths) if depths else 0,
