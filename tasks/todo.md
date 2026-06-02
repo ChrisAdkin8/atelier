@@ -7,6 +7,8 @@ Change history in `../CHANGELOG.md`.
 
 **Tracker discipline:** keep this file up to date whenever a plan lands, a risk/remediation status changes, or gate counts change. Do not leave `tasks/todo.md` as a historical snapshot; move detailed release history to `../CHANGELOG.md` and keep this file focused on current state plus active/pending work.
 
+**v60.89 (2026-06-02)** — `Runner::run` decomposition (audit Bundle 1). Extracted four behaviour-preserving units from the agent turn loop — `resolve_context_overflow`, `execute_tool_calls`, `parse_envelope`, and `last_turn_was_all_subagent` — cutting `run()` from cyclomatic 182→139 (−24%), cognitive 239→178, and 1,617→1,364 SLOC. All gates green (239 cli tests, fmt, clippy). The deep-scan that prompted this (`tasks/audit-2026-06-02.md`) found its two reported P0s were false positives (test code mis-flagged as production by the Explore review subagents); verified remediation plan in `tasks/plan_audit_2026-06-02_fixes.md`. Driving `run()` below cyclomatic 50 is deferred to a `TurnState`/`TurnContext` redesign (plan R1b), sequenced after the Bundle 2 coverage uplift (atelier-cli is 52% line-covered).
+
 **v60.88 (2026-05-23)** — Bundled workflow skills. Added ten embedded skills for CI diagnosis, dependency upgrades, issue planning, PR polish, performance investigation, config doctoring, release publishing, migrations, bug reports, and new-contributor onboarding. Packaged app version moves to `0.1.1` so Homebrew/GitHub Release installs receive the expanded catalogue.
 
 **v60.87 (2026-05-23)** — Removed the Phase A nightly gate action. `.github/workflows/nightly_phase_a_gate.yml` is gone; Phase A live-provider tests remain manually runnable, while regular CI keeps the offline Mock canonical coverage green.

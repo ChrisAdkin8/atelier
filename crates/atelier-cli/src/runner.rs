@@ -548,6 +548,13 @@ pub enum ContextOverflowPolicy {
 /// calibration run shows real models routinely need more.
 pub const MAX_OVERFLOW_RETRIES: usize = 2;
 
+/// Outcome of [`Runner::resolve_context_overflow`]: either retry the chat
+/// call (a compaction freed space) or abort the run with this error.
+enum OverflowOutcome {
+    Retry,
+    Abort(RunError),
+}
+
 /// §1 BYOM — fraction of the freed-token target the auto-selector
 /// padds with so a near-miss heuristic doesn't immediately re-overflow
 /// after compaction. 25% over the strict `needed - (limit - current)`
@@ -1133,6 +1140,283 @@ impl Runner {
             }
         })?;
         Ok((expanded, Some(format!("skill: {name}"))))
+    }
+
+    /// Dispatch this turn's non-envelope tool calls concurrently, fold the
+    /// outcomes back into `messages` / `context_manager`, and harvest each
+    /// `EditStaged` event into `observed_changes` for the end-of-run §7 verify
+    /// pass. Drives the `ToolDispatching → ToolExecuting → Streaming` state
+    /// transitions. Extracted verbatim from [`Runner::run`]'s turn loop; the
+    /// caller invokes it only when there are real tool calls and sets
+    /// `final_state = Streaming` afterward.
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_tool_calls(
+        &self,
+        real_tool_calls: Vec<ToolCallRequest>,
+        session_handle: &SessionHandle,
+        session_dispatcher: &SessionDispatcher,
+        sandbox: &SandboxPolicy,
+        workspace: &Path,
+        audit_log_path: &Path,
+        bus: &tokio::sync::broadcast::Sender<Event>,
+        context_manager: &parking_lot::Mutex<ContextManager>,
+        messages: &mut Vec<Message>,
+        observed_changes: &mut Vec<atelier_core::verify::ObservedChange>,
+    ) -> Result<(), RunError> {
+        advance(session_handle, State::Streaming, State::ToolDispatching).await?;
+        advance(session_handle, State::ToolDispatching, State::ToolExecuting).await?;
+        // Dispatch all tool calls from this turn concurrently. When the model
+        // emits multiple spawn_subagent calls, they run in parallel rather than
+        // serially, giving N× throughput on independent sub-agent workloads.
+        // Outcomes are processed in the original call order so message history
+        // stays deterministic. One ToolContext per call: the dispatcher
+        // overrides tool_call_id internally so these are equivalent to the
+        // single shared ctx used in the old sequential path.
+        let ctxs: Vec<atelier_core::dispatcher::ToolContext<'_>> = real_tool_calls
+            .iter()
+            .map(|_| atelier_core::dispatcher::ToolContext {
+                workspace_root: workspace,
+                sandbox,
+                tool_call_id: None,
+                audit_log_path: Some(audit_log_path),
+                cancel: session_handle.cancel_token(),
+                deadline: atelier_core::dispatcher::DEFAULT_TOOL_DEADLINE,
+                subagent_depth: self.subagent_depth,
+            })
+            .collect();
+        let outcomes = futures::future::join_all(
+            real_tool_calls
+                .iter()
+                .zip(ctxs.iter())
+                .map(|(call, ctx)| session_dispatcher.dispatch(call, ctx, now_rfc3339)),
+        )
+        .await;
+
+        for (_call, outcome) in real_tool_calls.into_iter().zip(outcomes) {
+            // v60.8 A2 follow-on — harvest per-file EditStaged events.
+            for evt in &outcome.events {
+                if let Event::EditStaged { path, hunks } = evt {
+                    let kind = match hunks {
+                        atelier_core::diff::Hunks::Created { .. } => {
+                            atelier_core::verify::ObservedKind::Created
+                        }
+                        atelier_core::diff::Hunks::Deleted { .. } => {
+                            atelier_core::verify::ObservedKind::Deleted
+                        }
+                        _ => atelier_core::verify::ObservedKind::Modified,
+                    };
+                    let path_str = path.to_string_lossy().into_owned();
+                    observed_changes.retain(|o| o.path != path_str);
+                    observed_changes.push(atelier_core::verify::ObservedChange {
+                        path: path_str,
+                        kind,
+                    });
+                }
+            }
+            let result_str = match &outcome.result {
+                Ok(r) => tool_result_string_for_model(&r.output, self.subagent_depth > 0),
+                Err(e) => serde_json::json!({ "error": e.to_string() }).to_string(),
+            };
+            let _ = try_emit(
+                bus,
+                Event::MessageCommitted {
+                    role: MessageRole::Tool,
+                    text: result_str.clone(),
+                },
+            );
+            context_manager.lock().add(context_item_for_tool_result(
+                &result_str,
+                &outcome.tool_call_id,
+                &now_rfc3339(),
+            ));
+            messages.push(Message {
+                role: Role::Tool,
+                content: result_str,
+                tool_call_id: Some(outcome.tool_call_id),
+                tool_calls: Vec::new(),
+            });
+        }
+        advance(session_handle, State::ToolExecuting, State::Streaming).await?;
+        Ok(())
+    }
+
+    /// Resolve an `AdapterError::ContextOverflow` raised mid-turn per the
+    /// configured [`ContextOverflowPolicy`]. Extracted from [`Runner::run`]'s
+    /// turn loop (its dominant complexity contributor). Returns
+    /// [`OverflowOutcome::Retry`] when a compaction freed space and the chat
+    /// call should be re-issued, or [`OverflowOutcome::Abort`] carrying the
+    /// `RunError` the caller must propagate. Behaviour is identical to the
+    /// pre-extraction inline arm; see the v60.5 compaction / v60.32 M03
+    /// history notes at the call site.
+    #[allow(clippy::too_many_arguments)]
+    async fn resolve_context_overflow(
+        &self,
+        needed_tokens: u32,
+        limit_tokens: u32,
+        overflow_retries: &mut usize,
+        messages: &mut Vec<Message>,
+        token_count_cache: &mut Option<(u64, AdapterTokenCount)>,
+        context_manager: &parking_lot::Mutex<ContextManager>,
+        session_dispatcher: &SessionDispatcher,
+        workspace: &Path,
+        session_id: &SessionId,
+        bus: &tokio::sync::broadcast::Sender<Event>,
+    ) -> OverflowOutcome {
+        // Choose the policy arm. After the retry cap we always drop to
+        // Surface, even when the policy is Compact, to defend against a
+        // wedged model.
+        let effective = if *overflow_retries >= MAX_OVERFLOW_RETRIES {
+            ContextOverflowPolicy::Surface
+        } else {
+            self.overflow_policy
+        };
+        match effective {
+            ContextOverflowPolicy::Compact => {
+                // Snapshot the live context, pick items to free the gap
+                // (plus a small safety margin), and run the v60.5 compaction
+                // orchestrator. A successful compaction publishes the
+                // resolution event then retries the turn; a failure surfaces.
+                let snapshot = context_manager.lock().panel_snapshot();
+                let current_total: u32 = snapshot.items.iter().map(|s| s.tokens).sum();
+                let picks = pick_overflow_compaction_targets(
+                    &snapshot.items,
+                    needed_tokens,
+                    limit_tokens,
+                    current_total,
+                );
+                if picks.is_empty() {
+                    // No unpinned items to free — there's nothing the
+                    // compaction arm can do. Surface so the user can
+                    // intervene (unpin, edit, etc).
+                    let _ = try_emit(
+                        bus,
+                        Event::ContextOverflowResolved {
+                            resolution: "surfaced",
+                            freed_tokens: None,
+                            items_compacted: None,
+                        },
+                    );
+                    return OverflowOutcome::Abort(RunError::ContextOverflow {
+                        needed_tokens,
+                        limit_tokens,
+                    });
+                }
+                // v60.32 M03 — snapshot the text of each picked context item
+                // before compaction so we can drop the matching conversation
+                // history entries after the mutator runs. Without this the
+                // retry chat call would re-send every original message
+                // verbatim, defeating the compaction.
+                let picked_texts: Vec<String> = {
+                    let cm = context_manager.lock();
+                    picks
+                        .iter()
+                        .filter_map(|id| {
+                            cm.iter()
+                                .find(|it| it.id.to_string() == *id)
+                                .and_then(|it| match &it.payload {
+                                    atelier_core::context::Payload::InlineText { text } => {
+                                        Some(text.clone())
+                                    }
+                                    _ => None,
+                                })
+                        })
+                        .collect()
+                };
+                let now = now_rfc3339();
+                let sid_str = session_id.0.to_string();
+                match crate::compaction::compact(
+                    self.adapter.as_ref(),
+                    session_dispatcher,
+                    workspace,
+                    &sid_str,
+                    picks.clone(),
+                    &now,
+                    // v60.37 A3 — propagate the same cost policy the main
+                    // loop uses so the compaction ModelCall ledger entry is
+                    // attributed correctly.
+                    self.cost_policy,
+                )
+                .await
+                {
+                    Ok(out) => {
+                        let _ = try_emit(
+                            bus,
+                            Event::ContextOverflowResolved {
+                                resolution: "compacted",
+                                freed_tokens: Some(out.freed_tokens),
+                                items_compacted: Some(picks.len()),
+                            },
+                        );
+                        // v60.32 M03 — drop the history entries the compaction
+                        // consumed so the next `project_messages_for_call`
+                        // builds a smaller payload. We only trim User /
+                        // Assistant rows (the rolling prose history); Tool rows
+                        // stay so a pending tool_use → tool_result pair isn't
+                        // orphaned. The atelier system prompt is never a
+                        // compaction target — the picker filters pinned items
+                        // and the system prompt isn't a context item to begin
+                        // with.
+                        if !picked_texts.is_empty() {
+                            messages.retain(|m| {
+                                !(matches!(m.role, Role::User | Role::Assistant)
+                                    && picked_texts.iter().any(|t| t == &m.content))
+                            });
+                        }
+                        *token_count_cache = None;
+                        *overflow_retries += 1;
+                        OverflowOutcome::Retry
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "context-overflow auto-compaction failed; surfacing the original overflow"
+                        );
+                        let _ = try_emit(
+                            bus,
+                            Event::ContextOverflowResolved {
+                                resolution: "surfaced",
+                                freed_tokens: None,
+                                items_compacted: None,
+                            },
+                        );
+                        OverflowOutcome::Abort(RunError::ContextOverflow {
+                            needed_tokens,
+                            limit_tokens,
+                        })
+                    }
+                }
+            }
+            ContextOverflowPolicy::Reroute => {
+                // v60.9 stub — the routing-dispatcher arm lands in a follow-on
+                // bundle. Emit the resolution event so a subscriber can render
+                // "reroute requested but unconfigured" and surface a typed
+                // config error so the caller knows the policy arm hasn't been
+                // wired yet.
+                let _ = try_emit(
+                    bus,
+                    Event::ContextOverflowResolved {
+                        resolution: "rerouted",
+                        freed_tokens: None,
+                        items_compacted: None,
+                    },
+                );
+                OverflowOutcome::Abort(RunError::Config("reroute not yet implemented".into()))
+            }
+            ContextOverflowPolicy::Surface => {
+                let _ = try_emit(
+                    bus,
+                    Event::ContextOverflowResolved {
+                        resolution: "surfaced",
+                        freed_tokens: None,
+                        items_compacted: None,
+                    },
+                );
+                OverflowOutcome::Abort(RunError::ContextOverflow {
+                    needed_tokens,
+                    limit_tokens,
+                })
+            }
+        }
     }
 
     /// Drive the loop until `claims_done` or `max_turns`. Returns when:
@@ -1789,182 +2073,28 @@ impl Runner {
                             needed_tokens,
                             limit_tokens,
                         }) => {
-                            // Choose the policy arm. After the retry
-                            // cap we always drop to Surface, even when
-                            // the policy is Compact, to defend against
-                            // a wedged model.
-                            let effective = if overflow_retries >= MAX_OVERFLOW_RETRIES {
-                                ContextOverflowPolicy::Surface
-                            } else {
-                                self.overflow_policy
-                            };
-                            match effective {
-                                ContextOverflowPolicy::Compact => {
-                                    // Snapshot the live context, pick
-                                    // items to free the gap (plus a
-                                    // small safety margin), and run
-                                    // the v60.5 compaction
-                                    // orchestrator. A successful
-                                    // compaction publishes the
-                                    // resolution event then retries
-                                    // the turn; a failure surfaces.
-                                    let snapshot = context_manager.lock().panel_snapshot();
-                                    let current_total: u32 =
-                                        snapshot.items.iter().map(|s| s.tokens).sum();
-                                    let picks = pick_overflow_compaction_targets(
-                                        &snapshot.items,
-                                        needed_tokens,
-                                        limit_tokens,
-                                        current_total,
-                                    );
-                                    if picks.is_empty() {
-                                        // No unpinned items to free —
-                                        // there's nothing the
-                                        // compaction arm can do.
-                                        // Surface so the user can
-                                        // intervene (unpin, edit, etc).
-                                        let _ = try_emit(
-                                            &bus,
-                                            Event::ContextOverflowResolved {
-                                                resolution: "surfaced",
-                                                freed_tokens: None,
-                                                items_compacted: None,
-                                            },
-                                        );
-                                        return Err(RunError::ContextOverflow {
-                                            needed_tokens,
-                                            limit_tokens,
-                                        });
-                                    }
-                                    // v60.32 M03 — snapshot the text
-                                    // of each picked context item
-                                    // before compaction so we can drop
-                                    // the matching conversation
-                                    // history entries after the
-                                    // mutator runs. Without this the
-                                    // retry chat call would re-send
-                                    // every original message verbatim,
-                                    // defeating the compaction.
-                                    let picked_texts: Vec<String> = {
-                                        let cm = context_manager.lock();
-                                        picks
-                                            .iter()
-                                            .filter_map(|id| {
-                                                cm.iter()
-                                                    .find(|it| it.id.to_string() == *id)
-                                                    .and_then(|it| match &it.payload {
-                                                        atelier_core::context::Payload::InlineText { text } => {
-                                                            Some(text.clone())
-                                                        }
-                                                        _ => None,
-                                                    })
-                                            })
-                                            .collect()
-                                    };
-                                    let now = now_rfc3339();
-                                    let sid_str = session_id.0.to_string();
-                                    match crate::compaction::compact(
-                                        self.adapter.as_ref(),
-                                        &session_dispatcher,
-                                        &workspace,
-                                        &sid_str,
-                                        picks.clone(),
-                                        &now,
-                                        // v60.37 A3 — propagate the same cost policy
-                                        // the main loop uses so the compaction ModelCall
-                                        // ledger entry is attributed correctly.
-                                        self.cost_policy,
-                                    )
-                                    .await
-                                    {
-                                        Ok(out) => {
-                                            let _ = try_emit(
-                                                &bus,
-                                                Event::ContextOverflowResolved {
-                                                    resolution: "compacted",
-                                                    freed_tokens: Some(out.freed_tokens),
-                                                    items_compacted: Some(picks.len()),
-                                                },
-                                            );
-                                            // v60.32 M03 — drop the history entries the
-                                            // compaction consumed so the next
-                                            // `project_messages_for_call` builds a smaller
-                                            // payload. We only trim User / Assistant rows
-                                            // (the rolling prose history); Tool rows stay
-                                            // so a pending tool_use → tool_result pair
-                                            // isn't orphaned. The atelier system prompt is
-                                            // never a compaction target — the picker
-                                            // filters pinned items and the system prompt
-                                            // isn't a context item to begin with.
-                                            if !picked_texts.is_empty() {
-                                                messages.retain(|m| {
-                                                    !(matches!(
-                                                        m.role,
-                                                        Role::User | Role::Assistant
-                                                    ) && picked_texts
-                                                        .iter()
-                                                        .any(|t| t == &m.content))
-                                                });
-                                            }
-                                            token_count_cache = None;
-                                            overflow_retries += 1;
-                                            continue;
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!(
-                                                error = %e,
-                                                "context-overflow auto-compaction failed; surfacing the original overflow"
-                                            );
-                                            let _ = try_emit(
-                                                &bus,
-                                                Event::ContextOverflowResolved {
-                                                    resolution: "surfaced",
-                                                    freed_tokens: None,
-                                                    items_compacted: None,
-                                                },
-                                            );
-                                            return Err(RunError::ContextOverflow {
-                                                needed_tokens,
-                                                limit_tokens,
-                                            });
-                                        }
-                                    }
-                                }
-                                ContextOverflowPolicy::Reroute => {
-                                    // v60.9 stub — the routing-dispatcher
-                                    // arm lands in a follow-on bundle.
-                                    // Emit the resolution event so a
-                                    // subscriber can render
-                                    // "reroute requested but unconfigured"
-                                    // and surface a typed config error
-                                    // so the caller knows the policy
-                                    // arm hasn't been wired yet.
-                                    let _ = try_emit(
-                                        &bus,
-                                        Event::ContextOverflowResolved {
-                                            resolution: "rerouted",
-                                            freed_tokens: None,
-                                            items_compacted: None,
-                                        },
-                                    );
-                                    return Err(RunError::Config(
-                                        "reroute not yet implemented".into(),
-                                    ));
-                                }
-                                ContextOverflowPolicy::Surface => {
-                                    let _ = try_emit(
-                                        &bus,
-                                        Event::ContextOverflowResolved {
-                                            resolution: "surfaced",
-                                            freed_tokens: None,
-                                            items_compacted: None,
-                                        },
-                                    );
-                                    return Err(RunError::ContextOverflow {
-                                        needed_tokens,
-                                        limit_tokens,
-                                    });
-                                }
+                            // v60.5 compaction / v60.32 M03 — delegated to
+                            // `resolve_context_overflow`; a successful
+                            // compaction returns `Retry` (re-issue the chat
+                            // call), otherwise it returns the `RunError` to
+                            // surface.
+                            match self
+                                .resolve_context_overflow(
+                                    needed_tokens,
+                                    limit_tokens,
+                                    &mut overflow_retries,
+                                    &mut messages,
+                                    &mut token_count_cache,
+                                    &context_manager,
+                                    &session_dispatcher,
+                                    &workspace,
+                                    &session_id,
+                                    &bus,
+                                )
+                                .await
+                            {
+                                OverflowOutcome::Retry => continue,
+                                OverflowOutcome::Abort(e) => return Err(e),
                             }
                         }
                         Err(e) => return Err(RunError::Adapter(format!("{e}"))),
@@ -2028,22 +2158,8 @@ impl Runner {
             //    the dispatcher executes them and feeds results back as
             //    Role::Tool messages.
             let parse_strategy = active_strategy;
-            let (envelope, parse_ok) = match parse_strategy {
-                Strategy::NativeTool => match extract_native_envelope(&response.tool_calls) {
-                    Some(env) => (env, true),
-                    None => (Envelope::default(), false),
-                },
-                Strategy::JsonSentinel => match parse_json_sentinel(&response.text) {
-                    Ok(parsed) => (parsed.envelope, true),
-                    Err(_) => (Envelope::default(), false),
-                },
-                Strategy::RegexProse => {
-                    match atelier_core::protocol_strategy::parse_regex_prose(&response.text) {
-                        Ok(env) => (env, true),
-                        Err(_) => (Envelope::default(), false),
-                    }
-                }
-            };
+            let (envelope, parse_ok) =
+                parse_envelope(parse_strategy, &response.tool_calls, &response.text);
             // Record the outcome against the *active* strategy so the
             // per-strategy breakdown lines up with what the runner was
             // actually trying to use.
@@ -2170,86 +2286,19 @@ impl Runner {
             let made_tool_calls = !real_tool_calls.is_empty();
 
             if !real_tool_calls.is_empty() {
-                advance(&session_handle, State::Streaming, State::ToolDispatching).await?;
-                advance(
+                self.execute_tool_calls(
+                    real_tool_calls,
                     &session_handle,
-                    State::ToolDispatching,
-                    State::ToolExecuting,
+                    &session_dispatcher,
+                    &sandbox,
+                    &workspace,
+                    &audit_log_path,
+                    &bus,
+                    &context_manager,
+                    &mut messages,
+                    &mut observed_changes,
                 )
                 .await?;
-                // Dispatch all tool calls from this turn concurrently.
-                // When the model emits multiple spawn_subagent calls, they
-                // run in parallel rather than serially, giving N× throughput
-                // on independent sub-agent workloads. Outcomes are processed
-                // in the original call order so message history stays
-                // deterministic. One ToolContext per call: the dispatcher
-                // overrides tool_call_id internally so these are equivalent
-                // to the single shared ctx used in the old sequential path.
-                let ctxs: Vec<atelier_core::dispatcher::ToolContext<'_>> = real_tool_calls
-                    .iter()
-                    .map(|_| atelier_core::dispatcher::ToolContext {
-                        workspace_root: workspace.as_path(),
-                        sandbox: &sandbox,
-                        tool_call_id: None,
-                        audit_log_path: Some(audit_log_path.as_path()),
-                        cancel: session_handle.cancel_token(),
-                        deadline: atelier_core::dispatcher::DEFAULT_TOOL_DEADLINE,
-                        subagent_depth: self.subagent_depth,
-                    })
-                    .collect();
-                let outcomes = futures::future::join_all(
-                    real_tool_calls
-                        .iter()
-                        .zip(ctxs.iter())
-                        .map(|(call, ctx)| session_dispatcher.dispatch(call, ctx, now_rfc3339)),
-                )
-                .await;
-
-                for (_call, outcome) in real_tool_calls.into_iter().zip(outcomes) {
-                    // v60.8 A2 follow-on — harvest per-file EditStaged events.
-                    for evt in &outcome.events {
-                        if let Event::EditStaged { path, hunks } = evt {
-                            let kind = match hunks {
-                                atelier_core::diff::Hunks::Created { .. } => {
-                                    atelier_core::verify::ObservedKind::Created
-                                }
-                                atelier_core::diff::Hunks::Deleted { .. } => {
-                                    atelier_core::verify::ObservedKind::Deleted
-                                }
-                                _ => atelier_core::verify::ObservedKind::Modified,
-                            };
-                            let path_str = path.to_string_lossy().into_owned();
-                            observed_changes.retain(|o| o.path != path_str);
-                            observed_changes.push(atelier_core::verify::ObservedChange {
-                                path: path_str,
-                                kind,
-                            });
-                        }
-                    }
-                    let result_str = match &outcome.result {
-                        Ok(r) => tool_result_string_for_model(&r.output, self.subagent_depth > 0),
-                        Err(e) => serde_json::json!({ "error": e.to_string() }).to_string(),
-                    };
-                    let _ = try_emit(
-                        &bus,
-                        Event::MessageCommitted {
-                            role: MessageRole::Tool,
-                            text: result_str.clone(),
-                        },
-                    );
-                    context_manager.lock().add(context_item_for_tool_result(
-                        &result_str,
-                        &outcome.tool_call_id,
-                        &now_rfc3339(),
-                    ));
-                    messages.push(Message {
-                        role: Role::Tool,
-                        content: result_str,
-                        tool_call_id: Some(outcome.tool_call_id),
-                        tool_calls: Vec::new(),
-                    });
-                }
-                advance(&session_handle, State::ToolExecuting, State::Streaming).await?;
                 final_state = State::Streaming;
             }
 
@@ -2366,25 +2415,7 @@ impl Runner {
                 // implicit claimed_done. Any other tool mix (read_file,
                 // list_dir, …) means the model gathered info but didn't
                 // follow through, which is a genuine §2 stall.
-                let all_prev_were_subagent = {
-                    let n = messages.len();
-                    // messages[n-1] = current (just-pushed) Assistant.
-                    // Walk backwards from n-2 to find the start of the
-                    // contiguous Tool block.
-                    let mut tool_block_start = n.saturating_sub(1);
-                    while tool_block_start > 0 && messages[tool_block_start - 1].role == Role::Tool
-                    {
-                        tool_block_start -= 1;
-                    }
-                    // The Assistant turn that issued those tool calls sits at
-                    // tool_block_start - 1 (if any Tool messages were found).
-                    tool_block_start < n.saturating_sub(1)
-                        && tool_block_start > 0
-                        && messages[tool_block_start - 1].role == Role::Assistant
-                        && messages[tool_block_start - 1].tool_calls.iter().all(|tc| {
-                            tc.name == atelier_core::protocol_strategy::SPAWN_SUBAGENT_NAME
-                        })
-                };
+                let all_prev_were_subagent = last_turn_was_all_subagent(&messages);
                 if all_prev_were_subagent {
                     // All prior tool calls were spawn_subagent: this prose is
                     // the natural task-completion summary after delegation.
@@ -2957,6 +2988,54 @@ pub(crate) fn built_in_registry_with_deps(
 /// looping until `max_turns` (no `claimed_done` reached the run loop).
 /// Log via `tracing::warn` so the failure is visible in any harness
 /// running with `RUST_LOG=warn` or above.
+/// True when the most recent assistant turn's tool calls were *all*
+/// `spawn_subagent` — i.e. the current prose is a post-delegation wrap-up
+/// rather than a §2 stall. Walks back over the trailing Tool block to the
+/// Assistant turn that issued it. Extracted from [`Runner::run`]'s stall guard.
+fn last_turn_was_all_subagent(messages: &[Message]) -> bool {
+    let n = messages.len();
+    // messages[n-1] = current (just-pushed) Assistant. Walk backwards from
+    // n-2 to find the start of the contiguous Tool block.
+    let mut tool_block_start = n.saturating_sub(1);
+    while tool_block_start > 0 && messages[tool_block_start - 1].role == Role::Tool {
+        tool_block_start -= 1;
+    }
+    // The Assistant turn that issued those tool calls sits at
+    // tool_block_start - 1 (if any Tool messages were found).
+    tool_block_start < n.saturating_sub(1)
+        && tool_block_start > 0
+        && messages[tool_block_start - 1].role == Role::Assistant
+        && messages[tool_block_start - 1]
+            .tool_calls
+            .iter()
+            .all(|tc| tc.name == atelier_core::protocol_strategy::SPAWN_SUBAGENT_NAME)
+}
+
+/// Parse the protocol envelope from an adapter response under `strategy`.
+/// Returns the envelope (default on parse failure) and whether the parse was
+/// clean — the bool drives §1 conformance-degradation accounting. Extracted
+/// from `Runner::run`'s turn loop.
+fn parse_envelope(
+    strategy: Strategy,
+    tool_calls: &[ToolCallRequest],
+    text: &str,
+) -> (Envelope, bool) {
+    match strategy {
+        Strategy::NativeTool => match extract_native_envelope(tool_calls) {
+            Some(env) => (env, true),
+            None => (Envelope::default(), false),
+        },
+        Strategy::JsonSentinel => match parse_json_sentinel(text) {
+            Ok(parsed) => (parsed.envelope, true),
+            Err(_) => (Envelope::default(), false),
+        },
+        Strategy::RegexProse => match atelier_core::protocol_strategy::parse_regex_prose(text) {
+            Ok(env) => (env, true),
+            Err(_) => (Envelope::default(), false),
+        },
+    }
+}
+
 fn extract_native_envelope(calls: &[ToolCallRequest]) -> Option<Envelope> {
     for c in calls {
         if c.name == atelier_core::protocol_strategy::HARNESS_META_NAME {
