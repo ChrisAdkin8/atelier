@@ -49,6 +49,10 @@ use crate::subagent_spawner::RunnerSpawner;
 mod concurrent_edit;
 use concurrent_edit::spawn_concurrent_edit_resolver;
 
+#[path = "runner/turn.rs"]
+mod turn;
+use turn::{TurnContext, TurnControl, TurnState};
+
 /// How `atelier run` reports events. The binary uses `Stdout` (one line per
 /// event); tests use `Capture` to assert on the recorded sequence without
 /// stdout interception. `Null` is for tests that don't care about events.
@@ -1240,6 +1244,429 @@ impl Runner {
         Ok(())
     }
 
+    /// Hydrate `messages` from the persisted conversation (resume path) or push
+    /// the initial user prompt (fresh path). Returns the loaded `OnDiskSession`
+    /// when resuming, or `None` on a fresh run.
+    async fn hydrate_conversation(
+        &self,
+        prompt: &str,
+        prompt_now: &str,
+        messages: &mut Vec<Message>,
+        context_manager: &parking_lot::Mutex<ContextManager>,
+        bus: &tokio::sync::broadcast::Sender<Event>,
+        workspace: &std::path::Path,
+    ) -> Result<Option<OnDiskSession>, RunError> {
+        let mut resumed_session: Option<OnDiskSession> = None;
+        if let Some(resume_uuid) = self.resume_from {
+            let session_dir = OnDiskSession::session_dir(workspace, resume_uuid);
+            let on_disk = OnDiskSession::load_manifest_from(&session_dir).map_err(|e| {
+                RunError::Config(format!("resume: cannot load session {resume_uuid}: {e}"))
+            })?;
+            // Re-hydrate the in-memory message list from the prefix.
+            let resume_prefix = OnDiskSession::resume_conversation_prefix_from_dir(&session_dir)
+                .map_err(|e| {
+                    RunError::Config(format!(
+                        "resume: cannot load conversation prefix for session {resume_uuid}: {e}"
+                    ))
+                })?;
+            let resume_prefix = bounded_resume_prefix(resume_prefix);
+            for entry in resume_prefix {
+                let role = match entry.role.as_str() {
+                    "user" => Role::User,
+                    "assistant" => Role::Assistant,
+                    "tool" => Role::Tool,
+                    "system" => Role::System,
+                    other => {
+                        tracing::warn!(role = %other, "resume: skipping unknown role");
+                        continue;
+                    }
+                };
+                let tool_calls: Vec<ToolCallRequest> = entry
+                    .tool_calls
+                    .iter()
+                    .filter_map(reconstruct_tool_call_request)
+                    .collect();
+                let msg = Message {
+                    role,
+                    content: entry.content.clone(),
+                    tool_call_id: entry.tool_call_id.clone(),
+                    tool_calls,
+                };
+                let role_bus = match role {
+                    Role::User => MessageRole::User,
+                    Role::Assistant => MessageRole::Assistant,
+                    Role::Tool => MessageRole::Tool,
+                    Role::System => MessageRole::System,
+                };
+                let _ = try_emit(
+                    bus,
+                    Event::MessageCommitted {
+                        role: role_bus,
+                        text: entry.content,
+                    },
+                );
+                messages.push(msg);
+            }
+            // Surface every recovery_log entry to UIs as a system
+            // message so the user knows what was preserved. The
+            // entries themselves stay on the persisted recovery_log;
+            // we re-write them to the next save so the audit trail is
+            // never erased.
+            for rec in &on_disk.recovery_log {
+                let _ = try_emit(
+                    bus,
+                    Event::MessageCommitted {
+                        role: MessageRole::System,
+                        text: format!(
+                            "[recovery] turn={} reason={:?} captured_at={} partial={:?}",
+                            rec.turn_id, rec.reason, rec.captured_at, rec.partial_content
+                        ),
+                    },
+                );
+            }
+            resumed_session = Some(on_disk);
+            if !prompt.trim().is_empty() {
+                context_manager
+                    .lock()
+                    .add(context_item_for_user_prompt(prompt, prompt_now));
+                let _ = try_emit(
+                    bus,
+                    Event::MessageCommitted {
+                        role: MessageRole::User,
+                        text: prompt.to_string(),
+                    },
+                );
+                messages.push(Message::text(Role::User, prompt.to_string()));
+            }
+        } else {
+            // Fresh run — pre-v61 behaviour.
+            messages.push(Message::text(Role::User, prompt.to_string()));
+            context_manager
+                .lock()
+                .add(context_item_for_user_prompt(prompt, prompt_now));
+            // Broadcast the initial user prompt so the conversation pane
+            // catches up before the first turn. Best-effort send (no
+            // subscribers is fine — see SessionDispatcher::dispatch).
+            let _ = try_emit(
+                bus,
+                Event::MessageCommitted {
+                    role: MessageRole::User,
+                    text: prompt.to_string(),
+                },
+            );
+        }
+        Ok(resumed_session)
+    }
+
+    /// Run the §7 verification pass when the session ended in `Verifying` state.
+    /// Exercises Tier-1 LSP (TypeScript diagnostics) and Tier-3 textual
+    /// `verify_pass`, then transitions to `Done`. Extracted from `run()` to
+    /// reduce its cyclomatic complexity (Phase 3c R1b).
+    async fn run_verification_pass(
+        &self,
+        state: &mut TurnState,
+        session_handle: &SessionHandle,
+        session_dispatcher: &SessionDispatcher,
+        workspace: &std::path::Path,
+        sandbox: &SandboxPolicy,
+        bus: &tokio::sync::broadcast::Sender<Event>,
+    ) -> Result<(), RunError> {
+        if state.final_state == State::Verifying {
+            // v60.8 A2 follow-on — exercise the §7 verify pass. When the
+            // run produced either claimed_changes or observed edits,
+            // fire `verify_pass` so the bus carries the Tier 3 textual
+            // outcome and the GUI/TUI verify-pass badge converges off
+            // its `NotRun` default. When neither side has anything to
+            // weigh, the explicit `emit_verify_not_run` keeps the badge
+            // at `NotRun` rather than letting it drift to a prior
+            // turn's tier — both arms emit exactly one
+            // `Event::VerificationPassed` so consumers can rely on
+            // the per-run terminal-marker contract.
+            let has_claims = state
+                .last_envelope
+                .claimed_changes
+                .as_ref()
+                .map(|c| !c.is_empty())
+                .unwrap_or(false);
+            if has_claims || !state.observed_changes.is_empty() {
+                // U09 — §7 Tier-1 live LSP path.
+                //
+                // Priority (highest to lowest):
+                //   1. Test seam (tier1_diagnostics_for_test) — bypasses the
+                //      launcher entirely, used by the hallucinating-agent gate.
+                //   2. Live LSP receiver — fires when `.ts` files are in the
+                //      change set AND `LspApprovals` says "typescript" is approved.
+                //   3. Tier-3 textual verify_pass — fallback.
+                let tier1_discrepancies = self
+                    .tier1_lsp_discrepancies(&state.observed_changes, workspace, sandbox, bus)
+                    .await;
+
+                if tier1_discrepancies.is_empty() && self.tier1_diagnostics_for_test.is_empty() {
+                    let _ = session_dispatcher
+                        .verify_pass(&state.last_envelope, &state.observed_changes);
+                } else {
+                    let _ = session_dispatcher.verify_pass_with_tier1(
+                        &state.last_envelope,
+                        &state.observed_changes,
+                        tier1_discrepancies,
+                    );
+                }
+            } else {
+                session_dispatcher.emit_verify_not_run();
+            }
+            advance(session_handle, State::Verifying, State::Done).await?;
+            state.final_state = State::Done;
+        }
+        Ok(())
+    }
+
+    /// Build the `OnDiskSession` snapshot and persist it to disk.
+    /// Extracts the message materialisation + subagent record + pane-visibility
+    /// logic from `run()` to reduce its cyclomatic complexity (Phase 3b R1b).
+    fn build_and_persist_session(
+        &self,
+        session_id: SessionId,
+        workspace: &std::path::Path,
+        messages: &[Message],
+        resumed_session: &Option<OnDiskSession>,
+        spawner: &Arc<RunnerSpawner>,
+        bus: &tokio::sync::broadcast::Sender<Event>,
+    ) {
+        let persist_uuid = self.resume_from.unwrap_or(session_id.0);
+        let session_dir = OnDiskSession::session_dir(workspace, persist_uuid);
+        let mut snapshot = OnDiskSession::fresh(
+            persist_uuid,
+            env!("CARGO_PKG_VERSION").to_string(),
+            now_rfc3339(),
+        );
+        // Re-attach the resumed recovery_log so its audit trail
+        // survives the round-trip. Fresh runs get an empty log.
+        if let Some(resumed) = &resumed_session {
+            snapshot.recovery_log = resumed.recovery_log.clone();
+        }
+        // Materialise the in-memory `messages` into the persisted
+        // conversation field. Turn ids are session-local positional —
+        // sufficient for the resume protocol's ordering invariants;
+        // a future audit-grade format will carry stable per-call ids.
+        for (idx, msg) in messages.iter().enumerate() {
+            let turn_id = format!("turn-{idx}");
+            let role_str = match msg.role {
+                Role::User => "user",
+                Role::Assistant => "assistant",
+                Role::Tool => "tool",
+                Role::System => "system",
+            };
+            let tool_calls_json: Vec<serde_json::Value> = msg
+                .tool_calls
+                .iter()
+                .map(|tc| {
+                    serde_json::json!({
+                        "tool_call_id": tc.id,
+                        "tool_name": tc.name,
+                        "args": tc.arguments,
+                    })
+                })
+                .collect();
+            snapshot.append_conversation_turn(
+                turn_id,
+                role_str,
+                msg.content.clone(),
+                msg.tool_call_id.clone(),
+                tool_calls_json,
+            );
+        }
+        // §10 — persist completed sub-agent records into session.json.
+        for rec in spawner.drain_completed() {
+            let status_str = match rec.result.status {
+                SubagentStatus::Completed => "completed",
+                SubagentStatus::Failed => "failed",
+                SubagentStatus::TimedOut => "timed_out",
+                SubagentStatus::Cancelled => "cancelled",
+            };
+            let cost_summary = if rec.result.cost.prompt_tokens > 0
+                || rec.result.cost.completion_tokens > 0
+                || rec.result.cost.cost_usd.is_some()
+            {
+                Some(PersistedSubagentCost {
+                    prompt_tokens: rec.result.cost.prompt_tokens,
+                    completion_tokens: rec.result.cost.completion_tokens,
+                    cached_tokens: rec.result.cost.cached_tokens,
+                    cost_usd: rec.result.cost.cost_usd,
+                })
+            } else {
+                None
+            };
+            snapshot.subagents.insert(
+                rec.result.id.to_string(),
+                PersistedSubagent {
+                    subagent_type: Some(rec.subagent_type_name),
+                    description: Some(rec.description),
+                    started_at: Some(rec.started_at),
+                    finished_at: Some(rec.finished_at),
+                    status: status_str.to_string(),
+                    result: Some(rec.result.result),
+                    max_turns: Some(rec.max_turns),
+                    turns_used: Some(rec.result.turns_used),
+                    cost_summary,
+                },
+            );
+        }
+        // R-1: carry forward completed sub-agents from the prior session so
+        // the subagents map is additive across resumes.
+        if let Some(resumed) = &resumed_session {
+            for (id, rec) in &resumed.subagents {
+                snapshot
+                    .subagents
+                    .entry(id.clone())
+                    .or_insert_with(|| rec.clone());
+            }
+            // Mark any sub-agent that was `running` in the prior session as
+            // cancelled — v1 does not resume in-flight sub-agent runs (§10).
+            for rec in snapshot.subagents.values_mut() {
+                if rec.status == "running" {
+                    rec.status = "cancelled".to_string();
+                    let _ = try_emit(
+                        bus,
+                        Event::SubagentCancelled {
+                            id: rec.description.clone().unwrap_or_default(),
+                            reason: "resume_inflight".to_string(),
+                        },
+                    );
+                }
+            }
+        }
+
+        if let Err(e) = snapshot.save_split_to(&session_dir) {
+            tracing::warn!(error = %e, "atelier run: session snapshot save failed");
+        }
+
+        // Phase C close — write the pane-visibility record next to
+        // `session.json` if the driver supplied one. Best-effort: a
+        // failure here logs but does not fail the run (the spec
+        // measurement subsystem reads this file lazily and falls
+        // back to "all visible" when it's absent).
+        if let Some((panes, driver)) = &self.pane_visibility {
+            let rec = crate::instrumentation::PaneVisibilityRecord::new(
+                session_id.0.to_string(),
+                now_rfc3339(),
+                panes.clone(),
+                driver.clone(),
+            );
+            if let Err(e) = rec.save_to(&session_dir) {
+                tracing::warn!(error = %e, "pane_visibility.json write failed");
+            }
+        }
+    }
+
+    /// Gather §7 Tier-1 LSP diagnostics for modified TypeScript files.
+    /// Returns an empty Vec when the test seam is not active, no `.ts` files
+    /// were changed, or the language server is not yet approved.
+    async fn tier1_lsp_discrepancies(
+        &self,
+        observed_changes: &[atelier_core::verify::ObservedChange],
+        workspace: &std::path::Path,
+        sandbox: &atelier_core::sandbox::SandboxPolicy,
+        bus: &tokio::sync::broadcast::Sender<atelier_core::session::Event>,
+    ) -> Vec<atelier_core::verify::Discrepancy> {
+        if !self.tier1_diagnostics_for_test.is_empty() {
+            // Test seam: pre-mapped discrepancies bypass the launcher.
+            self.tier1_diagnostics_for_test.clone()
+        } else {
+            // Live path: detect TypeScript files in the change set.
+            let ts_paths: Vec<String> = observed_changes
+                .iter()
+                .filter(|o| o.path.ends_with(".ts") || o.path.ends_with(".tsx"))
+                .map(|o| o.path.clone())
+                .collect();
+
+            if ts_paths.is_empty() {
+                // No TypeScript files — skip LSP entirely.
+                Vec::new()
+            } else {
+                // Load approvals for this workspace.
+                let approvals_path = atelier_core::lsp::lsp_approvals_path(workspace);
+                let approvals =
+                    atelier_core::lsp::LspApprovals::load(&approvals_path).unwrap_or_default();
+
+                if !approvals.is_approved("typescript") {
+                    // Not approved yet — emit the install prompt so
+                    // the GUI/TUI can ask the user. Fall through to
+                    // Tier-3 textual for this run.
+                    let _ = try_emit(
+                        bus,
+                        Event::RequestLspInstall {
+                            language: "typescript".into(),
+                            candidate_packages: vec!["typescript-language-server".into()],
+                        },
+                    );
+                    Vec::new()
+                } else {
+                    // Approved — spawn the LSP server and gather
+                    // diagnostics for all modified `.ts` files.
+                    match atelier_core::lsp::LspLauncher::spawn(workspace, sandbox, &approvals)
+                        .await
+                    {
+                        Ok(mut session) => {
+                            // Open each TypeScript file.
+                            for rel_path in &ts_paths {
+                                let abs_path = workspace.join(rel_path);
+                                if let Ok(content) = std::fs::read_to_string(&abs_path) {
+                                    if let Err(e) = session.open_file(&abs_path, &content) {
+                                        tracing::warn!(
+                                            path = %abs_path.display(),
+                                            error = %e,
+                                            "LSP: open_file failed; file skipped for diagnostics"
+                                        );
+                                    }
+                                }
+                            }
+                            // Collect diagnostics (10-second budget).
+                            let raw = session
+                                .collect_diagnostics(std::time::Duration::from_secs(10))
+                                .await;
+                            session.shutdown().await;
+                            // Map raw diagnostics to discrepancies.
+                            raw.into_iter()
+                                .filter_map(|(abs_path, diag)| {
+                                    // Rebase absolute path to
+                                    // workspace-relative.
+                                    let rel = abs_path
+                                        .strip_prefix(workspace.to_string_lossy().as_ref())
+                                        .unwrap_or(abs_path.as_str())
+                                        .trim_start_matches('/')
+                                        .to_string();
+                                    atelier_core::lsp::map_diagnostic_to_discrepancy(&rel, &diag)
+                                })
+                                .collect()
+                        }
+                        Err(atelier_core::lsp::LspLaunchError::NotApproved { .. }) => {
+                            // Should not happen (we checked above), but
+                            // belt-and-suspenders: emit the install
+                            // prompt and fall through.
+                            let _ = try_emit(
+                                bus,
+                                Event::RequestLspInstall {
+                                    language: "typescript".into(),
+                                    candidate_packages: vec!["typescript-language-server".into()],
+                                },
+                            );
+                            Vec::new()
+                        }
+                        Err(e) => {
+                            // Non-approval launch error: warn + fall
+                            // through to Tier 3.
+                            tracing::warn!(
+                                error = %e,
+                                "LSP launcher failed; falling through to Tier-3 verify"
+                            );
+                            Vec::new()
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Resolve an `AdapterError::ContextOverflow` raised mid-turn per the
     /// configured [`ContextOverflowPolicy`]. Extracted from [`Runner::run`]'s
     /// turn loop (its dominant complexity contributor). Returns
@@ -1419,6 +1846,521 @@ impl Runner {
         }
     }
 
+    /// Execute one turn of the agent loop. Extracted from [`Runner::run`] to
+    /// reduce its cyclomatic complexity. Returns [`TurnControl::Break`] when
+    /// the loop should exit (claimed_done or stall), [`TurnControl::Continue`]
+    /// to advance to the next turn, or propagates errors out of `run()`.
+    async fn run_turn(
+        &self,
+        ctx: &TurnContext<'_>,
+        state: &mut TurnState,
+        turn: usize,
+    ) -> Result<TurnControl, RunError> {
+        // v60.15 (M-bug-state-desync) — only fire the `Idle → Streaming`
+        // edge once at the start of the run. After turn 0 the state
+        // is already `Streaming` (or `ToolExecuting → Streaming` after
+        // a tool dispatch), and unconditionally re-advancing was
+        // emitting an `IllegalTransitionAttempted{Streaming, Streaming}`
+        // ctx.bus event on every turn beyond the first. The spec §2.5
+        // table has no `Streaming → Idle` edge — multi-turn iteration
+        // stays inside `Streaming` modulo the `Streaming ↔ Tool*`
+        // sub-cycle.
+        if state.final_state == State::Idle {
+            advance(ctx.session_handle, State::Idle, State::Streaming).await?;
+            state.final_state = State::Streaming;
+        }
+
+        // §1 BYOM context-window asymmetry — wrap `adapter.chat()`
+        // in a small retry loop that consults
+        // [`ContextOverflowPolicy`] when the adapter raises
+        // `AdapterError::ContextOverflow`. Compact / Reroute /
+        // Surface arms each emit `ContextOverflowResolved` so the
+        // ctx.bus carries one terminal marker per overflow, regardless
+        // of which arm fired. The retry cap is
+        // [`MAX_OVERFLOW_RETRIES`] consecutive attempts; after that
+        // the runner drops to Surface behaviour rather than
+        // looping forever.
+        // v60.17 §2 — advertise the synthetic `harness_meta` tool to
+        // the model when the active strategy is `NativeTool`. Without
+        // this, the model has no way to signal `claimed_done` /
+        // `claimed_changes` and the loop stalls after the task is
+        // really done (surfaced by the t01 live re-probe where Claude
+        // completed the task, ran tests, then burned the remaining
+        // turn budget describing the result in prose). The list is
+        // recomputed per turn because `active_strategy` can degrade
+        // mid-run via the §1 conformance tracker.
+        let turn_tools_spec: Vec<atelier_core::adapter::ToolSpec> = match state.active_strategy {
+            atelier_core::protocol_strategy::Strategy::NativeTool => {
+                let mut v = Vec::with_capacity(ctx.tools_spec.len() + 1);
+                v.push(atelier_core::protocol_strategy::harness_meta_tool_spec());
+                v.extend(ctx.tools_spec.iter().cloned());
+                v
+            }
+            atelier_core::protocol_strategy::Strategy::JsonSentinel
+            | atelier_core::protocol_strategy::Strategy::RegexProse => ctx.tools_spec.to_vec(),
+        };
+
+        // v60.20 §5 — mental-model injection. Snapshot the
+        // SessionDispatcher's mental-model state once per turn
+        // (cheap; the snapshot is a clone of a tiny struct) and,
+        // when enabled + non-empty, prepend a second System
+        // message to the per-turn message vec carrying the user's
+        // text. The history `messages` is NOT mutated — the on-disk
+        // conversation transcript stays free of the panel preamble
+        // (which lives separately in `mental_model.json` and would
+        // re-inject on resume anyway).
+        // v60.32 M03 — `messages_for_call` is rebuilt at the head
+        // of every retry iteration so a compaction that runs in
+        // the `ContextOverflow → Compact` arm below feeds the
+        // post-mutation history into the next chat call. Pre-fix,
+        // the projection was captured once outside the loop and
+        // the retry re-sent the pre-compaction snapshot, defeating
+        // the compaction. The mental-model snapshot is also
+        // re-read each iteration so a concurrent
+        // `set_mental_model` mutation lands on the retry too.
+        let project_messages_for_call = |history: &[Message]| -> Vec<Message> {
+            let mm_snapshot = ctx.session_dispatcher.snapshot_mental_model();
+            if mm_snapshot.enabled && !mm_snapshot.text.trim().is_empty() {
+                let mut v = Vec::with_capacity(history.len() + 1);
+                // Insert immediately after the atelier system prompt
+                // (which is history[0] on a fresh run) so both system
+                // messages land together at the head of the
+                // conversation; Anthropic concatenates multiple system
+                // entries cleanly, OpenAI-compat keeps them as separate
+                // `system`-role rows. On a resumed run the prepended
+                // entry sits ahead of the rehydrated prefix — both
+                // shapes are acceptable wire-wise.
+                let insert_pos = if !history.is_empty() && matches!(history[0].role, Role::System) {
+                    1
+                } else {
+                    0
+                };
+                v.extend(history.iter().take(insert_pos).cloned());
+                v.push(Message::text(
+                    Role::System,
+                    format!(
+                        "User-supplied mental model / working hypothesis. The user \
+                     maintains this in the Atelier §5 mental-model panel; it is \
+                     additional context layered on top of the §2 protocol \
+                     instructions above. Treat it as guidance, not as ground \
+                     truth: the user may be wrong, and you should still verify \
+                     claims via tools.\n\n{}",
+                        mm_snapshot.text.trim()
+                    ),
+                ));
+                v.extend(history.iter().skip(insert_pos).cloned());
+                v
+            } else {
+                history.to_vec()
+            }
+        };
+
+        let response = {
+            // §1 per-task routing: if the last message is a tool
+            // result, use the executor adapter (fast/cheap) when
+            // one is configured; otherwise fall back to the primary.
+            let call_adapter: &dyn Adapter = {
+                let is_tool_turn = state
+                    .messages
+                    .last()
+                    .map(|m| matches!(m.role, Role::Tool))
+                    .unwrap_or(false);
+                if is_tool_turn {
+                    self.executor_adapter
+                        .as_deref()
+                        .unwrap_or(self.adapter.as_ref())
+                } else {
+                    self.adapter.as_ref()
+                }
+            };
+            let mut overflow_retries: usize = 0;
+            loop {
+                let mut messages_for_call = project_messages_for_call(&state.messages);
+                if self.subagent_depth > 0 {
+                    messages_for_call = bounded_subagent_messages(messages_for_call);
+                }
+                match call_adapter
+                    .chat(&messages_for_call, &turn_tools_spec)
+                    .await
+                {
+                    Ok(r) => break r,
+                    Err(AdapterError::ContextOverflow {
+                        needed_tokens,
+                        limit_tokens,
+                    }) => {
+                        // v60.5 compaction / v60.32 M03 — delegated to
+                        // `resolve_context_overflow`; a successful
+                        // compaction returns `Retry` (re-issue the chat
+                        // call), otherwise it returns the `RunError` to
+                        // surface.
+                        match self
+                            .resolve_context_overflow(
+                                needed_tokens,
+                                limit_tokens,
+                                &mut overflow_retries,
+                                &mut state.messages,
+                                &mut state.token_count_cache,
+                                ctx.context_manager,
+                                ctx.session_dispatcher,
+                                ctx.workspace,
+                                &ctx.session_id,
+                                ctx.bus,
+                            )
+                            .await
+                        {
+                            OverflowOutcome::Retry => continue,
+                            OverflowOutcome::Abort(e) => return Err(e),
+                        }
+                    }
+                    Err(e) => return Err(RunError::AdapterChain(e)),
+                }
+            }
+        };
+
+        // §1 BYOM (v60.7) — append one `ModelCall` ledger entry
+        // per `adapter.chat()` call. `count_source` is the
+        // adapter's own honest claim (Exact iff the provider
+        // returned `usage`; Unavailable otherwise — see the
+        // anthropic / openai_compat assemblers). `cost_usd` is
+        // determined by the runner's [`ModelCostPolicy`]:
+        // latency-weighted local rate for Mock + OpenAI-compat
+        // against a self-hosted server; `None` for cloud
+        // providers whose pricing comes from a per-provider
+        // table that hasn't shipped yet. `latency_ms` is
+        // whatever the adapter measured.
+        let model_call_ts = now_rfc3339();
+        let latency_f64 = response.usage.latency_ms.map(|ms| ms as f64);
+        let cost_usd = match self.cost_policy {
+            ModelCostPolicy::LatencyWeighted => latency_f64.map(|ms| {
+                atelier_core::ledger::local_cost_usd(
+                    ms,
+                    atelier_core::ledger::DEFAULT_LOCAL_RATE_USD_PER_SEC,
+                )
+            }),
+            ModelCostPolicy::UnknownPending => None,
+        };
+        ctx.session_dispatcher
+            .append_ledger_entry(atelier_core::ledger::LedgerEntry::ModelCall {
+                timestamp: model_call_ts,
+                model_id: self.adapter.model_id().to_string(),
+                prompt_tokens: response.usage.prompt_tokens,
+                completion_tokens: response.usage.completion_tokens,
+                cached_tokens: response.usage.cached_tokens,
+                count_source: response.usage.count_source,
+                cost_usd,
+                latency_ms: latency_f64,
+                // v60.51 §15 — the first `ModelCall` after a slash
+                // invocation carries `note: Some("skill: <name>")`;
+                // `take()` ensures only that first call is annotated.
+                note: state.pending_skill_note.take(),
+            });
+
+        // 6. Parse envelope from response per the *active* strategy
+        //    (the §1/§2 conformance tracker may have already
+        //    downshifted from the adapter's reported one).
+        //
+        //    We track whether the parse cleanly produced an envelope
+        //    so the cross-call rolling window can drive the §1
+        //    degradation check. "Clean" means the strategy-specific
+        //    parser returned `Ok`. An empty `tool_calls` payload on
+        //    the native-tool path is treated as malformed for
+        //    conformance — the carrier did not actually carry an
+        //    envelope. Pre-degradation, the adapter's reported
+        //    strategy and the active one agree; once degraded, we
+        //    use the active value so the parse stays aligned with
+        //    the UI badge.
+        //
+        //    Native tool calls (if any) still take precedence:
+        //    the dispatcher executes them and feeds results back as
+        //    Role::Tool messages.
+        let parse_strategy = state.active_strategy;
+        let (envelope, parse_ok) =
+            parse_envelope(parse_strategy, &response.tool_calls, &response.text);
+        // Record the outcome against the *active* strategy so the
+        // per-strategy breakdown lines up with what the runner was
+        // actually trying to use.
+        if parse_ok {
+            state.envelope_conformance.record_success(parse_strategy);
+        } else {
+            state.envelope_conformance.record_failure(parse_strategy);
+        }
+        // §1/§2 conformance-driven degradation. One-way: NativeTool →
+        // JsonSentinel → RegexProse. When the rolling window crosses
+        // the threshold we walk one step toward the more-tolerant
+        // strategy and announce the transition on the ctx.bus so the
+        // UI badge can refresh. If we are already at the lowest
+        // strategy (`RegexProse`), `downshift()` returns `None` and
+        // the check no-ops — the §2 escalate-to-user path lives in
+        // `TurnConformance` and fires separately.
+        if state
+            .envelope_conformance
+            .should_degrade_with(self.degradation_window, self.degradation_threshold)
+        {
+            if let Some(next) = state.active_strategy.downshift() {
+                let previous = state.active_strategy;
+                state.active_strategy = next;
+                // Clear the window so a freshly-degraded strategy
+                // gets its own evaluation window instead of carrying
+                // the failures from the prior strategy into the new
+                // one's accounting.
+                state.envelope_conformance =
+                    atelier_core::protocol_conformance::ConformanceRingBuffer::new();
+                let reason = format!(
+                    "{} of last {} envelope parses malformed",
+                    self.degradation_threshold, self.degradation_window,
+                );
+                let _ = try_emit(
+                    ctx.bus,
+                    Event::StrategyDegraded {
+                        from: previous,
+                        to: next,
+                        reason,
+                    },
+                );
+            }
+        }
+
+        // P5: re-send assistant turn with its tool_calls so multi-turn
+        // tool flows round-trip the tool_use ids correctly. Pre-P5 we
+        // flattened to text-only, which broke any provider whose
+        // protocol requires the prior `tool_use` block to reference
+        // its matching `tool_result` (Anthropic, OpenAI, Bedrock,
+        // Gemini all do).
+        //
+        // v25.2-F: keep ALL tool_calls — including the
+        // `harness_meta` envelope-bearing call — on the assistant
+        // message so the conversation history is complete. The
+        // dispatcher only executes the non-envelope ones (filtered
+        // below into `real_tool_calls`), but the envelope tool_use
+        // id must still appear in history because the next turn
+        // (or a future audit) may reference it.
+        state.last_assistant_text = Some(response.text.clone());
+        state.messages.push(Message {
+            role: Role::Assistant,
+            content: response.text.clone(),
+            tool_call_id: None,
+            tool_calls: response.tool_calls.clone(),
+        });
+        ctx.context_manager
+            .lock()
+            .add(context_item_for_assistant_turn(
+                &response.text,
+                &now_rfc3339(),
+            ));
+        let _ = try_emit(
+            ctx.bus,
+            Event::MessageCommitted {
+                role: MessageRole::Assistant,
+                text: response.text.clone(),
+            },
+        );
+        // Apply the envelope's plan_update (if any) and broadcast a
+        // fresh snapshot so the plan pane converges. `apply_envelope`
+        // is idempotent — re-applying the same update produces the
+        // same canvas — but we still broadcast on every turn so a
+        // late-joining subscriber sees something promptly.
+        if let Some(plan_update) = &envelope.plan_update {
+            let steps = {
+                let mut canvas = ctx.plan_canvas.lock();
+                let _report = canvas.apply_envelope(plan_update);
+                canvas.to_vec()
+            };
+            if state.last_plan_steps.as_ref() != Some(&steps) {
+                let _ = try_emit(
+                    ctx.bus,
+                    Event::PlanSnapshot {
+                        steps: steps.clone(),
+                    },
+                );
+                state.last_plan_steps = Some(steps);
+            }
+        }
+        // v56 — surface the envelope's per-file rationale so the
+        // §3 "Why this change?" UI can render it. The ctx.bus event
+        // carries the same shape as the envelope, flattened to
+        // string `kind` so consumers don't import the protocol enum.
+        if let Some(claimed) = &envelope.claimed_changes {
+            let changes = claimed
+                .iter()
+                .map(|c| atelier_core::session::ClaimedChangeSummary {
+                    path: c.path.clone(),
+                    // v59 (MED-smell-2 fix) — route through
+                    // `ClaimedChangeKind::wire_label` so the
+                    // projection stays in sync with the serde
+                    // `rename_all = "lowercase"` derive.
+                    kind: c.kind.wire_label().to_string(),
+                    summary: c.summary.clone(),
+                })
+                .collect();
+            let _ = try_emit(ctx.bus, Event::ClaimedChanges { changes });
+        }
+        let real_tool_calls: Vec<_> = response
+            .tool_calls
+            .into_iter()
+            .filter(|c| c.name != atelier_core::protocol_strategy::HARNESS_META_NAME)
+            .collect();
+        // v60.15 — capture before the `Vec` is consumed by the
+        // dispatch loop below; needed for the end-of-turn stall
+        // guard that detects "no tool calls AND no claimed_done".
+        let made_tool_calls = !real_tool_calls.is_empty();
+
+        if !real_tool_calls.is_empty() {
+            self.execute_tool_calls(
+                real_tool_calls,
+                ctx.session_handle,
+                ctx.session_dispatcher,
+                ctx.sandbox,
+                ctx.workspace,
+                ctx.audit_log_path,
+                ctx.bus,
+                ctx.context_manager,
+                &mut state.messages,
+                &mut state.observed_changes,
+            )
+            .await?;
+            state.final_state = State::Streaming;
+        }
+
+        state.turns = turn + 1;
+
+        // Per-turn ContextSnapshot + ContextItems (v55).
+        //
+        // The aggregate `ContextSnapshot` drives the §5 token
+        // meter; the per-item `ContextItems` stream feeds the
+        // Context panel. They go out together at the same turn
+        // boundary so the panel rows and the meter denominator
+        // can never disagree.
+        //
+        // v55 — items now come from the live `ContextManager`
+        // populated in parallel with the chat transcript above.
+        // Per-item token attribution still uses the same char/4
+        // approximation tagged `TokenSource::Approx`; the
+        // adapter's `count_tokens` continues to drive the
+        // aggregate meter. Pin / unpin / evict from the §5 panel
+        // operate on this store; the dispatcher (Step 2) shares
+        // the Arc to mutate it from UI handlers.
+        let message_fingerprint = message_history_fingerprint(&state.messages);
+        let counted = match state.token_count_cache.as_ref() {
+            Some((cached_fingerprint, token_count))
+                if *cached_fingerprint == message_fingerprint =>
+            {
+                Some(*token_count)
+            }
+            _ => match self.adapter.count_tokens(&state.messages).await {
+                Ok(token_count) => {
+                    state.token_count_cache = Some((message_fingerprint, token_count));
+                    Some(token_count)
+                }
+                Err(_) => None,
+            },
+        };
+        if let Some(token_count) = counted {
+            let meter = (token_count.count, 0);
+            if state.last_context_meter != Some(meter) {
+                state.last_context_meter = Some(meter);
+                let _ = try_emit(
+                    ctx.bus,
+                    Event::ContextSnapshot {
+                        known_tokens: token_count.count,
+                        unknown_tokens: 0,
+                    },
+                );
+            }
+        }
+        let context_items = ctx.context_manager.lock().panel_snapshot().items;
+        if state.last_context_items.as_ref() != Some(&context_items) {
+            let _ = try_emit(
+                ctx.bus,
+                Event::ContextItems {
+                    items: context_items.clone(),
+                },
+            );
+            state.last_context_items = Some(context_items);
+        }
+
+        // v55 — §5 Memory panel snapshot. The MemoryStore is now
+        // mutable from the UI via SessionDispatcher's add /
+        // delete / promote mutators (Step 3). The runner still
+        // re-emits at each turn boundary so a late-joining
+        // subscriber converges to the live state.
+        let memory_cards = ctx.memory_store.lock().summarise();
+        if state.last_memory_cards.as_ref() != Some(&memory_cards) {
+            let _ = try_emit(
+                ctx.bus,
+                Event::MemoryCards {
+                    cards: memory_cards.clone(),
+                },
+            );
+            state.last_memory_cards = Some(memory_cards);
+        }
+
+        // v60.8 A2 follow-on — stash the most recent envelope for
+        // the §7 verify pass below. The envelope is small (no
+        // streaming payload, just claims + plan_update) so the
+        // clone per turn is cheap; this stays the simplest seam.
+        state.last_envelope = envelope.clone();
+
+        // 8. If the envelope or scripted response says done, exit.
+        if envelope.claimed_done == Some(true) {
+            advance(ctx.session_handle, State::Streaming, State::Verifying).await?;
+            state.final_state = State::Verifying;
+            return Ok(TurnControl::Break);
+        }
+
+        // v60.15 (M-bug-stall) — stall guard. A turn that produced
+        // neither real tool calls nor `claimed_done=true` leaves
+        // the `messages` array ending on an assistant turn. The
+        // Anthropic API rejects "conversation ends with assistant"
+        // with a 400 `invalid_request_error` on stricter models
+        // (Sonnet, Opus); permissive providers (Haiku 4.5) return
+        // near-empty completions in a wedge until the turn cap.
+        //
+        // v60.67 — distinguish two sub-cases:
+        //   • Previous message was NOT a tool result: the model had
+        //     a user turn to work on but chose neither to call tools
+        //     nor claim done. That's a genuine §2 violation → stall.
+        //   • Previous message WAS a tool result: the model just
+        //     received tool outputs and wrote a prose conclusion
+        //     without calling `harness_meta`. This is the common
+        //     wrap-up pattern after sub-agent turns. Treat it as an
+        //     implicit claimed_done so the conversation completes
+        //     naturally rather than blocking with a stall banner.
+        if !made_tool_calls {
+            // v60.67 — distinguish wrap-up after sub-agents from a true
+            // stall. Walk backwards past the Tool block preceding the
+            // current Assistant turn; if every tool call in the preceding
+            // Assistant turn was `spawn_subagent`, the current prose is
+            // the natural task-completion summary — treat it as an
+            // implicit claimed_done. Any other tool mix (read_file,
+            // list_dir, …) means the model gathered info but didn't
+            // follow through, which is a genuine §2 stall.
+            let all_prev_were_subagent = last_turn_was_all_subagent(&state.messages);
+            if all_prev_were_subagent {
+                // All prior tool calls were spawn_subagent: this prose is
+                // the natural task-completion summary after delegation.
+                advance(ctx.session_handle, State::Streaming, State::Verifying).await?;
+                state.final_state = State::Verifying;
+            } else {
+                // True stall: no tool calls and the prior tool block (if
+                // any) was not a sub-agent delegation.
+                let _ = try_emit(
+                    ctx.bus,
+                    Event::AgentStalled {
+                        turn: turn + 1,
+                        reason: "assistant turn produced no tool calls and no \
+                                 claimed_done=true; conversation cannot advance \
+                                 without a §2 protocol violation"
+                            .to_string(),
+                    },
+                );
+                advance(ctx.session_handle, State::Streaming, State::AwaitingUser).await?;
+                state.final_state = State::AwaitingUser;
+            }
+            return Ok(TurnControl::Break);
+        }
+        Ok(TurnControl::Continue)
+    }
+
     /// Drive the loop until `claims_done` or `max_turns`. Returns when:
     ///   * a turn carried `claims_done: true` (success path; runs DoD next),
     ///   * `max_turns` reached (timeout; `final_state = AwaitingUser`),
@@ -1430,7 +2372,7 @@ impl Runner {
         // DoD / sandbox so a `/foo` typo bails cleanly without leaving
         // half-loaded state behind. `pending_skill_note` is consumed
         // by the first `ModelCall` ledger append below.
-        let (prompt, mut pending_skill_note) = self.expand_skill_prompt(prompt)?;
+        let (prompt, pending_skill_note) = self.expand_skill_prompt(prompt)?;
 
         // 1. Load config: hooks + DoD. Both are tolerant of missing files —
         //    a fresh repo with no .atelier/hooks/ or .atelier/dod.json
@@ -1723,12 +2665,8 @@ impl Runner {
         // wins over `profile.strategy` so the mechanical gate can drive
         // the `JsonSentinel` / `RegexProse` parse arms end-to-end
         // through `MockAdapter`. Production callers leave it `None`.
-        let mut active_strategy = self.starting_strategy_override.unwrap_or(profile.strategy);
-        // Rolling envelope-parse window. Successes / failures recorded
-        // by the parse arm of the turn loop drive
-        // `should_degrade` — see protocol_conformance::ConformanceRingBuffer.
-        let mut envelope_conformance =
-            atelier_core::protocol_conformance::ConformanceRingBuffer::new();
+        let initial_active_strategy = self.starting_strategy_override.unwrap_or(profile.strategy);
+        // envelope_conformance and other loop-carried vars live in TurnState below.
 
         // 5. Turn loop. v61 — when `resume_from` is set, replay the
         //    persisted conversation prefix first; the supplied prompt
@@ -1746,6 +2684,8 @@ impl Runner {
         let audit_session_uuid = self.resume_from.unwrap_or(session_id.0);
         let audit_log_path =
             OnDiskSession::session_dir(&workspace, audit_session_uuid).join("audit.log");
+        // Temporary pre-construction message accumulator: collects the system
+        // prompt + few-shot prefix + resume hydration before TurnState is built.
         let mut messages: Vec<Message> = Vec::new();
 
         // v60.17 §2 — atelier-flavoured system prompt. Without this, the
@@ -1759,7 +2699,7 @@ impl Runner {
         if self.resume_from.is_none() {
             messages.push(Message::text(
                 Role::System,
-                build_atelier_system_prompt(&workspace, active_strategy),
+                build_atelier_system_prompt(&workspace, initial_active_strategy),
             ));
         }
 
@@ -1789,7 +2729,7 @@ impl Runner {
             } else {
                 let computed = self
                     .adapter
-                    .few_shot_override(active_strategy)
+                    .few_shot_override(initial_active_strategy)
                     .unwrap_or_default();
                 *cache = Some(computed.clone());
                 computed
@@ -1799,107 +2739,18 @@ impl Runner {
             messages.push(m.clone());
         }
 
-        let mut resumed_session: Option<OnDiskSession> = None;
         let prompt_now = now_rfc3339();
 
-        if let Some(resume_uuid) = self.resume_from {
-            let session_dir = OnDiskSession::session_dir(&workspace, resume_uuid);
-            let on_disk = OnDiskSession::load_manifest_from(&session_dir).map_err(|e| {
-                RunError::Config(format!("resume: cannot load session {resume_uuid}: {e}"))
-            })?;
-            // Re-hydrate the in-memory message list from the prefix.
-            let resume_prefix = OnDiskSession::resume_conversation_prefix_from_dir(&session_dir)
-                .map_err(|e| {
-                    RunError::Config(format!(
-                        "resume: cannot load conversation prefix for session {resume_uuid}: {e}"
-                    ))
-                })?;
-            let resume_prefix = bounded_resume_prefix(resume_prefix);
-            for entry in resume_prefix {
-                let role = match entry.role.as_str() {
-                    "user" => Role::User,
-                    "assistant" => Role::Assistant,
-                    "tool" => Role::Tool,
-                    "system" => Role::System,
-                    other => {
-                        tracing::warn!(role = %other, "resume: skipping unknown role");
-                        continue;
-                    }
-                };
-                let tool_calls: Vec<ToolCallRequest> = entry
-                    .tool_calls
-                    .iter()
-                    .filter_map(reconstruct_tool_call_request)
-                    .collect();
-                let msg = Message {
-                    role,
-                    content: entry.content.clone(),
-                    tool_call_id: entry.tool_call_id.clone(),
-                    tool_calls,
-                };
-                let role_bus = match role {
-                    Role::User => MessageRole::User,
-                    Role::Assistant => MessageRole::Assistant,
-                    Role::Tool => MessageRole::Tool,
-                    Role::System => MessageRole::System,
-                };
-                let _ = try_emit(
-                    &bus,
-                    Event::MessageCommitted {
-                        role: role_bus,
-                        text: entry.content,
-                    },
-                );
-                messages.push(msg);
-            }
-            // Surface every recovery_log entry to UIs as a system
-            // message so the user knows what was preserved. The
-            // entries themselves stay on the persisted recovery_log;
-            // we re-write them to the next save so the audit trail is
-            // never erased.
-            for rec in &on_disk.recovery_log {
-                let _ = try_emit(
-                    &bus,
-                    Event::MessageCommitted {
-                        role: MessageRole::System,
-                        text: format!(
-                            "[recovery] turn={} reason={:?} captured_at={} partial={:?}",
-                            rec.turn_id, rec.reason, rec.captured_at, rec.partial_content
-                        ),
-                    },
-                );
-            }
-            resumed_session = Some(on_disk);
-            if !prompt.trim().is_empty() {
-                context_manager
-                    .lock()
-                    .add(context_item_for_user_prompt(&prompt, &prompt_now));
-                let _ = try_emit(
-                    &bus,
-                    Event::MessageCommitted {
-                        role: MessageRole::User,
-                        text: prompt.clone(),
-                    },
-                );
-                messages.push(Message::text(Role::User, prompt.clone()));
-            }
-        } else {
-            // Fresh run — pre-v61 behaviour.
-            messages.push(Message::text(Role::User, prompt.clone()));
-            context_manager
-                .lock()
-                .add(context_item_for_user_prompt(&prompt, &prompt_now));
-            // Broadcast the initial user prompt so the conversation pane
-            // catches up before the first turn. Best-effort send (no
-            // subscribers is fine — see SessionDispatcher::dispatch).
-            let _ = try_emit(
+        let resumed_session = self
+            .hydrate_conversation(
+                &prompt,
+                &prompt_now,
+                &mut messages,
+                &context_manager,
                 &bus,
-                Event::MessageCommitted {
-                    role: MessageRole::User,
-                    text: prompt.clone(),
-                },
-            );
-        }
+                &workspace,
+            )
+            .await?;
         // v57 (M-bug-3 fix) — emit one ContextItems snapshot before
         // entering the turn loop so a UI subscriber that joins
         // immediately after `MessageCommitted{User}` doesn't see an
@@ -1907,12 +2758,9 @@ impl Runner {
         // happens for max_turns=0). The aggregate `ContextSnapshot`
         // still fires per-turn; this pre-loop emission is the
         // per-item snapshot only.
-        let mut last_context_items: Option<Vec<atelier_core::context::ContextItemSummary>>;
-        let mut last_context_meter: Option<(u32, u32)> = None;
-        let mut last_memory_cards: Option<Vec<atelier_core::memory::MemoryCardSummary>> = None;
-        let mut last_plan_steps: Option<Vec<atelier_core::plan::PlanStep>> = None;
-        let mut token_count_cache: Option<(u64, AdapterTokenCount)> = None;
-
+        // Pre-loop ContextItems snapshot (v57 M-bug-3): emit before entering the
+        // turn loop so a UI subscriber joining after MessageCommitted{User} sees
+        // something. The aggregate ContextSnapshot still fires per-turn.
         let initial_items = context_manager.lock().panel_snapshot().items;
         let _ = try_emit(
             &bus,
@@ -1920,524 +2768,44 @@ impl Runner {
                 items: initial_items.clone(),
             },
         );
-        last_context_items = Some(initial_items);
-        let mut turns = 0;
-        let mut final_state = State::Idle;
 
-        // v60.8 A2 follow-on — accumulate the observed file changes
-        // across turns so we can feed them into the §7 verify pass at
-        // end-of-run. Each tool dispatch's `EditStaged` events carry
-        // the path + a `Hunks` discriminator that maps cleanly onto
-        // [`atelier_core::verify::ObservedKind`]; we keep the latest
-        // observation per path so repeat-edits collapse to one entry.
-        //
-        // The latest envelope rides alongside so the verify pass has
-        // its `claimed_changes` to compare against. `verify_pass` is
-        // a no-op (badge stays `NotRun`) when both vectors are empty,
-        // which is what `emit_verify_not_run` makes explicit on the bus.
-        let mut observed_changes: Vec<atelier_core::verify::ObservedChange> = Vec::new();
-        let mut last_envelope: Envelope = Envelope::default();
-        // §10 — track the last assistant text for sub-agent result extraction.
-        let mut last_assistant_text: Option<String> = None;
+        // Construct TurnContext (read-only refs borrowed from setup locals above).
+        let ctx = TurnContext {
+            workspace: &workspace,
+            sandbox: &sandbox,
+            session_handle: &session_handle,
+            bus: &bus,
+            session_dispatcher: &session_dispatcher,
+            context_manager: &context_manager,
+            memory_store: &memory_store,
+            plan_canvas: &plan_canvas,
+            tools_spec: &tools_spec,
+            audit_log_path: &audit_log_path,
+            session_id,
+        };
+
+        // Construct TurnState from the 13 loop-carried mutable variables.
+        let mut state = TurnState {
+            active_strategy: initial_active_strategy,
+            envelope_conformance: atelier_core::protocol_conformance::ConformanceRingBuffer::new(),
+            messages,
+            observed_changes: Vec::new(),
+            last_envelope: Envelope::default(),
+            last_assistant_text: None,
+            token_count_cache: None,
+            last_context_items: Some(initial_items),
+            last_context_meter: None,
+            last_memory_cards: None,
+            last_plan_steps: None,
+            turns: 0,
+            final_state: State::Idle,
+            pending_skill_note,
+        };
 
         for turn in 0..self.max_turns {
-            // v60.15 (M-bug-state-desync) — only fire the `Idle → Streaming`
-            // edge once at the start of the run. After turn 0 the state
-            // is already `Streaming` (or `ToolExecuting → Streaming` after
-            // a tool dispatch), and unconditionally re-advancing was
-            // emitting an `IllegalTransitionAttempted{Streaming, Streaming}`
-            // bus event on every turn beyond the first. The spec §2.5
-            // table has no `Streaming → Idle` edge — multi-turn iteration
-            // stays inside `Streaming` modulo the `Streaming ↔ Tool*`
-            // sub-cycle.
-            if final_state == State::Idle {
-                advance(&session_handle, State::Idle, State::Streaming).await?;
-                final_state = State::Streaming;
-            }
-
-            // §1 BYOM context-window asymmetry — wrap `adapter.chat()`
-            // in a small retry loop that consults
-            // [`ContextOverflowPolicy`] when the adapter raises
-            // `AdapterError::ContextOverflow`. Compact / Reroute /
-            // Surface arms each emit `ContextOverflowResolved` so the
-            // bus carries one terminal marker per overflow, regardless
-            // of which arm fired. The retry cap is
-            // [`MAX_OVERFLOW_RETRIES`] consecutive attempts; after that
-            // the runner drops to Surface behaviour rather than
-            // looping forever.
-            // v60.17 §2 — advertise the synthetic `harness_meta` tool to
-            // the model when the active strategy is `NativeTool`. Without
-            // this, the model has no way to signal `claimed_done` /
-            // `claimed_changes` and the loop stalls after the task is
-            // really done (surfaced by the t01 live re-probe where Claude
-            // completed the task, ran tests, then burned the remaining
-            // turn budget describing the result in prose). The list is
-            // recomputed per turn because `active_strategy` can degrade
-            // mid-run via the §1 conformance tracker.
-            let turn_tools_spec: Vec<atelier_core::adapter::ToolSpec> = match active_strategy {
-                atelier_core::protocol_strategy::Strategy::NativeTool => {
-                    let mut v = Vec::with_capacity(tools_spec.len() + 1);
-                    v.push(atelier_core::protocol_strategy::harness_meta_tool_spec());
-                    v.extend(tools_spec.iter().cloned());
-                    v
-                }
-                atelier_core::protocol_strategy::Strategy::JsonSentinel
-                | atelier_core::protocol_strategy::Strategy::RegexProse => tools_spec.clone(),
-            };
-
-            // v60.20 §5 — mental-model injection. Snapshot the
-            // SessionDispatcher's mental-model state once per turn
-            // (cheap; the snapshot is a clone of a tiny struct) and,
-            // when enabled + non-empty, prepend a second System
-            // message to the per-turn message vec carrying the user's
-            // text. The history `messages` is NOT mutated — the on-disk
-            // conversation transcript stays free of the panel preamble
-            // (which lives separately in `mental_model.json` and would
-            // re-inject on resume anyway).
-            // v60.32 M03 — `messages_for_call` is rebuilt at the head
-            // of every retry iteration so a compaction that runs in
-            // the `ContextOverflow → Compact` arm below feeds the
-            // post-mutation history into the next chat call. Pre-fix,
-            // the projection was captured once outside the loop and
-            // the retry re-sent the pre-compaction snapshot, defeating
-            // the compaction. The mental-model snapshot is also
-            // re-read each iteration so a concurrent
-            // `set_mental_model` mutation lands on the retry too.
-            let project_messages_for_call = |history: &[Message]| -> Vec<Message> {
-                let mm_snapshot = session_dispatcher.snapshot_mental_model();
-                if mm_snapshot.enabled && !mm_snapshot.text.trim().is_empty() {
-                    let mut v = Vec::with_capacity(history.len() + 1);
-                    // Insert immediately after the atelier system prompt
-                    // (which is history[0] on a fresh run) so both system
-                    // messages land together at the head of the
-                    // conversation; Anthropic concatenates multiple system
-                    // entries cleanly, OpenAI-compat keeps them as separate
-                    // `system`-role rows. On a resumed run the prepended
-                    // entry sits ahead of the rehydrated prefix — both
-                    // shapes are acceptable wire-wise.
-                    let insert_pos =
-                        if !history.is_empty() && matches!(history[0].role, Role::System) {
-                            1
-                        } else {
-                            0
-                        };
-                    v.extend(history.iter().take(insert_pos).cloned());
-                    v.push(Message::text(
-                        Role::System,
-                        format!(
-                            "User-supplied mental model / working hypothesis. The user \
-                         maintains this in the Atelier §5 mental-model panel; it is \
-                         additional context layered on top of the §2 protocol \
-                         instructions above. Treat it as guidance, not as ground \
-                         truth: the user may be wrong, and you should still verify \
-                         claims via tools.\n\n{}",
-                            mm_snapshot.text.trim()
-                        ),
-                    ));
-                    v.extend(history.iter().skip(insert_pos).cloned());
-                    v
-                } else {
-                    history.to_vec()
-                }
-            };
-
-            let response = {
-                // §1 per-task routing: if the last message is a tool
-                // result, use the executor adapter (fast/cheap) when
-                // one is configured; otherwise fall back to the primary.
-                let call_adapter: &dyn Adapter = {
-                    let is_tool_turn = messages
-                        .last()
-                        .map(|m| matches!(m.role, Role::Tool))
-                        .unwrap_or(false);
-                    if is_tool_turn {
-                        self.executor_adapter
-                            .as_deref()
-                            .unwrap_or(self.adapter.as_ref())
-                    } else {
-                        self.adapter.as_ref()
-                    }
-                };
-                let mut overflow_retries: usize = 0;
-                loop {
-                    let mut messages_for_call = project_messages_for_call(&messages);
-                    if self.subagent_depth > 0 {
-                        messages_for_call = bounded_subagent_messages(messages_for_call);
-                    }
-                    match call_adapter
-                        .chat(&messages_for_call, &turn_tools_spec)
-                        .await
-                    {
-                        Ok(r) => break r,
-                        Err(AdapterError::ContextOverflow {
-                            needed_tokens,
-                            limit_tokens,
-                        }) => {
-                            // v60.5 compaction / v60.32 M03 — delegated to
-                            // `resolve_context_overflow`; a successful
-                            // compaction returns `Retry` (re-issue the chat
-                            // call), otherwise it returns the `RunError` to
-                            // surface.
-                            match self
-                                .resolve_context_overflow(
-                                    needed_tokens,
-                                    limit_tokens,
-                                    &mut overflow_retries,
-                                    &mut messages,
-                                    &mut token_count_cache,
-                                    &context_manager,
-                                    &session_dispatcher,
-                                    &workspace,
-                                    &session_id,
-                                    &bus,
-                                )
-                                .await
-                            {
-                                OverflowOutcome::Retry => continue,
-                                OverflowOutcome::Abort(e) => return Err(e),
-                            }
-                        }
-                        Err(e) => return Err(RunError::AdapterChain(e)),
-                    }
-                }
-            };
-
-            // §1 BYOM (v60.7) — append one `ModelCall` ledger entry
-            // per `adapter.chat()` call. `count_source` is the
-            // adapter's own honest claim (Exact iff the provider
-            // returned `usage`; Unavailable otherwise — see the
-            // anthropic / openai_compat assemblers). `cost_usd` is
-            // determined by the runner's [`ModelCostPolicy`]:
-            // latency-weighted local rate for Mock + OpenAI-compat
-            // against a self-hosted server; `None` for cloud
-            // providers whose pricing comes from a per-provider
-            // table that hasn't shipped yet. `latency_ms` is
-            // whatever the adapter measured.
-            let model_call_ts = now_rfc3339();
-            let latency_f64 = response.usage.latency_ms.map(|ms| ms as f64);
-            let cost_usd = match self.cost_policy {
-                ModelCostPolicy::LatencyWeighted => latency_f64.map(|ms| {
-                    atelier_core::ledger::local_cost_usd(
-                        ms,
-                        atelier_core::ledger::DEFAULT_LOCAL_RATE_USD_PER_SEC,
-                    )
-                }),
-                ModelCostPolicy::UnknownPending => None,
-            };
-            session_dispatcher.append_ledger_entry(atelier_core::ledger::LedgerEntry::ModelCall {
-                timestamp: model_call_ts,
-                model_id: self.adapter.model_id().to_string(),
-                prompt_tokens: response.usage.prompt_tokens,
-                completion_tokens: response.usage.completion_tokens,
-                cached_tokens: response.usage.cached_tokens,
-                count_source: response.usage.count_source,
-                cost_usd,
-                latency_ms: latency_f64,
-                // v60.51 §15 — the first `ModelCall` after a slash
-                // invocation carries `note: Some("skill: <name>")`;
-                // `take()` ensures only that first call is annotated.
-                note: pending_skill_note.take(),
-            });
-
-            // 6. Parse envelope from response per the *active* strategy
-            //    (the §1/§2 conformance tracker may have already
-            //    downshifted from the adapter's reported one).
-            //
-            //    We track whether the parse cleanly produced an envelope
-            //    so the cross-call rolling window can drive the §1
-            //    degradation check. "Clean" means the strategy-specific
-            //    parser returned `Ok`. An empty `tool_calls` payload on
-            //    the native-tool path is treated as malformed for
-            //    conformance — the carrier did not actually carry an
-            //    envelope. Pre-degradation, the adapter's reported
-            //    strategy and the active one agree; once degraded, we
-            //    use the active value so the parse stays aligned with
-            //    the UI badge.
-            //
-            //    Native tool calls (if any) still take precedence:
-            //    the dispatcher executes them and feeds results back as
-            //    Role::Tool messages.
-            let parse_strategy = active_strategy;
-            let (envelope, parse_ok) =
-                parse_envelope(parse_strategy, &response.tool_calls, &response.text);
-            // Record the outcome against the *active* strategy so the
-            // per-strategy breakdown lines up with what the runner was
-            // actually trying to use.
-            if parse_ok {
-                envelope_conformance.record_success(parse_strategy);
-            } else {
-                envelope_conformance.record_failure(parse_strategy);
-            }
-            // §1/§2 conformance-driven degradation. One-way: NativeTool →
-            // JsonSentinel → RegexProse. When the rolling window crosses
-            // the threshold we walk one step toward the more-tolerant
-            // strategy and announce the transition on the bus so the
-            // UI badge can refresh. If we are already at the lowest
-            // strategy (`RegexProse`), `downshift()` returns `None` and
-            // the check no-ops — the §2 escalate-to-user path lives in
-            // `TurnConformance` and fires separately.
-            if envelope_conformance
-                .should_degrade_with(self.degradation_window, self.degradation_threshold)
-            {
-                if let Some(next) = active_strategy.downshift() {
-                    let previous = active_strategy;
-                    active_strategy = next;
-                    // Clear the window so a freshly-degraded strategy
-                    // gets its own evaluation window instead of carrying
-                    // the failures from the prior strategy into the new
-                    // one's accounting.
-                    envelope_conformance =
-                        atelier_core::protocol_conformance::ConformanceRingBuffer::new();
-                    let reason = format!(
-                        "{} of last {} envelope parses malformed",
-                        self.degradation_threshold, self.degradation_window,
-                    );
-                    let _ = try_emit(
-                        &bus,
-                        Event::StrategyDegraded {
-                            from: previous,
-                            to: next,
-                            reason,
-                        },
-                    );
-                }
-            }
-
-            // P5: re-send assistant turn with its tool_calls so multi-turn
-            // tool flows round-trip the tool_use ids correctly. Pre-P5 we
-            // flattened to text-only, which broke any provider whose
-            // protocol requires the prior `tool_use` block to reference
-            // its matching `tool_result` (Anthropic, OpenAI, Bedrock,
-            // Gemini all do).
-            //
-            // v25.2-F: keep ALL tool_calls — including the
-            // `harness_meta` envelope-bearing call — on the assistant
-            // message so the conversation history is complete. The
-            // dispatcher only executes the non-envelope ones (filtered
-            // below into `real_tool_calls`), but the envelope tool_use
-            // id must still appear in history because the next turn
-            // (or a future audit) may reference it.
-            last_assistant_text = Some(response.text.clone());
-            messages.push(Message {
-                role: Role::Assistant,
-                content: response.text.clone(),
-                tool_call_id: None,
-                tool_calls: response.tool_calls.clone(),
-            });
-            context_manager.lock().add(context_item_for_assistant_turn(
-                &response.text,
-                &now_rfc3339(),
-            ));
-            let _ = try_emit(
-                &bus,
-                Event::MessageCommitted {
-                    role: MessageRole::Assistant,
-                    text: response.text.clone(),
-                },
-            );
-            // Apply the envelope's plan_update (if any) and broadcast a
-            // fresh snapshot so the plan pane converges. `apply_envelope`
-            // is idempotent — re-applying the same update produces the
-            // same canvas — but we still broadcast on every turn so a
-            // late-joining subscriber sees something promptly.
-            if let Some(plan_update) = &envelope.plan_update {
-                let steps = {
-                    let mut canvas = plan_canvas.lock();
-                    let _report = canvas.apply_envelope(plan_update);
-                    canvas.to_vec()
-                };
-                if last_plan_steps.as_ref() != Some(&steps) {
-                    let _ = try_emit(
-                        &bus,
-                        Event::PlanSnapshot {
-                            steps: steps.clone(),
-                        },
-                    );
-                    last_plan_steps = Some(steps);
-                }
-            }
-            // v56 — surface the envelope's per-file rationale so the
-            // §3 "Why this change?" UI can render it. The bus event
-            // carries the same shape as the envelope, flattened to
-            // string `kind` so consumers don't import the protocol enum.
-            if let Some(claimed) = &envelope.claimed_changes {
-                let changes = claimed
-                    .iter()
-                    .map(|c| atelier_core::session::ClaimedChangeSummary {
-                        path: c.path.clone(),
-                        // v59 (MED-smell-2 fix) — route through
-                        // `ClaimedChangeKind::wire_label` so the
-                        // projection stays in sync with the serde
-                        // `rename_all = "lowercase"` derive.
-                        kind: c.kind.wire_label().to_string(),
-                        summary: c.summary.clone(),
-                    })
-                    .collect();
-                let _ = try_emit(&bus, Event::ClaimedChanges { changes });
-            }
-            let real_tool_calls: Vec<_> = response
-                .tool_calls
-                .into_iter()
-                .filter(|c| c.name != atelier_core::protocol_strategy::HARNESS_META_NAME)
-                .collect();
-            // v60.15 — capture before the `Vec` is consumed by the
-            // dispatch loop below; needed for the end-of-turn stall
-            // guard that detects "no tool calls AND no claimed_done".
-            let made_tool_calls = !real_tool_calls.is_empty();
-
-            if !real_tool_calls.is_empty() {
-                self.execute_tool_calls(
-                    real_tool_calls,
-                    &session_handle,
-                    &session_dispatcher,
-                    &sandbox,
-                    &workspace,
-                    &audit_log_path,
-                    &bus,
-                    &context_manager,
-                    &mut messages,
-                    &mut observed_changes,
-                )
-                .await?;
-                final_state = State::Streaming;
-            }
-
-            turns = turn + 1;
-
-            // Per-turn ContextSnapshot + ContextItems (v55).
-            //
-            // The aggregate `ContextSnapshot` drives the §5 token
-            // meter; the per-item `ContextItems` stream feeds the
-            // Context panel. They go out together at the same turn
-            // boundary so the panel rows and the meter denominator
-            // can never disagree.
-            //
-            // v55 — items now come from the live `ContextManager`
-            // populated in parallel with the chat transcript above.
-            // Per-item token attribution still uses the same char/4
-            // approximation tagged `TokenSource::Approx`; the
-            // adapter's `count_tokens` continues to drive the
-            // aggregate meter. Pin / unpin / evict from the §5 panel
-            // operate on this store; the dispatcher (Step 2) shares
-            // the Arc to mutate it from UI handlers.
-            let message_fingerprint = message_history_fingerprint(&messages);
-            let counted = match token_count_cache.as_ref() {
-                Some((cached_fingerprint, token_count))
-                    if *cached_fingerprint == message_fingerprint =>
-                {
-                    Some(*token_count)
-                }
-                _ => match self.adapter.count_tokens(&messages).await {
-                    Ok(token_count) => {
-                        token_count_cache = Some((message_fingerprint, token_count));
-                        Some(token_count)
-                    }
-                    Err(_) => None,
-                },
-            };
-            if let Some(token_count) = counted {
-                let meter = (token_count.count, 0);
-                if last_context_meter != Some(meter) {
-                    last_context_meter = Some(meter);
-                    let _ = try_emit(
-                        &bus,
-                        Event::ContextSnapshot {
-                            known_tokens: token_count.count,
-                            unknown_tokens: 0,
-                        },
-                    );
-                }
-            }
-            let context_items = context_manager.lock().panel_snapshot().items;
-            if last_context_items.as_ref() != Some(&context_items) {
-                let _ = try_emit(
-                    &bus,
-                    Event::ContextItems {
-                        items: context_items.clone(),
-                    },
-                );
-                last_context_items = Some(context_items);
-            }
-
-            // v55 — §5 Memory panel snapshot. The MemoryStore is now
-            // mutable from the UI via SessionDispatcher's add /
-            // delete / promote mutators (Step 3). The runner still
-            // re-emits at each turn boundary so a late-joining
-            // subscriber converges to the live state.
-            let memory_cards = memory_store.lock().summarise();
-            if last_memory_cards.as_ref() != Some(&memory_cards) {
-                let _ = try_emit(
-                    &bus,
-                    Event::MemoryCards {
-                        cards: memory_cards.clone(),
-                    },
-                );
-                last_memory_cards = Some(memory_cards);
-            }
-
-            // v60.8 A2 follow-on — stash the most recent envelope for
-            // the §7 verify pass below. The envelope is small (no
-            // streaming payload, just claims + plan_update) so the
-            // clone per turn is cheap; this stays the simplest seam.
-            last_envelope = envelope.clone();
-
-            // 8. If the envelope or scripted response says done, exit.
-            if envelope.claimed_done == Some(true) {
-                advance(&session_handle, State::Streaming, State::Verifying).await?;
-                final_state = State::Verifying;
-                break;
-            }
-
-            // v60.15 (M-bug-stall) — stall guard. A turn that produced
-            // neither real tool calls nor `claimed_done=true` leaves
-            // the `messages` array ending on an assistant turn. The
-            // Anthropic API rejects "conversation ends with assistant"
-            // with a 400 `invalid_request_error` on stricter models
-            // (Sonnet, Opus); permissive providers (Haiku 4.5) return
-            // near-empty completions in a wedge until the turn cap.
-            //
-            // v60.67 — distinguish two sub-cases:
-            //   • Previous message was NOT a tool result: the model had
-            //     a user turn to work on but chose neither to call tools
-            //     nor claim done. That's a genuine §2 violation → stall.
-            //   • Previous message WAS a tool result: the model just
-            //     received tool outputs and wrote a prose conclusion
-            //     without calling `harness_meta`. This is the common
-            //     wrap-up pattern after sub-agent turns. Treat it as an
-            //     implicit claimed_done so the conversation completes
-            //     naturally rather than blocking with a stall banner.
-            if !made_tool_calls {
-                // v60.67 — distinguish wrap-up after sub-agents from a true
-                // stall. Walk backwards past the Tool block preceding the
-                // current Assistant turn; if every tool call in the preceding
-                // Assistant turn was `spawn_subagent`, the current prose is
-                // the natural task-completion summary — treat it as an
-                // implicit claimed_done. Any other tool mix (read_file,
-                // list_dir, …) means the model gathered info but didn't
-                // follow through, which is a genuine §2 stall.
-                let all_prev_were_subagent = last_turn_was_all_subagent(&messages);
-                if all_prev_were_subagent {
-                    // All prior tool calls were spawn_subagent: this prose is
-                    // the natural task-completion summary after delegation.
-                    advance(&session_handle, State::Streaming, State::Verifying).await?;
-                    final_state = State::Verifying;
-                } else {
-                    // True stall: no tool calls and the prior tool block (if
-                    // any) was not a sub-agent delegation.
-                    let _ = try_emit(
-                        &bus,
-                        Event::AgentStalled {
-                            turn: turn + 1,
-                            reason: "assistant turn produced no tool calls and no \
-                                     claimed_done=true; conversation cannot advance \
-                                     without a §2 protocol violation"
-                                .to_string(),
-                        },
-                    );
-                    advance(&session_handle, State::Streaming, State::AwaitingUser).await?;
-                    final_state = State::AwaitingUser;
-                }
-                break;
+            match self.run_turn(&ctx, &mut state, turn).await? {
+                TurnControl::Continue => {}
+                TurnControl::Break => break,
             }
         }
 
@@ -2467,153 +2835,15 @@ impl Runner {
             .await;
 
         // 10. Done — transition to terminal and persist.
-        if final_state == State::Verifying {
-            // v60.8 A2 follow-on — exercise the §7 verify pass. When the
-            // run produced either claimed_changes or observed edits,
-            // fire `verify_pass` so the bus carries the Tier 3 textual
-            // outcome and the GUI/TUI verify-pass badge converges off
-            // its `NotRun` default. When neither side has anything to
-            // weigh, the explicit `emit_verify_not_run` keeps the badge
-            // at `NotRun` rather than letting it drift to a prior
-            // turn's tier — both arms emit exactly one
-            // `Event::VerificationPassed` so consumers can rely on
-            // the per-run terminal-marker contract.
-            let has_claims = last_envelope
-                .claimed_changes
-                .as_ref()
-                .map(|c| !c.is_empty())
-                .unwrap_or(false);
-            if has_claims || !observed_changes.is_empty() {
-                // U09 — §7 Tier-1 live LSP path.
-                //
-                // Priority (highest to lowest):
-                //   1. Test seam (tier1_diagnostics_for_test) — bypasses the
-                //      launcher entirely, used by the hallucinating-agent gate.
-                //   2. Live LSP receiver — fires when `.ts` files are in the
-                //      change set AND `LspApprovals` says "typescript" is approved.
-                //   3. Tier-3 textual verify_pass — fallback.
-                let tier1_discrepancies: Vec<atelier_core::verify::Discrepancy> = if !self
-                    .tier1_diagnostics_for_test
-                    .is_empty()
-                {
-                    // Test seam: pre-mapped discrepancies bypass the launcher.
-                    self.tier1_diagnostics_for_test.clone()
-                } else {
-                    // Live path: detect TypeScript files in the change set.
-                    let ts_paths: Vec<String> = observed_changes
-                        .iter()
-                        .filter(|o| o.path.ends_with(".ts") || o.path.ends_with(".tsx"))
-                        .map(|o| o.path.clone())
-                        .collect();
-
-                    if ts_paths.is_empty() {
-                        // No TypeScript files — skip LSP entirely.
-                        Vec::new()
-                    } else {
-                        // Load approvals for this workspace.
-                        let approvals_path = atelier_core::lsp::lsp_approvals_path(&workspace);
-                        let approvals = atelier_core::lsp::LspApprovals::load(&approvals_path)
-                            .unwrap_or_default();
-
-                        if !approvals.is_approved("typescript") {
-                            // Not approved yet — emit the install prompt so
-                            // the GUI/TUI can ask the user. Fall through to
-                            // Tier-3 textual for this run.
-                            let _ = try_emit(
-                                &bus,
-                                Event::RequestLspInstall {
-                                    language: "typescript".into(),
-                                    candidate_packages: vec!["typescript-language-server".into()],
-                                },
-                            );
-                            Vec::new()
-                        } else {
-                            // Approved — spawn the LSP server and gather
-                            // diagnostics for all modified `.ts` files.
-                            match atelier_core::lsp::LspLauncher::spawn(
-                                &workspace, &sandbox, &approvals,
-                            )
-                            .await
-                            {
-                                Ok(mut session) => {
-                                    // Open each TypeScript file.
-                                    for rel_path in &ts_paths {
-                                        let abs_path = workspace.join(rel_path);
-                                        if let Ok(content) = std::fs::read_to_string(&abs_path) {
-                                            if let Err(e) = session.open_file(&abs_path, &content) {
-                                                tracing::warn!(
-                                                    path = %abs_path.display(),
-                                                    error = %e,
-                                                    "LSP: open_file failed; file skipped for diagnostics"
-                                                );
-                                            }
-                                        }
-                                    }
-                                    // Collect diagnostics (10-second budget).
-                                    let raw = session
-                                        .collect_diagnostics(std::time::Duration::from_secs(10))
-                                        .await;
-                                    session.shutdown().await;
-                                    // Map raw diagnostics to discrepancies.
-                                    raw.into_iter()
-                                        .filter_map(|(abs_path, diag)| {
-                                            // Rebase absolute path to
-                                            // workspace-relative.
-                                            let rel = abs_path
-                                                .strip_prefix(workspace.to_string_lossy().as_ref())
-                                                .unwrap_or(abs_path.as_str())
-                                                .trim_start_matches('/')
-                                                .to_string();
-                                            atelier_core::lsp::map_diagnostic_to_discrepancy(
-                                                &rel, &diag,
-                                            )
-                                        })
-                                        .collect()
-                                }
-                                Err(atelier_core::lsp::LspLaunchError::NotApproved { .. }) => {
-                                    // Should not happen (we checked above), but
-                                    // belt-and-suspenders: emit the install
-                                    // prompt and fall through.
-                                    let _ = try_emit(
-                                        &bus,
-                                        Event::RequestLspInstall {
-                                            language: "typescript".into(),
-                                            candidate_packages: vec![
-                                                "typescript-language-server".into()
-                                            ],
-                                        },
-                                    );
-                                    Vec::new()
-                                }
-                                Err(e) => {
-                                    // Non-approval launch error: warn + fall
-                                    // through to Tier 3.
-                                    tracing::warn!(
-                                        error = %e,
-                                        "LSP launcher failed; falling through to Tier-3 verify"
-                                    );
-                                    Vec::new()
-                                }
-                            }
-                        }
-                    }
-                };
-
-                if tier1_discrepancies.is_empty() && self.tier1_diagnostics_for_test.is_empty() {
-                    let _ = session_dispatcher.verify_pass(&last_envelope, &observed_changes);
-                } else {
-                    let _ = session_dispatcher.verify_pass_with_tier1(
-                        &last_envelope,
-                        &observed_changes,
-                        tier1_discrepancies,
-                    );
-                }
-            } else {
-                session_dispatcher.emit_verify_not_run();
-            }
-            advance(&session_handle, State::Verifying, State::Done).await?;
-            final_state = State::Done;
-        }
+        self.run_verification_pass(
+            &mut state,
+            &session_handle,
+            &session_dispatcher,
+            &workspace,
+            &sandbox,
+            &bus,
+        )
+        .await?;
 
         // 11. Persist session. Best-effort — failure here logs but doesn't
         //     fail the run, because the in-memory state is what the user
@@ -2626,129 +2856,14 @@ impl Runner {
         //     prior `session_uuid` so the on-disk path is stable; fresh
         //     runs use the actor's session id.
         let persist_uuid = self.resume_from.unwrap_or(session_id.0);
-        let session_dir = OnDiskSession::session_dir(&workspace, persist_uuid);
-        let mut snapshot = OnDiskSession::fresh(
-            persist_uuid,
-            env!("CARGO_PKG_VERSION").to_string(),
-            now_rfc3339(),
+        self.build_and_persist_session(
+            session_id,
+            &workspace,
+            &state.messages,
+            &resumed_session,
+            &spawner,
+            &bus,
         );
-        // Re-attach the resumed recovery_log so its audit trail
-        // survives the round-trip. Fresh runs get an empty log.
-        if let Some(resumed) = &resumed_session {
-            snapshot.recovery_log = resumed.recovery_log.clone();
-        }
-        // Materialise the in-memory `messages` into the persisted
-        // conversation field. Turn ids are session-local positional —
-        // sufficient for the resume protocol's ordering invariants;
-        // a future audit-grade format will carry stable per-call ids.
-        for (idx, msg) in messages.iter().enumerate() {
-            let turn_id = format!("turn-{idx}");
-            let role_str = match msg.role {
-                Role::User => "user",
-                Role::Assistant => "assistant",
-                Role::Tool => "tool",
-                Role::System => "system",
-            };
-            let tool_calls_json: Vec<serde_json::Value> = msg
-                .tool_calls
-                .iter()
-                .map(|tc| {
-                    serde_json::json!({
-                        "tool_call_id": tc.id,
-                        "tool_name": tc.name,
-                        "args": tc.arguments,
-                    })
-                })
-                .collect();
-            snapshot.append_conversation_turn(
-                turn_id,
-                role_str,
-                msg.content.clone(),
-                msg.tool_call_id.clone(),
-                tool_calls_json,
-            );
-        }
-        // §10 — persist completed sub-agent records into session.json.
-        for rec in spawner.drain_completed() {
-            let status_str = match rec.result.status {
-                SubagentStatus::Completed => "completed",
-                SubagentStatus::Failed => "failed",
-                SubagentStatus::TimedOut => "timed_out",
-                SubagentStatus::Cancelled => "cancelled",
-            };
-            let cost_summary = if rec.result.cost.prompt_tokens > 0
-                || rec.result.cost.completion_tokens > 0
-                || rec.result.cost.cost_usd.is_some()
-            {
-                Some(PersistedSubagentCost {
-                    prompt_tokens: rec.result.cost.prompt_tokens,
-                    completion_tokens: rec.result.cost.completion_tokens,
-                    cached_tokens: rec.result.cost.cached_tokens,
-                    cost_usd: rec.result.cost.cost_usd,
-                })
-            } else {
-                None
-            };
-            snapshot.subagents.insert(
-                rec.result.id.to_string(),
-                PersistedSubagent {
-                    subagent_type: Some(rec.subagent_type_name),
-                    description: Some(rec.description),
-                    started_at: Some(rec.started_at),
-                    finished_at: Some(rec.finished_at),
-                    status: status_str.to_string(),
-                    result: Some(rec.result.result),
-                    max_turns: Some(rec.max_turns),
-                    turns_used: Some(rec.result.turns_used),
-                    cost_summary,
-                },
-            );
-        }
-        // R-1: carry forward completed sub-agents from the prior session so
-        // the subagents map is additive across resumes.
-        if let Some(resumed) = &resumed_session {
-            for (id, rec) in &resumed.subagents {
-                snapshot
-                    .subagents
-                    .entry(id.clone())
-                    .or_insert_with(|| rec.clone());
-            }
-            // Mark any sub-agent that was `running` in the prior session as
-            // cancelled — v1 does not resume in-flight sub-agent runs (§10).
-            for rec in snapshot.subagents.values_mut() {
-                if rec.status == "running" {
-                    rec.status = "cancelled".to_string();
-                    let _ = try_emit(
-                        &bus,
-                        Event::SubagentCancelled {
-                            id: rec.description.clone().unwrap_or_default(),
-                            reason: "resume_inflight".to_string(),
-                        },
-                    );
-                }
-            }
-        }
-
-        if let Err(e) = snapshot.save_split_to(&session_dir) {
-            tracing::warn!(error = %e, "atelier run: session snapshot save failed");
-        }
-
-        // Phase C close — write the pane-visibility record next to
-        // `session.json` if the driver supplied one. Best-effort: a
-        // failure here logs but does not fail the run (the spec
-        // measurement subsystem reads this file lazily and falls
-        // back to "all visible" when it's absent).
-        if let Some((panes, driver)) = &self.pane_visibility {
-            let rec = crate::instrumentation::PaneVisibilityRecord::new(
-                session_id.0.to_string(),
-                now_rfc3339(),
-                panes.clone(),
-                driver.clone(),
-            );
-            if let Err(e) = rec.save_to(&session_dir) {
-                tracing::warn!(error = %e, "pane_visibility.json write failed");
-            }
-        }
 
         // 12. Shutdown. The broadcast channel only closes when *every*
         //     Sender clone drops, and SessionDispatcher holds one
@@ -2776,7 +2891,7 @@ impl Runner {
         // end-of-run so test callers (and the nightly gate) can fold
         // per-strategy summaries without reaching into the runner's
         // internals. Cheap: the snapshot allocates a small Vec.
-        let envelope_conformance = envelope_conformance.snapshot();
+        let envelope_conformance_snapshot = state.envelope_conformance.snapshot();
 
         let ledger_snapshot = ledger.to_vec();
         Ok(RunReport {
@@ -2784,12 +2899,12 @@ impl Runner {
             // Resume runs deliberately persist back to `resume_from`; callers
             // such as the GUI chain follow-up submits from this value.
             session_id: SessionId(persist_uuid),
-            turns,
-            turns_used: turns,
-            final_state,
+            turns: state.turns,
+            turns_used: state.turns,
+            final_state: state.final_state,
             dod_passed,
-            envelope_conformance,
-            final_assistant_text: last_assistant_text,
+            envelope_conformance: envelope_conformance_snapshot,
+            final_assistant_text: state.last_assistant_text,
             ledger_entries: ledger_snapshot,
         })
     }
