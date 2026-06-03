@@ -1,5 +1,20 @@
 # Atelier Spec — Changelog
 
+## v60.92 — 2026-06-03 (Bundle 3 PR-2: Q2 LSP open_file observability)
+
+- `crates/atelier-cli/src/runner.rs` — the `let _ = session.open_file(...)` call in the LSP concurrent-edit TypeScript ingestion path now logs `tracing::warn!` with the path and error on failure instead of silently discarding it. Semantics unchanged: non-fatal, file skipped for diagnostics.
+- The 24 `let _ = try_emit(...)` call sites are intentionally unchanged: `try_emit` already performs rate-limited `tracing::warn!` internally (session.rs) with a `BROADCAST_LAGGED` global counter.
+- 1,408 workspace tests pass; fmt + clippy clean.
+
+## v60.91 — 2026-06-03 (Bundle 3 PR-1: T1 + Q1 + Q3)
+
+Closes three audit findings from `tasks/plan_audit_2026-06-02_fixes.md`.
+
+- **T1 — Test hygiene (atelier-core):** added `static ENV_LOCK: std::sync::Mutex<()>` to the test modules in `adapter/anthropic.rs` and `adapter/model_profile.rs`; the tests that call `set_var`/`remove_var` now acquire the lock before mutating, eliminating the parallel-test race window. No new dependencies.
+- **Q1 — Adapter error chain (atelier-cli/runner.rs):** added `RunError::AdapterChain(#[source] AdapterError)` alongside the existing `Adapter(String)` variant. Both runner.rs conversion sites now use `AdapterChain`, preserving the typed source for error-chain traversal (`anyhow`, `miette`, tracing `%e`). `Adapter(String)` is kept `#[allow(dead_code)]` for `atelier-gui` string-matching backward compatibility.
+- **Q3 — Input validation (atelier-cli/main.rs):** `--max-turns 0` is now rejected at parse time with "positive integer >= 1". Previously 0 was silently accepted, making the agent loop a no-op.
+- 1,408 workspace tests pass; fmt + clippy clean; `make check` 180/180.
+
 ## v60.90 — 2026-06-03 (coverage uplift + refactor regression guards)
 
 Completes audit Bundle 2 from `tasks/plan_audit_2026-06-02_fixes.md`.
