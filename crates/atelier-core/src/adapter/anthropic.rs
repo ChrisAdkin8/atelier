@@ -1197,6 +1197,9 @@ mod tests {
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    // Serializes tests that mutate the process-wide ANTHROPIC_API_KEY env var.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn user(content: &str) -> Message {
         Message::text(Role::User, content)
     }
@@ -1778,9 +1781,9 @@ mod tests {
 
     #[test]
     fn from_env_errors_when_key_missing() {
-        // SAFETY: this test sets+unsets a process-wide env var. Other tests
-        // never touch ANTHROPIC_API_KEY, so the race window is empty in
-        // practice; if a future test does, it must serialize with this one.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // SAFETY: ENV_LOCK serializes all tests that mutate ANTHROPIC_API_KEY
+        // so set/remove calls never race with parallel test threads.
         unsafe {
             std::env::remove_var(API_KEY_ENV);
         }

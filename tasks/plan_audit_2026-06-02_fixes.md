@@ -79,6 +79,8 @@ These are real but minor: the code works today. Batch them only if the cleanup i
 - Fix: add/!use a `RunError::Adapter(AdapterError)` variant (or `#[source]`) so the chain survives.
 - **Verify:** a test asserts the returned error's `source()` is the originating `AdapterError`.
 
+**Status — 2026-06-03 (DONE).** Added `RunError::AdapterChain(#[source] AdapterError)` alongside the existing `Adapter(String)` variant (kept for GUI string-matching backward compat). Both runner.rs conversion sites now use `AdapterChain`. The old `Adapter(String)` is marked `#[allow(dead_code)]` since it is constructed in `atelier-gui` (separate crate) which the integration test binary cannot see. All workspace tests pass.
+
 ### Q2 — Make best-effort failures observable
 
 - Files: `crates/atelier-cli/src/runner.rs:2512` (`let _ = session.open_file(...)`) and the `let _ = try_emit(...)` sites around `runner.rs:1400`.
@@ -91,6 +93,8 @@ These are real but minor: the code works today. Batch them only if the cleanup i
 - File: `crates/atelier-cli/src/main.rs:1572` — `parse::<usize>().ok()` accepts `0`, which makes the loop a no-op.
 - Fix: reject `0` at parse time with `missing_value("--max-turns", "positive integer >= 1")`.
 - **Verify:** unit test asserts `--max-turns 0` errors; covered end-to-end by C2's boundary test.
+
+**Status — 2026-06-03 (DONE).** Added `Some(0)` arm before `Some(n)` in the `--max-turns` parse match; error message updated to "positive integer >= 1".
 
 ### Q4 — Self-document the infallible serde unwraps (cosmetic)
 
@@ -106,6 +110,8 @@ These are real but minor: the code works today. Batch them only if the cleanup i
 - Files: `crates/atelier-core/src/adapter/anthropic.rs:1785` and `crates/atelier-core/src/adapter/model_profile.rs:1741/1747/1748` — tests `set_var`/`remove_var` on process-global env without serialization, so parallel runs can race.
 - Fix: add a dedicated serialization guard. `serial_test` is **not** currently a dep — either add it (`#[serial]`) or use a `static` `std::sync::Mutex` lock shared by these tests (no new dep). Prefer the mutex to avoid a dependency for two tests.
 - **Verify:** `cargo test -p atelier-core` green under default (parallel) threads across repeated runs.
+
+**Status — 2026-06-03 (DONE).** Added `static ENV_LOCK: std::sync::Mutex<()>` to each test module; the mutating tests now acquire `_guard = ENV_LOCK.lock()` before touching env vars. No new dependencies.
 
 ---
 

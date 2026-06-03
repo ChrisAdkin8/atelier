@@ -973,6 +973,9 @@ mod tests {
     use crate::context::TokenSource;
     use tempfile::TempDir;
 
+    // Serializes tests that mutate the process-wide PROFILE_DIR_ENV env var.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn complete(text: &str, tool_calls: Vec<ToolCallRequest>) -> StreamChunk {
         StreamChunk::Complete {
             response: ChatResponse {
@@ -1091,6 +1094,63 @@ mod tests {
         assert!(score.score < 50, "score was {}", score.score);
         assert_eq!(score.grade, SuitabilityGrade::Poor);
         assert!(score.risks.iter().any(|s| s.contains("regex/prose")));
+    }
+
+    #[test]
+    fn suitability_prompt_cache_factor_tracks_capability_claim() {
+        // Pins the scoring contract that the GUI surfaces back to the
+        // user: when prompt_cache is Supported, the factor is 5/5 and
+        // a "prompt caching is available" strength entry is emitted;
+        // when Unsupported, the factor is 0/5 and the strength is gone.
+        // This is what the openai-compat probe / `with_cache_prompt` flips
+        // now reach: getting the claim right propagates straight into
+        // the score and the strengths list.
+        let profile = fixture(
+            "openai-compat:test",
+            "http://localhost:11434/v1",
+            Strategy::NativeTool,
+        );
+
+        // Supported path — the default matrix_row() helper carries
+        // CapabilityClaim::Supported.
+        let row = matrix_row();
+        assert_eq!(row.prompt_cache, CapabilityClaim::Supported);
+        let score = score_model_suitability(&profile, &row);
+        let pc = score
+            .factors
+            .iter()
+            .find(|f| f.name == "prompt_cache")
+            .expect("prompt_cache factor must be present");
+        assert_eq!(pc.awarded, 5);
+        assert_eq!(pc.max, 5);
+        assert!(
+            score
+                .strengths
+                .iter()
+                .any(|s| s.contains("prompt caching is available")),
+            "strengths did not include the prompt-cache entry: {:?}",
+            score.strengths
+        );
+
+        // Unsupported path — flip the column and re-score.
+        let mut row = matrix_row();
+        row.prompt_cache = CapabilityClaim::Unsupported;
+        let score = score_model_suitability(&profile, &row);
+        let pc = score
+            .factors
+            .iter()
+            .find(|f| f.name == "prompt_cache")
+            .expect("prompt_cache factor must be present");
+        assert_eq!(pc.awarded, 0);
+        assert_eq!(pc.max, 5);
+        assert!(
+            !score
+                .strengths
+                .iter()
+                .any(|s| s.contains("prompt caching is available")),
+            "strengths leaked the prompt-cache entry when Unsupported: {:?}",
+            score.strengths
+        );
     }
 
     #[test]
@@ -1670,16 +1730,10 @@ mod tests {
 
     #[test]
     fn default_profile_dir_honours_env_override() {
-        // Save + restore the env so we don't leak into other tests
-        // that share the same process (cargo test by default runs
-        // tests in parallel within a crate; this var is read-only in
-        // those threads, so a sequential-in-test save/restore is the
-        // simplest safety net).
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let prior = std::env::var(PROFILE_DIR_ENV).ok();
-        // SAFETY: this is the documented test-only override; set+restore
-        // pattern protects parallel tests as long as no other test
-        // writes to the same var simultaneously. Our test suite has
-        // exactly one test that touches this env var.
+        // SAFETY: ENV_LOCK serializes all tests that mutate PROFILE_DIR_ENV
+        // so set/remove calls never race with parallel test threads.
         unsafe {
             std::env::set_var(PROFILE_DIR_ENV, "/tmp/atelier-profiles-test");
         }

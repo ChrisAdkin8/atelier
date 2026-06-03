@@ -1570,8 +1570,9 @@ fn parse_cli(mut args: impl Iterator<Item = String>) -> CliParseResult {
                 None => return missing_value("--workspace", "path"),
             },
             "--max-turns" => match args.next().and_then(|s| s.parse::<usize>().ok()) {
+                Some(0) => return missing_value("--max-turns", "positive integer >= 1"),
                 Some(n) => out.max_turns = Some(n),
-                None => return missing_value("--max-turns", "positive integer"),
+                None => return missing_value("--max-turns", "positive integer >= 1"),
             },
             "--prompt-file" => match args.next() {
                 Some(v) => out.prompt_file = Some(PathBuf::from(v)),

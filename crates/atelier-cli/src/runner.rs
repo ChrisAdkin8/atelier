@@ -2097,7 +2097,7 @@ impl Runner {
                                 OverflowOutcome::Abort(e) => return Err(e),
                             }
                         }
-                        Err(e) => return Err(RunError::Adapter(format!("{e}"))),
+                        Err(e) => return Err(RunError::AdapterChain(e)),
                     }
                 }
             };
@@ -2793,8 +2793,17 @@ impl Runner {
 pub enum RunError {
     #[error("config: {0}")]
     Config(String),
+    // Kept for GUI string-matching compatibility (atelier-gui matches on the
+    // message text of this variant); new construction sites use AdapterChain.
+    #[allow(dead_code)]
     #[error("adapter: {0}")]
     Adapter(String),
+    /// Adapter failure with the originating [`AdapterError`] preserved as a
+    /// `#[source]` so error-chain traversal works (e.g. `anyhow`, `miette`,
+    /// tracing `%e` spans). The `Adapter(String)` variant is kept alongside
+    /// for GUI string-matching compatibility; new conversion sites use this.
+    #[error("adapter: {0}")]
+    AdapterChain(#[source] AdapterError),
     #[error("session command failed: {0}")]
     Session(String),
     /// §1 BYOM — typed surface for the
@@ -2957,7 +2966,7 @@ fn message_history_fingerprint(messages: &[Message]) -> u64 {
 fn adapter_to_run_error(e: AdapterError) -> RunError {
     match e {
         AdapterError::NotConfigured(m) => RunError::Config(m),
-        other => RunError::Adapter(other.to_string()),
+        other => RunError::AdapterChain(other),
     }
 }
 
