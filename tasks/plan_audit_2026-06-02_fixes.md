@@ -41,6 +41,7 @@ The **CC<50 target was not reached by extraction** and is deferred. The remainin
 
 - Introduce a `TurnState` struct (the ~13 mutable per-turn variables) and a `TurnContext` (read-only refs), then extract `run_turn(&self, &ctx, &mut state) -> ControlFlow` so the entire per-turn body leaves `run()` at once. Do **after** Bundle 2.
 - **Verify:** `make metrics` shows `run()` worst-fn cyclomatic < 50; `cargo test -p atelier-cli` unchanged-green.
+- **Detailed plan written 2026-06-03 (Bundle 2 prereq now met):** see [`tasks/plan_r1b_turnstate_redesign.md`](plan_r1b_turnstate_redesign.md) — current-state analysis (the exact 13 vars + context refs + control flow), target design (`TurnState`/`TurnContext`/`TurnControl` + `run_turn`), 5-phase implementation with per-phase verification, risk analysis, and rollback. Ready to start.
 
 ---
 
