@@ -7,6 +7,8 @@ Change history in `../CHANGELOG.md`.
 
 **Tracker discipline:** keep this file up to date whenever a plan lands, a risk/remediation status changes, or gate counts change. Do not leave `tasks/todo.md` as a historical snapshot; move detailed release history to `../CHANGELOG.md` and keep this file focused on current state plus active/pending work.
 
+**v60.93 (2026-06-03)** — R1b: TurnState/TurnContext redesign. `Runner::run` CC 140→38; `run_turn` CC 48. Extracted `TurnState` (14 vars), `TurnContext` (11 refs), `TurnControl` into `runner/turn.rs`; 6 cohesive sub-methods from the loop body and pre/post-loop blocks. 1,408 tests pass, fmt + clippy clean, make check 180/180. All runner.rs functions now < 50 cyclomatic.
+
 **v60.92 (2026-06-03)** — audit Bundle 3 PR-2 (Q2). LSP `session.open_file` failure now logs `tracing::warn!` instead of being silently dropped. The 24 `try_emit` call sites left unchanged — `try_emit` already logs internally with rate-limiting. 1,408 tests pass.
 
 **v60.91 (2026-06-03)** — audit Bundle 3 PR-1 (T1 + Q1 + Q3). T1: env-mutating tests in `atelier-core` serialized with a `static Mutex` (no new deps). Q1: `RunError::AdapterChain(#[source] AdapterError)` added alongside `Adapter(String)` for typed error-chain preservation. Q3: `--max-turns 0` rejected at parse time. 1,408 tests pass; `make check` 180/180.

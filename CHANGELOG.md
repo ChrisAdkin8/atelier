@@ -1,5 +1,15 @@
 # Atelier Spec — Changelog
 
+## v60.93 — 2026-06-03 (R1b: TurnState/TurnContext redesign)
+
+Completes the `runner.rs` complexity-reduction programme. Every function in `runner.rs` is now < 50 cyclomatic.
+
+- Added `crates/atelier-cli/src/runner/turn.rs` with `TurnState` (14 loop-carried mutable vars), `TurnContext<'a>` (11 read-only refs borrowed from `run()` setup), and `TurnControl` (`Continue`/`Break`). All `pub(super)`, matching the `runner/concurrent_edit.rs` precedent.
+- Extracted `Runner::run_turn` — the entire `for turn` body — as a 4-param `async fn` that returns `Result<TurnControl, RunError>`. No `#[allow(clippy::too_many_arguments)]` needed; the two-struct split is the proof the factoring worked.
+- Further extracted four sub-block methods: `hydrate_conversation` (resume/fresh-run message setup), `run_verification_pass` (§7 verify + `Done` transition), `build_and_persist_session` (session snapshot + subagent records + pane-visibility), and `tier1_lsp_discrepancies` (§7 Tier-1 LSP block).
+- `run()` CC: **140 → 38**. `run_turn` CC: **48**. All other `runner.rs` functions < 50.
+- No behaviour change: 1,408 workspace tests pass / 0 fail; `cargo clippy --workspace` clean (including the `atelier-gui` `Send` gate); `make check` 180/180.
+
 ## v60.92 — 2026-06-03 (Bundle 3 PR-2: Q2 LSP open_file observability)
 
 - `crates/atelier-cli/src/runner.rs` — the `let _ = session.open_file(...)` call in the LSP concurrent-edit TypeScript ingestion path now logs `tracing::warn!` with the path and error on failure instead of silently discarding it. Semantics unchanged: non-fatal, file skipped for diagnostics.
