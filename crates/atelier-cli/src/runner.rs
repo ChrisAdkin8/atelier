@@ -2540,7 +2540,13 @@ impl Runner {
                                     for rel_path in &ts_paths {
                                         let abs_path = workspace.join(rel_path);
                                         if let Ok(content) = std::fs::read_to_string(&abs_path) {
-                                            let _ = session.open_file(&abs_path, &content);
+                                            if let Err(e) = session.open_file(&abs_path, &content) {
+                                                tracing::warn!(
+                                                    path = %abs_path.display(),
+                                                    error = %e,
+                                                    "LSP: open_file failed; file skipped for diagnostics"
+                                                );
+                                            }
                                         }
                                     }
                                     // Collect diagnostics (10-second budget).

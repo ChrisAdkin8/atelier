@@ -88,6 +88,8 @@ These are real but minor: the code works today. Batch them only if the cleanup i
 - Fix: keep them non-fatal but log on the error path (`tracing::warn!`). Do **not** make them propagate — the best-effort semantics are intentional.
 - **Verify:** clippy-clean; a test with a closed event channel observes the warn path (or at least does not change exit behaviour).
 
+**Status — 2026-06-03 (DONE, partial).** `session.open_file` now logs `tracing::warn!` on failure with path and error (runner.rs:2543). The 24 `try_emit` call sites were not changed: `try_emit` already performs rate-limited `tracing::warn!` internally (see `session.rs:83-107`) with a global `BROADCAST_LAGGED` counter — annotating each call site would duplicate this and add noise without new information.
+
 ### Q3 — Reject `--max-turns 0`
 
 - File: `crates/atelier-cli/src/main.rs:1572` — `parse::<usize>().ok()` accepts `0`, which makes the loop a no-op.
