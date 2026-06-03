@@ -1,5 +1,25 @@
 # Atelier Spec — Changelog
 
+## v60.90 — 2026-06-03 (coverage uplift + refactor regression guards)
+
+Completes audit Bundle 2 from `tasks/plan_audit_2026-06-02_fixes.md`.
+
+- Added 9 unit tests in `crates/atelier-cli/src/runner.rs` regression-guarding the two functions extracted in v60.89: `parse_envelope` (5 tests: native-tool with/without `harness_meta`, json-sentinel valid/malformed, regex-prose plain-prose semantics) and `last_turn_was_all_subagent` (4 tests: all-subagent, mixed-calls, no-tool-block, empty-slice).
+- Added 2 integration tests in `crates/atelier-cli/tests/run_integration.rs` (Bundle 2 / C2): `max_turns_one_executes_exactly_one_turn` pins the loop-bound contract; `concurrent_runs_on_separate_workspaces_do_not_corrupt_session_json` verifies parallel `Runner::run` calls on separate workdirs each produce a valid `session.json`.
+- `atelier-cli` full-suite line coverage: **72.9%** (was 51.9%, target ≥70%). Total Rust tests: 1,408 (was 1,397).
+- Security: `npm audit fix` bumped `dompurify` 3.4.4→3.4.7 (GHSA-87xg-pxx2-7hvx, XSS, transitive via `mermaid@11.15.0`). Unblocked the `check` CI workflow's audit job.
+- Rig: `test_no_claude_paths_in_tracked_source` now skips the gitignored `.atelier/sessions/` tree.
+
+## v60.89 — 2026-06-02 (Runner::run decomposition)
+
+First increment of the `runner.rs` complexity reduction mandated by `ATELIER.md`.
+
+- Extracted four behaviour-preserving units from `Runner::run`'s agent turn loop: `resolve_context_overflow` (overflow/compaction policy arm), `execute_tool_calls` (concurrent tool dispatch + result folding), `parse_envelope` (three-strategy envelope parse), `last_turn_was_all_subagent` (stall-guard back-walk). All are free fns or private methods; no public API change.
+- `run()` drops from cyclomatic 182→139 (−24%), cognitive 239→178, 1,617→1,364 SLOC. 239 cli tests pass, fmt + clippy clean.
+- Introduced `OverflowOutcome` enum as the communication contract between the extracted method and its call site.
+- `TurnState`/`TurnContext` redesign to reach CC<50 is deferred (plan R1b); coverage must reach ≥70% first (addressed in v60.90).
+- Deep-scan audit: `tasks/audit-2026-06-02.md`. The reported P0 "production panics" were false positives (test code mis-flagged by Explore subagents); the complexity hotspot was the only corroborated finding.
+
 ## v60.88 — 2026-05-23 (bundled workflow skills)
 
 Expands the bundled skill catalogue and prepares the next packaged release.

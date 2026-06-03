@@ -2,7 +2,7 @@
 
 [← back to README](README.md)
 
-The harness is **end-to-end runnable** for the Phase A/B/C scope, against Mock, Anthropic, and any OpenAI-compatible server (LM Studio, llama-server, vLLM, sglang, Ollama, OpenAI itself). The Tauri GUI is currently a chat/agent workspace with context/memory/sub-agent surfaces; the `ratatui` TUI remains the live agent workspace with diff, plan, and file-level approval controls. The spec, schemas, canonical workload, and self-testing rig are fully wired and verify the harness as it grows. This file tracks **what has landed**, **what is in flight**, and **what gates each phase**. Ordered build plan: [`tasks/todo.md`](tasks/todo.md); version-by-version trail: [`CHANGELOG.md`](CHANGELOG.md) (latest **v60.88**).
+The harness is **end-to-end runnable** for the Phase A/B/C scope, against Mock, Anthropic, and any OpenAI-compatible server (LM Studio, llama-server, vLLM, sglang, Ollama, OpenAI itself). The Tauri GUI is currently a chat/agent workspace with context/memory/sub-agent surfaces; the `ratatui` TUI remains the live agent workspace with diff, plan, and file-level approval controls. The spec, schemas, canonical workload, and self-testing rig are fully wired and verify the harness as it grows. This file tracks **what has landed**, **what is in flight**, and **what gates each phase**. Ordered build plan: [`tasks/todo.md`](tasks/todo.md); version-by-version trail: [`CHANGELOG.md`](CHANGELOG.md) (latest **v60.90**).
 
 ---
 
@@ -37,6 +37,8 @@ The Phase A foundation, Phase B protocol/verification subset, and Phase C worksp
 - **Deep-scan hardening (v60.85)** — the TUI model footer sanitizes external model/probe strings, GUI slash-skill autocomplete commits the highlighted skill on plain `Enter`, and the provider-scoring CLI code no longer trips Clippy's `type_complexity` lint. Shai-Hulud/npm IoC checks remain clean; RustSec `time`/`lru`/`glib` advisories stay documented audit-ignore debt while the workspace is pinned to Rust 1.85.
 - **Phase A nightly gate action removed (v60.87)** — Phase A no longer has a scheduled/live-model GitHub Actions workflow. The canonical priority subset remains covered by offline Mock integration tests in regular CI; live Anthropic/OpenAI-compatible tests remain manually runnable when a suitable model/API budget is available.
 - **Bundled workflow skills (v60.88)** — the packaged skill catalogue now includes ten additional workflow/onboarding skills (`/ci-failure`, `/config-doctor`, `/release-publish`, etc.) embedded in `atelier-core`, so Homebrew/GitHub Release installs get them automatically.
+- **`Runner::run` decomposition (v60.89)** — four behaviour-preserving extractions from the agent turn loop: `resolve_context_overflow`, `execute_tool_calls`, `parse_envelope`, `last_turn_was_all_subagent`. `run()` drops from cyclomatic 182→139, cognitive 239→178, 1,617→1,364 SLOC. `TurnState`/`TurnContext` redesign to reach CC<50 is deferred (plan R1b) until coverage is higher.
+- **Coverage uplift + refactor regression guards (v60.90)** — 11 new tests: 9 unit tests for the two v60.89 extracted fns, plus 2 integration tests (`max_turns_one_executes_exactly_one_turn`, `concurrent_runs_on_separate_workspaces`). `atelier-cli` full-suite line coverage now **72.9%** (was 52%). Also: `npm audit fix` bumped `dompurify` 3.4.4→3.4.7 for GHSA-87xg-pxx2-7hvx; `test_no_claude_paths_in_tracked_source` now skips the gitignored `.atelier/sessions/` tree.
 - **§5 Context panel (v53)** — `crates/atelier-core/src/context.rs::ContextItemSummary` + `ContextManager::summarise()` + `Event::ContextItems`; rendered by both UIs (Svelte `ContextPane.svelte`, TUI `render_context_pane`) as per-row token counts + provenance badges. Closes the stated §5 mechanical gate ("API assertions for token counts and why-here; cache-bust ledger entry on eviction").
 - **§5 Memory panel (v54)** — `crates/atelier-core/src/memory.rs::MemoryCardSummary` + `MemoryStore::summarise()` + `Event::MemoryCards`; rendered by both UIs (Svelte `MemoryPane.svelte`, TUI `render_memory_pane`). Empty until a card source wires in; event surface in place so future cards-from-tool / cards-from-replay are purely additive.
 
@@ -46,7 +48,7 @@ The Phase A foundation, Phase B protocol/verification subset, and Phase C worksp
 - `atelier-gui` (Tauri 2.x + Svelte 5) — chat/agent workspace (Header / ConversationPane / ContextPane / MemoryPane / SubagentPane / MetersPane / Composer), native folder picker, provider swap, memory auto-drafting/promotion, skills autocomplete, and Runner-backed Agent flows where needed. Concurrent-run guard via `Arc<AtomicBool>`; 64 KB prompt cap; durable session-resume pointer validation; per-run UUID workspaces with drop-guard cleanup.
 - `atelier-tui` (ratatui + crossterm) — conversation pane, textual diff, plan/context/memory/sub-agent panes, slash-skill completion, LSP install prompt, cost + context meters, scrubber keys `[`/`]`/`g`. Driver mode via `cargo run -p atelier-tui -- "<prompt>"`; `y` / `n` route through `SessionDispatcher::submit_approval`.
 
-### Gate counts (as of v60.88)
+### Gate counts (as of v60.90)
 
 | | Count | Where |
 |---|---|---|

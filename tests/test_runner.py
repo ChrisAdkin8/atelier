@@ -374,7 +374,7 @@ def test_no_claude_paths_in_tracked_source():
         # `.claude` covers the harness-managed runtime tree (worktrees, plugins
         # cache, etc.) that the BYOM repo never tracks. The directive is about
         # *tracked source* — runtime trees are out of scope.
-        if any(part in {".git", "target", "node_modules", ".pytest_cache", "__pycache__", ".atelier-bin", ".claude"} for part in path.parts):
+        if any(part in {".git", "target", "node_modules", ".pytest_cache", "__pycache__", ".atelier-bin", ".claude", "sessions"} for part in path.parts):
             continue
         if rel in allowed:
             continue
