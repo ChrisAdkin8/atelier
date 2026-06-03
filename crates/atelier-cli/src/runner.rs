@@ -3948,4 +3948,163 @@ mod tests {
         let picks = pick_overflow_compaction_targets(&summaries, 5000, 1000, 0);
         assert!(picks.is_empty(), "all-pinned ⇒ no picks; got {picks:?}");
     }
+
+    // ---------------------------------------------------------------
+    // parse_envelope — regression guards for the Bundle 1 extraction
+    // ---------------------------------------------------------------
+
+    fn make_harness_meta_call(claimed_done: bool) -> ToolCallRequest {
+        let env = atelier_core::protocol::Envelope {
+            claimed_done: Some(claimed_done),
+            ..Default::default()
+        };
+        let native = atelier_core::protocol_strategy::encode_native_tool(&env)
+            .expect("valid envelope encodes without error");
+        ToolCallRequest {
+            id: "tc-meta".into(),
+            name: native.name,
+            arguments: native.arguments,
+        }
+    }
+
+    #[test]
+    fn parse_envelope_native_tool_with_harness_meta_returns_envelope_and_ok() {
+        let call = make_harness_meta_call(true);
+        let (env, ok) = parse_envelope(Strategy::NativeTool, &[call], "");
+        assert!(ok, "harness_meta call must parse cleanly");
+        assert_eq!(env.claimed_done, Some(true));
+    }
+
+    #[test]
+    fn parse_envelope_native_tool_no_harness_meta_returns_default_and_false() {
+        let other = ToolCallRequest {
+            id: "tc-shell".into(),
+            name: "shell".into(),
+            arguments: serde_json::json!({"command": "ls"}),
+        };
+        let (env, ok) = parse_envelope(Strategy::NativeTool, &[other], "");
+        assert!(!ok, "no harness_meta call must be flagged as parse failure");
+        assert_eq!(env.claimed_done, None);
+    }
+
+    #[test]
+    fn parse_envelope_json_sentinel_valid_returns_envelope_and_ok() {
+        use atelier_core::protocol_strategy::{
+            encode_json_sentinel, SENTINEL_CLOSE, SENTINEL_OPEN,
+        };
+        let env = atelier_core::protocol::Envelope {
+            claimed_done: Some(true),
+            ..Default::default()
+        };
+        let text = encode_json_sentinel(&env).expect("encodes");
+        assert!(text.contains(SENTINEL_OPEN));
+        assert!(text.contains(SENTINEL_CLOSE));
+        let (parsed, ok) = parse_envelope(Strategy::JsonSentinel, &[], &text);
+        assert!(ok);
+        assert_eq!(parsed.claimed_done, Some(true));
+    }
+
+    #[test]
+    fn parse_envelope_json_sentinel_malformed_returns_default_and_false() {
+        let (env, ok) = parse_envelope(Strategy::JsonSentinel, &[], "just some prose");
+        assert!(
+            !ok,
+            "prose without sentinel must be flagged as parse failure"
+        );
+        assert_eq!(env.claimed_done, None);
+    }
+
+    #[test]
+    fn parse_envelope_regex_prose_plain_prose_returns_default_envelope_and_ok() {
+        // RegexProse is the most permissive strategy: plain prose with no
+        // section markers succeeds (ok=true) and produces an empty envelope.
+        // It never errors on bare text — only on structural violations.
+        let (env, ok) = parse_envelope(Strategy::RegexProse, &[], "just some prose, no markers");
+        assert!(ok, "plain prose must not be flagged as parse failure");
+        assert_eq!(env.claimed_done, None, "no markers means no claimed_done");
+    }
+
+    // ---------------------------------------------------------------
+    // last_turn_was_all_subagent — regression guards
+    // ---------------------------------------------------------------
+
+    fn spawn_subagent_call() -> ToolCallRequest {
+        ToolCallRequest {
+            id: "tc-spawn".into(),
+            name: atelier_core::protocol_strategy::SPAWN_SUBAGENT_NAME.into(),
+            arguments: serde_json::json!({"prompt": "do it"}),
+        }
+    }
+
+    fn other_call() -> ToolCallRequest {
+        ToolCallRequest {
+            id: "tc-shell".into(),
+            name: "shell".into(),
+            arguments: serde_json::json!({"command": "ls"}),
+        }
+    }
+
+    #[test]
+    fn last_turn_all_subagent_true_when_preceding_assistant_had_only_spawn_calls() {
+        // User → Assistant(spawn_subagent) → Tool → Assistant(prose) ← current
+        let messages = vec![
+            Message::text(Role::User, "go"),
+            Message {
+                role: Role::Assistant,
+                content: String::new(),
+                tool_call_id: None,
+                tool_calls: vec![spawn_subagent_call()],
+            },
+            Message {
+                role: Role::Tool,
+                content: "subagent result".into(),
+                tool_call_id: Some("tc-spawn".into()),
+                tool_calls: Vec::new(),
+            },
+            Message::text(Role::Assistant, "all done"),
+        ];
+        assert!(last_turn_was_all_subagent(&messages));
+    }
+
+    #[test]
+    fn last_turn_all_subagent_false_when_preceding_assistant_had_mixed_calls() {
+        let messages = vec![
+            Message::text(Role::User, "go"),
+            Message {
+                role: Role::Assistant,
+                content: String::new(),
+                tool_call_id: None,
+                tool_calls: vec![spawn_subagent_call(), other_call()],
+            },
+            Message {
+                role: Role::Tool,
+                content: "r1".into(),
+                tool_call_id: Some("tc-spawn".into()),
+                tool_calls: Vec::new(),
+            },
+            Message {
+                role: Role::Tool,
+                content: "r2".into(),
+                tool_call_id: Some("tc-shell".into()),
+                tool_calls: Vec::new(),
+            },
+            Message::text(Role::Assistant, "done"),
+        ];
+        assert!(!last_turn_was_all_subagent(&messages));
+    }
+
+    #[test]
+    fn last_turn_all_subagent_false_with_no_preceding_tool_block() {
+        // Plain user → assistant exchange — no tool calls at all.
+        let messages = vec![
+            Message::text(Role::User, "hello"),
+            Message::text(Role::Assistant, "hi"),
+        ];
+        assert!(!last_turn_was_all_subagent(&messages));
+    }
+
+    #[test]
+    fn last_turn_all_subagent_false_on_empty_messages() {
+        assert!(!last_turn_was_all_subagent(&[]));
+    }
 }

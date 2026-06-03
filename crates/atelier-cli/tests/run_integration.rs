@@ -5523,3 +5523,97 @@ async fn resume_marks_inflight_subagents_cancelled() {
         "in-flight sub-agent must be marked cancelled after resume; entry={entry}"
     );
 }
+
+// ---- Bundle 2 / C2 — max_turns boundary + concurrent-run guard ----
+
+#[tokio::test]
+async fn max_turns_one_executes_exactly_one_turn() {
+    // With max_turns=1 the runner must exit after a single adapter call
+    // regardless of whether the model claimed done. Guards the loop-bound
+    // arithmetic (off-by-one would either run 0 or 2 turns).
+    let workspace = tempfile::TempDir::new().unwrap();
+    // Response makes a tool call so the stall guard does NOT fire — the
+    // boundary being tested is max_turns, not the stall path.
+    let list_dir_call = ToolCallRequest {
+        id: "tc-list".into(),
+        name: "list_dir".into(),
+        arguments: serde_json::json!({"path": "."}),
+    };
+    let responses = vec![MockResponse {
+        assistant_text: "scoping the repo".into(),
+        tool_calls: vec![list_dir_call],
+        overflow: None,
+    }];
+    let runner = Runner::new(
+        workspace.path().to_path_buf(),
+        ProviderChoice::Mock { responses },
+        EventSink::Null,
+    )
+    .expect("mock runner construction is infallible")
+    .with_max_turns(1);
+
+    let report = runner.run("do one turn".into()).await.unwrap();
+    assert_eq!(
+        report.turns, 1,
+        "exactly 1 turn must execute with max_turns=1"
+    );
+    assert_ne!(
+        report.final_state,
+        atelier_core::State::Done,
+        "runner must not reach Done — model never claimed done"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_runs_on_separate_workspaces_do_not_corrupt_session_json() {
+    // Two Runner::run calls on *different* workspace directories execute
+    // concurrently. Each must write a valid session.json to its own session
+    // directory without racing with or corrupting the other.
+    let ws_a = tempfile::TempDir::new().unwrap();
+    let ws_b = tempfile::TempDir::new().unwrap();
+
+    let make_responses = || {
+        vec![MockResponse {
+            assistant_text: "done".into(),
+            tool_calls: vec![],
+            overflow: None,
+        }]
+    };
+    let make_runner = |ws: &tempfile::TempDir| {
+        Runner::new(
+            ws.path().to_path_buf(),
+            ProviderChoice::Mock {
+                responses: make_responses(),
+            },
+            EventSink::Null,
+        )
+        .expect("mock runner construction is infallible")
+    };
+
+    let runner_a = make_runner(&ws_a);
+    let runner_b = make_runner(&ws_b);
+    let (report_a, report_b) =
+        tokio::join!(runner_a.run("task A".into()), runner_b.run("task B".into()),);
+
+    for (label, ws, report) in [("A", &ws_a, report_a), ("B", &ws_b, report_b)] {
+        let report = report.unwrap_or_else(|e| panic!("runner {label} failed: {e}"));
+        let session_file = ws
+            .path()
+            .join(".atelier")
+            .join("sessions")
+            .join(report.session_id.0.to_string())
+            .join("session.json");
+        assert!(
+            session_file.exists(),
+            "runner {label}: session.json missing at {session_file:?}"
+        );
+        let raw = std::fs::read_to_string(&session_file)
+            .unwrap_or_else(|e| panic!("runner {label}: read session.json: {e}"));
+        let parsed: serde_json::Value = serde_json::from_str(&raw)
+            .unwrap_or_else(|e| panic!("runner {label}: invalid JSON in session.json: {e}"));
+        assert!(
+            parsed.get("session_uuid").is_some(),
+            "runner {label}: session.json missing session_uuid field"
+        );
+    }
+}
