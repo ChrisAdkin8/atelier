@@ -24,10 +24,22 @@ export type BridgedEvent = {
 
 export type ConversationRole = 'user' | 'assistant' | 'tool' | 'system'
 
-export type ConversationLine = {
-  role: ConversationRole
-  text: string
-}
+export type ConversationLine =
+  | {
+      kind?: undefined  // backward-compat: existing text lines have no kind field
+      role: ConversationRole
+      text: string
+    }
+  | {
+      kind: 'failure_card'
+      title: string
+      cause: string
+      message: string
+      fixHint: string | null
+      memoryCardPath: string | null
+      retryCommand: string
+      retryPrompt: string
+    }
 
 // Mirror of `atelier_core::ledger::LedgerEntry`. Serde tag is `kind`.
 export type LedgerEntry =
@@ -337,6 +349,20 @@ export type AppState = {
   /// `LspInstallResolved` or when the user approves / declines. The webview
   /// renders `LspInstallModal.svelte` (or an inline prompt) when non-null.
   lspInstallRequest: { language: string; candidates: string[] } | null
+  /// Provider-health UX (L1-3) — reachability of the active OpenAI-compat
+  /// adapter's endpoint. `null` = no claim (Mock, Anthropic, unchecked).
+  /// Reset to `null` on ModelProfileLoaded so stale health from a prior
+  /// profile can't survive a swap. Populated by EndpointHealthChanged.
+  endpointHealth: { status: 'reachable' | 'unreachable'; checkedAt: number; error: string | null } | null
+  /// Provider-health UX (L1-4) — `false` when the context-window
+  /// denominator is the conservative 8,192 fallback (probe returned no
+  /// max_model_len). Rule: unverified iff capability_row.source === 'adapter'
+  /// && !window_verified. Reset to `true` on ModelProfileLoaded; set by
+  /// EndpointHealthChanged once the trailing health event arrives.
+  contextWindowVerified: boolean
+  /// Provider-health UX (L3-2) — transient recovery toast. Set when health
+  /// transitions unreachable → reachable. Cleared after rendering the toast.
+  recoveryToast: { text: string; at: number } | null
 }
 
 export function initialState(): AppState {
@@ -363,6 +389,9 @@ export function initialState(): AppState {
     stalledAt: null,
     runInFlight: false,
     lspInstallRequest: null,
+    endpointHealth: null,
+    contextWindowVerified: true,
+    recoveryToast: null,
   }
 }
 
@@ -515,7 +544,98 @@ export function applyEvent(state: AppState, evt: BridgedEvent): AppState {
         p.capability_row && p.capability_row.context_window_tokens > 0
           ? p.capability_row.context_window_tokens
           : state.contextWindowTokens
-      return { ...state, events, currentModel, contextWindowTokens }
+      // F1b: only reset health state when the model identity actually changed.
+      // The Runner re-emits ModelProfileLoaded for the *same* model mid-run
+      // (runner.rs:~2678) — an unconditional reset wiped the health dot on
+      // every agent turn. Compare model_id only; do NOT compare base_url:
+      // GUI-side profiles use skipped_for_well_known which hard-codes
+      // base_url:"", while the Runner carries the real base_url — a base_url
+      // comparison mismatches on every agent run and defeats the fix.
+      const identityChanged = state.currentModel?.modelId !== p.model_id
+      return {
+        ...state,
+        events,
+        currentModel,
+        contextWindowTokens,
+        // Reset health only on a real identity change; preserve across same-model
+        // re-emissions (Runner probe refresh, redundant hydrates).
+        endpointHealth: identityChanged ? null : state.endpointHealth,
+        contextWindowVerified: identityChanged ? true : state.contextWindowVerified,
+        // Clear toast on swap — "X back online" must not survive a switch to Y.
+        recoveryToast: identityChanged ? null : state.recoveryToast,
+      }
+    }
+    case 'EndpointHealthChanged': {
+      const p = evt.payload as {
+        model_id: string
+        base_url: string
+        status: 'reachable' | 'unreachable'
+        checked_at: string
+        window_verified: boolean
+        max_model_len: number | null
+        error: string | null
+      }
+      const endpointHealth = {
+        status: p.status,
+        checkedAt: Date.now(),
+        error: p.error ?? null,
+      }
+      // Update contextWindowTokens when the probe found max_model_len.
+      const contextWindowTokens = p.window_verified && p.max_model_len != null
+        ? p.max_model_len
+        : state.contextWindowTokens
+      // Unverified iff source='adapter' && !window_verified.
+      // adapter-sourced rows are the 8,192 seed; static/probe rows are trusted.
+      const isAdapterSourced =
+        state.currentModel?.capabilityRow?.source === 'adapter'
+      const contextWindowVerified = isAdapterSourced ? p.window_verified : true
+      // F4: recovery toast lifecycle.
+      // - unreachable → reachable: set the toast (endpoint came back).
+      // - any unreachable event: clear the toast ("back online" next to a red
+      //   dot is misleading; a flap must clear the prior toast immediately).
+      // - repeated reachable events: preserve (don't cut mid-animation short).
+      const wasUnreachable = state.endpointHealth?.status === 'unreachable'
+      const nowReachable = p.status === 'reachable'
+      const modelId = state.currentModel?.modelId ?? p.model_id
+      const recoveryToast = !nowReachable
+        ? null  // clear on any unreachable event
+        : wasUnreachable
+          ? { text: `${modelId} is back online`, at: Date.now() }
+          : state.recoveryToast  // preserve for repeated reachable polls
+      return {
+        ...state,
+        events,
+        endpointHealth,
+        contextWindowTokens,
+        contextWindowVerified,
+        recoveryToast,
+      }
+    }
+    case 'ProviderFailure': {
+      // L2-2 — append a failure card to the conversation so the user
+      // sees an actionable card with Retry and Switch profile buttons.
+      const p = evt.payload as {
+        model_id: string
+        base_url: string
+        cause: string
+        message: string
+        fix_hint: string | null
+        memory_card_path: string | null
+        retry_command: string
+        retry_prompt: string
+      }
+      const card: ConversationLine = {
+        kind: 'failure_card',
+        title: `${p.cause} — ${p.model_id}`,
+        cause: p.cause,
+        message: p.message,
+        fixHint: p.fix_hint ?? null,
+        memoryCardPath: p.memory_card_path ?? null,
+        retryCommand: p.retry_command,
+        retryPrompt: p.retry_prompt,
+      }
+      const conversation = pushBounded(state.conversation, card, MAX_CONVERSATION_LINES)
+      return { ...state, events, conversation }
     }
     case 'ContextItems': {
       // v53 — replace the panel's items wholesale. Snapshots come

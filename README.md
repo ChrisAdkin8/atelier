@@ -136,6 +136,7 @@ In the GUI:
 3. Use **Agent** mode when you want tool-using runs that write durable sessions.
 4. Watch the right-side panels for context, memory, sub-agent progress, and token/cost meters.
 5. Press **↑** / **↓** in the Composer to cycle through previous prompts (persisted across window restarts).
+6. The model badge in the footer shows a **green dot** (endpoint reachable) or **red dot** (unreachable) for OpenAI-compatible profiles. A red dot means the `/v1/models` probe couldn't connect — hover for details and a suggested fix. If a run fails due to an unreachable endpoint, an **actionable failure card** appears in the conversation with a **Retry** button and a **Switch profile** link.
 
 ## Use the CLI
 
@@ -295,7 +296,7 @@ Atelier can remember useful facts across sessions:
 - Personal memory lives in `~/.atelier/memory/`.
 - Derived search indexes live outside the canonical card directories at `<workspace>/.atelier/indexes/memory.sqlite` and `~/.atelier/indexes/memory.sqlite`.
 - The GUI Memory panel can add, delete, and promote memory cards.
-- Chat and Agent runs auto-draft cards for known fixable provider/config problems such as auth failures, missing API-key environment variables, unreachable providers, rate limits, and context overflows. The Memory panel refreshes as soon as the card is written.
+- Chat and Agent runs auto-draft cards for known fixable provider/config problems such as auth failures, missing API-key environment variables, unreachable providers, rate limits, and context overflows. The Memory panel refreshes as soon as the card is written. When a run fails due to a connection error, the failure card in the conversation also shows the auto-drafted fix-hint inline — no need to open the Memory panel to find it.
 
 
 ### Skills
@@ -340,6 +341,7 @@ Atelier is MCP-first. Built-in tools and registered MCP tools share the same dis
 | Run stopped with exit code 6 | `--max-turns` was reached without `claimed_done`. Exit 6 is intentional (AwaitingUser); add more turns or refine the prompt. Exit 0 means the model claimed done. |
 | Session not persisted warning on stderr | The session directory write failed (disk full, permissions). The run result is still valid; `--resume` will not be available for that session. |
 | A GUI Agent follow-up starts fresh | The previous session directory was deleted; the GUI cleared the stale resume pointer and started fresh. The workspace choice persists in `~/.atelier/gui.toml`. |
+| GUI model badge shows a red dot | The OpenAI-compatible endpoint's `/v1/models` probe failed (unreachable endpoint, firewall, SG rule). Hover the badge for the error detail. The GUI will automatically retry in the background and turn the dot green when the endpoint comes back. |
 
 ## Architecture at a glance
 

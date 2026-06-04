@@ -1,5 +1,43 @@
 # Atelier Spec — Changelog
 
+## v60.104 — 2026-06-04 (docs sweep: v60.102–v60.103)
+
+- **README.md** — GUI section: endpoint health dot + failure card behaviour noted in step 6; memory section: failure card shows auto-drafted fix-hint inline; troubleshooting table: new row for red health dot (unreachable endpoint, background re-probe, hover for details).
+- **CAPABILITIES.md** — "Bring your own model": new **Endpoint health indicator** paragraph (health dot, failure card, Retry/Switch, background re-probe, recovery toast, `?` cap marker, Anthropic/Mock scope); GUI face description: cross-reference to health indicator.
+- **STATUS.md** / **ATELIER.md** — no changes needed; all stable facts remain accurate and the current-state list already carries v60.102–v60.103 bullets.
+
+## v60.103 — 2026-06-04 (provider-health scan fixes: F0–F6)
+
+Closes all findings from the v60.102 deep-scan audit (`tasks/plan_provider_health_scan_fixes.md`). All gates green: fmt, clippy, tests, svelte-check, make check.
+
+- **F0 / P0 — Mutex deadlock in `snapshot_current_model`** (`lib.rs`): the tail held the `endpoint_health` lock guard and called `emit_endpoint_health`, which re-locked the same non-reentrant `std::sync::Mutex`. Fixed by cloning the health out of the lock (guard dropped) before emitting. The explicit `(*g).clone()` deref documents that we are cloning the inner value, not the guard.
+- **F1a / P1 — single delivery path for `snapshot_current_model`** (`lib.rs`, `App.svelte`): the command was emitting `ModelProfileLoaded` on the bus AND returning it for App.svelte to apply — double reduction that reset `endpointHealth` after the health event set it (health dot flashed on then cleared). Fixed: return type changed to `Result<(), String>`; both events (profile, then health) delivered via bus only. `hydrateCurrentModel` updated to `await invoke('snapshot_current_model')` without applying the return.
+- **F1b / P1 — identity-keyed reset in `ModelProfileLoaded` reducer** (`state.ts`): the reducer unconditionally reset `endpointHealth`, `contextWindowVerified`, and `recoveryToast`. The Runner re-emits `ModelProfileLoaded` mid-agent-run for the same model, so the health dot was wiped on every agent turn. Fixed: reset only when `p.model_id !== state.currentModel?.modelId`; also clears `recoveryToast` on swap. Do NOT compare `base_url` (GUI profiles use `skipped_for_well_known` which hard-codes `""`; comparing mismatches on every agent run).
+- **F2 / P1 — failure arms use the shared generation counter** (`lib.rs`): chat, mid-stream, and agent failure arms were spawning re-probe loops with fresh `Arc::new(AtomicU64::new(0))` counters isolated from `state.health_probe_generation`. Adapter swaps never cancelled these loops; repeated failures stacked multiple uncoordinated probes. Fixed: all three arms now call `app.state::<SessionState>()` (Manager is implemented on AppHandle — the "state is not accessible" comments were wrong) and route through `emit_endpoint_health`, which slot-writes, bumps the shared counter, and spawns or replaces the loop. **Scope guard added**: all arms and `spawn_health_reprobe` itself early-return on empty `base_url` (Anthropic/Mock never write the slot; an empty URL would probe `"/models"` forever).
+- **F3 / P2 — retry command allowlist** (`ConversationPane.svelte`): `retryCard` now validates `command ∈ {'start_chat_run', 'start_agent_run'}` before calling `invoke()`, with a `console.warn` on rejection.
+- **F4 / P3 — recovery toast lifecycle** (`state.ts`): `EndpointHealthChanged` reducer now clears `recoveryToast` on any unreachable event (a flap must not leave "back online" next to a red dot); sets the toast on `unreachable → reachable`; preserves it on repeated reachable polls (don't cut mid-animation).
+- **F5 / carried omission — missing behavioural test** (`lib.rs`): added `build_swap_adapter_returns_unreachable_health_for_dead_endpoint` (closed-port listener + ENV_LOCK pattern). Guards the data the F1a ordering contract depends on.
+- **F5b — allowlist before credentials** (`lib.rs`): `build_swap_adapter` now calls `ensure_base_url_allowed` before `resolve_openai_api_key`. The trust boundary no longer touches the keychain/env for URLs it will reject; the existing allowlist test is now env-independent.
+- **F6 — three lessons** (`tasks/lessons.md`): one-delivery-path rule, identity-keyed resets, manual verify steps are gates not suggestions.
+
+## v60.102 — 2026-06-04 (provider-health UX: L1 + L2 + L3)
+
+Implements all three layers of the provider-health UX plan (`tasks/plan_provider_health_ux.md`). Gates: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings`, all tests (77+57 core/cli unit + 121 cli integration + 961 atelier-core), svelte-check 0 errors, `make check` 180/180.
+
+**L1 — passive health status on the model badge:**
+- `openai_compat.rs`: `probe_context_window()` now returns `ProbeOutcome::{WindowVerified,ReachableNoWindow,Unreachable,MalformedResponse}` instead of `()`. Added `with_http_client()` cfg(test) seam. All existing probe tests extended with variant assertions; 3 new tests: `probe_returns_malformed_response_on_non_success`, `probe_returns_malformed_response_when_data_array_missing`, `probe_returns_unreachable_on_connect_failure` (uses a closed-port listener + short timeout).
+- `session.rs`: added `Event::EndpointHealthChanged{model_id,base_url,status,checked_at,window_verified,max_model_len,error}` with `EndpointHealthStatus::{Reachable,Unreachable}+wire_label()`; added `Event::ProviderFailure{model_id,base_url,cause,message,fix_hint,memory_card_path,retry_command,retry_prompt}` with `ProviderFailureCause::{Unreachable,Auth,RateLimited,Malformed,NotConfigured,Other}+wire_label()`. Both variants added to `kind()` and `bridge_event`. TUI `apply()` and `project_event()` extended with no-op / log arms.
+- `lib.rs` (GUI): `EndpointHealth` struct + `build_swap_adapter` returns `Result<(Arc<dyn Adapter>,Option<EndpointHealth>),String>`; `SessionState` gains `endpoint_health:Mutex<Option<EndpointHealth>>` and `health_probe_generation:Arc<AtomicU64>`; `snapshot_current_model` gains `app:AppHandle` param; `emit_endpoint_health()` helper writes slot, emits event, bumps generation, and spawns L3 re-probe loop when `Unreachable`; all adapter build/swap sites emit `EndpointHealthChanged` after `ModelProfileLoaded` (pinned ordering).
+- `state.ts`: `endpointHealth`, `contextWindowVerified`, `recoveryToast` added to `AppState`; `ModelProfileLoaded` arm resets both health fields; new `EndpointHealthChanged` arm reduces all three. `App.svelte`: health dot (green/red) on model badge, unverified `?` + `opacity:0.6` on cap denominator, tooltip includes health status + timestamp.
+
+**L2 — actionable failure card in the conversation:**
+- `ConversationLine` type extended to a union including `kind:'failure_card'` entries. New `ProviderFailure` reducer arm appends a failure card. `ConversationPane.svelte` renders the card (title, message, fix hint, footnote for memory path) with **Retry** (`invoke(retry_command,{prompt})`) and **Switch profile** (focuses the swap-select) buttons. `cause_from_adapter_error()` and `cause_from_run_error()` helpers unify classification with `auto_card_for_*`; chat and agent failure arms now emit `ProviderFailure` + (on `Unreachable`) `EndpointHealthChanged` instead of the plain `[chat error]`/`[agent error]` `MessageCommitted` lines. L2-3: dropdown option shows `⚠` overlay for the unreachable active profile (pure frontend, no Rust change).
+
+**L3 — background re-probe + recovery toast:**
+- `spawn_health_reprobe()`: bare reqwest client (4s timeout, no auth — any HTTP response = Reachable), 30s→120s backoff, stops on `Reachable` or generation mismatch. `reqwest` added to `atelier-gui/Cargo.toml`. `recoveryToast` set in reducer on `unreachable→reachable` transition; App.svelte renders fixed-position toast with 6s CSS fade + `prefers-reduced-motion` support.
+
+**Agreement tests (L-D-5):** `endpoint_health_status_wire_label_matches_serde`, `provider_failure_cause_wire_label_matches_serde`, `bridge_endpoint_health_changed_carries_wire_label`, `bridge_provider_failure_carries_cause_wire_label`.
+
 ## v60.101 — 2026-06-04 (docs sweep)
 
 Full documentation sweep covering all changes since v60.93.

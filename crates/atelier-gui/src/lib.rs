@@ -29,7 +29,9 @@ use atelier_core::dispatcher::ApprovalPolicy;
 use atelier_core::persistence::OnDiskSession;
 use atelier_core::protocol::Envelope;
 use atelier_core::protocol_strategy::HARNESS_META_NAME;
-use atelier_core::session::{Event as SessionEvent, MessageRole};
+use atelier_core::session::{
+    EndpointHealthStatus, Event as SessionEvent, MessageRole, ProviderFailureCause,
+};
 use serde::Serialize;
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager};
@@ -57,6 +59,21 @@ pub struct BridgedEvent {
 /// subdirectory (v49) so concurrent runs can't see each other's
 /// edits.
 ///
+/// Snapshot of the active adapter's last-known endpoint reachability.
+/// Stored in `SessionState` so L3's re-probe loop can compare the
+/// previous status and `start_*` commands can trigger re-probe when
+/// a send-time failure transitions the health to `Unreachable`.
+#[derive(Debug, Clone)]
+pub struct EndpointHealth {
+    pub status: EndpointHealthStatus,
+    pub base_url: String,
+    pub model_id: String,
+    pub checked_at: String,
+    pub window_verified: bool,
+    pub max_model_len: Option<u32>,
+    pub error: Option<String>,
+}
+
 /// `run_in_flight` (v49) is the concurrent-run guard: `start_demo_run`
 /// uses compare_exchange to refuse a second invocation while one is
 /// still active. Cleared by the spawned task's `Drop`-style cleanup.
@@ -108,6 +125,15 @@ pub struct SessionState {
     /// Cancellation token for the currently running `start_agent_run` task.
     /// `cancel_run` calls `token.cancel()` on it; cleared when the run exits.
     pub cancel_token: Arc<std::sync::Mutex<Option<tokio_util::sync::CancellationToken>>>,
+    /// Provider-health UX (L1-2) — last-known health of the active
+    /// OpenAI-compat adapter. Written by every command that builds or swaps
+    /// an adapter, and by the chat/agent failure arms on `Unreachable`
+    /// errors. `None` for Mock/Anthropic adapters.
+    pub endpoint_health: std::sync::Mutex<Option<EndpointHealth>>,
+    /// Provider-health UX (L3-1) — generation counter for the background
+    /// re-probe loop. Bumped on every adapter build/swap so a stale loop
+    /// for a prior adapter exits when it observes the generation has moved.
+    pub health_probe_generation: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// v60.28 H2 follow-on — wire-format decision the renderer's consent
@@ -200,6 +226,8 @@ pub fn run() {
                 active_session_id: Arc::new(std::sync::Mutex::new(None)),
                 chat_history: Arc::new(std::sync::Mutex::new(Vec::new())),
                 cancel_token: Arc::new(std::sync::Mutex::new(None)),
+                endpoint_health: std::sync::Mutex::new(None),
+                health_probe_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             });
             Ok(())
         })
@@ -683,10 +711,20 @@ fn list_provider_profiles(state: tauri::State<'_, SessionState>) -> Vec<SwapOpti
     list_provider_profiles_in(&state.workspace_root())
 }
 
+/// v60.103 — changed from `Result<BridgedEvent, String>` to `Result<(), String>`:
+/// both `ModelProfileLoaded` and `EndpointHealthChanged` are now emitted on the
+/// bus only; the command no longer returns an event for the caller to apply.
+/// This enforces the one-delivery-path rule: the frontend's bus listener already
+/// applies every bus event, so a returned+applied event was a double-reduction
+/// that reset `endpointHealth` after the health event set it (the health dot
+/// flashed on then immediately cleared at mount). Also fixes a Mutex re-lock
+/// deadlock: the previous tail held the `endpoint_health` lock guard and called
+/// `emit_endpoint_health`, which re-locks the same non-reentrant `std::sync::Mutex`.
 #[tauri::command]
 async fn snapshot_current_model(
+    app: AppHandle,
     state: tauri::State<'_, SessionState>,
-) -> Result<BridgedEvent, String> {
+) -> Result<(), String> {
     let adapter = match state.adapter_handle.get() {
         Some(adapter) => adapter,
         None => {
@@ -711,7 +749,7 @@ async fn snapshot_current_model(
             // unaffected; the footer's model badge stays empty until the
             // first chat or an explicit dropdown swap installs the real
             // adapter.
-            let adapter = resolve_default_adapter(&state.workspace_root())
+            let (adapter, probe_health) = resolve_default_adapter(&state.workspace_root())
                 .await
                 .map_err(|e| {
                     tracing::warn!(
@@ -721,13 +759,32 @@ async fn snapshot_current_model(
                     e
                 })?;
             state.adapter_handle.swap(adapter.clone());
+            // Emit health AFTER ModelProfileLoaded below (see caller).
+            if let Some(h) = probe_health {
+                if let Ok(mut guard) = state.endpoint_health.lock() {
+                    *guard = Some(h);
+                }
+            }
             adapter
         }
     };
-    Ok(bridge_event(&model_profile_loaded_event(
+    let mpl = model_profile_loaded_event(
         adapter.as_ref(),
         atelier_core::adapter::model_profile::ProbeLoadOutcome::CacheHit,
-    )))
+    );
+    // Emit ModelProfileLoaded first so the reducer's reset fires, then
+    // EndpointHealthChanged so the fresh health dot lands after the reset.
+    // Bus-only: returning the event AND emitting it double-reduced the frontend.
+    emit_event(&app, &mpl);
+    // F0 fix: clone health out of the lock before calling emit_endpoint_health,
+    // which re-locks the same Mutex. Holding the guard across the call was a
+    // non-reentrant Mutex re-lock: same-thread deadlock or panic.
+    let health_snapshot: Option<EndpointHealth> =
+        state.endpoint_health.lock().ok().and_then(|g| (*g).clone());
+    if let Some(health) = health_snapshot {
+        emit_endpoint_health(&app, &state, &health);
+    }
+    Ok(())
 }
 
 /// Test-visible inner helper for [`list_provider_profiles`]. Splitting
@@ -976,15 +1033,25 @@ async fn invoke_skill(
 /// as the binary path.
 async fn build_swap_adapter(
     provider: SwapProviderWire,
-) -> Result<std::sync::Arc<dyn atelier_core::adapter::Adapter>, String> {
+) -> Result<
+    (
+        std::sync::Arc<dyn atelier_core::adapter::Adapter>,
+        Option<EndpointHealth>,
+    ),
+    String,
+> {
     use atelier_core::adapter::{
-        anthropic::AnthropicAdapter, openai_compat::OpenAiCompatAdapter, MockAdapter,
+        anthropic::AnthropicAdapter,
+        openai_compat::{OpenAiCompatAdapter, ProbeOutcome},
+        MockAdapter,
     };
     match provider {
-        SwapProviderWire::Mock { model_id } => Ok(std::sync::Arc::new(MockAdapter::new(model_id))),
+        SwapProviderWire::Mock { model_id } => {
+            Ok((std::sync::Arc::new(MockAdapter::new(model_id)), None))
+        }
         SwapProviderWire::Anthropic { model_id } => {
             let a = AnthropicAdapter::from_env(model_id).map_err(|e| e.to_string())?;
-            Ok(std::sync::Arc::new(a))
+            Ok((std::sync::Arc::new(a), None))
         }
         SwapProviderWire::OpenAiCompat {
             model_id,
@@ -992,38 +1059,53 @@ async fn build_swap_adapter(
             api_key,
             cache_prompt,
         } => {
-            let api_key = atelier_core::resolve_openai_api_key(api_key.as_deref())
-                .map_err(|e| e.to_string())?;
+            // F5b: check the allowlist BEFORE resolving credentials so the
+            // trust boundary rejects a URL before any secret material (env var,
+            // keychain) is read for it. This also makes the allowlist test
+            // env-independent (credential resolution no longer runs for blocked
+            // URLs, so OPENAI_API_KEY doesn't need to be set in the test env).
             let base = effective_openai_base_url(base_url);
             ensure_base_url_allowed(Some(&base))?;
-            let mut adapter = OpenAiCompatAdapter::new(api_key, model_id, base);
+            let api_key = atelier_core::resolve_openai_api_key(api_key.as_deref())
+                .map_err(|e| e.to_string())?;
+            let mut adapter = OpenAiCompatAdapter::new(api_key, model_id, base.clone());
             if cache_prompt {
                 adapter = adapter.with_cache_prompt(true);
             }
-            // Best-effort, time-boxed capability probe: vLLM, sglang,
-            // llama-server, and LM Studio advertise `max_model_len` on
-            // `/v1/models`. OpenAI proper does not, so the probe silently
-            // falls through to the adapter's `DEFAULT_CONTEXT_WINDOW_TOKENS`
-            // for those endpoints. The adapter is single-owner here (not yet
-            // wrapped in `Arc`), so the mutable probe call requires no
-            // interior mutability.
-            //
-            // The wrapping timeout matters: the OpenAiCompat reqwest client
-            // has a 600s overall timeout and NO connect timeout, so an
-            // unreachable endpoint (a torn-down dev server, a stale ELB)
-            // would block this `await` for up to ten minutes. That hang
-            // propagates to the mount-time `snapshot_current_model` call,
-            // leaving the footer's model-fit badge empty for the whole
-            // duration — and to the first chat/agent turn. Bounding the
-            // probe to a few seconds means an unreachable endpoint simply
-            // falls through to static capabilities, exactly as the probe
-            // already does on a non-success response or parse error.
-            let _ = tokio::time::timeout(
+            // Best-effort, time-boxed capability probe. Returns a typed
+            // ProbeOutcome so the caller can drive the endpoint-health badge.
+            let outcome = match tokio::time::timeout(
                 std::time::Duration::from_secs(PROBE_TIMEOUT_SECS),
                 adapter.probe_context_window(),
             )
-            .await;
-            Ok(std::sync::Arc::new(adapter))
+            .await
+            {
+                Ok(o) => o,
+                Err(_) => ProbeOutcome::Unreachable {
+                    error: format!("probe timed out after {PROBE_TIMEOUT_SECS}s"),
+                },
+            };
+            let health = EndpointHealth {
+                status: match &outcome {
+                    ProbeOutcome::Unreachable { .. } => EndpointHealthStatus::Unreachable,
+                    _ => EndpointHealthStatus::Reachable,
+                },
+                base_url: base,
+                model_id: atelier_core::adapter::Adapter::model_id(&adapter).to_string(),
+                checked_at: atelier_core::time::now_rfc3339(),
+                window_verified: matches!(outcome, ProbeOutcome::WindowVerified { .. }),
+                max_model_len: if let ProbeOutcome::WindowVerified { tokens } = &outcome {
+                    Some(*tokens)
+                } else {
+                    None
+                },
+                error: match &outcome {
+                    ProbeOutcome::Unreachable { error } => Some(error.clone()),
+                    ProbeOutcome::MalformedResponse { detail } => Some(detail.clone()),
+                    _ => None,
+                },
+            };
+            Ok((std::sync::Arc::new(adapter), Some(health)))
         }
     }
 }
@@ -1158,8 +1240,8 @@ async fn swap_adapter(
     // on Accept hit the now-empty registry and surfaced
     // "no pending swap with id <uuid>" — a confusing downstream
     // symptom of the missing rejection event.
-    let new_adapter = match build_swap_adapter(provider).await {
-        Ok(a) => a,
+    let (new_adapter, probe_health) = match build_swap_adapter(provider).await {
+        Ok(pair) => pair,
         Err(e) => {
             emit_event(
                 &app,
@@ -1236,6 +1318,12 @@ async fn swap_adapter(
             suitability: Some(suitability),
         },
     );
+    // Emit endpoint health AFTER ModelProfileLoaded — the reducer resets
+    // health on ModelProfileLoaded, so this order ensures the fresh result
+    // lands after the reset and is not immediately clobbered.
+    if let Some(health) = &probe_health {
+        emit_endpoint_health(&app, &state, health);
+    }
     Ok(SwapResult {
         from_model_id,
         to_model_id,
@@ -2133,7 +2221,13 @@ fn strip_frontmatter(s: &str) -> &str {
 /// gap by activating the default exactly as the CLI does.
 async fn resolve_default_adapter(
     repo_root: &std::path::Path,
-) -> Result<std::sync::Arc<dyn atelier_core::adapter::Adapter>, String> {
+) -> Result<
+    (
+        std::sync::Arc<dyn atelier_core::adapter::Adapter>,
+        Option<EndpointHealth>,
+    ),
+    String,
+> {
     use atelier_core::config::{ProviderKind, ProvidersConfig};
     let loaded = ProvidersConfig::load(repo_root)
         .map_err(|e| format!("providers.toml load failed: {e}"))?
@@ -2227,13 +2321,15 @@ async fn resolve_executor_adapter(
                      (TCP connect timed out); skipping executor adapter"
                 ));
             }
-            build_swap_adapter(SwapProviderWire::OpenAiCompat {
+            // Executor health is out of scope — discard the probe result.
+            let (adapter, _health) = build_swap_adapter(SwapProviderWire::OpenAiCompat {
                 model_id: model,
                 base_url: Some(base),
                 api_key: prof.api_key.clone(),
                 cache_prompt: prof.cache_prompt.unwrap_or(false),
             })
-            .await?
+            .await?;
+            adapter
         }
         ProviderKind::Anthropic => {
             use atelier_core::adapter::anthropic::AnthropicAdapter;
@@ -2295,12 +2391,12 @@ async fn start_chat_run(
     // the footer's context-usage meter a `context_window_tokens` value
     // to divide against. Without it the meter renders as `N / 0` until
     // an explicit dropdown swap.
-    let (adapter, default_was_built) = match state.adapter_handle.get() {
-        Some(a) => (a, false),
+    let (adapter, default_was_built, default_probe_health) = match state.adapter_handle.get() {
+        Some(a) => (a, false, None),
         None => match resolve_default_adapter(&state.workspace_root()).await {
-            Ok(a) => {
+            Ok((a, h)) => {
                 state.adapter_handle.swap(a.clone());
-                (a, true)
+                (a, true, h)
             }
             Err(e) => return Err(e),
         },
@@ -2339,6 +2435,22 @@ async fn start_chat_run(
             payload: serde_json::Value::Null,
         },
     );
+    // Write the health slot before spawning so L3 can detect transitions
+    // regardless of whether the spawned task runs fast or slow.
+    if let Some(h) = &default_probe_health {
+        if let Ok(mut guard) = state.endpoint_health.lock() {
+            *guard = Some(h.clone());
+        }
+    }
+    // Capture model_id and base_url for the ProviderFailure event (L2-1).
+    // base_url comes from the health slot (most reliable source at this point).
+    let chat_model_id = adapter.model_id().to_string();
+    let chat_base_url = state
+        .endpoint_health
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|h| h.base_url.clone()))
+        .unwrap_or_default();
     tauri::async_runtime::spawn(async move {
         let _cleanup = ChatRunCleanup {
             in_flight: run_in_flight,
@@ -2386,6 +2498,22 @@ async fn start_chat_run(
                     suitability: Some(suitability),
                 },
             );
+            // Emit health AFTER ModelProfileLoaded. The slot was already
+            // written before the spawn; here we only need to emit the event.
+            if let Some(health) = &default_probe_health {
+                emit_event(
+                    &app_clone,
+                    &SessionEvent::EndpointHealthChanged {
+                        model_id: health.model_id.clone(),
+                        base_url: health.base_url.clone(),
+                        status: health.status,
+                        checked_at: health.checked_at.clone(),
+                        window_verified: health.window_verified,
+                        max_model_len: health.max_model_len,
+                        error: health.error.clone(),
+                    },
+                );
+            }
         }
         // Echo the user message onto the bus first so the ConversationPane
         // renders it immediately, then the model reply lands as a second
@@ -2419,21 +2547,51 @@ async fn start_chat_run(
         let mut stream = match adapter.stream(&messages, &[]).await {
             Ok(s) => s,
             Err(e) => {
-                emit_event(
-                    &app_clone,
-                    &SessionEvent::MessageCommitted {
-                        role: MessageRole::System,
-                        text: format!("[chat error] {e}"),
-                    },
-                );
                 tracing::warn!(error = %e, "start_chat_run: adapter.stream failed");
-                if let Some(card) = auto_card_for_error(&e) {
+                let card = auto_card_for_error(&e);
+                let card_path = card.as_ref().and_then(|c| {
                     emit_auto_memory_card(
                         &app_clone,
                         workspace_override.as_deref(),
-                        &card,
+                        c,
                         "start_chat_run",
                     );
+                    // Return the path if it was written (best-effort; None on failure).
+                    None::<String>
+                });
+                // L2-1: emit ProviderFailure instead of [chat error] MessageCommitted.
+                emit_event(
+                    &app_clone,
+                    &SessionEvent::ProviderFailure {
+                        model_id: chat_model_id.clone(),
+                        base_url: chat_base_url.clone(),
+                        cause: cause_from_adapter_error(&e),
+                        message: e.to_string(),
+                        fix_hint: card.as_ref().map(|c| c.body.clone()),
+                        memory_card_path: card_path,
+                        retry_command: "start_chat_run".to_string(),
+                        retry_prompt: user_prompt.clone(),
+                    },
+                );
+                // Update health slot and emit EndpointHealthChanged when the
+                // failure was an unreachable error, arming L3's re-probe loop.
+                // F2 fix: use app_clone.state() (Manager is on AppHandle; the
+                // "state is not accessible" comment was wrong) and route through
+                // emit_endpoint_health so the shared generation counter is bumped
+                // and repeated failures replace the loop instead of stacking.
+                // Scope guard: skip for empty base_url (Anthropic/Mock — no dot).
+                if matches!(e, AdapterError::Unreachable(_)) && !chat_base_url.is_empty() {
+                    let health = EndpointHealth {
+                        status: EndpointHealthStatus::Unreachable,
+                        base_url: chat_base_url.clone(),
+                        model_id: chat_model_id.clone(),
+                        checked_at: atelier_core::time::now_rfc3339(),
+                        window_verified: false,
+                        max_model_len: None,
+                        error: Some(e.to_string()),
+                    };
+                    let session_state = app_clone.state::<SessionState>();
+                    emit_endpoint_health(&app_clone, session_state.inner(), &health);
                 }
                 return;
             }
@@ -2466,14 +2624,36 @@ async fn start_chat_run(
                     break;
                 }
                 Some(atelier_core::adapter::StreamChunk::Error { error }) => {
+                    // Mid-stream AdapterError: emit as ProviderFailure with typed cause.
+                    tracing::warn!(error = %error, "start_chat_run: mid-stream error");
                     emit_event(
                         &app_clone,
-                        &SessionEvent::MessageCommitted {
-                            role: MessageRole::System,
-                            text: format!("[chat error] {error}"),
+                        &SessionEvent::ProviderFailure {
+                            model_id: chat_model_id.clone(),
+                            base_url: chat_base_url.clone(),
+                            cause: cause_from_adapter_error(&error),
+                            message: error.to_string(),
+                            fix_hint: None,
+                            memory_card_path: None,
+                            retry_command: "start_chat_run".to_string(),
+                            retry_prompt: user_prompt.clone(),
                         },
                     );
-                    tracing::warn!(error = %error, "start_chat_run: mid-stream error");
+                    // F2: mid-stream Unreachable also updates the health slot and
+                    // arms the re-probe loop, same as the pre-stream failure arm.
+                    if matches!(error, AdapterError::Unreachable(_)) && !chat_base_url.is_empty() {
+                        let health = EndpointHealth {
+                            status: EndpointHealthStatus::Unreachable,
+                            base_url: chat_base_url.clone(),
+                            model_id: chat_model_id.clone(),
+                            checked_at: atelier_core::time::now_rfc3339(),
+                            window_verified: false,
+                            max_model_len: None,
+                            error: Some(error.to_string()),
+                        };
+                        let session_state = app_clone.state::<SessionState>();
+                        emit_endpoint_health(&app_clone, session_state.inner(), &health);
+                    }
                     return;
                 }
                 Some(_) => {}  // ToolCall variants — not used in zero-tool chat mode
@@ -2608,12 +2788,12 @@ async fn start_agent_run(
             MAX_PROMPT_BYTES
         ));
     }
-    let (adapter, _) = match state.adapter_handle.get() {
-        Some(a) => (a, false),
+    let (adapter, agent_default_probe_health) = match state.adapter_handle.get() {
+        Some(a) => (a, None),
         None => match resolve_default_adapter(&state.workspace_root()).await {
-            Ok(a) => {
+            Ok((a, h)) => {
                 state.adapter_handle.swap(a.clone());
-                (a, true)
+                (a, h)
             }
             Err(e) => return Err(e),
         },
@@ -2691,6 +2871,8 @@ async fn start_agent_run(
     } else {
         runner
     };
+    // Capture model_id before adapter is moved into the runner (L2-1).
+    let agent_model_id = adapter.model_id().to_string();
     let mut runner = runner
         .with_adapter(adapter)
         .with_dispatcher_handle(handle)
@@ -2719,6 +2901,21 @@ async fn start_agent_run(
             payload: serde_json::Value::Null,
         },
     );
+    // Write the probe health into the slot so L3's re-probe can detect
+    // transitions. The runner will emit its own ModelProfileLoaded; health
+    // is emitted immediately here only if we just built a new default adapter
+    // (not if we reused an existing adapter — health was already emitted then).
+    if let Some(health) = agent_default_probe_health {
+        emit_endpoint_health(&app, &state, &health);
+    }
+
+    // Capture base_url for ProviderFailure event in agent error arm (L2-1).
+    let agent_base_url = state
+        .endpoint_health
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|h| h.base_url.clone()))
+        .unwrap_or_default();
 
     let app_for_finish = app.clone();
     let real_workspace_for_auto_card = workspace_override.clone();
@@ -2727,6 +2924,7 @@ async fn start_agent_run(
             in_flight: run_in_flight,
             workspace_to_remove: cleanup_workspace,
         };
+        let retry_prompt_copy = prompt.clone();
         match runner.run(prompt).await {
             Ok(report) => {
                 if let Ok(mut guard) = session_id_arc.lock() {
@@ -2734,21 +2932,48 @@ async fn start_agent_run(
                 }
             }
             Err(e) => {
-                emit_event(
-                    &app_for_finish,
-                    &SessionEvent::MessageCommitted {
-                        role: MessageRole::System,
-                        text: format!("[agent error] {e}"),
-                    },
-                );
                 tracing::warn!(error = %e, "agent run failed");
-                if let Some(card) = auto_card_for_run_error(&e) {
+                let card = auto_card_for_run_error(&e);
+                let card_path = card.as_ref().and_then(|c| {
                     emit_auto_memory_card(
                         &app_for_finish,
                         real_workspace_for_auto_card.as_deref(),
-                        &card,
+                        c,
                         "start_agent_run",
                     );
+                    None::<String>
+                });
+                let is_unreachable =
+                    matches!(&e, RunError::AdapterChain(AdapterError::Unreachable(_)))
+                        || matches!(&e, RunError::Adapter(s) if s.contains("provider unreachable"));
+                // L2-1: emit ProviderFailure instead of [agent error] MessageCommitted.
+                emit_event(
+                    &app_for_finish,
+                    &SessionEvent::ProviderFailure {
+                        model_id: agent_model_id.clone(),
+                        base_url: agent_base_url.clone(),
+                        cause: cause_from_run_error(&e),
+                        message: e.to_string(),
+                        fix_hint: card.as_ref().map(|c| c.body.clone()),
+                        memory_card_path: card_path,
+                        retry_command: "start_agent_run".to_string(),
+                        retry_prompt: retry_prompt_copy.clone(),
+                    },
+                );
+                // F2: route through emit_endpoint_health (shared counter) and
+                // guard on non-empty base_url (Anthropic/Mock have no health dot).
+                if is_unreachable && !agent_base_url.is_empty() {
+                    let health = EndpointHealth {
+                        status: EndpointHealthStatus::Unreachable,
+                        base_url: agent_base_url.clone(),
+                        model_id: agent_model_id.clone(),
+                        checked_at: atelier_core::time::now_rfc3339(),
+                        window_verified: false,
+                        max_model_len: None,
+                        error: Some(e.to_string()),
+                    };
+                    let session_state = app_for_finish.state::<SessionState>();
+                    emit_endpoint_health(&app_for_finish, session_state.inner(), &health);
                 }
             }
         }
@@ -2882,6 +3107,181 @@ fn first_word_or_default(s: &str, default: &str) -> String {
         word
     } else {
         format!("{word}.txt")
+    }
+}
+
+/// Map an `AdapterError` to a `ProviderFailureCause` for the failure card.
+fn cause_from_adapter_error(err: &AdapterError) -> ProviderFailureCause {
+    match err {
+        AdapterError::Unreachable(_) => ProviderFailureCause::Unreachable,
+        AdapterError::Auth(_) => ProviderFailureCause::Auth,
+        AdapterError::RateLimited { .. } => ProviderFailureCause::RateLimited,
+        AdapterError::Malformed(_) | AdapterError::Provider { .. } => {
+            ProviderFailureCause::Malformed
+        }
+        AdapterError::NotConfigured(_) => ProviderFailureCause::NotConfigured,
+        _ => ProviderFailureCause::Other,
+    }
+}
+
+/// Map a `RunError` to a `ProviderFailureCause`, reusing the `AdapterError`
+/// mapping when the source is available.
+fn cause_from_run_error(err: &RunError) -> ProviderFailureCause {
+    match err {
+        RunError::AdapterChain(e) => cause_from_adapter_error(e),
+        RunError::Adapter(msg) if msg.contains("provider unreachable") => {
+            ProviderFailureCause::Unreachable
+        }
+        RunError::Adapter(msg) if msg.contains("authentication failed") => {
+            ProviderFailureCause::Auth
+        }
+        RunError::Adapter(msg) if msg.contains("rate-limited") => ProviderFailureCause::RateLimited,
+        RunError::Adapter(msg) if msg.contains("provider error") => ProviderFailureCause::Malformed,
+        RunError::Config(msg)
+            if msg.contains("environment variable") || msg.contains("not configured") =>
+        {
+            ProviderFailureCause::NotConfigured
+        }
+        RunError::ContextOverflow { .. } => ProviderFailureCause::Other,
+        _ => ProviderFailureCause::Other,
+    }
+}
+
+/// Spawn a background re-probe loop for the given base_url.
+/// Probes `GET {base_url}/models` every 30–120s (backoff), emitting
+/// `EndpointHealthChanged` each time so the frontend health dot stays fresh.
+/// Exits when the generation counter advances (adapter was swapped), when
+/// status flips to `Reachable`, or when the task is cancelled.
+///
+/// Uses a bare reqwest client (4s connect timeout) so it doesn't need `&mut`
+/// on the live adapter (which is behind `Arc`). No bearer header — any HTTP
+/// response counts as reachable (L3 rule).
+fn spawn_health_reprobe(
+    app: AppHandle,
+    base_url: String,
+    model_id: String,
+    generation: u64,
+    generation_counter: Arc<std::sync::atomic::AtomicU64>,
+) {
+    // Scope guard: only probe OpenAI-compat endpoints. An empty base_url means
+    // Mock or Anthropic (neither writes the health slot); probing "" would loop
+    // against "/models" forever and violate the OpenAI-compat-only binding rule.
+    if base_url.is_empty() {
+        return;
+    }
+    tauri::async_runtime::spawn(async move {
+        let client = match reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(PROBE_TIMEOUT_SECS))
+            .timeout(std::time::Duration::from_secs(PROBE_TIMEOUT_SECS + 2))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(error = %e, "health re-probe: failed to build reqwest client");
+                return;
+            }
+        };
+        let url = format!("{}/models", base_url.trim_end_matches('/'));
+        let mut delay_secs: u64 = 30;
+        const MAX_DELAY_SECS: u64 = 120;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+            // Exit if the adapter was swapped.
+            if generation_counter.load(std::sync::atomic::Ordering::Relaxed) != generation {
+                return;
+            }
+            let checked_at = atelier_core::time::now_rfc3339();
+            let (status, window_verified, max_model_len, error) =
+                match client.get(&url).send().await {
+                    Ok(resp) => {
+                        // Any HTTP response = reachable.
+                        let (wv, mml) = if resp.status().is_success() {
+                            // Try to parse max_model_len for cap recovery.
+                            match resp.json::<serde_json::Value>().await {
+                                Ok(body) => {
+                                    let mml = body
+                                        .get("data")
+                                        .and_then(|d| d.as_array())
+                                        .and_then(|arr| arr.first())
+                                        .and_then(|e| e.get("max_model_len"))
+                                        .and_then(|v| v.as_u64())
+                                        .map(|v| v.min(u32::MAX as u64) as u32);
+                                    (mml.is_some(), mml)
+                                }
+                                Err(_) => (false, None),
+                            }
+                        } else {
+                            (false, None)
+                        };
+                        (EndpointHealthStatus::Reachable, wv, mml, None)
+                    }
+                    Err(e) => (
+                        EndpointHealthStatus::Unreachable,
+                        false,
+                        None,
+                        Some(e.to_string()),
+                    ),
+                };
+            // Re-check generation after the await.
+            if generation_counter.load(std::sync::atomic::Ordering::Relaxed) != generation {
+                return;
+            }
+            emit_event(
+                &app,
+                &SessionEvent::EndpointHealthChanged {
+                    model_id: model_id.clone(),
+                    base_url: base_url.clone(),
+                    status,
+                    checked_at,
+                    window_verified,
+                    max_model_len,
+                    error,
+                },
+            );
+            if status == EndpointHealthStatus::Reachable {
+                return;
+            }
+            delay_secs = (delay_secs * 2).min(MAX_DELAY_SECS);
+        }
+    });
+}
+
+/// Emit `EndpointHealthChanged` for the given health snapshot and update the
+/// `endpoint_health` slot in `SessionState`. Must be called **after**
+/// `ModelProfileLoaded` at every site (the reducer resets health on
+/// `ModelProfileLoaded`, so emitting before would self-clobber).
+fn emit_endpoint_health(app: &AppHandle, state: &SessionState, health: &EndpointHealth) {
+    // Bump the generation counter on every adapter build/swap so any
+    // existing re-probe loop for a prior adapter exits.
+    let gen = state
+        .health_probe_generation
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        + 1;
+    if let Ok(mut guard) = state.endpoint_health.lock() {
+        *guard = Some(health.clone());
+    }
+    emit_event(
+        app,
+        &SessionEvent::EndpointHealthChanged {
+            model_id: health.model_id.clone(),
+            base_url: health.base_url.clone(),
+            status: health.status,
+            checked_at: health.checked_at.clone(),
+            window_verified: health.window_verified,
+            max_model_len: health.max_model_len,
+            error: health.error.clone(),
+        },
+    );
+    // Spawn re-probe loop when the endpoint is unreachable (L3-1).
+    if health.status == EndpointHealthStatus::Unreachable {
+        spawn_health_reprobe(
+            app.clone(),
+            health.base_url.clone(),
+            health.model_id.clone(),
+            gen,
+            Arc::clone(&state.health_probe_generation),
+        );
     }
 }
 
@@ -3284,6 +3684,42 @@ pub fn bridge_event(evt: &SessionEvent) -> BridgedEvent {
         SessionEvent::SubagentCancelled { id, reason } => json!({
             "id": id,
             "reason": reason,
+        }),
+        SessionEvent::EndpointHealthChanged {
+            model_id,
+            base_url,
+            status,
+            checked_at,
+            window_verified,
+            max_model_len,
+            error,
+        } => json!({
+            "model_id": model_id,
+            "base_url": base_url,
+            "status": status.wire_label(),
+            "checked_at": checked_at,
+            "window_verified": window_verified,
+            "max_model_len": max_model_len,
+            "error": error,
+        }),
+        SessionEvent::ProviderFailure {
+            model_id,
+            base_url,
+            cause,
+            message,
+            fix_hint,
+            memory_card_path,
+            retry_command,
+            retry_prompt,
+        } => json!({
+            "model_id": model_id,
+            "base_url": base_url,
+            "cause": cause.wire_label(),
+            "message": message,
+            "fix_hint": fix_hint,
+            "memory_card_path": memory_card_path,
+            "retry_command": retry_command,
+            "retry_prompt": retry_prompt,
         }),
     };
     BridgedEvent { kind, payload }
@@ -3820,6 +4256,8 @@ model = "local:evil"
             Ok(_) => panic!("malicious base_url must reject"),
             Err(e) => e,
         };
+        // F5b: allowlist is checked before credential resolution, so this
+        // test runs without OPENAI_API_KEY in the environment.
         assert!(err.contains("allowlist"), "got: {err}");
         assert!(err.contains("evil.example"), "got: {err}");
     }
@@ -4242,6 +4680,78 @@ model = "anthropic:claude-opus-4-7"
             .expect("receiver should resolve within 50ms once sender is dropped");
         assert!(recv.is_err(), "dropped sender must surface as RecvError");
     }
+
+    // ---- F5: resolve_default_adapter unreachable-endpoint behavioural test ----
+    // Guards the data the F1a ordering contract depends on: the adapter build
+    // path must return EndpointHealth { Unreachable } when the probe can't
+    // connect, so callers can emit EndpointHealthChanged after ModelProfileLoaded.
+    // Full bus-ordering assertion needs an AppHandle (skipped — no Tauri runtime
+    // in unit tests); this tuple-level test pins the data the ordering depends on.
+
+    static ENV_LOCK_BUILD_SWAP: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[tokio::test]
+    async fn resolve_default_adapter_returns_unreachable_health_for_dead_endpoint() {
+        // Bind a listener, grab the port, drop it so the port is closed.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let url = format!("http://127.0.0.1:{port}/v1");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dot_atelier = tmp.path().join(".atelier");
+        std::fs::create_dir_all(&dot_atelier).unwrap();
+        std::fs::write(
+            dot_atelier.join("providers.toml"),
+            format!(
+                r#"
+default = "dead"
+
+[providers.dead]
+provider = "openai-compat"
+base_url = "{url}"
+model = "local:dead-model"
+api_key = "env:OPENAI_API_KEY"
+"#
+            ),
+        )
+        .unwrap();
+
+        // resolve_openai_api_key reads OPENAI_API_KEY; serialise env mutation.
+        // Set-if-absent, drop the lock before the await (MutexGuard across .await
+        // is a Clippy error), then restore the prior value after.
+        let prior_key = {
+            let _guard = ENV_LOCK_BUILD_SWAP
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let prior = std::env::var("OPENAI_API_KEY").ok();
+            std::env::set_var("OPENAI_API_KEY", "test-key-f5");
+            prior
+            // _guard dropped here; lock released before the await below
+        };
+
+        let result = resolve_default_adapter(tmp.path()).await;
+
+        // Restore env — never unset (concurrent tests may read it).
+        if let Some(v) = prior_key {
+            std::env::set_var("OPENAI_API_KEY", v);
+        }
+
+        let (_, health) =
+            result.expect("resolve_default_adapter must succeed for an allowlisted URL");
+        let health = health.expect("EndpointHealth must be Some for OpenAI-compat profiles");
+        assert_eq!(
+            health.status,
+            EndpointHealthStatus::Unreachable,
+            "dead endpoint must produce Unreachable health"
+        );
+        assert!(
+            !health.window_verified,
+            "window must not be verified when unreachable"
+        );
+        assert_eq!(health.base_url, url);
+    }
 }
 
 #[cfg(test)]
@@ -4322,5 +4832,88 @@ mod adapter_swap_tests {
             !loaded2.is_approved("typescript"),
             "revoke must clear the entry"
         );
+    }
+
+    // ---- L-D-5 agreement tests: wire_label() == serde projection ----
+
+    use atelier_core::session::{EndpointHealthStatus, ProviderFailureCause};
+
+    #[test]
+    fn endpoint_health_status_wire_label_matches_serde() {
+        // wire_label() is the canonical label; bridge_event uses it.
+        // The serde rename_all = "snake_case" must produce the same string
+        // so any future consumer that deserialises the raw JSON gets the
+        // same value.
+        assert_eq!(EndpointHealthStatus::Reachable.wire_label(), "reachable");
+        assert_eq!(
+            EndpointHealthStatus::Unreachable.wire_label(),
+            "unreachable"
+        );
+        // Serde round-trip
+        let r = serde_json::to_string(&EndpointHealthStatus::Reachable).unwrap();
+        let u = serde_json::to_string(&EndpointHealthStatus::Unreachable).unwrap();
+        assert_eq!(r, "\"reachable\"");
+        assert_eq!(u, "\"unreachable\"");
+    }
+
+    #[test]
+    fn provider_failure_cause_wire_label_matches_serde() {
+        use ProviderFailureCause::*;
+        let cases: &[(ProviderFailureCause, &str)] = &[
+            (Unreachable, "unreachable"),
+            (Auth, "auth"),
+            (RateLimited, "rate_limited"),
+            (Malformed, "malformed"),
+            (NotConfigured, "not_configured"),
+            (Other, "other"),
+        ];
+        for (variant, expected) in cases {
+            assert_eq!(
+                variant.wire_label(),
+                *expected,
+                "wire_label mismatch for {variant:?}"
+            );
+            let serialised = serde_json::to_string(variant).unwrap();
+            assert_eq!(
+                serialised,
+                format!("\"{expected}\""),
+                "serde mismatch for {variant:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bridge_endpoint_health_changed_carries_wire_label() {
+        let b = bridge_event(&SessionEvent::EndpointHealthChanged {
+            model_id: "local:qwen2.5".into(),
+            base_url: "http://localhost:8000/v1".into(),
+            status: EndpointHealthStatus::Unreachable,
+            checked_at: "2026-06-04T10:00:00Z".into(),
+            window_verified: false,
+            max_model_len: None,
+            error: Some("connect timeout".into()),
+        });
+        assert_eq!(b.kind, "EndpointHealthChanged");
+        assert_eq!(b.payload["status"], "unreachable");
+        assert_eq!(b.payload["window_verified"], false);
+        assert_eq!(b.payload["error"], "connect timeout");
+    }
+
+    #[test]
+    fn bridge_provider_failure_carries_cause_wire_label() {
+        let b = bridge_event(&SessionEvent::ProviderFailure {
+            model_id: "local:qwen".into(),
+            base_url: "http://localhost:8000/v1".into(),
+            cause: ProviderFailureCause::Unreachable,
+            message: "connect timeout".into(),
+            fix_hint: Some("check the server is running".into()),
+            memory_card_path: None,
+            retry_command: "start_chat_run".into(),
+            retry_prompt: "hello".into(),
+        });
+        assert_eq!(b.kind, "ProviderFailure");
+        assert_eq!(b.payload["cause"], "unreachable");
+        assert_eq!(b.payload["retry_command"], "start_chat_run");
+        assert_eq!(b.payload["fix_hint"], "check the server is running");
     }
 }

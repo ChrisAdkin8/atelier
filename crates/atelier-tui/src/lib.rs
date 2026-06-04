@@ -883,6 +883,10 @@ impl AppState {
                     e.status = "cancelled".to_string();
                 }
             }
+            // Provider-health events (GUI-only rendering). TUI ignores them
+            // for now; the default arm below records them in the event log.
+            SessionEvent::EndpointHealthChanged { .. }
+            | SessionEvent::ProviderFailure { .. } => {}
         }
         self.push_event_line(line);
     }
@@ -1243,6 +1247,12 @@ pub fn project_event(evt: &SessionEvent) -> EventLine {
         }
         SessionEvent::SubagentCancelled { id, reason } => {
             format!("[subagent] {id} cancelled: {reason}")
+        }
+        SessionEvent::EndpointHealthChanged { model_id, status, .. } => {
+            format!("[health] {model_id} {}", status.wire_label())
+        }
+        SessionEvent::ProviderFailure { model_id, cause, .. } => {
+            format!("[provider-failure] {model_id} {}", cause.wire_label())
         }
         SessionEvent::AssistantTextDelta { .. } => String::new(),
     };

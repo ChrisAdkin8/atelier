@@ -7,6 +7,14 @@ Change history in `../CHANGELOG.md`.
 
 **Tracker discipline:** keep this file up to date whenever a plan lands, a risk/remediation status changes, or gate counts change. Do not leave `tasks/todo.md` as a historical snapshot; move detailed release history to `../CHANGELOG.md` and keep this file focused on current state plus active/pending work.
 
+**v60.104 (2026-06-04)** — docs sweep (v60.102–v60.103). README: health dot + failure card + troubleshooting row. CAPABILITIES: Endpoint health indicator paragraph + GUI cross-reference.
+
+**v60.103 (2026-06-04)** — provider-health scan fixes (all F0–F6 items). Plan: [`tasks/plan_provider_health_scan_fixes.md`](plan_provider_health_scan_fixes.md).
+
+**CLOSED (v60.103) — Deep scan of the uncommitted v60.102 work found 2×P1 (snapshot double-emit wipes the health dot; failure-arm re-probe loops never cancelled on swap), 1×P2 (retry invoke allowlist), 1×P3 (toast lifecycle). The plan review then found a **P0 the scan missed**: self-deadlock in `snapshot_current_model` (lock held across `emit_endpoint_health` re-lock — GUI hangs on first hydrate), plus a third instance of the reset-bug class (Runner re-emits `ModelProfileLoaded` mid-agent-run → dot wiped). Plan: [`tasks/plan_provider_health_scan_fixes.md`](plan_provider_health_scan_fixes.md). **v60.102 must not ship without F0/F1/F2.** Manual GUI verification is a mandatory gate this round.
+
+**v60.102 (2026-06-04)** — provider-health UX (L1 + L2 + L3, all three layers in one session). L1: `ProbeOutcome` return, `EndpointHealthChanged` event, badge health dot, unverified `?` cap marker. L2: `ProviderFailure` event, failure card with Retry + Switch-profile, dropdown `⚠` overlay. L3: background re-probe loop (30s→120s backoff) + recovery toast. Plan: [`tasks/plan_provider_health_ux.md`](plan_provider_health_ux.md). All gates green.
+
 **v60.100 (2026-06-04)** — deep-scan 2026-06-04 Bundle 2 (all P2 items). Tool-error chains logged; synthetic system line on resume drop; executor-routing fail-fast (CLI + GUI); `[runner] pause_timeout_secs` config key; HOME-missing warns; prod-mode `castPayload` console.warn. Full plan: [`tasks/plan_deep_scan_2026-06-04_fixes.md`](plan_deep_scan_2026-06-04_fixes.md). All gates green.
 
 **v60.94–v60.98 (2026-06-04)** — GUI polish + provider hardening batch. Footer 3-column grid (v60.94) then overlap fix via `auto 1fr auto` tracks (v60.96); wordmark thinking-sweep animation (v60.95); Composer readline-style ↑/↓ prompt history persisted to localStorage (v60.97); provider hardening (v60.98): connect timeouts on both adapters, `/v1/models` `max_model_len` probe wired into the GUI with 4s bound, `with_cache_prompt(true)` syncs the prompt_cache capability claim, trust-boundary wildcard allowlist entry for the vLLM ALB, mock-fallback removal in `snapshot_current_model`. Detail in `../CHANGELOG.md`.

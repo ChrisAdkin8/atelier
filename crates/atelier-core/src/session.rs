@@ -627,6 +627,105 @@ pub enum Event {
     /// A sub-agent was cancelled (via the cancel shape, parent cancel token, or
     /// time-travel rewind). `reason` is a short free-text label for display.
     SubagentCancelled { id: String, reason: String },
+
+    /// Provider-health UX (L1-2) — reachability result for the active
+    /// OpenAI-compat adapter's `/v1/models` endpoint. Emitted by
+    /// `atelier-gui::build_swap_adapter` after each probe attempt (startup,
+    /// swap, and background re-probe). Never emitted for Mock or Anthropic
+    /// adapters — frontend treats absence as "no health claim" (null dot).
+    ///
+    /// Emitted **after** [`Event::ModelProfileLoaded`] at every site so
+    /// the frontend reducer can safely reset health on `ModelProfileLoaded`
+    /// without clobbering the immediately-following health update.
+    EndpointHealthChanged {
+        model_id: String,
+        base_url: String,
+        status: EndpointHealthStatus,
+        /// RFC 3339 timestamp of this probe attempt.
+        checked_at: String,
+        /// `true` only when the probe found `max_model_len` — i.e.
+        /// `ProbeOutcome::WindowVerified`. Frontend uses this to decide
+        /// whether to render the `?` unverified marker on the cap meter.
+        window_verified: bool,
+        /// The verified window value when `window_verified` is true.
+        /// `None` for all other outcomes.
+        max_model_len: Option<u32>,
+        /// Short human-readable error string when `status == Unreachable`
+        /// or the response was malformed. Used in the badge tooltip.
+        error: Option<String>,
+    },
+
+    /// Provider-health UX (L2-1) — structured provider failure carrying
+    /// retry plumbing and inline fix hints. Emitted by `atelier-gui`
+    /// failure arms instead of a plain `MessageCommitted { System }` line
+    /// so the frontend can render an actionable failure card.
+    ///
+    /// Only emitted on the Tauri webview bridge (GUI-local); the core bus
+    /// never carries this event.
+    ProviderFailure {
+        model_id: String,
+        base_url: String,
+        cause: ProviderFailureCause,
+        /// Adapter error message (human-readable).
+        message: String,
+        /// Markdown "Likely fix" body from the auto-drafted memory card.
+        fix_hint: Option<String>,
+        /// Path to the auto-drafted memory card on disk (if written).
+        memory_card_path: Option<String>,
+        /// Tauri command to invoke on Retry (`"start_chat_run"` or
+        /// `"start_agent_run"`).
+        retry_command: String,
+        /// Exact post-skill-expansion prompt to re-submit on Retry.
+        retry_prompt: String,
+    },
+}
+
+/// Reachability status for an OpenAI-compat adapter endpoint.
+/// Two variants only — `Unknown` is represented as `null` / absent on
+/// the frontend; no site ever emits it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EndpointHealthStatus {
+    Reachable,
+    Unreachable,
+}
+
+impl EndpointHealthStatus {
+    /// Canonical lowercase wire label. Used for the agreement test (L-D-5).
+    pub fn wire_label(self) -> &'static str {
+        match self {
+            Self::Reachable => "reachable",
+            Self::Unreachable => "unreachable",
+        }
+    }
+}
+
+/// Cause classification for a provider failure (L2-1). Maps from
+/// `AdapterError` variants so the frontend can pick an icon / colour
+/// without parsing the `message` string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderFailureCause {
+    Unreachable,
+    Auth,
+    RateLimited,
+    Malformed,
+    NotConfigured,
+    Other,
+}
+
+impl ProviderFailureCause {
+    /// Canonical lowercase wire label. Used for the agreement test (L-D-5).
+    pub fn wire_label(self) -> &'static str {
+        match self {
+            Self::Unreachable => "unreachable",
+            Self::Auth => "auth",
+            Self::RateLimited => "rate_limited",
+            Self::Malformed => "malformed",
+            Self::NotConfigured => "not_configured",
+            Self::Other => "other",
+        }
+    }
 }
 
 impl Event {
@@ -677,6 +776,8 @@ impl Event {
             Self::SubagentTokensUpdated { .. } => "SubagentTokensUpdated",
             Self::SubagentCompleted { .. } => "SubagentCompleted",
             Self::SubagentCancelled { .. } => "SubagentCancelled",
+            Self::EndpointHealthChanged { .. } => "EndpointHealthChanged",
+            Self::ProviderFailure { .. } => "ProviderFailure",
         }
     }
 }

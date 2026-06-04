@@ -30,6 +30,11 @@ tauri-plugin-dialog = "2"
 # reply via `tokio::sync::oneshot`, bounded by `tokio::time::timeout`.
 tokio = { workspace = true }
 tokio-util = { workspace = true }
+# L3-1 — bare reqwest client for the background health re-probe loop.
+# atelier-cli already has reqwest as a dep; atelier-gui adds it directly
+# so the re-probe loop can build its own short-timeout client without
+# going through the live adapter (which needs &mut).
+reqwest = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 serde = { workspace = true }

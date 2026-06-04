@@ -221,3 +221,25 @@ Lessons distilled from the v52–v60.17 trail: four deep-scan audit rounds, four
 **Failure**: switching `.help` from flex to `grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr)` was intended to prevent the model badge from pushing the token meter off-centre. It fixed the *centre* column's position but the *right* zone's flex children (`.swap-select` sized by longest option label, `.model-badge` with `white-space: nowrap`) still computed a natural width wider than `1fr` and overflowed leftward (the zone is `justify-content: flex-end`), painting on top of the token meter. The grid boundary was respected by the track but not by overflowing flex content.
 
 **Prevention**: `minmax(0, X)` prevents the *track* from growing beyond `X`, but it does not clip content that overflows the track's box. To guarantee content in the right zone can't reach the centre column, use `auto` for the side tracks instead: `auto 1fr auto`. The side tracks expand to exactly their content width; the centre takes the remainder. The trade-off is the centre is no longer geometrically centred to the footer — it centres *between* the side zones — but overlap becomes physically impossible. Use `overflow: hidden` on a side zone only when content clipping is acceptable; note that absolutely-positioned children (e.g. the model popover) will be clipped too.
+
+---
+
+## 2026-06-04 — v60.102 provider-health UX post-mortems
+
+### One delivery path per Tauri event: command return + bus emit both reduce
+
+**Failure**: `snapshot_current_model` was changed to emit `ModelProfileLoaded` via the bus AND return it as a `BridgedEvent` for the JS caller to apply. App.svelte's bus listener applies every bus event; the command return applied it a second time. The second application reset `endpointHealth = null` (the `ModelProfileLoaded` reducer resets health) after the health event had just set the red dot — the health dot flashed on then immediately disappeared at every mount and workspace change.
+
+**Prevention**: A Tauri command either emits events on the bus **or** returns an event for the caller to apply — never both. Commands that fire multiple events (e.g. `ModelProfileLoaded` then `EndpointHealthChanged`) must use bus-only delivery; only a command with a single return value can use the return path. Before adding `emit_event` to a command that already returns `BridgedEvent` (or vice versa), ask: "does the frontend bus listener also receive this?" If yes, one path must be removed.
+
+### Reset-on-event must be identity-keyed when the event recurs for the same entity
+
+**Failure**: the `ModelProfileLoaded` reducer unconditionally reset `endpointHealth`, `contextWindowVerified`, and `recoveryToast`. The Runner re-emits `ModelProfileLoaded` mid-agent-run for the *same* model (runner.rs:~2678) so the health dot was wiped on every agent turn; no later event restored it. The original plan anticipated two delivery paths (snapshot + swap) but missed the third (Runner probe).
+
+**Prevention**: any reducer arm that resets state on event X must ask: "can X arrive again without the underlying entity actually changing?" If yes, gate the reset on an identity check (`p.model_id !== state.currentModel?.modelId`, etc.) and document the accepted caveat. Do NOT compare fields that have different values across delivery paths (e.g. `base_url` — GUI-side profiles use `skipped_for_well_known` which hard-codes `""`, while the Runner carries the real URL — a two-field comparison defeats the fix on the Runner path).
+
+### Manual verify steps are gates, not suggestions
+
+**Failure**: v60.102's plan listed "manual: launch GUI with the dead-ELB profile" as the L1-3 verify step; it was never executed. A self-deadlock in `snapshot_current_model` (holding the `endpoint_health` Mutex guard while calling `emit_endpoint_health`, which re-locks the same non-reentrant Mutex) shipped into the working tree while every automated gate stayed green. The deadlock would have been caught in under 10 seconds by the specified manual step.
+
+**Prevention**: if a manual step in a verify section is skipped, the verification report must say so explicitly — "manual step not run: [reason]" — rather than marking the item complete. Automated gates (clippy, tests, fmt, svelte-check) verify correctness of code; they do not substitute for running the actual application. For GUI features, the mandatory manual gate is `cargo tauri dev` with the relevant provider profile configured.

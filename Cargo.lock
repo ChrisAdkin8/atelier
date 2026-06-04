@@ -311,6 +311,7 @@ version = "0.1.1"
 dependencies = [
  "atelier-cli",
  "atelier-core",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "tauri",

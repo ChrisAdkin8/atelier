@@ -27,6 +27,8 @@ Switching providers is one flag (`--provider`, `--model`, `--base-url`) or a nam
 
 **Capability matrix.** For nine well-known models the harness ships a built-in `capability_matrix` that records what each model can really do versus what it claims; the model's footer badge tells you if there's a mismatch.
 
+**Endpoint health indicator (OpenAI-compatible only).** On startup and after each provider swap, Atelier probes `GET /v1/models` and renders a coloured dot on the model badge: green = reachable, red = unreachable. Hover for the error detail and a fix hint. If a run fails because the endpoint is down, a structured failure card appears in the conversation with a **Retry** button and a **Switch profile** shortcut — no manual inspection of the event log required. The GUI re-probes in the background with exponential backoff (30s → 120s); when the endpoint comes back the dot turns green and a toast confirms recovery. The context-window denominator in the footer shows a `?` suffix when the probe returned no `max_model_len` (the conservative 8 KiB seed is in use). Anthropic and Mock profiles never show a dot — they have no unauthenticated health endpoint.
+
 ---
 
 ## Three ways to drive it
@@ -35,7 +37,7 @@ Atelier is one engine with three faces:
 
 - **`atelier` CLI** — `cargo run -p atelier-cli -- run "<prompt>"`. Headless, scriptable, great for one-shot prompts and CI workloads.
 - **TUI** — terminal app built on ratatui. Three panes (conversation, context/memory/plan, diff), scrubber-style history, full keyboard discipline. Good fit when you live in tmux.
-- **GUI** — Tauri 2 + Svelte 5 desktop app. Chat-REPL mode: Composer talks directly to the adapter, with the same three side-panels (Context, Memory, Plan), inline Mermaid / image rendering, and drag-and-drop plan reorder. The Composer keeps a readline-style prompt history (persisted to `localStorage`); **↑** / **↓** cycles through previous prompts.
+- **GUI** — Tauri 2 + Svelte 5 desktop app. Chat-REPL mode: Composer talks directly to the adapter, with the same three side-panels (Context, Memory, Plan), inline Mermaid / image rendering, and drag-and-drop plan reorder. The Composer keeps a readline-style prompt history (persisted to `localStorage`); **↑** / **↓** cycles through previous prompts. The footer model badge includes an endpoint health dot and an actionable failure card on connection errors (see Endpoint health indicator above).
 
 The CLI, TUI, and GUI all consume the same `atelier-core` engine through a broadcast event channel, while each surface exposes the controls that are currently implemented for that UI.
 

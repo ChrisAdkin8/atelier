@@ -151,9 +151,12 @@
   }
 
   async function hydrateCurrentModel() {
+    // v60.103: snapshot_current_model now emits events via the bus only
+    // (Result<(), String>). The bus listener applies them; no return value to
+    // apply. This is the one-delivery-path rule: a command that both emits and
+    // returns causes double-reduction, which reset the health dot immediately.
     try {
-      const evt = await invoke<BridgedEvent>('snapshot_current_model')
-      app = applyEvent(app, evt)
+      await invoke('snapshot_current_model')
     } catch (err) {
       console.warn('snapshot_current_model failed', err)
     }
@@ -219,9 +222,18 @@
   // *and* the adapter declined to declare capabilities).
   function modelBadgeTooltip(model: CurrentModel): string {
     const row = model.capabilityRow
-    if (!row) return model.baseUrl
     const lines: string[] = []
     if (model.baseUrl) lines.push(model.baseUrl)
+    if (app.endpointHealth) {
+      const h = app.endpointHealth
+      const ts = new Date(h.checkedAt).toLocaleTimeString()
+      if (h.status === 'unreachable') {
+        lines.push(`endpoint: unreachable${h.error ? ` — ${h.error}` : ''} (checked ${ts})`)
+      } else {
+        lines.push(`endpoint: reachable (checked ${ts})`)
+      }
+    }
+    if (!row) return lines.join('\n') || model.baseUrl
     if (row.display_label) lines.push(row.display_label)
     lines.push(`window: ${row.context_window_tokens.toLocaleString()} tokens`)
     lines.push(`native_tool_use: ${row.native_tool_use}`)
@@ -390,7 +402,17 @@
 
   <main class="grid" class:right-collapsed={rightPanelCollapsed}>
     <div class="pane-slot conversation-slot">
-      <ConversationPane conversation={app.conversation} streamingAssistant={app.streamingAssistant} />
+      <ConversationPane
+        conversation={app.conversation}
+        streamingAssistant={app.streamingAssistant}
+        busy={composerBusy}
+        onSwitchProfile={() => {
+          // L2-3: focus the swap-select dropdown so the user can pick a
+          // reachable profile without hunting for it in the footer.
+          const el = document.querySelector('[data-testid="swap-adapter-select"]') as HTMLSelectElement | null
+          el?.focus()
+        }}
+      />
     </div>
     <div class="pane-slot memory-slot">
       <div class="memory-stack">
@@ -420,16 +442,21 @@
         {@const used = app.contextTokens.known}
         {@const cap = app.contextWindowTokens}
         {@const pct = Math.min(100, Math.round((used / cap) * 100))}
+        {@const capUnverified = !app.contextWindowVerified}
         <span
           class="ctx-meter"
-          title={app.currentModel
-            ? `context window usage for ${app.currentModel.modelId}`
-            : 'context window usage'}
+          title={capUnverified
+            ? `cap unverified — endpoint did not report max_model_len (showing fallback ${cap.toLocaleString()})`
+            : app.currentModel
+              ? `context window usage for ${app.currentModel.modelId}`
+              : 'context window usage'}
         >
           <span class="ctx-label">context</span>
           <span class="ctx-bar"
             ><span class="ctx-fill" style="width: {pct}%"></span></span>
-          <span class="ctx-text">{used.toLocaleString()} / {cap.toLocaleString()} ({pct}%)</span>
+          <span class="ctx-text" class:cap-unverified={capUnverified}
+            >{used.toLocaleString()} / {cap.toLocaleString()}{capUnverified ? '?' : ''} ({pct}%)</span
+          >
         </span>
       {/if}
       <span class="cost-meter" title="session cost (USD)">
@@ -464,8 +491,11 @@
         data-testid="swap-adapter-select"
       >
         {#each swapOptions as opt, i (opt.model_id)}
+          {@const isUnreachableActive =
+            app.endpointHealth?.status === 'unreachable' &&
+            app.currentModel?.modelId === opt.model_id}
           <option value={String(i)}>
-            {opt.is_default ? '★ ' : ''}{opt.label}
+            {opt.is_default ? '★ ' : ''}{isUnreachableActive ? '⚠ ' : ''}{opt.label}
           </option>
         {/each}
       </select>
@@ -478,6 +508,14 @@
             aria-expanded={showModelDetails}
             onclick={() => (showModelDetails = !showModelDetails)}
           >
+            {#if app.endpointHealth}
+              <span
+                class="health-dot"
+                class:health-dot--reachable={app.endpointHealth.status === 'reachable'}
+                class:health-dot--unreachable={app.endpointHealth.status === 'unreachable'}
+                aria-label={app.endpointHealth.status === 'reachable' ? 'endpoint reachable' : 'endpoint unreachable'}
+              ></span>
+            {/if}
             <span class="model-fit">{suitabilityLabel(app.currentModel.suitability)}</span>
             <span class="model-strategy">{app.currentModel.strategy}</span>
           </button>
@@ -532,6 +570,21 @@
   {#if app.stalledAt != null}
     <div class="stall-banner" role="alert">
       Model stalled — no tool calls or done signal. Type a follow-up or rephrase your request.
+    </div>
+  {/if}
+
+  {#if app.recoveryToast}
+    <!-- L3-2: recovery toast — fades out after 6s via CSS animation. -->
+    <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+    <div
+      class="recovery-toast"
+      role="status"
+      aria-live="polite"
+      onanimationend={() => (app = { ...app, recoveryToast: null })}
+      onclick={() => (app = { ...app, recoveryToast: null })}
+      onkeydown={() => {}}
+    >
+      {app.recoveryToast.text}
     </div>
   {/if}
 
@@ -928,5 +981,55 @@
     /* v60.50 — sized via inherited 0.75rem from `.help *`; padding bumped
        slightly so the box height matches the adjacent text-only spans. */
     padding: 0.15rem 0.35rem;
+  }
+
+  /* L1-3 — endpoint health dot on the model badge. */
+  .health-dot {
+    display: inline-block;
+    width: 0.45rem;
+    height: 0.45rem;
+    border-radius: 50%;
+    background: var(--fg-dim);
+    flex-shrink: 0;
+  }
+  .health-dot--reachable {
+    background: var(--accent-green, #4ec9b0);
+  }
+  .health-dot--unreachable {
+    background: var(--accent-red, #e06c75);
+  }
+
+  /* L1-4 — unverified context-cap marker: dim the denominator. */
+  .ctx-text.cap-unverified {
+    opacity: 0.55;
+    font-style: italic;
+  }
+
+  /* L3-2 — recovery toast. Floats above the footer, fades after 6s. */
+  .recovery-toast {
+    position: fixed;
+    bottom: 3.5rem;
+    left: 50%;
+    transform: translateX(-50%);
+    background: color-mix(in srgb, var(--accent-green) 18%, var(--bg-pane));
+    border: 1px solid var(--accent-green, #4ec9b0);
+    border-radius: 6px;
+    color: var(--accent-green, #4ec9b0);
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    padding: 0.4rem 0.9rem;
+    z-index: 50;
+    cursor: pointer;
+    animation: toast-fade 6s forwards;
+    pointer-events: auto;
+  }
+  @keyframes toast-fade {
+    0%, 70% { opacity: 1; }
+    100% { opacity: 0; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .recovery-toast {
+      animation: none;
+    }
   }
 </style>

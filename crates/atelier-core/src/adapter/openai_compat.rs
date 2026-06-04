@@ -119,6 +119,27 @@ const MAX_RESPONSE_BODY_BYTES: usize = 32 << 20;
 const MIN_RATE_LIMIT_BACKOFF_MS: u64 = 100;
 const DEFAULT_RATE_LIMIT_BACKOFF_MS: u64 = 1_000;
 
+/// Outcome of [`OpenAiCompatAdapter::probe_context_window`].
+/// The single caller (`atelier-gui::build_swap_adapter`) uses this to
+/// drive the endpoint-health badge without re-parsing the adapter's
+/// internal capability state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProbeOutcome {
+    /// `/v1/models` answered and the entry carried `max_model_len` —
+    /// the context window is verified and the adapter state was updated.
+    WindowVerified { tokens: u32 },
+    /// `/v1/models` answered but had no `max_model_len` field (OpenAI
+    /// proper, older llama.cpp). The endpoint is **reachable**; the
+    /// window value stays at the builder-set or default.
+    ReachableNoWindow,
+    /// Connect or request failed — endpoint unreachable.
+    Unreachable { error: String },
+    /// Endpoint answered but the response was malformed (non-2xx, bad
+    /// JSON, missing `data` array). The endpoint is likely reachable;
+    /// carry the detail for display in the health tooltip.
+    MalformedResponse { detail: String },
+}
+
 /// Concrete BYOM adapter for any server speaking the OpenAI
 /// `/v1/chat/completions` format.
 ///
@@ -235,22 +256,20 @@ impl OpenAiCompatAdapter {
     /// vLLM, sglang, llama-server, and LM Studio all expose `max_model_len`
     /// as an integer on each model entry; OpenAI proper does not, so a
     /// missing field is treated as "no information" and the existing value
-    /// (default or builder-set) is preserved. The adapter call sites in
-    /// `atelier-gui` and `atelier-cli` invoke this once after construction
-    /// so the GUI footer / TUI meter shows the real ceiling (e.g. vLLM's
-    /// `max_model_len = 32768`) instead of the conservative 8 KiB default.
+    /// (default or builder-set) is preserved.
     ///
-    /// Best-effort: network errors, non-2xx responses, JSON parse failures,
-    /// and missing fields are all logged via `tracing::debug!` rather than
-    /// returned. The adapter must remain usable when the probe fails — the
-    /// probe is a capability hint, not a precondition. OpenAI proper hits
-    /// this every time and that's the intended behaviour: keep the
-    /// builder-set / default value, do not block construction.
+    /// Returns a [`ProbeOutcome`] so the single caller in `atelier-gui` can
+    /// distinguish "endpoint dead" from "endpoint alive but no window info"
+    /// and drive the endpoint-health badge accordingly. The adapter's
+    /// internal state is always updated regardless of the outcome.
     ///
-    /// Sends `Authorization: Bearer …` when an api_key is set so vLLM
-    /// endpoints behind `--api-key` succeed without changing the adapter's
-    /// auth posture for the subsequent chat traffic.
-    pub async fn probe_context_window(&mut self) {
+    /// Best-effort: the adapter must remain usable when the probe fails —
+    /// the probe is a capability hint, not a precondition.
+    ///
+    /// Note: `atelier-gui` is the only caller (confirmed by grep). The
+    /// prior doc comment claimed `atelier-cli` also calls this — that was
+    /// stale; the CLI build path never invokes `probe_context_window`.
+    pub async fn probe_context_window(&mut self) -> ProbeOutcome {
         let url = format!("{}/models", self.base_url.trim_end_matches('/'));
         let req = self.http.get(&url);
         let req = if self.api_key.is_empty() {
@@ -262,27 +281,34 @@ impl OpenAiCompatAdapter {
             Ok(r) => r,
             Err(e) => {
                 tracing::debug!(error = %e, %url, "probe_context_window: GET failed");
-                return;
+                return ProbeOutcome::Unreachable {
+                    error: e.to_string(),
+                };
             }
         };
         if !resp.status().is_success() {
+            let detail = format!("HTTP {}", resp.status());
             tracing::debug!(
                 status = %resp.status(),
                 %url,
                 "probe_context_window: non-success response"
             );
-            return;
+            return ProbeOutcome::MalformedResponse { detail };
         }
         let body: serde_json::Value = match resp.json().await {
             Ok(v) => v,
             Err(e) => {
                 tracing::debug!(error = %e, "probe_context_window: JSON parse failed");
-                return;
+                return ProbeOutcome::MalformedResponse {
+                    detail: e.to_string(),
+                };
             }
         };
         let Some(entries) = body.get("data").and_then(|d| d.as_array()) else {
             tracing::debug!("probe_context_window: response has no `data` array");
-            return;
+            return ProbeOutcome::MalformedResponse {
+                detail: "response has no `data` array".to_string(),
+            };
         };
         let target = self.provider_model_name();
         let entry = entries
@@ -291,14 +317,14 @@ impl OpenAiCompatAdapter {
             .or_else(|| entries.first());
         let Some(entry) = entry else {
             tracing::debug!("probe_context_window: response `data` is empty");
-            return;
+            return ProbeOutcome::ReachableNoWindow;
         };
         let Some(raw) = entry.get("max_model_len").and_then(|v| v.as_u64()) else {
             tracing::debug!(
                 model = target,
                 "probe_context_window: entry has no max_model_len (OpenAI proper or older server)"
             );
-            return;
+            return ProbeOutcome::ReachableNoWindow;
         };
         // u32 ceiling for the existing field type. Saturating cast is
         // robust to a server returning an absurd integer.
@@ -323,6 +349,15 @@ impl OpenAiCompatAdapter {
         // suitability score (`prompt_cache` factor, 5/5 instead of 0/5
         // plus a "prompt caching is available" strength) match reality.
         self.capabilities.prompt_cache = CapabilityClaim::Supported;
+        ProbeOutcome::WindowVerified { tokens: new_val }
+    }
+
+    /// Test-only: replace the internal reqwest client, e.g. to inject a
+    /// short connect timeout for a connect-failure test.
+    #[cfg(test)]
+    pub fn with_http_client(mut self, client: reqwest::Client) -> Self {
+        self.http = client;
+        self
     }
 
     /// Provider-side model name (the part after `<provider>:`). Used
@@ -1280,7 +1315,12 @@ mod tests {
         // Conservative default before the probe — covers OpenAI proper +
         // any server that doesn't advertise `max_model_len`.
         assert_eq!(a.capabilities().prompt_cache, CapabilityClaim::Unsupported);
-        a.probe_context_window().await;
+        let outcome = a.probe_context_window().await;
+        assert_eq!(
+            outcome,
+            ProbeOutcome::WindowVerified { tokens: 32_768 },
+            "probe must return WindowVerified when max_model_len is present"
+        );
         assert_eq!(a.capabilities().context_window_tokens, 32_768);
         // Seeing `max_model_len` is a vLLM/sglang signal; both have
         // prefix caching enabled by default, so the probe flips the
@@ -1304,20 +1344,20 @@ mod tests {
             .mount(&server)
             .await;
         let mut a = adapter_for(&server);
-        a.probe_context_window().await;
+        let outcome = a.probe_context_window().await;
         // Picks the entry whose id matches the adapter's served model name,
         // not just the first entry.
         assert_eq!(a.capabilities().context_window_tokens, 65_536);
+        assert_eq!(outcome, ProbeOutcome::WindowVerified { tokens: 65_536 });
     }
 
     #[tokio::test]
     async fn probe_preserves_default_when_max_model_len_absent() {
         // OpenAI proper's /v1/models response: no `max_model_len` field.
-        // The probe must silently keep the existing default rather than
-        // clobber it with 0 or panic on the missing field — and it must
-        // NOT flip `prompt_cache` to Supported, because the absence of
-        // `max_model_len` is precisely what distinguishes OpenAI proper
-        // from vLLM/sglang here.
+        // The probe must return ReachableNoWindow and keep the existing
+        // default rather than clobber it — and must NOT flip `prompt_cache`
+        // to Supported, because the absence of `max_model_len` is precisely
+        // what distinguishes OpenAI proper from vLLM/sglang here.
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/models"))
@@ -1328,7 +1368,12 @@ mod tests {
             .mount(&server)
             .await;
         let mut a = adapter_for(&server);
-        a.probe_context_window().await;
+        let outcome = a.probe_context_window().await;
+        assert_eq!(
+            outcome,
+            ProbeOutcome::ReachableNoWindow,
+            "missing max_model_len must return ReachableNoWindow"
+        );
         assert_eq!(
             a.capabilities().context_window_tokens,
             DEFAULT_CONTEXT_WINDOW_TOKENS
@@ -1337,9 +1382,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn probe_preserves_default_on_non_success_response() {
+    async fn probe_returns_malformed_response_on_non_success() {
         // A misbehaving / unauthenticated server returning 401/500 must
-        // not erase the adapter's configured context-window value.
+        // not erase the adapter's configured context-window value, and
+        // must return MalformedResponse so the caller can set the health dot.
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/models"))
@@ -1347,12 +1393,16 @@ mod tests {
             .mount(&server)
             .await;
         let mut a = adapter_for(&server).with_context_window(131_072);
-        a.probe_context_window().await;
+        let outcome = a.probe_context_window().await;
         assert_eq!(a.capabilities().context_window_tokens, 131_072);
+        assert!(
+            matches!(outcome, ProbeOutcome::MalformedResponse { .. }),
+            "non-2xx must return MalformedResponse; got {outcome:?}"
+        );
     }
 
     #[tokio::test]
-    async fn probe_preserves_default_when_data_array_is_missing() {
+    async fn probe_returns_malformed_response_when_data_array_missing() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/models"))
@@ -1362,10 +1412,39 @@ mod tests {
             .mount(&server)
             .await;
         let mut a = adapter_for(&server);
-        a.probe_context_window().await;
+        let outcome = a.probe_context_window().await;
         assert_eq!(
             a.capabilities().context_window_tokens,
             DEFAULT_CONTEXT_WINDOW_TOKENS
+        );
+        assert!(
+            matches!(outcome, ProbeOutcome::MalformedResponse { .. }),
+            "missing `data` array must return MalformedResponse; got {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_returns_unreachable_on_connect_failure() {
+        // Port 0 is not a listening service and the connect will either
+        // fail immediately (ECONNREFUSED) or time out. Use a very short
+        // timeout so the test finishes quickly.
+        //
+        // We can't use `http://127.0.0.1:0/v1` (reserved). Instead bind a
+        // real listener, record its port, then drop it so the port is
+        // closed when the probe runs.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener); // port is now closed; connects should refuse quickly
+        let url = format!("http://127.0.0.1:{port}/v1");
+        let fast_client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_millis(500))
+            .build()
+            .unwrap();
+        let mut a = OpenAiCompatAdapter::new("key", "local:m", url).with_http_client(fast_client);
+        let outcome = a.probe_context_window().await;
+        assert!(
+            matches!(outcome, ProbeOutcome::Unreachable { .. }),
+            "connect failure must return Unreachable; got {outcome:?}"
         );
     }
 
@@ -1410,8 +1489,9 @@ mod tests {
             .mount(&server)
             .await;
         let mut a = adapter_for_no_auth(&server);
-        a.probe_context_window().await;
+        let outcome = a.probe_context_window().await;
         assert_eq!(a.capabilities().context_window_tokens, 16_384);
+        assert_eq!(outcome, ProbeOutcome::WindowVerified { tokens: 16_384 });
     }
 
     // ---------- non-streaming chat ----------
