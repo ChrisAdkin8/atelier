@@ -720,13 +720,15 @@ async fn run_bails_after_max_turns_without_claimed_done() {
     let report = runner.run("never done".into()).await.unwrap();
     assert_eq!(report.turns, 2);
     assert_ne!(report.final_state, State::Done);
-    // Specifically NOT AwaitingUser — that's the v60.15 stall signal.
-    // Reaching max_turns with progress (tool calls every turn) leaves
-    // the runner in `Streaming` per the pre-stall-guard contract.
-    assert_ne!(
+    // Since F2 (v60.99) max_turns exhaustion correctly transitions to
+    // AwaitingUser (exit code 6) rather than leaving the state as Streaming.
+    // The old assertion `!= AwaitingUser` was testing the pre-fix (broken)
+    // behaviour; the contract the doc-comment on Runner::run has always
+    // promised is "max_turns reached → AwaitingUser".
+    assert_eq!(
         report.final_state,
         State::AwaitingUser,
-        "tool-call-bearing turns must NOT trigger the stall guard"
+        "max_turns exhaustion must set final_state = AwaitingUser"
     );
     assert_eq!(report.dod_passed, None); // no DoD configured
 }
@@ -5565,6 +5567,79 @@ async fn max_turns_one_executes_exactly_one_turn() {
 }
 
 #[tokio::test]
+async fn max_turns_exhaustion_reports_awaiting_user_and_stalled_event() {
+    // When every turn returns Continue and max_turns is exhausted without
+    // claimed_done, the runner must:
+    //   (a) set final_state = AwaitingUser (so exit_code_for_final_state → 6),
+    //   (b) emit exactly one AgentStalled event with "max_turns" in the reason.
+    // Guards the F2 fix (pre-fix the loop left final_state = Streaming → exit 0).
+    let workspace = tempfile::TempDir::new().unwrap();
+    // Each response makes a tool call so the stall guard does NOT fire — we want
+    // to exercise the exhaustion path, not the stall-detection path.
+    let list_dir_call = ToolCallRequest {
+        id: "tc-list".into(),
+        name: "list_dir".into(),
+        arguments: serde_json::json!({"path": "."}),
+    };
+    let responses = vec![
+        MockResponse {
+            assistant_text: "turn 1".into(),
+            tool_calls: vec![list_dir_call.clone()],
+            overflow: None,
+        },
+        MockResponse {
+            assistant_text: "turn 2".into(),
+            tool_calls: vec![list_dir_call.clone()],
+            overflow: None,
+        },
+    ];
+    let events = Arc::new(parking_lot::Mutex::new(Vec::<Event>::new()));
+    let runner = Runner::new(
+        workspace.path().to_path_buf(),
+        ProviderChoice::Mock { responses },
+        EventSink::Capture(events.clone()),
+    )
+    .expect("mock runner construction is infallible")
+    .with_max_turns(2);
+
+    let report = runner.run("keep going".into()).await.unwrap();
+
+    // (a) final_state must be AwaitingUser, not Streaming
+    assert_eq!(
+        report.final_state,
+        atelier_core::State::AwaitingUser,
+        "max_turns exhaustion must set final_state = AwaitingUser (not {:?})",
+        report.final_state
+    );
+    assert_eq!(
+        atelier_cli::exit_code_for_final_state(report.final_state),
+        6,
+        "exit code must be 6 for AwaitingUser"
+    );
+
+    // (b) exactly one AgentStalled event with "max_turns" in the reason
+    let stalled: Vec<(usize, String)> = events
+        .lock()
+        .iter()
+        .filter_map(|e| match e {
+            Event::AgentStalled { turn, reason } => Some((*turn, reason.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        stalled.len(),
+        1,
+        "expected exactly one AgentStalled event; got {}",
+        stalled.len()
+    );
+    assert!(
+        stalled[0].1.contains("max_turns"),
+        "AgentStalled.reason must mention max_turns; got: {:?}",
+        stalled[0].1
+    );
+}
+
+#[tokio::test]
 async fn concurrent_runs_on_separate_workspaces_do_not_corrupt_session_json() {
     // Two Runner::run calls on *different* workspace directories execute
     // concurrently. Each must write a valid session.json to its own session
@@ -5616,4 +5691,50 @@ async fn concurrent_runs_on_separate_workspaces_do_not_corrupt_session_json() {
             "runner {label}: session.json missing session_uuid field"
         );
     }
+}
+
+// ---- Bundle 1 / F3 — persist failure surfaces in RunReport ----
+
+#[tokio::test]
+#[cfg(unix)]
+async fn persist_failure_sets_report_persist_error() {
+    // Point the workspace at a directory whose .atelier/sessions subdirectory
+    // is read-only, so save_split_to fails. The run must still succeed
+    // (persist_error is non-fatal) but RunReport.persist_error must be Some.
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    let workspace = tempfile::TempDir::new().unwrap();
+
+    // Pre-create the sessions dir and make it read-only so the runner
+    // cannot create a session subdirectory inside it.
+    let sessions_dir = workspace.path().join(".atelier").join("sessions");
+    fs::create_dir_all(&sessions_dir).unwrap();
+    let mut perms = fs::metadata(&sessions_dir).unwrap().permissions();
+    perms.set_mode(0o555); // r-xr-xr-x — no writes
+    fs::set_permissions(&sessions_dir, perms).unwrap();
+
+    let responses = vec![MockResponse {
+        assistant_text: "done".into(),
+        tool_calls: vec![],
+        overflow: None,
+    }];
+    let runner = Runner::new(
+        workspace.path().to_path_buf(),
+        ProviderChoice::Mock { responses },
+        EventSink::Null,
+    )
+    .expect("mock runner construction is infallible");
+
+    let report = runner.run("test persist failure".into()).await.unwrap();
+
+    // Restore permissions so TempDir cleanup can delete the directory.
+    let mut perms = fs::metadata(&sessions_dir).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&sessions_dir, perms).unwrap();
+
+    assert!(
+        report.persist_error.is_some(),
+        "persist_error must be Some when session_dir is read-only; got None"
+    );
 }

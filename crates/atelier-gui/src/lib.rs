@@ -125,6 +125,14 @@ pub enum SwapDecision {
 /// hung webview can't pin the credential-bearing path forever.
 const SWAP_CONSENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// Upper bound on the best-effort `/v1/models` capability probe in
+/// [`build_swap_adapter`]. The probe only refines the context-window
+/// denominator for the footer meter, so it must never gate the UI: an
+/// unreachable endpoint should fall through to static capabilities fast
+/// rather than block badge hydration (and the first turn) on the
+/// adapter's 600s request timeout.
+const PROBE_TIMEOUT_SECS: u64 = 4;
+
 impl SessionState {
     /// Per-process workspace root. v60.45 — if `workspace_override`
     /// is `Some`, returns that path (user picked a real repo via
@@ -676,17 +684,42 @@ fn list_provider_profiles(state: tauri::State<'_, SessionState>) -> Vec<SwapOpti
 }
 
 #[tauri::command]
-fn snapshot_current_model(state: tauri::State<'_, SessionState>) -> Result<BridgedEvent, String> {
+async fn snapshot_current_model(
+    state: tauri::State<'_, SessionState>,
+) -> Result<BridgedEvent, String> {
     let adapter = match state.adapter_handle.get() {
         Some(adapter) => adapter,
         None => {
-            let adapter = resolve_default_adapter(&state.workspace_root()).unwrap_or_else(|e| {
-                tracing::debug!(
-                    error = %e,
-                    "snapshot_current_model: falling back to mock default"
-                );
-                std::sync::Arc::new(atelier_core::adapter::MockAdapter::new("mock:default"))
-            });
+            // Lazily resolve the providers.toml default. On failure, do NOT
+            // install a Mock fallback into the slot. The previous behaviour
+            // swapped in a queueless `MockAdapter` whenever `resolve_default_adapter`
+            // returned an error (missing/invalid providers.toml, keyring access
+            // refused, etc.), which then masked the underlying problem: the
+            // chat path's own lazy init at the start of `run_chat` reads
+            // `state.adapter_handle.get()` and reuses whatever it finds, so a
+            // Mock-fallback installed here silently routes the user's first
+            // prompt through Mock and surfaces an unhelpful
+            // `adapter not configured: no queued stream` error instead of
+            // the real reason the default profile failed to load.
+            //
+            // Returning the error here keeps the slot empty so the chat
+            // path's `resolve_default_adapter` (~line 2243) runs fresh on
+            // first prompt and either succeeds against the real provider or
+            // propagates the real failure to the user. The dropdown's
+            // `is_default` row hydration (via `list_provider_profiles`) is
+            // independent of this command, so the first-paint UX is
+            // unaffected; the footer's model badge stays empty until the
+            // first chat or an explicit dropdown swap installs the real
+            // adapter.
+            let adapter = resolve_default_adapter(&state.workspace_root())
+                .await
+                .map_err(|e| {
+                    tracing::warn!(
+                        error = %e,
+                        "snapshot_current_model: default resolve failed; slot left empty"
+                    );
+                    e
+                })?;
             state.adapter_handle.swap(adapter.clone());
             adapter
         }
@@ -909,7 +942,7 @@ pub fn list_skills_in(repo_root: &std::path::Path) -> Vec<SkillWire> {
 /// Errors map to a stringified message so the Composer can surface
 /// them inline.
 #[tauri::command]
-fn invoke_skill(
+async fn invoke_skill(
     app: AppHandle,
     state: tauri::State<'_, SessionState>,
     name: String,
@@ -932,7 +965,7 @@ fn invoke_skill(
         .map_err(|e| format!("skill `/{name}`: {e}"))?;
     // Delegate to the Runner-backed path so sub-agents, tools, and §7
     // verification are available during skill execution.
-    start_agent_run(app, state, expanded)
+    start_agent_run(app, state, expanded).await
 }
 
 /// v60.10 §1 BYOM — build a fresh `Arc<dyn Adapter>` from a
@@ -941,7 +974,7 @@ fn invoke_skill(
 /// have to go through the full `Runner` constructor. Reads
 /// `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` from the environment, same
 /// as the binary path.
-fn build_swap_adapter(
+async fn build_swap_adapter(
     provider: SwapProviderWire,
 ) -> Result<std::sync::Arc<dyn atelier_core::adapter::Adapter>, String> {
     use atelier_core::adapter::{
@@ -967,6 +1000,29 @@ fn build_swap_adapter(
             if cache_prompt {
                 adapter = adapter.with_cache_prompt(true);
             }
+            // Best-effort, time-boxed capability probe: vLLM, sglang,
+            // llama-server, and LM Studio advertise `max_model_len` on
+            // `/v1/models`. OpenAI proper does not, so the probe silently
+            // falls through to the adapter's `DEFAULT_CONTEXT_WINDOW_TOKENS`
+            // for those endpoints. The adapter is single-owner here (not yet
+            // wrapped in `Arc`), so the mutable probe call requires no
+            // interior mutability.
+            //
+            // The wrapping timeout matters: the OpenAiCompat reqwest client
+            // has a 600s overall timeout and NO connect timeout, so an
+            // unreachable endpoint (a torn-down dev server, a stale ELB)
+            // would block this `await` for up to ten minutes. That hang
+            // propagates to the mount-time `snapshot_current_model` call,
+            // leaving the footer's model-fit badge empty for the whole
+            // duration — and to the first chat/agent turn. Bounding the
+            // probe to a few seconds means an unreachable endpoint simply
+            // falls through to static capabilities, exactly as the probe
+            // already does on a non-success response or parse error.
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(PROBE_TIMEOUT_SECS),
+                adapter.probe_context_window(),
+            )
+            .await;
             Ok(std::sync::Arc::new(adapter))
         }
     }
@@ -1102,7 +1158,7 @@ async fn swap_adapter(
     // on Accept hit the now-empty registry and surfaced
     // "no pending swap with id <uuid>" — a confusing downstream
     // symptom of the missing rejection event.
-    let new_adapter = match build_swap_adapter(provider) {
+    let new_adapter = match build_swap_adapter(provider).await {
         Ok(a) => a,
         Err(e) => {
             emit_event(
@@ -2075,7 +2131,7 @@ fn strip_frontmatter(s: &str) -> &str {
 /// model would otherwise get "no adapter selected" with no way out
 /// short of toggling the dropdown twice. This helper closes that
 /// gap by activating the default exactly as the CLI does.
-fn resolve_default_adapter(
+async fn resolve_default_adapter(
     repo_root: &std::path::Path,
 ) -> Result<std::sync::Arc<dyn atelier_core::adapter::Adapter>, String> {
     use atelier_core::config::{ProviderKind, ProvidersConfig};
@@ -2124,13 +2180,13 @@ fn resolve_default_adapter(
             cache_prompt: prof.cache_prompt.unwrap_or(false),
         },
     };
-    build_swap_adapter(wire)
+    build_swap_adapter(wire).await
 }
 
 /// §1 per-task routing — build the executor adapter from the profile
 /// named in `[routing].executor`. Returns `None` when routing is not
 /// configured; returns `Err` if the profile exists but is misconfigured.
-fn resolve_executor_adapter(
+async fn resolve_executor_adapter(
     repo_root: &std::path::Path,
 ) -> Result<Option<std::sync::Arc<dyn atelier_core::adapter::Adapter>>, String> {
     use atelier_core::config::{ProviderKind, ProvidersConfig};
@@ -2176,7 +2232,8 @@ fn resolve_executor_adapter(
                 base_url: Some(base),
                 api_key: prof.api_key.clone(),
                 cache_prompt: prof.cache_prompt.unwrap_or(false),
-            })?
+            })
+            .await?
         }
         ProviderKind::Anthropic => {
             use atelier_core::adapter::anthropic::AnthropicAdapter;
@@ -2215,7 +2272,7 @@ fn resolve_executor_adapter(
 /// Concurrent-run guard reuses `run_in_flight` so the Composer
 /// disables correctly while a turn is in flight.
 #[tauri::command]
-fn start_chat_run(
+async fn start_chat_run(
     app: AppHandle,
     state: tauri::State<'_, SessionState>,
     prompt: String,
@@ -2240,7 +2297,7 @@ fn start_chat_run(
     // an explicit dropdown swap.
     let (adapter, default_was_built) = match state.adapter_handle.get() {
         Some(a) => (a, false),
-        None => match resolve_default_adapter(&state.workspace_root()) {
+        None => match resolve_default_adapter(&state.workspace_root()).await {
             Ok(a) => {
                 state.adapter_handle.swap(a.clone());
                 (a, true)
@@ -2267,9 +2324,25 @@ fn start_chat_run(
     let chat_history = Arc::clone(&state.chat_history);
     let app_clone = app.clone();
     let run_in_flight = state.run_in_flight.clone();
+    // Emit RunStarted now (before the spawn) so the frontend's
+    // `runInFlight` flips true and the header wordmark glows for the
+    // duration of the chat turn. Unlike `start_agent_run`, the chat path
+    // historically never emitted RunStarted/RunFinished, so the
+    // "thinking" glow only ever fired for agent-routed prompts. The
+    // matching RunFinished is emitted by `ChatRunCleanup`'s Drop so it
+    // fires on every exit path (normal completion, stream error,
+    // mid-stream error, or panic inside the spawned task).
+    let _ = app.emit(
+        "atelier://event",
+        BridgedEvent {
+            kind: "RunStarted",
+            payload: serde_json::Value::Null,
+        },
+    );
     tauri::async_runtime::spawn(async move {
         let _cleanup = ChatRunCleanup {
             in_flight: run_in_flight,
+            app: app_clone.clone(),
         };
         // First chat through the default-built adapter: synthesise a
         // `ModelProfileLoaded` so the footer's context-usage meter has a
@@ -2523,7 +2596,7 @@ fn start_chat_run(
 /// the run doesn't block awaiting a DiffPane that no longer exists in the
 /// chat-REPL GUI.
 #[tauri::command]
-fn start_agent_run(
+async fn start_agent_run(
     app: AppHandle,
     state: tauri::State<'_, SessionState>,
     prompt: String,
@@ -2537,7 +2610,7 @@ fn start_agent_run(
     }
     let (adapter, _) = match state.adapter_handle.get() {
         Some(a) => (a, false),
-        None => match resolve_default_adapter(&state.workspace_root()) {
+        None => match resolve_default_adapter(&state.workspace_root()).await {
             Ok(a) => {
                 state.adapter_handle.swap(a.clone());
                 (a, true)
@@ -2624,10 +2697,17 @@ fn start_agent_run(
         .with_adapter_handle(adapter_handle)
         .with_external_cancel(cancel_token);
     // §1 per-task routing — wire executor adapter if configured.
-    match resolve_executor_adapter(&state.workspace_root()) {
+    // Fail fast on error: the user explicitly set [routing].executor;
+    // silently falling back to the planner adapter produces misleading
+    // behaviour (wrong model for tool turns) that is worse than a clear
+    // error. Consistent with the CLI's fail-fast behaviour (Q3 / v60.100).
+    match resolve_executor_adapter(&state.workspace_root()).await {
         Ok(Some(exec)) => runner = runner.with_executor_adapter(exec),
         Ok(None) => {}
-        Err(e) => tracing::warn!(error = %e, "routing.executor: skipping"),
+        Err(e) => {
+            run_in_flight.store(false, std::sync::atomic::Ordering::Release);
+            return Err(format!("routing.executor failed: {e} — remove [routing].executor from providers.toml to run without per-task routing"));
+        }
     }
 
     // Emit immediately so the frontend shows a spinner before the first
@@ -2701,16 +2781,29 @@ fn cancel_run(state: tauri::State<'_, SessionState>) {
 }
 
 /// v60.43 — minimal drop-guard for `start_chat_run`'s spawned task.
-/// Only clears `run_in_flight`; there's no per-run workspace to
-/// remove because the chat path doesn't construct a Runner.
+/// Clears `run_in_flight` and emits `RunFinished` on every exit path;
+/// there's no per-run workspace to remove because the chat path doesn't
+/// construct a Runner.
 struct ChatRunCleanup {
     in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    app: AppHandle,
 }
 
 impl Drop for ChatRunCleanup {
     fn drop(&mut self) {
         self.in_flight
             .store(false, std::sync::atomic::Ordering::Release);
+        // Pair the RunStarted emitted by `start_chat_run`. Emitting from
+        // Drop covers every exit (normal completion, the early `return`s
+        // on stream/mid-stream errors, and panics) so the frontend's
+        // `runInFlight` reliably flips false and the wordmark glow stops.
+        let _ = self.app.emit(
+            "atelier://event",
+            BridgedEvent {
+                kind: "RunFinished",
+                payload: serde_json::Value::Null,
+            },
+        );
     }
 }
 
@@ -3702,8 +3795,8 @@ mod tests {
         assert!(is_base_url_allowed(None));
     }
 
-    #[test]
-    fn default_openai_profile_uses_swap_allowlist() {
+    #[tokio::test]
+    async fn default_openai_profile_uses_swap_allowlist() {
         let tmp = tempfile::tempdir().unwrap();
         let dot_atelier = tmp.path().join(".atelier");
         std::fs::create_dir_all(&dot_atelier).unwrap();
@@ -3720,7 +3813,10 @@ model = "local:evil"
         )
         .unwrap();
 
-        let err = match resolve_default_adapter(tmp.path()) {
+        // resolve_default_adapter is async since the build path probes
+        // /v1/models for `max_model_len`. The allowlist gate fires before
+        // any network call, so the test still runs without a mock server.
+        let err = match resolve_default_adapter(tmp.path()).await {
             Ok(_) => panic!("malicious base_url must reject"),
             Err(e) => e,
         };
@@ -3728,8 +3824,8 @@ model = "local:evil"
         assert!(err.contains("evil.example"), "got: {err}");
     }
 
-    #[test]
-    fn executor_openai_profile_uses_swap_allowlist() {
+    #[tokio::test]
+    async fn executor_openai_profile_uses_swap_allowlist() {
         let tmp = tempfile::tempdir().unwrap();
         let dot_atelier = tmp.path().join(".atelier");
         std::fs::create_dir_all(&dot_atelier).unwrap();
@@ -3747,7 +3843,7 @@ model = "local:evil"
         )
         .unwrap();
 
-        let err = match resolve_executor_adapter(tmp.path()) {
+        let err = match resolve_executor_adapter(tmp.path()).await {
             Ok(_) => panic!("malicious executor base_url must reject"),
             Err(e) => e,
         };

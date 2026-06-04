@@ -196,6 +196,14 @@ pub struct RunReport {
     /// §10 — number of turns actually consumed (alias for `turns` for
     /// clarity in sub-agent callers).
     pub turns_used: usize,
+    /// Non-None when the end-of-run session snapshot failed to persist.
+    /// The run is still considered successful (the in-memory result is
+    /// valid); this field lets drivers surface the failure to the user
+    /// without failing the run. Drivers must NOT write to stderr themselves
+    /// — the CLI does it in main.rs; the TUI should render a status line;
+    /// the GUI should toast. (Runner is a library linked by raw-mode TUI;
+    /// library-side stderr writes corrupt the alternate screen.)
+    pub persist_error: Option<String>,
 }
 
 /// Shared slot a caller registers via [`Runner::with_dispatcher_handle`]
@@ -388,6 +396,10 @@ pub struct Runner {
     /// `Event::FilesChanged` and waits for a user decision; `AutoReload`
     /// auto-resolves to Reload for `--non-interactive` mode.
     concurrent_edit_policy: ConcurrentEditPolicy,
+    /// §14 — seconds to wait for a user response to the Modal concurrent-edit
+    /// prompt before auto-resuming. Default 300 (5 min). Configurable via
+    /// `[runner] pause_timeout_secs` in providers.toml.
+    pause_timeout_secs: u64,
     /// v61 — §14 resume. When `Some(uuid)`, the runner loads the
     /// on-disk session and replays its conversation prefix instead of
     /// starting from the supplied prompt. The prompt is appended after
@@ -692,6 +704,7 @@ impl Runner {
             pane_visibility: None,
             cost_policy,
             concurrent_edit_policy: ConcurrentEditPolicy::Modal,
+            pause_timeout_secs: 300,
             resume_from: None,
             initial_mental_model: None,
             non_interactive: false,
@@ -942,6 +955,15 @@ impl Runner {
     #[allow(dead_code)] // called from main.rs; integration tests pull this file via `#[path]`.
     pub fn with_concurrent_edit_policy(mut self, policy: ConcurrentEditPolicy) -> Self {
         self.concurrent_edit_policy = policy;
+        self
+    }
+
+    /// Override the §14 Modal pause timeout (seconds before auto-resume).
+    /// Default 300 (5 min). Configurable via `[runner] pause_timeout_secs`
+    /// in `providers.toml`.
+    #[allow(dead_code)]
+    pub fn with_pause_timeout_secs(mut self, secs: u64) -> Self {
+        self.pause_timeout_secs = secs;
         self
     }
 
@@ -1219,7 +1241,18 @@ impl Runner {
             }
             let result_str = match &outcome.result {
                 Ok(r) => tool_result_string_for_model(&r.output, self.subagent_depth > 0),
-                Err(e) => serde_json::json!({ "error": e.to_string() }).to_string(),
+                Err(e) => {
+                    // Log the full typed error chain so the host-side diagnostic
+                    // path (tracing spans, log aggregation) sees the cause tree,
+                    // not just the stringified leaf. The payload sent to the model
+                    // is still a plain string — the model can't act on Rust types.
+                    tracing::warn!(
+                        tool = %outcome.tool_call_id,
+                        error = ?e,
+                        "tool call failed"
+                    );
+                    serde_json::json!({ "error": e.to_string() }).to_string()
+                }
             };
             let _ = try_emit(
                 bus,
@@ -1423,6 +1456,11 @@ impl Runner {
     /// Build the `OnDiskSession` snapshot and persist it to disk.
     /// Extracts the message materialisation + subagent record + pane-visibility
     /// logic from `run()` to reduce its cyclomatic complexity (Phase 3b R1b).
+    ///
+    /// Returns `Some(error_message)` when the session snapshot fails to save,
+    /// `None` on success. Callers should surface the error to the user (via
+    /// `persist_error` in `RunReport`) without failing the run — the in-memory
+    /// result is still valid.
     fn build_and_persist_session(
         &self,
         session_id: SessionId,
@@ -1431,7 +1469,7 @@ impl Runner {
         resumed_session: &Option<OnDiskSession>,
         spawner: &Arc<RunnerSpawner>,
         bus: &tokio::sync::broadcast::Sender<Event>,
-    ) {
+    ) -> Option<String> {
         let persist_uuid = self.resume_from.unwrap_or(session_id.0);
         let session_dir = OnDiskSession::session_dir(workspace, persist_uuid);
         let mut snapshot = OnDiskSession::fresh(
@@ -1536,9 +1574,13 @@ impl Runner {
             }
         }
 
-        if let Err(e) = snapshot.save_split_to(&session_dir) {
-            tracing::warn!(error = %e, "atelier run: session snapshot save failed");
-        }
+        let persist_error = if let Err(e) = snapshot.save_split_to(&session_dir) {
+            let msg = format!("session snapshot save failed: {e}");
+            tracing::warn!(error = %e, "atelier run: {msg}");
+            Some(msg)
+        } else {
+            None
+        };
 
         // Phase C close — write the pane-visibility record next to
         // `session.json` if the driver supplied one. Best-effort: a
@@ -1556,6 +1598,8 @@ impl Runner {
                 tracing::warn!(error = %e, "pane_visibility.json write failed");
             }
         }
+
+        persist_error
     }
 
     /// Gather §7 Tier-1 LSP diagnostics for modified TypeScript files.
@@ -2389,6 +2433,12 @@ impl Runner {
         // directory — falls back to bundled-only types). Build the spawner that
         // shares the parent's adapter; register it as the 8th built-in.
         let home_dir = std::env::var_os("HOME").map(PathBuf::from);
+        if home_dir.is_none() {
+            tracing::warn!(
+                "HOME is not set; user-level subagent type registry not loaded \
+                 (bundled types still available)"
+            );
+        }
         let type_registry = Arc::new(
             SubagentTypeRegistry::load(&workspace, home_dir.as_deref())
                 .map_err(|e| RunError::Config(format!("subagent type registry: {e}")))?,
@@ -2490,7 +2540,7 @@ impl Runner {
         let auto_reload_task = spawn_concurrent_edit_resolver(
             bus.clone(),
             self.concurrent_edit_policy,
-            std::time::Duration::from_secs(5 * 60),
+            std::time::Duration::from_secs(self.pause_timeout_secs),
         );
         // Publish the dispatcher to any caller-registered handle BEFORE
         // we start dispatching. The GUI's `submit_approval` Tauri
@@ -2802,11 +2852,36 @@ impl Runner {
             pending_skill_note,
         };
 
+        let mut turn_broke_early = false;
         for turn in 0..self.max_turns {
             match self.run_turn(&ctx, &mut state, turn).await? {
                 TurnControl::Continue => {}
-                TurnControl::Break => break,
+                TurnControl::Break => {
+                    turn_broke_early = true;
+                    break;
+                }
             }
+        }
+
+        // When every turn returned Continue and max_turns was exhausted, the
+        // actor is still in Streaming (execute_tool_calls advances back at
+        // runner.rs:~1243). Transition to AwaitingUser and emit AgentStalled so
+        // the GUI/TUI user sees why the run stopped, and so exit_code_for_final_state
+        // returns 6 instead of 0. Contract: the doc-comment on run() promises
+        // "max_turns reached (timeout; final_state = AwaitingUser)".
+        if !turn_broke_early && state.final_state == State::Streaming {
+            advance(&session_handle, State::Streaming, State::AwaitingUser).await?;
+            state.final_state = State::AwaitingUser;
+            let _ = try_emit(
+                &bus,
+                Event::AgentStalled {
+                    turn: self.max_turns,
+                    reason: format!(
+                        "max_turns ({}) exhausted without claimed_done",
+                        self.max_turns
+                    ),
+                },
+            );
         }
 
         // 9. DoD checks. The runner doesn't yet shell out to dod.checks
@@ -2856,7 +2931,7 @@ impl Runner {
         //     prior `session_uuid` so the on-disk path is stable; fresh
         //     runs use the actor's session id.
         let persist_uuid = self.resume_from.unwrap_or(session_id.0);
-        self.build_and_persist_session(
+        let persist_error = self.build_and_persist_session(
             session_id,
             &workspace,
             &state.messages,
@@ -2906,6 +2981,7 @@ impl Runner {
             envelope_conformance: envelope_conformance_snapshot,
             final_assistant_text: state.last_assistant_text,
             ledger_entries: ledger_snapshot,
+            persist_error,
         })
     }
 }
@@ -3286,11 +3362,35 @@ fn bounded_resume_prefix(
         return entries;
     }
 
+    // Count tool-call / tool-result rows before filtering them out so we can
+    // inject a synthetic note telling the model (and the user) what was dropped.
+    let dropped_tool_rows = entries
+        .iter()
+        .filter(|e| e.tool_call_id.is_some() || !e.tool_calls.is_empty())
+        .count();
+
     let mut out: Vec<atelier_core::persistence::ConversationEntry> = entries
         .iter()
         .filter(|e| e.role == "system")
         .cloned()
         .collect();
+
+    // If tool roundtrips were dropped, inject a synthetic system message so
+    // the model is not silently unaware that prior tool calls existed. This
+    // prevents the model from hallucinating a clean conversation history.
+    if dropped_tool_rows > 0 {
+        out.push(atelier_core::persistence::ConversationEntry {
+            role: "system".to_string(),
+            content: format!(
+                "[resume] {dropped_tool_rows} tool-call/result row(s) from the prior session \
+                 were omitted from the resume prefix (they exceed the prose-only cap). \
+                 The prior run stalled or was interrupted mid-tool-loop; continue from the \
+                 last user message."
+            ),
+            tool_call_id: None,
+            tool_calls: Vec::new(),
+        });
+    }
 
     let mut tail: Vec<atelier_core::persistence::ConversationEntry> = entries
         .iter()
@@ -3903,9 +4003,87 @@ mod tests {
         ];
 
         let bounded = bounded_resume_prefix(entries);
-        assert_eq!(bounded.len(), 2);
+        // system + synthetic-note + final prose assistant = 3 rows
+        assert_eq!(
+            bounded.len(),
+            3,
+            "expected system + synthetic note + final prose"
+        );
         assert_eq!(bounded[0].role, "system");
-        assert_eq!(bounded[1].content, "Final answer from the prior task.");
+        // Second row is the synthetic system note about dropped tool rows.
+        assert_eq!(bounded[1].role, "system");
+        assert!(
+            bounded[1].content.contains("[resume]"),
+            "synthetic note must start with [resume]"
+        );
+        assert_eq!(bounded[2].content, "Final answer from the prior task.");
+    }
+
+    #[test]
+    fn bounded_resume_prefix_prose_only_passes_through_without_synthetic_note() {
+        // A history with no tool rows and within caps passes through unchanged
+        // and must NOT get a synthetic note.
+        let entries = vec![
+            atelier_core::persistence::ConversationEntry {
+                role: "user".into(),
+                content: "hello".into(),
+                tool_call_id: None,
+                tool_calls: Vec::new(),
+            },
+            atelier_core::persistence::ConversationEntry {
+                role: "assistant".into(),
+                content: "hi there".into(),
+                tool_call_id: None,
+                tool_calls: Vec::new(),
+            },
+        ];
+        let bounded = bounded_resume_prefix(entries.clone());
+        assert_eq!(
+            bounded, entries,
+            "prose-only within-cap history must pass through unchanged"
+        );
+    }
+
+    #[test]
+    fn bounded_resume_prefix_synthetic_note_counts_dropped_rows() {
+        // When tool rows are dropped the synthetic note must name the count.
+        let entries = vec![
+            atelier_core::persistence::ConversationEntry {
+                role: "assistant".into(),
+                content: String::new(),
+                tool_call_id: None,
+                tool_calls: vec![serde_json::json!({"name": "read_file"})],
+            },
+            atelier_core::persistence::ConversationEntry {
+                role: "tool".into(),
+                content: "file content".into(),
+                tool_call_id: Some("tc-1".into()),
+                tool_calls: Vec::new(),
+            },
+            atelier_core::persistence::ConversationEntry {
+                role: "assistant".into(),
+                content: String::new(),
+                tool_call_id: None,
+                tool_calls: vec![serde_json::json!({"name": "write_file"})],
+            },
+            atelier_core::persistence::ConversationEntry {
+                role: "tool".into(),
+                content: "written".into(),
+                tool_call_id: Some("tc-2".into()),
+                tool_calls: Vec::new(),
+            },
+        ];
+        let bounded = bounded_resume_prefix(entries);
+        let note = bounded
+            .iter()
+            .find(|e| e.content.contains("[resume]"))
+            .unwrap();
+        // Two tool_calls rows + two tool-result rows = 4 dropped rows.
+        assert!(
+            note.content.contains('4'),
+            "note must mention the 4 dropped rows; got: {}",
+            note.content
+        );
     }
 
     #[test]
@@ -4236,5 +4414,33 @@ mod tests {
     #[test]
     fn last_turn_all_subagent_false_on_empty_messages() {
         assert!(!last_turn_was_all_subagent(&[]));
+    }
+
+    // ---- Q5 — subagent type registry loads bundled types when HOME is absent ----
+
+    #[test]
+    fn subagent_type_registry_loads_with_missing_home() {
+        // SubagentTypeRegistry::load with home_dir=None must succeed and return
+        // at least the bundled types (no user-home directory required).
+        // Guards the Q5 fix: the registry must not panic or return Err when HOME
+        // is unset; the warn fires at the call site in run(), which is not
+        // exercised here (logging is not captured in unit tests).
+        let workspace = tempfile::TempDir::new().unwrap();
+        // Pass None explicitly (simulates missing HOME without mutating env).
+        let registry = atelier_core::subagents::SubagentTypeRegistry::load(
+            workspace.path(),
+            None, // no user home
+        );
+        assert!(
+            registry.is_ok(),
+            "SubagentTypeRegistry::load must succeed with home=None; got: {:?}",
+            registry.err()
+        );
+        // Bundled types should still be present even without a user home dir.
+        let reg = registry.unwrap();
+        assert!(
+            !reg.is_empty(),
+            "registry must contain at least the bundled types when HOME is absent"
+        );
     }
 }

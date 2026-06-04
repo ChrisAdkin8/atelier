@@ -1,5 +1,78 @@
 # Atelier Spec — Changelog
 
+## v60.101 — 2026-06-04 (docs sweep)
+
+Full documentation sweep covering all changes since v60.93.
+
+- **README.md** — GUI section: prompt history (↑/↓) noted; `--max-turns` flag: exit code 6 documented; `providers.toml` example: `pause_timeout_secs` added to `[runner]`; troubleshooting table: three new rows (`[routing].executor` failure, exit 6 / max-turns timeout, session-not-persisted stderr warning).
+- **CAPABILITIES.md** — `§14 concurrent-edit modal`: "5-minute" replaced with "configurable via `pause_timeout_secs`"; executor pre-flight bullet: corrected from "warns and runs without turn routing" (the pre-Q3 behaviour) to the current fail-fast contract; GUI face: Composer readline-style prompt history (↑/↓) noted.
+- **ATELIER.md** — no changes required; all stable facts remain accurate.
+
+## v60.100 — 2026-06-04 (Bundle 2: P2 quality items)
+
+Closes the eight P2 items from the 2026-06-04 deep-scan audit (`tasks/plan_deep_scan_2026-06-04_fixes.md`). Gates: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings`, 77+57 unit + 121 integration tests, `svelte-check` 0 errors, `make check` 180/180. Q6/Q8 tracked no-action.
+
+- **Q1 — tool-error source chains logged** (`runner.rs:~1222`): the `Err(e)` arm of the tool-result fold now logs `tracing::warn!(tool, error = ?e, "tool call failed")` before stringifying. The typed chain (including any nested `#[source]`) reaches tracing subscribers (now installed by F1/v60.99 in the CLI); the payload string sent to the model is unchanged.
+- **Q2 — synthetic system line on resume drop** (`runner.rs: bounded_resume_prefix`): when tool-call/tool-result rows are dropped from the resume prefix, a synthetic `role: "system"` entry is injected noting the count (`[resume] N tool-call/result row(s) from the prior session were omitted`). Prevents the model from assuming a clean conversation history. Prose-only histories within cap pass through unchanged — no synthetic line. Three new unit tests: `bounded_resume_prefix_drops_tool_protocol_rows` (updated assertion), `bounded_resume_prefix_prose_only_passes_through_without_synthetic_note`, `bounded_resume_prefix_synthetic_note_counts_dropped_rows`.
+- **Q3 — executor-routing fail-fast** (`main.rs`, `atelier-gui/src/lib.rs`): CLI now returns `ExitCode::from(1)` with an actionable message when `[routing].executor` profile fails to load, instead of silently falling back to single-adapter. GUI (`start_agent_run`) does the same — releases the `run_in_flight` guard and returns `Err(...)` so the frontend surfaces the failure instead of silently routing tool-result turns through the wrong model.
+- **Q4 — `[runner] pause_timeout_secs` config key** (`config.rs`, `runner.rs`, `main.rs`): `RunnerSection` gains `pause_timeout_secs: Option<u64>`; `Runner` gains a `pause_timeout_secs` field (default 300) and `with_pause_timeout_secs()` builder; `main.rs` wires it from the parsed config. The hard-coded `5 * 60` in `spawn_concurrent_edit_resolver` is replaced with `self.pause_timeout_secs`. Two new config-parse unit tests.
+- **Q5 — warn when HOME is missing** (`runner.rs`, `main.rs`): `tracing::warn!` added at the subagent type registry load site (runner.rs) and the skill registry load site (main.rs) when `HOME` is absent. Registries still load bundled types successfully; the warn is visible via the F1 subscriber. New unit test: `subagent_type_registry_loads_with_missing_home` (verifies bundled types available with `home=None`).
+- **Q6 — TOCTOU windows in core**: no code change. Documented in `tasks/audit-2026-06-04.md`.
+- **Q7 — prod-mode shape-guard `console.warn`** (`ui/src/lib/state.ts`): `castPayload` now emits `console.warn` (once per event kind, via a module-level `Set`) when a required field is missing in production — keeps the no-throw behaviour but makes wire-label drift visible in DevTools without a DEV build. `svelte-check` clean.
+- **Q8 — unmaintained/unsound dep warnings**: no code change. Re-confirmed; re-evaluate at next toolchain/Tauri bump.
+
+## v60.99 — 2026-06-04 (Bundle 1: CLI failure-visibility)
+
+Closes the three compounding P1s from the 2026-06-04 deep-scan audit (`tasks/plan_deep_scan_2026-06-04_fixes.md`). All gates green: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings`, 54 unit + 118 integration tests, `make check` 180/180.
+
+- **F1 — tracing subscriber in CLI binary** (`crates/atelier-cli/Cargo.toml`, `src/main.rs`): `tracing-subscriber` (with `env-filter`) added to `[dependencies]`; `fmt()` subscriber installed at the top of `main()`, writing WARN+ to stderr (respects `RUST_LOG`). Previously every `tracing::warn!` from `runner.rs` was silently dropped — session-save failures, the DoD-not-wired warning, probe failures were all invisible to `atelier run` users.
+- **F2 — `final_state = AwaitingUser` on max_turns exhaustion** (`src/runner.rs`): the `for turn in 0..self.max_turns` loop now tracks whether it exited via `Break`; on exhaustion it advances the actor `Streaming → AwaitingUser` and emits `Event::AgentStalled { reason: "max_turns (N) exhausted without claimed_done" }`. Previously `final_state` was left as `Streaming` and `exit_code_for_final_state` returned 0 — CI/scripts treated timed-out runs as success. Exit code now correctly returns 6 for `AwaitingUser`. One pre-existing test (`run_bails_after_max_turns_without_claimed_done`) was asserting the old incorrect `!= AwaitingUser` behaviour; updated to `== AwaitingUser`. New regression test: `max_turns_exhaustion_reports_awaiting_user_and_stalled_event`.
+- **F3 — surface session-persist failure** (`src/runner.rs`, `src/main.rs`): `build_and_persist_session` now returns `Option<String>` (error message) instead of `()`; the return value is captured and stored in the new `RunReport::persist_error` field. `main.rs` prints two `eprintln!` warnings when the field is `Some` (the runner is a library linked by the raw-mode TUI — library-side stderr writes corrupt the alternate screen, so the print lives only in the CLI driver). New regression test: `persist_failure_sets_report_persist_error` (Unix-only; makes the sessions dir read-only, asserts `report.persist_error.is_some()`).
+
+## v60.98 — 2026-06-04 (provider hardening: connect timeout + context-window probe + trust boundary wildcard)
+
+Five related fixes that surfaced when the default vLLM ELB became unreachable (SG rule drifted): the GUI showed the conservative 8K fallback instead of vLLM's real `max_model_len`, and the probe was blocking the full 600s request budget instead of failing fast.
+
+- **Both adapters** (`anthropic.rs`, `openai_compat.rs`): added `DEFAULT_CONNECT_TIMEOUT_SECS = 10`. The 600s overall timeout covers a reachable-but-slow endpoint; it must not double as the connect bound — a dead endpoint (stale ELB, offline server) was blocking every request (probe, chat, agent turn) for ten minutes. `connect_timeout` caps only the TCP/TLS handshake; live connections keep the full budget.
+- **`OpenAiCompatAdapter::probe_context_window()`** (`openai_compat.rs`): new method; probes `GET /v1/models` for `max_model_len` and applies it to `capabilities.context_window_tokens`. vLLM, sglang, llama-server, and LM Studio all expose this field; OpenAI proper and older llama.cpp do not, so a missing field is best-effort and the conservative default is preserved. Sends `Authorization: Bearer …` when an api_key is set.
+- **`with_cache_prompt(true)` capability sync** (`openai_compat.rs`): calling `with_cache_prompt(true)` now also sets `capabilities.prompt_cache = Supported`. Previously an operator could opt into prefix-cache request flags while the capability matrix still reported `Unsupported`, causing a false-negative model badge and a −5 score penalty on the suitability scorer.
+- **Trust boundary wildcard** (`trust_boundary.rs`): `PROVIDER_BASE_URL_ALLOWLIST` entries may now contain a single `*` wildcard. Added `"atelier-gpu-vllm-*.elb.amazonaws.com"` to cover any region or LB ID for the dev ALB (each rebuild or region migration changes the ID; the old exact-match entry required an allowlist edit every time). The wildcard is host-scoped — `*` never matches path/query components and requires at least one character; entries with more than one `*` are rejected rather than guessed. Added four property tests: wildcard positive match, prefix-injection rejection, suffix-injection rejection, zero-length rejection, multiple-wildcard rejection.
+- **GUI `build_swap_adapter` probe integration** (`lib.rs`): `build_swap_adapter` now calls `probe_context_window()` for OpenAI-compat adapters, bounded by `PROBE_TIMEOUT_SECS = 4`. The timeout is critical: the reqwest client has a 600s request budget with no prior connect bound, so an unreachable endpoint would have hung badge hydration (and the first turn) for ten minutes; 4s means an unreachable endpoint falls through to static capabilities fast, exactly as a missing `max_model_len` field does.
+- **`snapshot_current_model` mock-fallback removal** (`lib.rs`): the command no longer installs a `MockAdapter` into the slot when `resolve_default_adapter` fails. The mock-fallback silently routed the user's first prompt through Mock and surfaced a misleading "adapter not configured: no queued stream" error rather than the real cause (missing `providers.toml`, keychain denial, etc.). The slot is now left empty; the chat path's own lazy-init at the start of `run_chat` re-attempts resolution on the first prompt and propagates the real failure.
+
+## v60.97 — 2026-06-04 (Composer: readline-style prompt history)
+
+Adds `↑`/`↓` prompt history navigation to the GUI Composer, consistent with shell readline behaviour.
+
+- History persisted to `localStorage` under `atelier.composer.history.v1` (survives window close). Capped at 100 entries; consecutive duplicate prompts are deduplicated (bash-style `HISTCONTROL=ignoredups`).
+- `↑` walks back through history, saving the in-flight draft to an internal buffer on first press. `↓` walks forward; pressing past the newest entry restores the saved draft.
+- Only intercepts arrows when: (a) the slash-skill menu is hidden (the menu's own `↑`/`↓` handler claims them first), (b) the prompt is single-line (multi-line editing keeps native cursor movement), (c) no modifiers are held.
+- Caret moved to end of text after each recall (`queueMicrotask` so the DOM flush has happened) so the user can append immediately.
+- History is pushed on successful commit via both the normal `Cmd+Enter` path and the force-Agent `Shift+Cmd+Enter` path.
+- Placeholder updated to surface `↑/↓ for history`.
+
+## v60.96 — 2026-06-04 (GUI footer: fix model badge overflow onto token meter)
+
+Fixes the token meter being partially painted over by the model badge / swap-select on wide provider labels.
+
+- `grid-template-columns` changed from `minmax(0, 1fr) auto minmax(0, 1fr)` to `auto 1fr auto`. The earlier equal-`1fr` side tracks were a bid for mathematical centring but the right zone's `.swap-select` (intrinsic width = longest option label) and `.model-badge` (`white-space: nowrap`) refused to shrink within `minmax(0, 1fr)`, overflowing leftward (`justify-content: flex-end`) onto the centre token meter. `auto` side tracks size to their natural content, making overlap impossible; the cost is that the meter centres between the side zones rather than to the footer midline.
+
+## v60.95 — 2026-06-04 (GUI header: wordmark "thinking" sweep animation)
+
+Adds a per-letter animated highlight that sweeps left→right across "atelier" while a prompt is in flight.
+
+- `Header.svelte` now accepts a `thinking: boolean` prop. The wordmark is split into seven `<span class="logo-letter">` elements (inline, no whitespace between, so the word renders contiguous); `aria-label="atelier"` on the `<h1>` keeps the wordmark a single accessible word.
+- CSS `letter-cycle` keyframe: each letter transitions through cyan (`#a8d8ff`) at 20% of the cycle then returns to cream, with `animation-delay: calc(var(--i) * 0.2s)` staggering the peak so only ~2 letters glow at once — a travelling comet rather than a uniform flash. Cycle = 1.4s (7 letters × 0.2s step).
+- `prefers-reduced-motion`: animation dropped; wordmark tints to cyan while busy so the state is still conveyed without motion.
+- `App.svelte` passes `thinking={app.runInFlight}` through to `Header`.
+
+## v60.94 — 2026-06-04 (GUI footer: 3-column grid layout for centred token meter)
+
+Replaces the flex layout on `.help` with a 3-column CSS grid so the centre column (token meter) is always mathematically centred regardless of how wide the right column (swap-select + model badge) grows.
+
+- `grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr)` — equal `1fr` side tracks force the centre column to the geometric midpoint. `min-width: 0` on each side zone lets flex content within the track shrink instead of forcing the track wider.
+- The earlier `flex: 1 / 0 0 auto / 1` formula let the right zone (wider, due to the provider label) push the centre column leftward; the interim `min-width: 0` flex fix still allowed overflow because flex tracks are not hard columns.
+
 ## v60.93 — 2026-06-03 (R1b: TurnState/TurnContext redesign)
 
 Completes the `runner.rs` complexity-reduction programme. Every function in `runner.rs` is now < 50 cyclomatic.

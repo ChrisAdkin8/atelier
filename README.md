@@ -135,6 +135,7 @@ In the GUI:
 2. Use **Chat** mode for normal conversation with the selected model.
 3. Use **Agent** mode when you want tool-using runs that write durable sessions.
 4. Watch the right-side panels for context, memory, sub-agent progress, and token/cost meters.
+5. Press **↑** / **↓** in the Composer to cycle through previous prompts (persisted across window restarts).
 
 ## Use the CLI
 
@@ -153,7 +154,7 @@ Common flags:
 | `--model <id>` | Model id sent to the provider. |
 | `--base-url <url>` | OpenAI-compatible endpoint, usually ending in `/v1`. |
 | `--workspace <path>` | Repo root; defaults to the current directory. |
-| `--max-turns <n>` | Stop after N turns if the model has not claimed done. |
+| `--max-turns <n>` | Stop after N turns without `claimed_done`; exits with code 6 when reached (code 0 = done). |
 | `--prompt-file <path>` | Read the prompt from a file; use `-` for stdin. |
 | `--no-probe` / `--force-probe` | Skip or force OpenAI-compatible capability probing. |
 
@@ -270,6 +271,7 @@ model = "anthropic:claude-opus-4-7"
 
 [runner]
 max_turns = 32
+pause_timeout_secs = 300  # seconds before a §14 Modal concurrent-edit auto-resumes (default 300)
 
 [probe]
 policy = "auto" # "auto" | "skip" | "force"
@@ -334,6 +336,9 @@ Atelier is MCP-first. Built-in tools and registered MCP tools share the same dis
 | GUI starts on a temp workspace | Click **Browse...** and select a real repo; the choice persists to `~/.atelier/gui.toml`. |
 | A profile is ignored | Project `.atelier/providers.toml` wins over `~/.atelier/providers.toml`; check which file `atelier run` reports. |
 | Config fails to load | Fix the TOML error. Atelier intentionally treats malformed config as fatal. |
+| `[routing].executor` profile fails | Atelier now exits 1 with an actionable message. Fix the profile (credentials, base-url, model id) or remove `[routing].executor` from `providers.toml` to run without per-task routing. |
+| Run stopped with exit code 6 | `--max-turns` was reached without `claimed_done`. Exit 6 is intentional (AwaitingUser); add more turns or refine the prompt. Exit 0 means the model claimed done. |
+| Session not persisted warning on stderr | The session directory write failed (disk full, permissions). The run result is still valid; `--resume` will not be available for that session. |
 | A GUI Agent follow-up starts fresh | The previous session directory was deleted; the GUI cleared the stale resume pointer and started fresh. The workspace choice persists in `~/.atelier/gui.toml`. |
 
 ## Architecture at a glance

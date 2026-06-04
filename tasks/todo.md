@@ -7,6 +7,10 @@ Change history in `../CHANGELOG.md`.
 
 **Tracker discipline:** keep this file up to date whenever a plan lands, a risk/remediation status changes, or gate counts change. Do not leave `tasks/todo.md` as a historical snapshot; move detailed release history to `../CHANGELOG.md` and keep this file focused on current state plus active/pending work.
 
+**v60.100 (2026-06-04)** — deep-scan 2026-06-04 Bundle 2 (all P2 items). Tool-error chains logged; synthetic system line on resume drop; executor-routing fail-fast (CLI + GUI); `[runner] pause_timeout_secs` config key; HOME-missing warns; prod-mode `castPayload` console.warn. Full plan: [`tasks/plan_deep_scan_2026-06-04_fixes.md`](plan_deep_scan_2026-06-04_fixes.md). All gates green.
+
+**v60.94–v60.98 (2026-06-04)** — GUI polish + provider hardening batch. Footer 3-column grid (v60.94) then overlap fix via `auto 1fr auto` tracks (v60.96); wordmark thinking-sweep animation (v60.95); Composer readline-style ↑/↓ prompt history persisted to localStorage (v60.97); provider hardening (v60.98): connect timeouts on both adapters, `/v1/models` `max_model_len` probe wired into the GUI with 4s bound, `with_cache_prompt(true)` syncs the prompt_cache capability claim, trust-boundary wildcard allowlist entry for the vLLM ALB, mock-fallback removal in `snapshot_current_model`. Detail in `../CHANGELOG.md`.
+
 **v60.93 (2026-06-03)** — R1b: TurnState/TurnContext redesign. `Runner::run` CC 140→38; `run_turn` CC 48. Extracted `TurnState` (14 vars), `TurnContext` (11 refs), `TurnControl` into `runner/turn.rs`; 6 cohesive sub-methods from the loop body and pre/post-loop blocks. 1,408 tests pass, fmt + clippy clean, make check 180/180. All runner.rs functions now < 50 cyclomatic.
 
 **v60.92 (2026-06-03)** — audit Bundle 3 PR-2 (Q2). LSP `session.open_file` failure now logs `tracing::warn!` instead of being silently dropped. The 24 `try_emit` call sites left unchanged — `try_emit` already logs internally with rate-limiting. 1,408 tests pass.

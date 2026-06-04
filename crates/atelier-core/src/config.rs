@@ -186,15 +186,19 @@ impl ProviderKind {
     }
 }
 
-/// Top-level `[runner]` section. Currently just `max_turns`; future
-/// fields slot in here (sandbox profile override, DoD timeout
-/// multiplier, …).
+/// Top-level `[runner]` section. Currently `max_turns` and
+/// `pause_timeout_secs`; future fields slot in here (sandbox profile
+/// override, DoD timeout multiplier, …).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RunnerSection {
     /// Bail after N turns without `claimed_done`. Built-in default 32.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_turns: Option<usize>,
+    /// Seconds to wait for a user response to a concurrent-edit Modal
+    /// before auto-resuming (`PauseTimedOut`). Built-in default 300 (5 min).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pause_timeout_secs: Option<u64>,
 }
 
 /// Top-level `[probe]` section — v51 probe-on-first-use policy.
@@ -793,5 +797,29 @@ base_url = "https://api.anthropic.com/v1"
         let text = toml::to_string(&cfg).unwrap();
         let parsed: ProvidersConfig = toml::from_str(&text).unwrap();
         assert_eq!(parsed, cfg);
+    }
+
+    #[test]
+    fn runner_section_pause_timeout_secs_parses() {
+        let tmp_repo = TempDir::new().unwrap();
+        write_project_config(tmp_repo.path(), "[runner]\npause_timeout_secs = 120\n");
+        let loaded = ProvidersConfig::load(tmp_repo.path()).unwrap().unwrap();
+        assert_eq!(
+            loaded.config.runner.unwrap().pause_timeout_secs,
+            Some(120),
+            "pause_timeout_secs should parse from [runner]"
+        );
+    }
+
+    #[test]
+    fn runner_section_pause_timeout_secs_absent_is_none() {
+        let tmp_repo = TempDir::new().unwrap();
+        write_project_config(tmp_repo.path(), "[runner]\nmax_turns = 8\n");
+        let loaded = ProvidersConfig::load(tmp_repo.path()).unwrap().unwrap();
+        assert_eq!(
+            loaded.config.runner.unwrap().pause_timeout_secs,
+            None,
+            "pause_timeout_secs absent → None (default used by Runner)"
+        );
     }
 }

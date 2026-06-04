@@ -75,8 +75,14 @@ mod tests {
     #[test]
     fn allowlist_delegates_to_core_trust_boundary() {
         assert!(is_base_url_allowed(Some("https://api.openai.com/v1")));
+        // Wildcard allowlist entry covers any region / LB ID for the
+        // atelier dev ALB. Original us-east-1 LB and current us-west-2
+        // LB both match without an allowlist edit.
         assert!(is_base_url_allowed(Some(
             "http://atelier-gpu-vllm-dev-1460977764.us-east-1.elb.amazonaws.com/v1"
+        )));
+        assert!(is_base_url_allowed(Some(
+            "http://atelier-gpu-vllm-dev-654802396.us-west-2.elb.amazonaws.com/v1"
         )));
         assert!(is_base_url_allowed(Some("http://localhost:11434/v1")));
         assert!(!is_base_url_allowed(Some("https://evil.example/v1")));

@@ -89,6 +89,16 @@ const DEFAULT_MAX_TOKENS: u32 = 4096;
 // large prompt — the 120s cap was severing the connection mid-generation,
 // leaving the GUI with a phantom in-flight run and no surfaced error.
 const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 600;
+// Connection-establishment bound, distinct from the overall request
+// timeout above. The 600s budget covers a *reachable* server that streams
+// slowly; it must not double as the connect bound, or an unreachable
+// endpoint (a torn-down dev server, a stale ELB that black-holes SYNs)
+// blocks every request — probe, chat, and agent turn — for the full ten
+// minutes. `connect_timeout` caps only the TCP/TLS handshake, so a dead
+// endpoint fails fast while a legitimately slow generation keeps its full
+// 600s. 10s tolerates a cold cross-region ELB or a loaded local server
+// without severing healthy connections.
+const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
 /// Default context window when the caller doesn't override. 8192 is a
 /// typical local-model floor (llama 2 / mistral 7b shipped with 4096
 /// or 8192; modern local models go higher but we don't autodetect).
@@ -151,6 +161,7 @@ impl OpenAiCompatAdapter {
             },
             http: Client::builder()
                 .timeout(Duration::from_secs(DEFAULT_HTTP_TIMEOUT_SECS))
+                .connect_timeout(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS))
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .expect("reqwest::Client::builder default config is infallible"),
@@ -190,8 +201,23 @@ impl OpenAiCompatAdapter {
     /// ignores this field; local servers that don't support it also
     /// ignore it silently, so the flag is safe to send unconditionally
     /// once the operator opts in.
+    ///
+    /// Setting this to `true` also flips
+    /// [`Capabilities::prompt_cache`] to [`CapabilityClaim::Supported`].
+    /// The capability claim drives the GUI's model badge and the §1
+    /// suitability score (a 5/5 factor); without this flip, the operator
+    /// could opt into request-flag prompt caching and the harness would
+    /// still report `Unsupported`, producing a false negative in the UI
+    /// and a -5 point score penalty for a model that's actually getting
+    /// prefix-cache hits. The flip is one-way (`false` leaves the existing
+    /// claim alone) so a stronger signal — for example the probe detecting
+    /// vLLM via `max_model_len` — can't be downgraded by a later
+    /// `with_cache_prompt(false)` call.
     pub fn with_cache_prompt(mut self, v: bool) -> Self {
         self.cache_prompt = v;
+        if v {
+            self.capabilities.prompt_cache = CapabilityClaim::Supported;
+        }
         self
     }
 
@@ -202,6 +228,101 @@ impl OpenAiCompatAdapter {
     pub fn with_context_window(mut self, tokens: u32) -> Self {
         self.capabilities.context_window_tokens = tokens;
         self
+    }
+
+    /// Probe the server's `/v1/models` endpoint for the served model's
+    /// `max_model_len` and apply it to [`Capabilities::context_window_tokens`].
+    /// vLLM, sglang, llama-server, and LM Studio all expose `max_model_len`
+    /// as an integer on each model entry; OpenAI proper does not, so a
+    /// missing field is treated as "no information" and the existing value
+    /// (default or builder-set) is preserved. The adapter call sites in
+    /// `atelier-gui` and `atelier-cli` invoke this once after construction
+    /// so the GUI footer / TUI meter shows the real ceiling (e.g. vLLM's
+    /// `max_model_len = 32768`) instead of the conservative 8 KiB default.
+    ///
+    /// Best-effort: network errors, non-2xx responses, JSON parse failures,
+    /// and missing fields are all logged via `tracing::debug!` rather than
+    /// returned. The adapter must remain usable when the probe fails — the
+    /// probe is a capability hint, not a precondition. OpenAI proper hits
+    /// this every time and that's the intended behaviour: keep the
+    /// builder-set / default value, do not block construction.
+    ///
+    /// Sends `Authorization: Bearer …` when an api_key is set so vLLM
+    /// endpoints behind `--api-key` succeed without changing the adapter's
+    /// auth posture for the subsequent chat traffic.
+    pub async fn probe_context_window(&mut self) {
+        let url = format!("{}/models", self.base_url.trim_end_matches('/'));
+        let req = self.http.get(&url);
+        let req = if self.api_key.is_empty() {
+            req
+        } else {
+            req.bearer_auth(&self.api_key)
+        };
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::debug!(error = %e, %url, "probe_context_window: GET failed");
+                return;
+            }
+        };
+        if !resp.status().is_success() {
+            tracing::debug!(
+                status = %resp.status(),
+                %url,
+                "probe_context_window: non-success response"
+            );
+            return;
+        }
+        let body: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!(error = %e, "probe_context_window: JSON parse failed");
+                return;
+            }
+        };
+        let Some(entries) = body.get("data").and_then(|d| d.as_array()) else {
+            tracing::debug!("probe_context_window: response has no `data` array");
+            return;
+        };
+        let target = self.provider_model_name();
+        let entry = entries
+            .iter()
+            .find(|m| m.get("id").and_then(|v| v.as_str()) == Some(target))
+            .or_else(|| entries.first());
+        let Some(entry) = entry else {
+            tracing::debug!("probe_context_window: response `data` is empty");
+            return;
+        };
+        let Some(raw) = entry.get("max_model_len").and_then(|v| v.as_u64()) else {
+            tracing::debug!(
+                model = target,
+                "probe_context_window: entry has no max_model_len (OpenAI proper or older server)"
+            );
+            return;
+        };
+        // u32 ceiling for the existing field type. Saturating cast is
+        // robust to a server returning an absurd integer.
+        let new_val = raw.min(u32::MAX as u64) as u32;
+        let prev = self.capabilities.context_window_tokens;
+        if new_val != prev {
+            tracing::info!(
+                prev,
+                new = new_val,
+                model = target,
+                "probe_context_window: context window updated from /v1/models"
+            );
+        }
+        self.capabilities.context_window_tokens = new_val;
+        // `max_model_len` is a vLLM / sglang family marker — OpenAI proper
+        // and older llama.cpp don't surface it on `/v1/models`. Both vLLM
+        // (`enable_prefix_caching=True` default since v0.4) and sglang
+        // (RadixAttention by default) serve subsequent requests from a
+        // shared KV-prefix cache, so seeing this field is a reliable
+        // signal that prompt caching is actually happening on every turn.
+        // Flip the capability claim so the GUI badge and the §1
+        // suitability score (`prompt_cache` factor, 5/5 instead of 0/5
+        // plus a "prompt caching is available" strength) match reality.
+        self.capabilities.prompt_cache = CapabilityClaim::Supported;
     }
 
     /// Provider-side model name (the part after `<provider>:`). Used
@@ -1130,6 +1251,167 @@ mod tests {
 
     fn adapter_for_no_auth(server: &MockServer) -> OpenAiCompatAdapter {
         OpenAiCompatAdapter::new("", "local:llama3", server.uri())
+    }
+
+    // ---------- probe_context_window ----------
+
+    #[tokio::test]
+    async fn probe_updates_context_window_from_vllm_max_model_len() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .and(header("authorization", "Bearer test-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "object": "list",
+                "data": [{
+                    "id": "llama3",
+                    "object": "model",
+                    "max_model_len": 32_768,
+                    "owned_by": "vllm"
+                }]
+            })))
+            .mount(&server)
+            .await;
+        let mut a = adapter_for(&server);
+        assert_eq!(
+            a.capabilities().context_window_tokens,
+            DEFAULT_CONTEXT_WINDOW_TOKENS
+        );
+        // Conservative default before the probe — covers OpenAI proper +
+        // any server that doesn't advertise `max_model_len`.
+        assert_eq!(a.capabilities().prompt_cache, CapabilityClaim::Unsupported);
+        a.probe_context_window().await;
+        assert_eq!(a.capabilities().context_window_tokens, 32_768);
+        // Seeing `max_model_len` is a vLLM/sglang signal; both have
+        // prefix caching enabled by default, so the probe flips the
+        // claim alongside the context-window update.
+        assert_eq!(a.capabilities().prompt_cache, CapabilityClaim::Supported);
+    }
+
+    #[tokio::test]
+    async fn probe_matches_served_model_id_when_multiple_entries() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "object": "list",
+                "data": [
+                    {"id": "other-model", "object": "model", "max_model_len": 8_192},
+                    {"id": "llama3",      "object": "model", "max_model_len": 65_536},
+                    {"id": "third",       "object": "model", "max_model_len": 4_096}
+                ]
+            })))
+            .mount(&server)
+            .await;
+        let mut a = adapter_for(&server);
+        a.probe_context_window().await;
+        // Picks the entry whose id matches the adapter's served model name,
+        // not just the first entry.
+        assert_eq!(a.capabilities().context_window_tokens, 65_536);
+    }
+
+    #[tokio::test]
+    async fn probe_preserves_default_when_max_model_len_absent() {
+        // OpenAI proper's /v1/models response: no `max_model_len` field.
+        // The probe must silently keep the existing default rather than
+        // clobber it with 0 or panic on the missing field — and it must
+        // NOT flip `prompt_cache` to Supported, because the absence of
+        // `max_model_len` is precisely what distinguishes OpenAI proper
+        // from vLLM/sglang here.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "object": "list",
+                "data": [{"id": "gpt-4o", "object": "model", "owned_by": "openai"}]
+            })))
+            .mount(&server)
+            .await;
+        let mut a = adapter_for(&server);
+        a.probe_context_window().await;
+        assert_eq!(
+            a.capabilities().context_window_tokens,
+            DEFAULT_CONTEXT_WINDOW_TOKENS
+        );
+        assert_eq!(a.capabilities().prompt_cache, CapabilityClaim::Unsupported);
+    }
+
+    #[tokio::test]
+    async fn probe_preserves_default_on_non_success_response() {
+        // A misbehaving / unauthenticated server returning 401/500 must
+        // not erase the adapter's configured context-window value.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+        let mut a = adapter_for(&server).with_context_window(131_072);
+        a.probe_context_window().await;
+        assert_eq!(a.capabilities().context_window_tokens, 131_072);
+    }
+
+    #[tokio::test]
+    async fn probe_preserves_default_when_data_array_is_missing() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "error": "endpoint not implemented"
+            })))
+            .mount(&server)
+            .await;
+        let mut a = adapter_for(&server);
+        a.probe_context_window().await;
+        assert_eq!(
+            a.capabilities().context_window_tokens,
+            DEFAULT_CONTEXT_WINDOW_TOKENS
+        );
+    }
+
+    #[tokio::test]
+    async fn with_cache_prompt_true_flips_prompt_cache_claim() {
+        // The request-flag opt-in (`cache_prompt: true` body field) is
+        // what the llama.cpp / mlx-lm KV cache reuse needs. Flipping the
+        // adapter's capability claim alongside lets the §1 suitability
+        // score and the GUI badge stop reporting a false negative for
+        // backends where the operator has explicitly opted in.
+        let server = MockServer::start().await;
+        let a = adapter_for(&server).with_cache_prompt(true);
+        assert_eq!(a.capabilities().prompt_cache, CapabilityClaim::Supported);
+    }
+
+    #[tokio::test]
+    async fn with_cache_prompt_false_does_not_downgrade_previous_claim() {
+        // One-way flip: if a stronger signal (e.g. the probe finding
+        // `max_model_len`) has already raised the claim to Supported, a
+        // subsequent `with_cache_prompt(false)` must not clobber it back
+        // to Unsupported — the probe's signal is independent of the
+        // request flag.
+        let server = MockServer::start().await;
+        let a = adapter_for(&server)
+            .with_cache_prompt(true)
+            .with_cache_prompt(false);
+        assert_eq!(a.capabilities().prompt_cache, CapabilityClaim::Supported);
+    }
+
+    #[tokio::test]
+    async fn probe_works_without_api_key() {
+        // Many local servers (Ollama, LM Studio default) don't require a
+        // bearer token. The probe must omit the header rather than send
+        // an empty bearer string the server might reject.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "object": "list",
+                "data": [{"id": "llama3", "object": "model", "max_model_len": 16_384}]
+            })))
+            .mount(&server)
+            .await;
+        let mut a = adapter_for_no_auth(&server);
+        a.probe_context_window().await;
+        assert_eq!(a.capabilities().context_window_tokens, 16_384);
     }
 
     // ---------- non-streaming chat ----------

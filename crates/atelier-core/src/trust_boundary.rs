@@ -13,19 +13,28 @@
 /// supplied by the user at the invoking surface; repo-controlled profile
 /// files should not silently route `OPENAI_API_KEY` to them.
 ///
-/// The Atelier dev vLLM ALB is included as a project-owned OpenAI-compatible
-/// endpoint used by the GUI and repo profile during local development.
+/// Entries may contain a single `*` wildcard that matches one or more
+/// characters when compared against an extracted host. This is used to
+/// cover the Atelier dev vLLM ALB whose DNS name embeds an ephemeral
+/// load-balancer ID (`atelier-gpu-vllm-<env>-<lbid>.<region>.elb.amazonaws.com`);
+/// pinning the exact DNS makes the allowlist drift every time the LB is
+/// rebuilt or moved to a new region. The wildcard is host-scoped — `*`
+/// never matches a path/query and only fires after `http_host` has already
+/// stripped the scheme, port, and userinfo, so a hostile URL can't sneak
+/// in via path components.
 pub const PROVIDER_BASE_URL_ALLOWLIST: &[&str] = &[
     "api.anthropic.com",
     "api.openai.com",
-    "atelier-gpu-vllm-dev-1460977764.us-east-1.elb.amazonaws.com",
+    "atelier-gpu-vllm-*.elb.amazonaws.com",
     "localhost",
     "127.0.0.1",
     "::1",
 ];
 
-/// Return `true` when `base_url` is absent or its host is on
-/// [`PROVIDER_BASE_URL_ALLOWLIST`].
+/// Return `true` when `base_url` is absent or its host matches an entry
+/// on [`PROVIDER_BASE_URL_ALLOWLIST`]. Entries with a single `*` are
+/// treated as wildcard patterns matching one or more characters; entries
+/// without `*` require exact equality.
 pub fn provider_base_url_allowed(base_url: Option<&str>) -> bool {
     let Some(url) = base_url else {
         return true;
@@ -33,7 +42,28 @@ pub fn provider_base_url_allowed(base_url: Option<&str>) -> bool {
     let Some(host) = http_host(url) else {
         return false;
     };
-    PROVIDER_BASE_URL_ALLOWLIST.iter().any(|h| *h == host)
+    PROVIDER_BASE_URL_ALLOWLIST
+        .iter()
+        .any(|pattern| host_matches_pattern(pattern, &host))
+}
+
+/// Match a host string against an allowlist entry. Entries with no `*`
+/// must equal `host` exactly; entries with one `*` must satisfy
+/// `host.starts_with(prefix) && host.ends_with(suffix)` with at least
+/// one character matched by the wildcard. A pattern with more than one
+/// `*` is rejected (treated as a non-match) rather than guessed.
+fn host_matches_pattern(pattern: &str, host: &str) -> bool {
+    match pattern.split_once('*') {
+        None => pattern == host,
+        Some((prefix, suffix)) => {
+            if suffix.contains('*') {
+                return false;
+            }
+            host.len() > prefix.len() + suffix.len()
+                && host.starts_with(prefix)
+                && host.ends_with(suffix)
+        }
+    }
 }
 
 /// Extract a lower-case host from an explicit HTTP/HTTPS URL.
@@ -112,8 +142,18 @@ mod tests {
         assert!(provider_base_url_allowed(Some(
             "https://api.anthropic.com/v1"
         )));
+        // Wildcard `atelier-gpu-vllm-*.elb.amazonaws.com` covers both the
+        // original us-east-1 LB and the post-region-migration us-west-2 LB
+        // (whose LB ID changed). New deployments of the same module pattern
+        // are also accepted without an allowlist edit.
         assert!(provider_base_url_allowed(Some(
             "http://atelier-gpu-vllm-dev-1460977764.us-east-1.elb.amazonaws.com/v1"
+        )));
+        assert!(provider_base_url_allowed(Some(
+            "http://atelier-gpu-vllm-dev-654802396.us-west-2.elb.amazonaws.com/v1"
+        )));
+        assert!(provider_base_url_allowed(Some(
+            "http://atelier-gpu-vllm-prod-99999.eu-west-1.elb.amazonaws.com/v1"
         )));
         assert!(provider_base_url_allowed(Some("http://localhost:11434/v1")));
         assert!(provider_base_url_allowed(Some("http://127.0.0.1:8080/v1")));
@@ -125,6 +165,38 @@ mod tests {
     fn provider_allowlist_rejects_unknown_hosts() {
         assert!(!provider_base_url_allowed(Some("https://evil.example/v1")));
         assert!(!provider_base_url_allowed(Some("http://attacker.test/v1")));
+    }
+
+    #[test]
+    fn provider_allowlist_wildcard_does_not_match_prefix_injection() {
+        // An attacker who controls `evil.example` cannot bypass the allowlist
+        // by appending the legit suffix to their hostname — the wildcard is
+        // host-scoped and requires the prefix to match from the start.
+        assert!(!provider_base_url_allowed(Some(
+            "https://evil.atelier-gpu-vllm-dev.elb.amazonaws.com/v1"
+        )));
+        assert!(!provider_base_url_allowed(Some(
+            "https://atelier-gpu-vllm-dev.elb.amazonaws.com.evil.example/v1"
+        )));
+    }
+
+    #[test]
+    fn provider_allowlist_wildcard_requires_at_least_one_char() {
+        // The wildcard must match at least one character so the prefix and
+        // suffix can't simply concatenate without a separator.
+        assert!(!host_matches_pattern(
+            "atelier-gpu-vllm-*.elb.amazonaws.com",
+            "atelier-gpu-vllm-.elb.amazonaws.com"
+        ));
+    }
+
+    #[test]
+    fn provider_allowlist_pattern_rejects_multiple_wildcards() {
+        // Defence-in-depth: an entry the developer wrote with two `*` is
+        // ambiguous, so the predicate refuses it rather than guessing.
+        // (PROVIDER_BASE_URL_ALLOWLIST has no such entries today; this
+        // pins the behaviour for any future addition.)
+        assert!(!host_matches_pattern("a-*-b-*", "a-X-b-Y"));
     }
 
     #[test]

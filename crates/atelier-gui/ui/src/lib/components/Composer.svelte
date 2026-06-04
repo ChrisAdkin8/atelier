@@ -42,8 +42,32 @@
   let starting: boolean = $state(false)
   let skills: SkillEntry[] = $state([])
   let menuSelectedIndex: number = $state(0)
+  let textareaEl: HTMLTextAreaElement | null = $state(null)
+
+  // v60.97 — readline-style prompt history. Persisted to localStorage
+  // so it survives a window close. `historyIndex === -1` means "not
+  // browsing — the textarea holds the user's live draft." When the
+  // user up-arrows away from that draft we stash it in `draftBuffer`
+  // so down-arrowing past the newest entry restores it.
+  const HISTORY_STORAGE_KEY = 'atelier.composer.history.v1'
+  const HISTORY_MAX = 100
+  let history: string[] = $state([])
+  let historyIndex: number = $state(-1)
+  let draftBuffer: string = ''
 
   onMount(async () => {
+    try {
+      const raw = localStorage.getItem(HISTORY_STORAGE_KEY)
+      if (raw) {
+        const parsed = JSON.parse(raw)
+        if (Array.isArray(parsed)) {
+          history = parsed.filter((x): x is string => typeof x === 'string' && x.length > 0)
+        }
+      }
+    } catch (e) {
+      // Corrupt JSON shouldn't disable the composer.
+      console.warn('prompt history load failed', e)
+    }
     try {
       skills = await invoke<SkillEntry[]>('list_skills')
     } catch (e) {
@@ -51,6 +75,70 @@
       console.warn('list_skills failed', e)
     }
   })
+
+  function pushHistory(entry: string) {
+    const trimmed = entry.trim()
+    if (!trimmed) return
+    // Bash-style: skip when identical to the most recent entry.
+    if (history.length > 0 && history[history.length - 1] === trimmed) {
+      historyIndex = -1
+      draftBuffer = ''
+      return
+    }
+    const next = history.length >= HISTORY_MAX
+      ? [...history.slice(history.length - HISTORY_MAX + 1), trimmed]
+      : [...history, trimmed]
+    history = next
+    try {
+      localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(next))
+    } catch (e) {
+      // Quota exhaustion / private-mode denial — the in-memory copy
+      // still works for this session; future sessions just won't see it.
+      console.warn('prompt history save failed', e)
+    }
+    historyIndex = -1
+    draftBuffer = ''
+  }
+
+  function moveCaretToEnd() {
+    // Run after Svelte flushes the new `prompt` into the textarea.
+    queueMicrotask(() => {
+      const el = textareaEl
+      if (el) el.selectionStart = el.selectionEnd = el.value.length
+    })
+  }
+
+  function recallPrev(): boolean {
+    if (history.length === 0) return false
+    if (historyIndex === -1) {
+      draftBuffer = prompt
+      historyIndex = history.length - 1
+    } else if (historyIndex > 0) {
+      historyIndex -= 1
+    } else {
+      // Already at oldest entry — still consume the keypress so the
+      // caret doesn't jump into the (now identical) line above.
+      return true
+    }
+    prompt = history[historyIndex]
+    moveCaretToEnd()
+    return true
+  }
+
+  function recallNext(): boolean {
+    if (historyIndex === -1) return false
+    if (historyIndex < history.length - 1) {
+      historyIndex += 1
+      prompt = history[historyIndex]
+    } else {
+      // Off the end → restore the in-flight draft.
+      historyIndex = -1
+      prompt = draftBuffer
+      draftBuffer = ''
+    }
+    moveCaretToEnd()
+    return true
+  }
 
   // Filter the menu based on the in-progress slash token. Returns []
   // when the input doesn't begin with `/` (menu is hidden).
@@ -144,6 +232,7 @@
       } else {
         await invoke('start_chat_run', { prompt: trimmed })
       }
+      pushHistory(trimmed)
       prompt = ''
     } catch (e) {
       error = String(e)
@@ -191,6 +280,21 @@
         return
       }
     }
+    // v60.97 — readline-style history walk. Only fires when the slash
+    // menu didn't claim the keypress, no modifier is held, and the
+    // prompt is single-line (so multi-line authoring keeps native
+    // up/down cursor navigation within the textarea).
+    if (
+      (e.key === 'ArrowUp' || e.key === 'ArrowDown')
+      && !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey
+      && !prompt.includes('\n')
+    ) {
+      const consumed = e.key === 'ArrowUp' ? recallPrev() : recallNext()
+      if (consumed) {
+        e.preventDefault()
+        return
+      }
+    }
     if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key === 'Enter') {
       e.preventDefault()
       const trimmed = prompt.trim()
@@ -199,6 +303,7 @@
       error = null
       invoke('start_agent_run', { prompt: trimmed })
         .then(() => {
+          pushHistory(trimmed)
           prompt = ''
         })
         .catch((e) => {
@@ -247,9 +352,10 @@
 
 <section class="composer" class:thinking>
   <textarea
+    bind:this={textareaEl}
     placeholder={busy
       ? 'a turn is in progress — wait for it to finish'
-      : 'type a prompt and hit Cmd+Enter — auto-routes chat vs agent; `/` for skills'}
+      : 'type a prompt and hit Cmd+Enter — auto-routes chat vs agent; `/` for skills · ↑/↓ for history'}
     bind:value={prompt}
     onkeydown={onKey}
     disabled={busy || starting}

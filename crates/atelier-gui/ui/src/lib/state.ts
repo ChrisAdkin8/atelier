@@ -371,9 +371,14 @@ export function initialState(): AppState {
 // existing silent-coerce behaviour is preserved (so a single wire-label
 // drift on a non-critical event doesn't take the whole UI down).
 //
+// v60.100 — in prod, emits a console.warn once per event kind on shape
+// mismatch so wire-label drift is at least visible in DevTools without
+// crashing the UI. A module-level Set caps noise to one warning per kind.
+//
 // Used by the highest-stakes arms (modal triggers, consent-flow events).
 // The lower-stakes arms keep the raw `as X` cast pattern for now; promote
 // them here as they grow new required fields.
+const _castPayloadWarnedKinds = new Set<string>()
 function castPayload<T>(
   payload: unknown,
   required: readonly string[],
@@ -388,6 +393,18 @@ function castPayload<T>(
     for (const k of required) {
       if (!(k in (payload as Record<string, unknown>))) {
         throw new Error(`state.ts: ${kind} payload missing required field '${k}'`)
+      }
+    }
+  }
+  if (!import.meta.env?.DEV && typeof payload === 'object' && payload != null) {
+    for (const k of required) {
+      if (!(k in (payload as Record<string, unknown>))) {
+        if (!_castPayloadWarnedKinds.has(kind)) {
+          _castPayloadWarnedKinds.add(kind)
+          console.warn(
+            `[atelier] state.ts: ${kind} payload missing field '${k}' — possible wire-label drift. Coercing.`,
+          )
+        }
       }
     }
   }

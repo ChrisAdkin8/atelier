@@ -16,8 +16,15 @@
     rightCollapsed?: boolean
     onToggleRight?: () => void
     onWorkspaceSet?: () => void
+    thinking?: boolean
   }
-  let { rightCollapsed = false, onToggleRight, onWorkspaceSet }: Props = $props()
+  let { rightCollapsed = false, onToggleRight, onWorkspaceSet, thinking = false }: Props =
+    $props()
+
+  // v60.95 — wordmark letters, each rendered in its own span so the
+  // "thinking" highlight can sweep across them one at a time (see the
+  // `.logo-letter` animation in the style block).
+  const letters = 'atelier'.split('')
 
   let workspacePath: string = $state('')
   let editing: boolean = $state(false)
@@ -110,7 +117,12 @@
 </script>
 
 <header class="header">
-  <h1 class="brand">atelier</h1>
+  <!-- Each letter is its own span so the "thinking" highlight can cycle
+       across them. The loop and spans are kept on one line so no
+       whitespace renders between letters (the word stays contiguous, not
+       spaced out). aria-label keeps the wordmark a single word for screen
+       readers; the per-letter spans are aria-hidden. -->
+  <h1 class="brand" aria-label="atelier">{#each letters as letter, i}<span class="logo-letter" class:thinking style:--i={i} aria-hidden="true">{letter}</span>{/each}</h1>
   <div class="meta">
     <span class="meta-item workspace">
       <span class="meta-label">workspace</span>
@@ -192,6 +204,46 @@
     color: #f0ead6;
     letter-spacing: -0.02em;
     line-height: 1;
+  }
+  /* v60.95 — per-letter colour cycle. Every letter runs the same pulse,
+     but with an `animation-delay` staggered by its index (`--i`), so the
+     bright spot sweeps left→right across "atelier" and loops while a
+     prompt is in flight. The delay step is cycle ÷ letter-count
+     (1.4s ÷ 7 = 0.2s), which spaces the wave evenly and lets it wrap
+     seamlessly. The bright window (~peak at 20%, dark again by 55%) is
+     narrow relative to the cycle so only ~2 letters glow at once — a
+     travelling comet rather than a uniform flash. Off `.thinking`, each
+     letter transitions back to the cream base. */
+  .logo-letter {
+    color: #f0ead6;
+    transition: color 0.4s ease;
+  }
+  .logo-letter.thinking {
+    animation: letter-cycle 1.4s ease-in-out infinite;
+    animation-delay: calc(var(--i) * 0.2s);
+  }
+  @keyframes letter-cycle {
+    0%,
+    55%,
+    100% {
+      color: #f0ead6;
+      text-shadow: none;
+    }
+    20% {
+      color: #a8d8ff;
+      text-shadow:
+        0 0 6px rgba(121, 192, 255, 0.9),
+        0 0 20px rgba(121, 192, 255, 0.55),
+        0 0 48px rgba(121, 192, 255, 0.25);
+    }
+  }
+  /* Respect reduced-motion: drop the sweep but still tint the wordmark
+     so the busy state is conveyed without animation. */
+  @media (prefers-reduced-motion: reduce) {
+    .logo-letter.thinking {
+      animation: none;
+      color: #a8d8ff;
+    }
   }
   .meta {
     /* v60.48 — pinned to the far right of the header. `margin-left: auto`

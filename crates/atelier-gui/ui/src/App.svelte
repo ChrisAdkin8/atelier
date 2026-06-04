@@ -361,6 +361,7 @@
     rightCollapsed={rightPanelCollapsed}
     onToggleRight={toggleRightPanel}
     onWorkspaceSet={reloadProviderProfiles}
+    thinking={app.runInFlight}
   />
 
   <!-- Phase C close — mental-model panel toggle. Lives in its own
@@ -697,8 +698,23 @@
      (0.65rem for tracked-caps labels, 0.7rem for the swap-select)
      drifted text vertically by ~1-2px. `align-items: center` plus a
      unified line-height fixes the v-align without per-element hacks. */
+  /* v60.96 — side tracks size to content (`auto`), centre claims the
+     remainder (`1fr`). The earlier `minmax(0, 1fr) auto minmax(0, 1fr)`
+     formula clamped both sides to equal `1fr` for mathematical centring,
+     but the right zone's `.swap-select` (intrinsic width set by the
+     longest option label) plus the `.model-badge`'s `white-space: nowrap`
+     spans refused to shrink within `minmax(0, 1fr)`, so their content
+     overflowed leftward (right zone is `justify-content: flex-end`) and
+     painted on top of the centre token meter. Letting the side tracks
+     auto-size to their natural content guarantees they can't overlap
+     the centre — at the cost of the meter being centred *between* the
+     side zones rather than mathematically centred to the footer width.
+     With a wide right zone (selected provider) and a narrow left zone
+     (just `context` + `cost`), the meter shifts slightly leftward; this
+     is the lesser evil. */
   .help {
-    display: flex;
+    display: grid;
+    grid-template-columns: auto 1fr auto;
     align-items: center;
     padding: 0.35rem 1rem;
     border-top: 1px solid var(--border-pane);
@@ -749,20 +765,24 @@
   /* v60.44 — cost meter, sibling of ctx-meter. No `margin-left:auto`
      here; the ctx-meter already claimed the auto-margin so cost sits
      immediately to its right via the parent flex `gap`. */
+  /* v60.94 — each zone is a grid column (see `.help`). `min-width: 0`
+     lets a zone's flex content shrink within its track instead of
+     forcing the track wider; the side tracks stay equal so the centre
+     column holds true centre. No `overflow: hidden` on `.footer-right`
+     — the model popover is absolutely positioned and would be clipped. */
   .help .footer-left {
-    flex: 1;
+    min-width: 0;
     display: flex;
     align-items: center;
     gap: 1rem;
   }
   .help .footer-center {
-    flex: 0 0 auto;
     display: flex;
     align-items: center;
     justify-content: center;
   }
   .help .footer-right {
-    flex: 1;
+    min-width: 0;
     display: flex;
     align-items: center;
     justify-content: flex-end;

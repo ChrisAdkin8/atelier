@@ -61,6 +61,13 @@ const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
 const DEFAULT_MAX_TOKENS: u32 = 4096;
 const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 120;
+// Connection-establishment bound, distinct from the overall request
+// timeout above. Without it an unreachable endpoint (offline, DNS
+// failure, a host that black-holes SYNs) blocks every request for the
+// full overall timeout; `connect_timeout` caps only the TCP/TLS
+// handshake so a dead endpoint fails fast while a slow-but-reachable
+// response keeps its full budget. Mirrors the openai_compat adapter.
+const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
 /// v60.28 H7 — hard cap on a single non-stream HTTP response body. A
 /// hostile or runaway upstream must not be allowed to push us into OOM.
 const MAX_RESPONSE_BODY_BYTES: usize = 32 << 20;
@@ -102,6 +109,7 @@ impl AnthropicAdapter {
             },
             http: Client::builder()
                 .timeout(Duration::from_secs(DEFAULT_HTTP_TIMEOUT_SECS))
+                .connect_timeout(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS))
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .expect("reqwest::Client::builder default config is infallible"),

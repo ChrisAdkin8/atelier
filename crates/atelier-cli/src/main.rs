@@ -148,6 +148,17 @@ OPTIONS:
 ";
 
 fn main() -> ExitCode {
+    // Install a tracing subscriber so runner.rs warn/info messages reach the
+    // user. Writes to stderr (stdout may be machine-consumed). Respects
+    // RUST_LOG for override; defaults to WARN so normal runs stay quiet.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .with_writer(std::io::stderr)
+        .init();
+
     let mut args = env::args().skip(1);
     let Some(subcommand) = args.next() else {
         eprintln!("{USAGE}");
@@ -1719,6 +1730,12 @@ fn run_run(args: impl Iterator<Item = String>) -> ExitCode {
     // by the profile store) is the canonical home-dir lookup; missing
     // is OK and just means only bundled + per-repo layers contribute.
     let home_dir = std::env::var_os("HOME").map(PathBuf::from);
+    if home_dir.is_none() {
+        tracing::warn!(
+            "HOME is not set; user-level skill registry not loaded \
+             (bundled skills still available)"
+        );
+    }
     let registry = match atelier_core::skills::SkillRegistry::load(&workspace, home_dir.as_deref())
     {
         Ok(r) => std::sync::Arc::new(r),
@@ -1760,11 +1777,22 @@ fn run_run(args: impl Iterator<Item = String>) -> ExitCode {
                     "per-task routing: executor adapter loaded"
                 );
             }
-            Err(e) => eprintln!("atelier run: routing.executor: {e}"),
+            Err(e) => {
+                // Fail fast: the user explicitly configured routing.executor;
+                // silently falling back to the planner adapter produces
+                // misleading behaviour that's worse than a clear error.
+                // Exit 1 (operational failure) not 2 (usage error).
+                eprintln!("atelier run: routing.executor \"{exec_name}\": {e}");
+                eprintln!("atelier run: remove [routing].executor from providers.toml to run without per-task routing");
+                return ExitCode::from(1);
+            }
         }
     }
     if let Some(n) = max_turns {
         runner = runner.with_max_turns(n);
+    }
+    if let Some(secs) = config.runner.as_ref().and_then(|r| r.pause_timeout_secs) {
+        runner = runner.with_pause_timeout_secs(secs);
     }
     if let Some(policy) = probe_policy_override {
         runner = runner.with_probe_policy(policy);
@@ -1803,6 +1831,12 @@ fn run_run(args: impl Iterator<Item = String>) -> ExitCode {
                     None => "; DoD: not configured",
                 }
             );
+            if let Some(e) = &report.persist_error {
+                eprintln!("atelier run: warning: session not persisted — {e}");
+                eprintln!(
+                    "atelier run: warning: `--resume` will not be available for this session"
+                );
+            }
             ExitCode::from(atelier_cli::exit_code_for_final_state(report.final_state))
         }
         SignalOutcome::Completed(Err(e)) => {
