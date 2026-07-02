@@ -1,8 +1,8 @@
 {
   "version": 1,
-  "run_id": "2026-07-01T10:39:02Z",
-  "git_sha": "c92a8b3",
-  "workflow_run_url": "https://github.com/ChrisAdkin8/atelier/actions/runs/28511500255",
+  "run_id": "2026-07-02T09:56:13Z",
+  "git_sha": "95bcf6a",
+  "workflow_run_url": "https://github.com/ChrisAdkin8/atelier/actions/runs/28581351718",
   "all_passed": true,
   "status": "yellow",
   "calibration_phase": true,
