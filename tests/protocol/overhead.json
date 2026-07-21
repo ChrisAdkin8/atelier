@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "measured_at": "2026-07-20T09:25:48Z",
+  "measured_at": "2026-07-21T08:37:58Z",
   "providers": [
     {
       "provider": "mock",
@@ -10,7 +10,7 @@
       "conformance_rate": 1.0,
       "bytes_on_wire": 256,
       "tokens_envelope": 64,
-      "parse_time_ns": 3055,
+      "parse_time_ns": 3897,
       "rolling_median": {
         "window_days": 7,
         "value": 64.0,
@@ -25,7 +25,7 @@
       "conformance_rate": 1.0,
       "bytes_on_wire": 265,
       "tokens_envelope": 67,
-      "parse_time_ns": 17803,
+      "parse_time_ns": 20927,
       "rolling_median": {
         "window_days": 7,
         "value": 67.0,
@@ -40,7 +40,7 @@
       "conformance_rate": 1.0,
       "bytes_on_wire": 129,
       "tokens_envelope": 33,
-      "parse_time_ns": 1282,
+      "parse_time_ns": 1500,
       "rolling_median": {
         "window_days": 7,
         "value": 33.0,
