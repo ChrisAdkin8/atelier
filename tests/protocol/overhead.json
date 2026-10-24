@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "measured_at": "2026-10-23T11:20:58Z",
+  "measured_at": "2026-10-24T10:39:49Z",
   "providers": [
     {
       "provider": "mock",
@@ -25,7 +25,7 @@
       "conformance_rate": 1.0,
       "bytes_on_wire": 265,
       "tokens_envelope": 67,
-      "parse_time_ns": 20218,
+      "parse_time_ns": 21320,
       "rolling_median": {
         "window_days": 7,
         "value": 67.0,
